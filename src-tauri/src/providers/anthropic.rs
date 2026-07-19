@@ -233,6 +233,18 @@ fn anthropic_messages(messages: &[ProviderMessage]) -> Vec<Value> {
                 "role": match role { MessageRole::User => "user", MessageRole::Assistant => "assistant" },
                 "content": text
             })),
+            ProviderMessage::UserContent { text, images } => result.push(json!({
+                "role": "user",
+                "content": std::iter::once(json!({ "type": "text", "text": text }))
+                    .chain(images.iter().filter_map(|image| {
+                        let (media_type, data) = super::split_image_data_url(&image.data_url)?;
+                        Some(json!({
+                            "type": "image",
+                            "source": { "type": "base64", "media_type": media_type, "data": data }
+                        }))
+                    }))
+                    .collect::<Vec<_>>()
+            })),
             ProviderMessage::AssistantToolCalls { calls } => result.push(json!({
                 "role": "assistant",
                 "content": calls.iter().map(|call| json!({
@@ -323,6 +335,7 @@ fn parse_sse_data(data: &str) -> Result<ParsedAnthropicEvent, ProviderError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::providers::ProviderImage;
 
     #[test]
     fn parses_text_and_tool_lifecycle() {
@@ -349,5 +362,20 @@ mod tests {
         }]);
         assert_eq!(messages[0]["content"][0]["type"], "tool_result");
         assert_eq!(messages[0]["content"][0]["is_error"], true);
+    }
+
+    #[test]
+    fn serializes_image_content() {
+        let messages = anthropic_messages(&[ProviderMessage::UserContent {
+            text: "inspect".into(),
+            images: vec![ProviderImage {
+                name: "screen.png".into(),
+                data_url: "data:image/png;base64,AA==".into(),
+            }],
+        }]);
+        assert_eq!(
+            messages[0]["content"][1]["source"]["media_type"],
+            "image/png"
+        );
     }
 }

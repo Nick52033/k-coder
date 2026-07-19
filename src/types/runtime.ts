@@ -6,6 +6,25 @@ export interface RuntimeStatus {
   capabilities: string[];
 }
 
+export interface ProjectRecord { id: string; name: string; path: string; trusted: boolean; lastOpenedAtMs: number; }
+export interface WorkspaceState { current: ProjectRecord; recent: ProjectRecord[]; }
+export interface FileEntry { name: string; path: string; isDirectory: boolean; size: number | null; modifiedAtMs: number | null; }
+export interface FilePreview { path: string; name: string; language: string; content: string | null; dataUrl: string | null; size: number; truncated: boolean; }
+export interface AttachmentContent { path: string; name: string; kind: "image" | "document"; content: string; size: number; truncated: boolean; }
+export interface ImageAttachment { name: string; dataUrl: string; }
+export interface GitFileStatus { path: string; indexStatus: string; worktreeStatus: string; }
+export interface GitStatusView { isRepository: boolean; branch: string | null; upstream: string | null; ahead: number; behind: number; files: GitFileStatus[]; }
+export interface GitBranchView { current: string | null; branches: string[]; }
+export interface UsageSummary { inputTokens: number; outputTokens: number; totalTokens: number; providerCalls: number; }
+export interface ProviderConnectionTest { connected: boolean; latencyMs: number; usage: TokenUsage | null; }
+export interface InstructionSource { path: string; scope: string; priority: number; bytes: number; }
+export interface SkillDiagnostic { name: string; description: string; path: string; scope: string; risk: ToolRisk; triggers: string[]; enabled: boolean; }
+export interface CredentialDiagnostic { name: string; configured: boolean; }
+export interface McpDiagnostic { id: string; transport: string; enabled: boolean; state: string; toolCount: number; credentials: CredentialDiagnostic[]; error: string | null; }
+export interface HookDiagnostic { id: string; phase: string; tool: string; enabled: boolean; }
+export interface ExtensionAudit { timestampMs: number; event: string; kind: string; id: string; success: boolean; detail: string; }
+export interface ExtensionOverview { schemaVersion: number; configPaths: string[]; instructions: InstructionSource[]; skills: SkillDiagnostic[]; mcpServers: McpDiagnostic[]; hooks: HookDiagnostic[]; audit: ExtensionAudit[]; error: string | null; }
+
 export type CommandMode = "foreground" | "background";
 export type CommandState =
   | { state: "running" }
@@ -97,11 +116,19 @@ export interface TextContentBlock {
   text: string;
 }
 
+export interface ImageContentBlock {
+  type: "image";
+  name: string;
+  dataUrl: string;
+}
+
+export type ContentBlock = TextContentBlock | ImageContentBlock;
+
 export interface ChatMessage {
   schemaVersion: number;
   id: string;
   role: MessageRole;
-  content: TextContentBlock[];
+  content: ContentBlock[];
   createdAtMs: number;
 }
 

@@ -6,7 +6,26 @@ use rusqlite::{Connection, OptionalExtension, params};
 use crate::protocol::TokenUsage;
 use crate::storage::{StoredEvent, StoredEventKind, ThreadSummary};
 
-pub const DATABASE_SCHEMA_VERSION: u32 = 1;
+pub const DATABASE_SCHEMA_VERSION: u32 = 2;
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectRecord {
+    pub id: String,
+    pub name: String,
+    pub path: String,
+    pub trusted: bool,
+    pub last_opened_at_ms: u64,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageSummary {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub total_tokens: u64,
+    pub provider_calls: u64,
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum ProjectionError {
@@ -121,6 +140,42 @@ impl ProjectionDb {
             })
             .optional()?)
     }
+
+    pub fn upsert_project(&self, project: &ProjectRecord) -> Result<(), ProjectionError> {
+        self.connection.lock().map_err(|_| ProjectionError::Poisoned)?.execute(
+            "INSERT INTO projects(id,name,path,trusted,last_opened_at_ms) VALUES(?1,?2,?3,?4,?5)
+             ON CONFLICT(path) DO UPDATE SET name=excluded.name,trusted=excluded.trusted,last_opened_at_ms=excluded.last_opened_at_ms",
+            params![project.id, project.name, project.path, project.trusted as i64, project.last_opened_at_ms],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_projects(&self) -> Result<Vec<ProjectRecord>, ProjectionError> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| ProjectionError::Poisoned)?;
+        let mut statement = connection.prepare(
+            "SELECT id,name,path,trusted,last_opened_at_ms FROM projects ORDER BY last_opened_at_ms DESC")?;
+        Ok(statement
+            .query_map([], |row| {
+                Ok(ProjectRecord {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    path: row.get(2)?,
+                    trusted: row.get::<_, i64>(3)? != 0,
+                    last_opened_at_ms: row.get(4)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn usage_summary(&self) -> Result<UsageSummary, ProjectionError> {
+        Ok(self.connection.lock().map_err(|_| ProjectionError::Poisoned)?.query_row(
+            "SELECT COALESCE(SUM(input_tokens),0),COALESCE(SUM(output_tokens),0),COALESCE(SUM(total_tokens),0),COUNT(*) FROM usage",
+            [], |row| Ok(UsageSummary { input_tokens: row.get(0)?, output_tokens: row.get(1)?,
+                total_tokens: row.get(2)?, provider_calls: row.get(3)? }))?)
+    }
 }
 
 fn insert_usage(
@@ -166,6 +221,15 @@ fn migrate(connection: &Connection) -> Result<(), rusqlite::Error> {
              CREATE INDEX usage_thread_turn ON usage(thread_id,turn_id);
              INSERT INTO schema_migrations(version,applied_at) VALUES(1,datetime('now'));
              COMMIT;")?;
+    }
+    if version < 2 {
+        connection.execute_batch(
+            "BEGIN;
+             CREATE TABLE projects(id TEXT PRIMARY KEY,name TEXT NOT NULL,path TEXT NOT NULL UNIQUE,
+               trusted INTEGER NOT NULL DEFAULT 0,last_opened_at_ms INTEGER NOT NULL);
+             INSERT INTO schema_migrations(version,applied_at) VALUES(2,datetime('now'));
+             COMMIT;",
+        )?;
     }
     Ok(())
 }

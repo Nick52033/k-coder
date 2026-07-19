@@ -284,6 +284,15 @@ fn chat_messages(messages: &[ProviderMessage]) -> Vec<Value> {
                 "role": match role { MessageRole::User => "user", MessageRole::Assistant => "assistant" },
                 "content": text
             })),
+            ProviderMessage::UserContent { text, images } => Some(json!({
+                "role": "user",
+                "content": std::iter::once(json!({ "type": "text", "text": text }))
+                    .chain(images.iter().map(|image| json!({
+                        "type": "image_url",
+                        "image_url": { "url": image.data_url }
+                    })))
+                    .collect::<Vec<_>>()
+            })),
             ProviderMessage::AssistantToolCalls { calls } => Some(json!({
                 "role": "assistant",
                 "content": null,
@@ -355,6 +364,7 @@ fn parse_sse_data(data: &str) -> Result<ParsedSseData, ProviderError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::providers::ProviderImage;
 
     #[test]
     fn parses_text_usage_and_fragmented_tool_calls() {
@@ -411,5 +421,17 @@ mod tests {
             "read_file"
         );
         assert_eq!(messages[1]["role"], "tool");
+    }
+
+    #[test]
+    fn serializes_image_content() {
+        let messages = chat_messages(&[ProviderMessage::UserContent {
+            text: "inspect".into(),
+            images: vec![ProviderImage {
+                name: "screen.png".into(),
+                data_url: "data:image/png;base64,AA==".into(),
+            }],
+        }]);
+        assert_eq!(messages[0]["content"][1]["type"], "image_url");
     }
 }

@@ -6,6 +6,7 @@ import {
   FileDiff,
   RefreshCw,
   Rows3,
+  ShieldCheck,
   Undo2,
   X,
 } from "lucide-react";
@@ -116,6 +117,15 @@ export function PatchReviewDialog({
     };
   }, [isApproval]);
 
+  if (request && !preview) {
+    return (
+      <GenericToolApproval
+        request={request}
+        error={error}
+        onResolve={onResolve}
+      />
+    );
+  }
   if (!preview) return null;
 
   const activeFile =
@@ -319,6 +329,64 @@ export function PatchReviewDialog({
       </footer>
     </div>
   );
+}
+
+function GenericToolApproval({
+  request,
+  error,
+  onResolve,
+}: {
+  request: ApprovalRequest;
+  error: string;
+  onResolve?: (resolution: ApprovalResolution) => Promise<boolean>;
+}) {
+  const [busy, setBusy] = useState(false);
+  const [localError, setLocalError] = useState("");
+
+  async function resolve(action: "approved" | "rejected") {
+    if (!onResolve) return;
+    setBusy(true);
+    const success = await onResolve({
+      action,
+      patch: null,
+      selectedPaths: [],
+      expectedHashes: [],
+    });
+    if (!success) {
+      setLocalError("审批未能提交，请重试");
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="review-overlay generic-approval" role="dialog" aria-modal="true" aria-label="外部工具审批" aria-busy={busy}>
+      <section className="generic-approval-panel">
+        <header>
+          <ShieldCheck size={20} />
+          <div><h2>外部工具请求</h2><span>{request.toolName}</span></div>
+        </header>
+        <dl>
+          <div><dt>风险</dt><dd>{riskLabel(request.risk)}</dd></div>
+          <div><dt>原因</dt><dd>{request.reason}</dd></div>
+        </dl>
+        <pre><code>{JSON.stringify(request.arguments, null, 2)}</code></pre>
+        {(error || localError) && <div className="review-error" role="alert">{localError || error}</div>}
+        <footer>
+          <button className="secondary-button" type="button" disabled={busy} onClick={() => void resolve("rejected")}>拒绝</button>
+          <button className="primary-button" type="button" disabled={busy} onClick={() => void resolve("approved")}>允许一次</button>
+        </footer>
+      </section>
+    </div>
+  );
+}
+
+function riskLabel(risk: ApprovalRequest["risk"]) {
+  switch (risk) {
+    case "read": return "只读";
+    case "write": return "写入";
+    case "delete": return "破坏性操作";
+    case "external": return "外部访问";
+  }
 }
 
 function DiffContent({ file, mode }: { file: PatchFilePreview; mode: "unified" | "side_by_side" }) {

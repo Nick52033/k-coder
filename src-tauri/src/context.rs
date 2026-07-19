@@ -72,6 +72,9 @@ pub fn compact(
                 role: MessageRole::User,
                 text,
             } if is_constraint(text) => Some(bound(text, 600)),
+            ProviderMessage::UserContent { text, .. } if is_constraint(text) => {
+                Some(bound(text, 600))
+            }
             _ => None,
         })
         .rev()
@@ -99,6 +102,11 @@ pub fn compact(
             ProviderMessage::Text { role, text } => {
                 Some(format!("{:?}: {}", role, bound(text, 500)))
             }
+            ProviderMessage::UserContent { text, images } => Some(format!(
+                "User: {} [{} image attachment(s)]",
+                bound(text, 500),
+                images.len()
+            )),
             ProviderMessage::ToolResult {
                 name,
                 success,
@@ -155,6 +163,7 @@ fn is_constraint(text: &str) -> bool {
 fn message_chars(message: &ProviderMessage) -> usize {
     match message {
         ProviderMessage::Text { text, .. } => text.len(),
+        ProviderMessage::UserContent { text, images } => text.len() + images.len() * 4096,
         ProviderMessage::AssistantToolCalls { calls } => calls
             .iter()
             .map(|call| call.name.len() + call.arguments.to_string().len())

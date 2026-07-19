@@ -177,6 +177,15 @@ fn gemini_contents(messages: &[ProviderMessage]) -> Vec<Value> {
                 "role": match role { MessageRole::User => "user", MessageRole::Assistant => "model" },
                 "parts": [{ "text": text }]
             })),
+            ProviderMessage::UserContent { text, images } => Some(json!({
+                "role": "user",
+                "parts": std::iter::once(json!({ "text": text }))
+                    .chain(images.iter().filter_map(|image| {
+                        let (mime_type, data) = super::split_image_data_url(&image.data_url)?;
+                        Some(json!({ "inlineData": { "mimeType": mime_type, "data": data } }))
+                    }))
+                    .collect::<Vec<_>>()
+            })),
             ProviderMessage::AssistantToolCalls { calls } => {
                 let parts = calls.iter().map(|call| {
                     let mut part = json!({
@@ -297,6 +306,7 @@ fn gemini_schema(mut schema: Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::providers::ProviderImage;
 
     #[test]
     fn parses_text_usage_and_function_calls() {
@@ -347,5 +357,20 @@ mod tests {
             "properties": { "path": { "type": "string" } }
         }));
         assert!(schema.get("additionalProperties").is_none());
+    }
+
+    #[test]
+    fn serializes_image_content() {
+        let contents = gemini_contents(&[ProviderMessage::UserContent {
+            text: "inspect".into(),
+            images: vec![ProviderImage {
+                name: "screen.png".into(),
+                data_url: "data:image/png;base64,AA==".into(),
+            }],
+        }]);
+        assert_eq!(
+            contents[0]["parts"][1]["inlineData"]["mimeType"],
+            "image/png"
+        );
     }
 }

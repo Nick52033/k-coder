@@ -12,14 +12,19 @@ use crate::context::{self, CompactionSummary, DEFAULT_CONTEXT_LIMIT};
 use crate::policy::{ApprovalError, ApprovalManager, PolicyDecision};
 use crate::protocol::{
     AgentEvent, AgentEventEnvelope, ApprovalAction, ApprovalRequest, ApprovalResolution, ChangeSet,
-    ChatMessage, ContentBlock, ExpectedFileHash, MessageRole, PROTOCOL_VERSION, PatchPreview,
-    TokenUsage, ToolCall, ToolResult, TurnState,
+    ChatMessage, ContentBlock, ExpectedFileHash, ImageAttachment, MessageRole, PROTOCOL_VERSION,
+    PatchPreview, TokenUsage, ToolCall, ToolResult, TurnState,
 };
-use crate::providers::{Provider, ProviderError, ProviderEvent, ProviderMessage, ProviderRequest};
+use crate::providers::{
+    Provider, ProviderError, ProviderEvent, ProviderImage, ProviderMessage, ProviderRequest,
+};
 use crate::storage::{StorageError, StoredEvent, StoredEventKind, ThreadRepository, now_ms};
 use crate::tools::{ApprovedToolExecution, ToolContext, ToolError, ToolRegistry};
 
 const MAX_INPUT_BYTES: usize = 100_000;
+const MAX_IMAGE_COUNT: usize = 4;
+const MAX_IMAGE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_TOTAL_IMAGE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_RESPONSE_BYTES: usize = 10 * 1024 * 1024;
 const MAX_TOOL_OUTPUT_BYTES: usize = 256 * 1024;
 const MAX_TOOL_ITERATIONS: usize = 8;
@@ -67,6 +72,7 @@ pub struct AgentRuntime {
     tools: ToolRegistry,
     workspace_root: PathBuf,
     approvals: Arc<ApprovalManager>,
+    runtime_instructions: String,
 }
 
 impl AgentRuntime {
@@ -102,7 +108,13 @@ impl AgentRuntime {
             tools,
             workspace_root,
             approvals,
+            runtime_instructions: String::new(),
         }
+    }
+
+    pub fn with_runtime_instructions(mut self, instructions: String) -> Self {
+        self.runtime_instructions = instructions;
+        self
     }
 
     pub async fn run_turn(
@@ -113,12 +125,33 @@ impl AgentRuntime {
         cancellation: CancellationToken,
         publisher: Arc<dyn EventPublisher>,
     ) -> Result<TurnOutcome, AgentRuntimeError> {
+        self.run_turn_with_attachments(
+            provider,
+            model,
+            request,
+            Vec::new(),
+            cancellation,
+            publisher,
+        )
+        .await
+    }
+
+    pub async fn run_turn_with_attachments(
+        &self,
+        provider: Arc<dyn Provider>,
+        model: String,
+        request: RunTurnRequest,
+        attachments: Vec<ImageAttachment>,
+        cancellation: CancellationToken,
+        publisher: Arc<dyn EventPublisher>,
+    ) -> Result<TurnOutcome, AgentRuntimeError> {
         let input = validate_input(&request.input)?;
+        let message = user_message(input, attachments)?;
         self.run_turn_inner(
             provider,
             model,
             request.thread_id,
-            Some(input),
+            Some(message),
             cancellation,
             publisher,
         )
@@ -183,7 +216,7 @@ impl AgentRuntime {
         provider: Arc<dyn Provider>,
         model: String,
         thread_id: String,
-        new_input: Option<String>,
+        new_input: Option<ChatMessage>,
         cancellation: CancellationToken,
         publisher: Arc<dyn EventPublisher>,
     ) -> Result<TurnOutcome, AgentRuntimeError> {
@@ -197,14 +230,12 @@ impl AgentRuntime {
             ));
         }
 
-        if let Some(input) = new_input {
+        if let Some(message) = new_input {
             self.repository
                 .append(StoredEvent::new(
                     &thread_id,
                     None,
-                    StoredEventKind::UserMessage {
-                        message: text_message(MessageRole::User, input),
-                    },
+                    StoredEventKind::UserMessage { message },
                 ))
                 .await?;
         }
@@ -250,6 +281,15 @@ impl AgentRuntime {
                         .await?;
                     history = compacted;
                 }
+            }
+            if !self.runtime_instructions.trim().is_empty() {
+                history.insert(
+                    0,
+                    ProviderMessage::Text {
+                        role: MessageRole::User,
+                        text: self.runtime_instructions.clone(),
+                    },
+                );
             }
             let request = ProviderRequest {
                 schema_version: PROTOCOL_VERSION,
@@ -520,11 +560,6 @@ impl AgentRuntime {
                     Ok(preview) => preview,
                     Err(error) => return Ok(Some(failure_result(error.to_string()))),
                 };
-                let Some(preview) = preview else {
-                    return Ok(Some(failure_result(
-                        "approval_required: tool did not provide a reviewable preview".to_string(),
-                    )));
-                };
                 let request_id = Uuid::new_v4().to_string();
                 let created_at_ms = now_ms();
                 let request = ApprovalRequest {
@@ -536,7 +571,7 @@ impl AgentRuntime {
                     reason,
                     risk: authorization.risk,
                     arguments: call.arguments.clone(),
-                    preview: Some(preview.clone()),
+                    preview: preview.clone(),
                     created_at_ms,
                     expires_at_ms: created_at_ms.saturating_add(self.approvals.timeout_ms()),
                 };
@@ -601,6 +636,34 @@ impl AgentRuntime {
                     ApprovalAction::Cancelled => return Ok(None),
                     ApprovalAction::Approved => {}
                 }
+
+                let Some(preview) = preview else {
+                    if resolution.patch.is_some()
+                        || !resolution.selected_paths.is_empty()
+                        || !resolution.expected_hashes.is_empty()
+                    {
+                        return Ok(Some(failure_result(
+                            "approval_invalid: external tool approval cannot contain patch scope"
+                                .to_string(),
+                        )));
+                    }
+                    return Ok(Some(
+                        match self
+                            .tools
+                            .dispatch_authorized(
+                                context,
+                                &call.name,
+                                call.arguments.clone(),
+                                cancellation,
+                            )
+                            .await
+                        {
+                            Ok(result) => result,
+                            Err(ToolError::Cancelled) => return Ok(None),
+                            Err(error) => failure_result(error.to_string()),
+                        },
+                    ));
+                };
 
                 if resolution.patch.is_some() && call.name != "apply_patch" {
                     return Ok(Some(failure_result(
@@ -860,13 +923,7 @@ fn provider_history(events: Vec<StoredEvent>) -> Vec<ProviderMessage> {
     for event in events {
         let message = match event.kind {
             StoredEventKind::UserMessage { message }
-            | StoredEventKind::AssistantMessage { message } => {
-                let text = message.text();
-                Some(ProviderMessage::Text {
-                    role: message.role,
-                    text,
-                })
-            }
+            | StoredEventKind::AssistantMessage { message } => chat_to_provider(message),
             StoredEventKind::AssistantToolCalls { calls } => {
                 Some(ProviderMessage::AssistantToolCalls { calls })
             }
@@ -1046,6 +1103,87 @@ fn text_message(role: MessageRole, text: String) -> ChatMessage {
     }
 }
 
+fn user_message(
+    text: String,
+    attachments: Vec<ImageAttachment>,
+) -> Result<ChatMessage, AgentRuntimeError> {
+    if attachments.len() > MAX_IMAGE_COUNT {
+        return Err(AgentRuntimeError::InvalidInput(format!(
+            "at most {MAX_IMAGE_COUNT} images may be attached"
+        )));
+    }
+    let mut total = 0usize;
+    let mut content = vec![ContentBlock::Text { text }];
+    for attachment in attachments {
+        let (_, encoded) = parse_image_data_url(&attachment.data_url)?;
+        let decoded = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, encoded)
+            .map_err(|_| {
+            AgentRuntimeError::InvalidInput("image data is not valid base64".into())
+        })?;
+        if decoded.len() > MAX_IMAGE_BYTES {
+            return Err(AgentRuntimeError::InvalidInput(
+                "an attached image exceeds the 4 MiB limit".into(),
+            ));
+        }
+        total = total.saturating_add(decoded.len());
+        if total > MAX_TOTAL_IMAGE_BYTES {
+            return Err(AgentRuntimeError::InvalidInput(
+                "attached images exceed the 8 MiB total limit".into(),
+            ));
+        }
+        content.push(ContentBlock::Image {
+            name: attachment.name.chars().take(255).collect(),
+            data_url: attachment.data_url,
+        });
+    }
+    Ok(ChatMessage {
+        schema_version: PROTOCOL_VERSION,
+        id: Uuid::new_v4().to_string(),
+        role: MessageRole::User,
+        content,
+        created_at_ms: now_ms(),
+    })
+}
+
+fn parse_image_data_url(value: &str) -> Result<(&str, &str), AgentRuntimeError> {
+    let (metadata, encoded) = value.split_once(',').ok_or_else(|| {
+        AgentRuntimeError::InvalidInput("image attachment must be a data URL".into())
+    })?;
+    let media_type = metadata
+        .strip_prefix("data:")
+        .and_then(|value| value.strip_suffix(";base64"))
+        .ok_or_else(|| AgentRuntimeError::InvalidInput("image data URL must use base64".into()))?;
+    if !matches!(
+        media_type,
+        "image/png" | "image/jpeg" | "image/gif" | "image/webp"
+    ) {
+        return Err(AgentRuntimeError::InvalidInput(
+            "image type must be PNG, JPEG, GIF, or WebP".into(),
+        ));
+    }
+    Ok((media_type, encoded))
+}
+
+fn chat_to_provider(message: ChatMessage) -> Option<ProviderMessage> {
+    let text = message.text();
+    let images = message
+        .content
+        .into_iter()
+        .filter_map(|block| match block {
+            ContentBlock::Image { name, data_url } => Some(ProviderImage { name, data_url }),
+            ContentBlock::Text { .. } => None,
+        })
+        .collect::<Vec<_>>();
+    if message.role == MessageRole::User && !images.is_empty() {
+        Some(ProviderMessage::UserContent { text, images })
+    } else {
+        Some(ProviderMessage::Text {
+            role: message.role,
+            text,
+        })
+    }
+}
+
 fn validate_input(input: &str) -> Result<String, AgentRuntimeError> {
     let input = input.trim();
     if input.is_empty() {
@@ -1080,10 +1218,37 @@ mod tests {
     use async_trait::async_trait;
 
     use super::*;
-    use crate::protocol::ToolDefinition;
+    use crate::protocol::{ToolDefinition, ToolRisk};
     use crate::providers::testing::FakeProvider;
     use crate::storage::JsonlThreadRepository;
     use crate::tools::ToolHandler;
+
+    #[test]
+    fn validates_and_maps_bounded_image_attachments() {
+        let message = user_message(
+            "inspect this screenshot".into(),
+            vec![ImageAttachment {
+                name: "screen.png".into(),
+                data_url: "data:image/png;base64,iVBORw0KGgo=".into(),
+            }],
+        )
+        .unwrap();
+        assert!(matches!(
+            chat_to_provider(message),
+            Some(ProviderMessage::UserContent { text, images })
+                if text == "inspect this screenshot" && images.len() == 1
+        ));
+        assert!(
+            user_message(
+                "bad image".into(),
+                vec![ImageAttachment {
+                    name: "bad.svg".into(),
+                    data_url: "data:image/svg+xml;base64,PHN2Zy8+".into(),
+                }],
+            )
+            .is_err()
+        );
+    }
 
     #[derive(Default)]
     struct RecordingPublisher {
@@ -1156,6 +1321,32 @@ mod tests {
     }
 
     struct SlowTool;
+
+    struct ExternalTool;
+
+    #[async_trait]
+    impl ToolHandler for ExternalTool {
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition {
+                name: "mcp__fixture__write".into(),
+                description: "external write fixture".into(),
+                input_schema: json!({ "type": "object", "additionalProperties": false }),
+            }
+        }
+
+        async fn execute(
+            &self,
+            _context: &ToolContext,
+            _arguments: Value,
+            _cancellation: CancellationToken,
+        ) -> Result<ToolResult, ToolError> {
+            Ok(ToolResult {
+                success: true,
+                output: "external completed".into(),
+                metadata: json!({ "mcp": true }),
+            })
+        }
+    }
 
     #[async_trait]
     impl ToolHandler for SlowTool {
@@ -1530,6 +1721,82 @@ mod tests {
             Some("before\n")
         );
         assert_eq!(approvals.pending_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn generic_external_approval_executes_once_without_patch_capabilities() {
+        let directory = tempfile::tempdir().unwrap();
+        let repository =
+            Arc::new(JsonlThreadRepository::new(directory.path().join("data")).unwrap());
+        let thread = repository.create_thread().await.unwrap();
+        let approvals = Arc::new(ApprovalManager::new(Duration::from_secs(1)));
+        let name = "mcp__fixture__write".to_string();
+        let tools = ToolRegistry::read_only()
+            .with_extensions(
+                vec![Arc::new(ExternalTool)],
+                HashMap::from([(name.clone(), ToolRisk::Write)]),
+                None,
+            )
+            .unwrap();
+        let runtime = AgentRuntime::with_tools_and_approvals(
+            repository.clone(),
+            tools,
+            directory.path().into(),
+            approvals.clone(),
+        );
+        let provider = Arc::new(FakeProvider::script(vec![
+            vec![
+                Ok(ProviderEvent::ToolCall {
+                    call: ToolCall {
+                        id: "external-call".into(),
+                        name,
+                        arguments: json!({}),
+                        metadata: json!({}),
+                    },
+                }),
+                Ok(ProviderEvent::Completed),
+            ],
+            vec![
+                Ok(ProviderEvent::TextDelta {
+                    delta: "done".into(),
+                }),
+                Ok(ProviderEvent::Completed),
+            ],
+        ]));
+        let publisher = Arc::new(ResolvingPublisher {
+            events: Mutex::new(Vec::new()),
+            approvals: approvals.clone(),
+            resolution: ApprovalResolution {
+                action: ApprovalAction::Approved,
+                patch: None,
+                selected_paths: Vec::new(),
+                expected_hashes: Vec::new(),
+            },
+            mutation: None,
+        });
+        let outcome = runtime
+            .run_turn(
+                provider,
+                "fake".into(),
+                RunTurnRequest {
+                    thread_id: thread.id.clone(),
+                    input: "use external tool".into(),
+                },
+                CancellationToken::new(),
+                publisher,
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome.state, TurnState::Completed);
+        let detail = repository.read_thread(&thread.id).await.unwrap();
+        assert_eq!(detail.approvals.len(), 1);
+        assert!(detail.approvals[0].request.preview.is_none());
+        assert!(detail.tool_activities.iter().any(|activity| {
+            activity
+                .result
+                .as_ref()
+                .is_some_and(|result| result.output == "external completed")
+        }));
     }
 
     #[tokio::test]

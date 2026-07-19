@@ -286,6 +286,11 @@ struct OutputBuffer {
 }
 
 impl CommandRuntime {
+    #[cfg(test)]
+    pub(crate) fn root(&self) -> PathBuf {
+        self.workspace_root.clone()
+    }
+
     pub fn new(workspace_root: impl AsRef<Path>) -> Result<Self, ExecutionError> {
         let workspace_root = workspace_root
             .as_ref()
@@ -722,26 +727,26 @@ fn now_ms() -> u64 {
 }
 
 #[cfg(unix)]
-fn configure_process_group(command: &mut Command) {
+pub(crate) fn configure_process_group(command: &mut Command) {
     use std::os::unix::process::CommandExt;
     command.as_std_mut().process_group(0);
 }
 
 #[cfg(windows)]
-fn configure_process_group(command: &mut Command) {
+pub(crate) fn configure_process_group(command: &mut Command) {
     const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
     command.creation_flags(CREATE_NEW_PROCESS_GROUP);
 }
 
 #[cfg(unix)]
-async fn terminate_tree(pid: u32) {
+pub(crate) async fn terminate_tree(pid: u32) {
     unsafe {
         libc::kill(-(pid as i32), libc::SIGKILL);
     }
 }
 
 #[cfg(windows)]
-async fn terminate_tree(pid: u32) {
+pub(crate) async fn terminate_tree(pid: u32) {
     let _ = Command::new("taskkill")
         .args(["/PID", &pid.to_string(), "/T", "/F"])
         .stdin(Stdio::null())
@@ -826,6 +831,11 @@ struct PtyOutputBuffer {
 }
 
 impl NativePtyRuntime {
+    #[cfg(test)]
+    pub(crate) fn root(&self) -> PathBuf {
+        self.workspace_root.clone()
+    }
+
     pub fn new(workspace_root: impl AsRef<Path>) -> Result<Self, ExecutionError> {
         let workspace_root = workspace_root
             .as_ref()

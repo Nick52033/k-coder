@@ -69,6 +69,26 @@ pub trait ToolHandler: Send + Sync {
     ) -> Result<ToolResult, ToolError>;
 }
 
+#[async_trait]
+pub trait ToolHookRunner: Send + Sync {
+    async fn before(
+        &self,
+        context: &ToolContext,
+        name: &str,
+        arguments: &Value,
+        cancellation: CancellationToken,
+    ) -> Result<(), ToolError>;
+
+    async fn after(
+        &self,
+        context: &ToolContext,
+        name: &str,
+        arguments: &Value,
+        result: ToolResult,
+        cancellation: CancellationToken,
+    ) -> Result<ToolResult, ToolError>;
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolAuthorization {
     pub decision: PolicyDecision,
@@ -80,6 +100,8 @@ pub struct ToolRegistry {
     handlers: Arc<HashMap<String, Arc<dyn ToolHandler>>>,
     policy: Arc<dyn PolicyEngine>,
     patch_service: Option<PatchService>,
+    extension_risks: Arc<HashMap<String, ToolRisk>>,
+    hooks: Option<Arc<dyn ToolHookRunner>>,
 }
 
 impl ToolRegistry {
@@ -176,7 +198,44 @@ impl ToolRegistry {
             handlers: Arc::new(registered),
             policy,
             patch_service: None,
+            extension_risks: Arc::new(HashMap::new()),
+            hooks: None,
         })
+    }
+
+    pub fn with_extensions(
+        mut self,
+        handlers: Vec<Arc<dyn ToolHandler>>,
+        risks: HashMap<String, ToolRisk>,
+        hooks: Option<Arc<dyn ToolHookRunner>>,
+    ) -> Result<Self, ToolError> {
+        let mut registered = self.handlers.as_ref().clone();
+        for handler in handlers {
+            let definition = handler.definition();
+            if registered.contains_key(&definition.name) {
+                return Err(ToolError::InvalidArguments(format!(
+                    "extension tool conflicts with an existing tool: {}",
+                    definition.name
+                )));
+            }
+            jsonschema::validator_for(&definition.input_schema).map_err(|error| {
+                ToolError::InvalidArguments(format!(
+                    "extension tool {} has an invalid JSON schema: {error}",
+                    definition.name
+                ))
+            })?;
+            if !risks.contains_key(&definition.name) {
+                return Err(ToolError::InvalidArguments(format!(
+                    "extension tool is missing risk metadata: {}",
+                    definition.name
+                )));
+            }
+            registered.insert(definition.name, handler);
+        }
+        self.handlers = Arc::new(registered);
+        self.extension_risks = Arc::new(risks);
+        self.hooks = hooks;
+        Ok(self)
     }
 
     pub fn definitions(&self) -> Vec<ToolDefinition> {
@@ -217,6 +276,21 @@ impl ToolRegistry {
         arguments: &Value,
     ) -> Result<ToolAuthorization, ToolError> {
         self.validate_arguments(name, arguments)?;
+        if let Some(risk) = self.extension_risks.get(name).copied() {
+            let decision = match risk {
+                ToolRisk::Read => PolicyDecision::Allow,
+                ToolRisk::Write => PolicyDecision::RequireApproval {
+                    reason: "review the external write tool before execution".into(),
+                },
+                ToolRisk::Delete => PolicyDecision::RequireApproval {
+                    reason: "review the destructive external tool before execution".into(),
+                },
+                ToolRisk::External => PolicyDecision::RequireApproval {
+                    reason: "review external network or process access before execution".into(),
+                },
+            };
+            return Ok(ToolAuthorization { decision, risk });
+        }
         Ok(ToolAuthorization {
             decision: self.policy.authorize(name, arguments),
             risk: self.policy.risk(name, arguments),
@@ -247,11 +321,25 @@ impl ToolRegistry {
             return Err(ToolError::Cancelled);
         }
         self.validate_arguments(name, &arguments)?;
+        if let Some(hooks) = &self.hooks {
+            hooks
+                .before(context, name, &arguments, cancellation.clone())
+                .await?;
+        }
         let handler = self
             .handlers
             .get(name)
             .ok_or_else(|| ToolError::UnknownTool(name.to_string()))?;
-        handler.execute(context, arguments, cancellation).await
+        let result = handler
+            .execute(context, arguments.clone(), cancellation.clone())
+            .await?;
+        if let Some(hooks) = &self.hooks {
+            hooks
+                .after(context, name, &arguments, result, cancellation)
+                .await
+        } else {
+            Ok(result)
+        }
     }
 
     pub async fn rollback_change(
@@ -812,6 +900,34 @@ fn decode_text(bytes: &[u8]) -> Result<String, ToolError> {
 mod tests {
     use super::*;
 
+    struct ExtensionTestTool {
+        name: String,
+    }
+
+    #[async_trait]
+    impl ToolHandler for ExtensionTestTool {
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition {
+                name: self.name.clone(),
+                description: "test extension".into(),
+                input_schema: json!({ "type": "object", "additionalProperties": false }),
+            }
+        }
+
+        async fn execute(
+            &self,
+            _context: &ToolContext,
+            _arguments: Value,
+            _cancellation: CancellationToken,
+        ) -> Result<ToolResult, ToolError> {
+            Ok(ToolResult {
+                success: true,
+                output: "ok".into(),
+                metadata: json!({}),
+            })
+        }
+    }
+
     fn context(root: &Path) -> ToolContext {
         ToolContext {
             thread_id: "thread".to_string(),
@@ -852,6 +968,66 @@ mod tests {
             )
             .await;
         assert_eq!(result, Err(ToolError::UnknownTool("shell".to_string())));
+    }
+
+    #[tokio::test]
+    async fn extension_tools_cannot_replace_builtins_and_use_host_risk_metadata() {
+        let duplicate = Arc::new(ExtensionTestTool {
+            name: "read_file".into(),
+        }) as Arc<dyn ToolHandler>;
+        assert!(
+            ToolRegistry::read_only()
+                .with_extensions(
+                    vec![duplicate],
+                    HashMap::from([("read_file".into(), ToolRisk::Read)]),
+                    None,
+                )
+                .is_err()
+        );
+
+        let read_name = "mcp__local__read".to_string();
+        let write_name = "mcp__local__write".to_string();
+        let registry = ToolRegistry::read_only()
+            .with_extensions(
+                vec![
+                    Arc::new(ExtensionTestTool {
+                        name: read_name.clone(),
+                    }),
+                    Arc::new(ExtensionTestTool {
+                        name: write_name.clone(),
+                    }),
+                ],
+                HashMap::from([
+                    (read_name.clone(), ToolRisk::Read),
+                    (write_name.clone(), ToolRisk::External),
+                ]),
+                None,
+            )
+            .unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        assert!(
+            registry
+                .dispatch(
+                    &context(workspace.path()),
+                    &read_name,
+                    json!({}),
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap()
+                .success
+        );
+        assert!(matches!(
+            registry
+                .dispatch(
+                    &context(workspace.path()),
+                    &write_name,
+                    json!({}),
+                    CancellationToken::new(),
+                )
+                .await,
+            Err(ToolError::ApprovalRequired(_))
+        ));
     }
 
     #[tokio::test]

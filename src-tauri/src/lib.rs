@@ -3,6 +3,7 @@ pub mod app_state;
 pub mod commands;
 pub mod context;
 pub mod execution;
+pub mod extensions;
 pub mod logging;
 pub mod patch;
 pub mod persistence;
@@ -11,6 +12,7 @@ pub mod protocol;
 pub mod providers;
 pub mod storage;
 pub mod tools;
+pub mod workbench;
 
 use app_state::AppState;
 use tauri::Manager;
@@ -19,6 +21,7 @@ use tauri::Manager;
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let data_root = app.path().app_data_dir()?.join("runtime-data");
             let state = AppState::new(data_root)
@@ -30,9 +33,30 @@ pub fn run() {
             commands::runtime_status,
             commands::get_provider_config,
             commands::save_provider_config,
+            commands::test_provider_connection,
             commands::delete_provider_api_key,
             commands::create_thread,
             commands::list_threads,
+            commands::search_threads,
+            commands::rename_thread,
+            commands::delete_thread,
+            commands::usage_summary,
+            commands::workspace_state,
+            commands::switch_workspace,
+            commands::list_workspace_directory,
+            commands::preview_workspace_file,
+            commands::extract_attachment,
+            commands::open_workspace_file,
+            commands::reveal_workspace_file,
+            commands::git_status,
+            commands::git_diff,
+            commands::git_branches,
+            commands::git_switch_branch,
+            commands::git_action,
+            commands::extension_overview,
+            commands::set_extension_enabled,
+            commands::save_mcp_secret,
+            commands::delete_mcp_secret,
             commands::read_thread,
             commands::archive_thread,
             commands::compact_thread,

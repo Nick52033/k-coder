@@ -7,16 +7,20 @@ import {
   Code2,
   FileDiff,
   KeyRound,
+  Loader2,
   Maximize2,
   MessageSquare,
   Minus,
   Moon,
+  Paperclip,
   PanelRight,
+  Pencil,
   Plus,
   RefreshCw,
   Settings,
   Square,
   Sun,
+  Trash2,
   Undo2,
   X,
 } from "lucide-react";
@@ -25,10 +29,12 @@ import { getRuntimeStatus, subscribeToAgentEvents } from "./api/runtime";
 import { useWorkbenchStore } from "./stores/workbenchStore";
 import { PatchReviewDialog } from "./components/PatchReviewDialog";
 import { SettingsDialog } from "./components/SettingsDialog";
-import type { RuntimeStatus } from "./types/runtime";
+import { WorkbenchPanel, WorkspacePicker } from "./components/WorkbenchPanel";
+import { cn } from "./lib/cn";
+import type { AttachmentContent, RuntimeStatus } from "./types/runtime";
 import "./App.css";
 
-type Skin = "paper" | "midnight" | "amethyst";
+type Skin = "paper" | "midnight" | "amethyst" | "indigo" | "amber";
 type ThemeMode = "light" | "dark";
 
 const STORAGE_SKIN = "kcoder_skin";
@@ -50,6 +56,10 @@ function App() {
   const [draft, setDraft] = useState("");
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [selectedChangeId, setSelectedChangeId] = useState<string | null>(null);
+  const [attachments, setAttachments] = useState<AttachmentContent[]>([]);
+  const [threadQuery, setThreadQuery] = useState("");
+  const [workbenchOpen, setWorkbenchOpen] = useState(false);
+  const [workspaceRevision, setWorkspaceRevision] = useState(0);
   const [skin, setSkinState] = useState<Skin>(() => readStored(STORAGE_SKIN, "paper"));
   const [themeMode, setThemeModeState] = useState<ThemeMode>(() =>
     readStored(STORAGE_THEME, "light"),
@@ -80,6 +90,9 @@ function App() {
     saveProvider,
     handleAgentEvent,
     clearError,
+    searchThreadHistory,
+    renameConversation,
+    deleteConversation,
   } = useWorkbenchStore();
 
   useEffect(() => {
@@ -122,6 +135,22 @@ function App() {
     document.documentElement.setAttribute("data-theme", themeMode);
   }, [skin, themeMode]);
 
+  useEffect(() => {
+    function handleShortcut(event: globalThis.KeyboardEvent) {
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "n") {
+        event.preventDefault();
+        void createThread();
+      }
+      if ((event.ctrlKey || event.metaKey) && event.key === ",") {
+        event.preventDefault();
+        setSettingsOpen(true);
+      }
+      if (event.key === "Escape") setWorkbenchOpen(false);
+    }
+    window.addEventListener("keydown", handleShortcut);
+    return () => window.removeEventListener("keydown", handleShortcut);
+  }, [createThread]);
+
   const setSkin = (next: Skin) => {
     setSkinState(next);
     try { localStorage.setItem(STORAGE_SKIN, next); } catch { /* noop */ }
@@ -141,8 +170,15 @@ function App() {
     event.preventDefault();
     const message = draft.trim();
     if (!message || activeTurnId) return;
+    const attachmentContext = attachments.filter((attachment) => attachment.kind === "document").map((attachment) =>
+      `\n\n[附件: ${attachment.name}]\n${attachment.content}`,
+    ).join("");
+    const imageAttachments = attachments
+      .filter((attachment) => attachment.kind === "image")
+      .map((attachment) => ({ name: attachment.name, dataUrl: attachment.content }));
     setDraft("");
-    void sendMessage(message);
+    setAttachments([]);
+    void sendMessage(message + attachmentContext, imageAttachments);
   }
 
   function handleComposerKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
@@ -158,6 +194,7 @@ function App() {
 
   function openSettings() {
     clearError();
+    setWorkbenchOpen(false);
     setSettingsOpen(true);
   }
 
@@ -169,7 +206,7 @@ function App() {
           <strong>k-Coder</strong>
         </div>
         <div className="titlebar-actions">
-          <span className={`runtime-state ${runtimeError ? "runtime-state--error" : ""}`}>
+          <span className={cn("runtime-state", runtimeError && "runtime-state--error")}>
             {runtimeError ? <CircleAlert size={14} /> : <Activity size={14} />}
             {runtimeError ? "运行时不可用" : runtime ? "运行时就绪" : "正在连接"}
           </span>
@@ -224,26 +261,28 @@ function App() {
       </header>
 
       <aside className="sidebar">
+        <WorkspacePicker onChanged={() => { setWorkspaceRevision((value) => value + 1); void initialize(); }} />
         <button className="new-thread-button" type="button" onClick={() => void createThread()}>
           <Plus size={16} />
           新建会话
         </button>
-        <div className="section-label">会话</div>
+        <div className="section-label section-label--search"><span>会话</span><input aria-label="搜索会话" placeholder="搜索" value={threadQuery} onChange={(event) => { const query = event.target.value; setThreadQuery(query); void searchThreadHistory(query); }} /></div>
         <nav className="thread-list" aria-label="会话列表">
           {threads.map((thread) => (
-            <button
-              className={`thread-item ${thread.id === activeThreadId ? "thread-item--active" : ""}`}
-              key={thread.id}
-              type="button"
-              onClick={() => void selectThread(thread.id)}
-            >
-              <MessageSquare size={15} />
-              <span>{thread.title}</span>
-            </button>
+            <div className={cn("thread-item", thread.id === activeThreadId && "thread-item--active")} key={thread.id}>
+              <button className="thread-item-main" type="button" onClick={() => void selectThread(thread.id)}>
+                <MessageSquare size={15} />
+                <span>{thread.title}</span>
+              </button>
+              <span className="thread-actions">
+                <button type="button" title="重命名" aria-label={`重命名会话 ${thread.title}`} onClick={() => { const title = window.prompt("会话名称", thread.title); if (title) void renameConversation(thread.id, title); }}><Pencil size={12} /></button>
+                <button type="button" title="删除" aria-label={`删除会话 ${thread.title}`} onClick={async () => { if (window.confirm(`删除会话"${thread.title}"？`)) await deleteConversation(thread.id); }}><Trash2 size={12} /></button>
+              </span>
+            </div>
           ))}
         </nav>
         <button
-          className={`provider-button ${providerConfig ? "provider-button--ready" : ""}`}
+          className={cn("provider-button", providerConfig && "provider-button--ready")}
           type="button"
           onClick={openSettings}
         >
@@ -261,6 +300,9 @@ function App() {
             </span>
           </div>
           <div className="conversation-actions">
+            <button className="icon-button" type="button" aria-label="切换工作台面板" title="切换工作台面板" onClick={() => setWorkbenchOpen((value) => !value)}>
+              <PanelRight size={17} />
+            </button>
             <button
               className="icon-button"
               type="button"
@@ -271,19 +313,16 @@ function App() {
             >
               <Archive size={17} />
             </button>
-            <button className="icon-button" type="button" aria-label="切换活动面板" title="切换活动面板">
-              <PanelRight size={17} />
-            </button>
           </div>
         </div>
 
-        <div className={`message-area ${messages.length ? "message-area--populated" : ""}`} ref={messageAreaRef}>
+        <div className={cn("message-area", Boolean(messages.length) && "message-area--populated")} ref={messageAreaRef}>
           {loading && !messages.length ? (
             <div className="empty-thread"><Activity className="spin" size={24} /><p>正在读取会话</p></div>
           ) : messages.length ? (
             <div className="message-list">
               {messages.map((message) => (
-                <article className={`message message--${message.role}`} key={message.id}>
+                <article className={cn("message", `message--${message.role}`)} key={message.id}>
                   <div className="message-role">{message.role === "user" ? "你" : "k-Coder"}</div>
                   <div className="message-content">
                     {message.text || (message.status === "streaming" ? <span className="typing-indicator">•••</span> : null)}
@@ -316,6 +355,7 @@ function App() {
         )}
 
         <form className="composer" onSubmit={submitMessage}>
+          {attachments.length > 0 && <div className="attachment-strip">{attachments.map((attachment) => <span key={attachment.path}><Paperclip size={12} />{attachment.name}<button type="button" aria-label={`移除 ${attachment.name}`} onClick={() => setAttachments((items) => items.filter((item) => item.path !== attachment.path))}><X size={12} /></button></span>)}</div>}
           <textarea
             aria-label="消息"
             value={draft}
@@ -329,7 +369,11 @@ function App() {
             <span className="composer-mode">{providerConfig?.model ?? "未配置模型"}</span>
             {activeTurnId ? (
               <button className="stop-button" type="button" aria-label="停止生成" title="停止生成" onClick={() => void stopTurn()}>
-                <Square size={15} fill="currentColor" />
+                {lastTurn?.state === "streaming" ? (
+                  <Loader2 className="spin" size={16} />
+                ) : (
+                  <Square size={15} fill="currentColor" />
+                )}
               </button>
             ) : (
               <button
@@ -346,34 +390,30 @@ function App() {
         </form>
       </section>
 
-      <aside className="activity-panel">
-        <div className="activity-header">
-          <Activity size={16} />
-          <h2>活动</h2>
-        </div>
-        <div className="activity-list">
+      <WorkbenchPanel key={workspaceRevision} open={workbenchOpen} toolActivities={toolActivities} changes={changes} onSelectChange={setSelectedChangeId} onAttach={(attachment) => setAttachments((items) => items.some((item) => item.path === attachment.path) ? items : [...items, attachment])} />
+      <aside className="activity-panel activity-panel--overlay" aria-hidden="true">
+        <div className="activity-list activity-list--hidden">
           <div className="activity-row">
-            <span className={`activity-dot ${runtime ? "activity-dot--success" : ""}`} />
+            <span className={cn("activity-dot", runtime && "activity-dot--success")} />
             <div><strong>运行时</strong><span>{runtime ? `v${runtime.version}` : "等待中"}</span></div>
           </div>
           <div className="activity-row">
-            <span className={`activity-dot ${providerConfig ? "activity-dot--success" : ""}`} />
+            <span className={cn("activity-dot", providerConfig && "activity-dot--success")} />
             <div><strong>Provider</strong><span>{providerConfig?.model ?? "未配置"}</span></div>
           </div>
           <div className="activity-row">
-            <span className={`activity-dot ${activeTurnId ? "activity-dot--active" : ""}`} />
+            <span className={cn("activity-dot", activeTurnId && "activity-dot--active")} />
             <div><strong>当前 Turn</strong><span>{lastTurn ? stateLabel(lastTurn.state) : "空闲"}</span></div>
           </div>
           {toolActivities.slice(-8).map((activity) => (
             <div className="activity-row activity-row--tool" key={`${activity.turnId}-${activity.call.id}`}>
               <span
-                className={`activity-dot ${
-                  activity.state === "running"
-                    ? "activity-dot--active"
-                    : activity.state === "completed"
-                      ? "activity-dot--success"
-                      : "activity-dot--error"
-                }`}
+                className={cn(
+                  "activity-dot",
+                  activity.state === "running" && "activity-dot--active",
+                  activity.state === "completed" && "activity-dot--success",
+                  activity.state === "failed" && "activity-dot--error",
+                )}
               />
               <div>
                 <strong>{activity.call.name}</strong>

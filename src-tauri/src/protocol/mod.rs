@@ -161,6 +161,14 @@ pub enum MessageRole {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentBlock {
     Text { text: String },
+    Image { name: String, data_url: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ImageAttachment {
+    pub name: String,
+    pub data_url: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -179,6 +187,7 @@ impl ChatMessage {
             .iter()
             .map(|block| match block {
                 ContentBlock::Text { text } => text.as_str(),
+                ContentBlock::Image { .. } => "",
             })
             .collect()
     }

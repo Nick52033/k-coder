@@ -1,5 +1,14 @@
 import { FormEvent, useEffect, useState } from "react";
 import {
+  deleteMcpSecret,
+  getExtensionOverview,
+  getUsageSummary,
+  saveMcpSecret,
+  setExtensionEnabled,
+  testProviderConnection,
+} from "../api/runtime";
+import { useToast } from "./Toast";
+import {
   BarChart3,
   Bot,
   Boxes,
@@ -9,6 +18,7 @@ import {
   Network,
   Palette,
   Puzzle,
+  RefreshCw,
   Save,
   ServerCog,
   Settings,
@@ -22,6 +32,8 @@ import type {
   ProviderConfigView,
   ProviderTransport,
   SaveProviderConfigRequest,
+  UsageSummary,
+  ExtensionOverview,
 } from "../types/runtime";
 
 const DEFAULT_BASE_URL = "https://api.openai.com/v1";
@@ -46,7 +58,7 @@ type SettingsSection =
   | "rules"
   | "general";
 
-type Skin = "paper" | "midnight" | "amethyst";
+type Skin = "paper" | "midnight" | "amethyst" | "indigo" | "amber";
 type ThemeMode = "light" | "dark";
 
 interface SkinDefinition {
@@ -59,7 +71,9 @@ interface SkinDefinition {
 const skinDefinitions: SkinDefinition[] = [
   { id: "paper", label: "纸墨精工", desc: "绿色品牌 · 浅色为主 · 日常精工", preview: "#176b4d" },
   { id: "midnight", label: "午夜终端", desc: "OLED 深黑 · 翠绿高亮 · 纯暗色", preview: "#10b981" },
+  { id: "indigo", label: "靛蓝电影", desc: "深蓝渐变 · 紫色高亮 · 玻璃质感", preview: "#5E6AD2" },
   { id: "amethyst", label: "紫晶指令", desc: "紫金渐变 · 明亮活泼 · 双模式", preview: "#7c3aed" },
+  { id: "amber", label: "琥珀暖光", desc: "暖白纸感 · 橙金点缀 · 极度护眼", preview: "#D97706" },
 ];
 
 interface SettingsDefinition {
@@ -83,14 +97,14 @@ interface SettingsDialogProps {
 
 const settingsDefinitions: SettingsDefinition[] = [
   { id: "providers", label: "模型供应商", group: "模型与用量", icon: ServerCog, available: true },
-  { id: "usage", label: "用量追踪", group: "模型与用量", icon: BarChart3, available: false },
-  { id: "mcp", label: "工作区 / MCP", group: "扩展", icon: Network, available: false },
+  { id: "usage", label: "用量追踪", group: "模型与用量", icon: BarChart3, available: true },
+  { id: "mcp", label: "MCP 与 Hooks", group: "扩展", icon: Network, available: true },
   { id: "plugins", label: "插件管理", group: "扩展", icon: Puzzle, available: false },
-  { id: "skills", label: "Skills", group: "扩展", icon: Sparkles, available: false },
+  { id: "skills", label: "Skills", group: "扩展", icon: Sparkles, available: true },
   { id: "robots", label: "机器人", group: "智能体", icon: Bot, available: false },
   { id: "workflows", label: "Workflows", group: "智能体", icon: Workflow, available: false },
   { id: "knowledge", label: "本地知识库", group: "知识与规则", icon: Library, available: false },
-  { id: "rules", label: "用户规则", group: "知识与规则", icon: ShieldCheck, available: false },
+  { id: "rules", label: "规则与审计", group: "知识与规则", icon: ShieldCheck, available: true },
   { id: "appearance", label: "外观", group: "应用", icon: Palette, available: true },
   { id: "general", label: "通用", group: "应用", icon: Settings, available: false },
 ];
@@ -187,6 +201,10 @@ export function SettingsDialog({
                 onSetSkin={onSetSkin}
                 onToggleTheme={onToggleTheme}
               />
+            ) : section === "usage" ? (
+              <UsagePage />
+            ) : section === "mcp" || section === "skills" || section === "rules" ? (
+              <ExtensionsPage mode={section} />
             ) : (
               <PendingSection definition={activeDefinition} />
             )}
@@ -242,6 +260,7 @@ interface ProviderEditorProps {
 }
 
 function ProviderEditor({ initial, error, onSave }: ProviderEditorProps) {
+  const toast = useToast();
   const [baseUrl, setBaseUrl] = useState(initial?.baseUrl ?? DEFAULT_BASE_URL);
   const [model, setModel] = useState(initial?.model ?? "");
   const [transport, setTransport] = useState<ProviderTransport>(
@@ -250,6 +269,8 @@ function ProviderEditor({ initial, error, onSave }: ProviderEditorProps) {
   const [apiKey, setApiKey] = useState("");
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
+  const [testing, setTesting] = useState(false);
+  const [testResult, setTestResult] = useState("");
 
   async function submit(event: FormEvent) {
     event.preventDefault();
@@ -266,6 +287,9 @@ function ProviderEditor({ initial, error, onSave }: ProviderEditorProps) {
     if (didSave) {
       setApiKey("");
       setSaved(true);
+      toast.success("配置已保存");
+    } else {
+      toast.error("保存失败，请重试");
     }
   }
 
@@ -352,6 +376,10 @@ function ProviderEditor({ initial, error, onSave }: ProviderEditorProps) {
 
       <footer className="provider-form-actions">
         {saved && <span className="provider-saved-state"><Check size={14} /> 配置已保存</span>}
+        {testResult && <span className="provider-saved-state">{testResult}</span>}
+        <button className="secondary-button settings-command" type="button" disabled={!initial || testing} onClick={() => { setTesting(true); setTestResult(""); void testProviderConnection().then((result) => { setTestResult(`连接正常 · ${result.latencyMs} ms`); toast.success(`连接正常 · ${result.latencyMs} ms`); }).catch((reason) => { const msg = String(reason); setTestResult(msg); toast.error(msg); }).finally(() => setTesting(false)); }}>
+          <Network size={15} />{testing ? "测试中" : "测试连接"}
+        </button>
         <button className="primary-button settings-command" type="submit" disabled={saving}>
           <Save size={15} />
           {saving ? "保存中" : "保存配置"}
@@ -359,6 +387,102 @@ function ProviderEditor({ initial, error, onSave }: ProviderEditorProps) {
       </footer>
     </form>
   );
+}
+
+function UsagePage() {
+  const [usage, setUsage] = useState<UsageSummary | null>(null);
+  useEffect(() => { void getUsageSummary().then(setUsage); }, []);
+  return <section className="settings-page" aria-labelledby="usage-page-title">
+    <div className="settings-page-header"><div><p className="settings-eyebrow">模型与用量</p><h3 id="usage-page-title">累计用量</h3></div></div>
+    <div className="usage-summary-grid">
+      <div><span>Provider 调用</span><strong>{usage?.providerCalls ?? 0}</strong></div>
+      <div><span>输入 Token</span><strong>{usage?.inputTokens ?? 0}</strong></div>
+      <div><span>输出 Token</span><strong>{usage?.outputTokens ?? 0}</strong></div>
+      <div><span>总 Token</span><strong>{usage?.totalTokens ?? 0}</strong></div>
+    </div>
+  </section>;
+}
+
+function ExtensionsPage({ mode }: { mode: "mcp" | "skills" | "rules" }) {
+  const [overview, setOverview] = useState<ExtensionOverview | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+
+  async function load(refresh = false) {
+    setLoading(true);
+    setError("");
+    try {
+      setOverview(await getExtensionOverview(refresh));
+    } catch (reason) {
+      setError(String(reason));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => { void load(); }, [mode]);
+
+  async function toggle(kind: "skill" | "mcp" | "hook", id: string, enabled: boolean) {
+    setLoading(true);
+    try {
+      setOverview(await setExtensionEnabled(kind, id, enabled));
+      setError("");
+    } catch (reason) {
+      setError(String(reason));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  const title = mode === "mcp" ? "MCP 与 Hooks" : mode === "skills" ? "Skills" : "规则与审计";
+  return <section className="settings-page extensions-page" aria-labelledby={`${mode}-page-title`}>
+    <div className="settings-page-header"><div><p className="settings-eyebrow">可控扩展</p><h3 id={`${mode}-page-title`}>{title}</h3></div><button className="icon-button" type="button" aria-label="刷新扩展" title="刷新扩展" disabled={loading} onClick={() => void load(true)}><RefreshCw className={loading ? "spin" : ""} size={16} /></button></div>
+    {(error || overview?.error) && <div className="settings-error" role="alert">{error || overview?.error}</div>}
+    {mode === "mcp" && <>
+      <div className="extension-section-label">服务器</div>
+      <div className="extension-list">{overview?.mcpServers.length ? overview.mcpServers.map((server) => <div className="extension-row" key={server.id}>
+        <div className={`extension-state extension-state--${server.state}`} aria-hidden="true" />
+        <div className="extension-row-main"><strong>{server.id}</strong><span>{server.transport} · {server.toolCount} 个工具 · {server.state}</span>{server.error && <small>{server.error}</small>}</div>
+        <label className="extension-toggle"><input type="checkbox" checked={server.enabled} disabled={loading} onChange={(event) => void toggle("mcp", server.id, event.target.checked)} /><span>启用</span></label>
+        {server.credentials.length > 0 && <div className="extension-credentials">{server.credentials.map((credential) => <McpCredential key={credential.name} server={server.id} name={credential.name} configured={credential.configured} onUpdated={setOverview} />)}</div>}
+      </div>) : <ExtensionEmpty text="尚未配置 MCP 服务器" />}</div>
+      <div className="extension-section-label">Hooks</div>
+      <div className="extension-list">{overview?.hooks.length ? overview.hooks.map((hook) => <div className="extension-row extension-row--compact" key={hook.id}><div className="extension-row-main"><strong>{hook.id}</strong><span>{hook.phase} · {hook.tool}</span></div><label className="extension-toggle"><input type="checkbox" checked={hook.enabled} disabled={loading} onChange={(event) => void toggle("hook", hook.id, event.target.checked)} /><span>启用</span></label></div>) : <ExtensionEmpty text="尚未配置工具 Hook" />}</div>
+    </>}
+    {mode === "skills" && <div className="extension-list">{overview?.skills.length ? overview.skills.map((skill) => <div className="extension-row" key={skill.name}><div className={`skill-risk skill-risk--${skill.risk}`}>{riskText(skill.risk)}</div><div className="extension-row-main"><strong>{skill.name}</strong><span>{skill.description}</span><small>{skill.scope} · {skill.triggers.join("、")}</small></div><label className="extension-toggle"><input type="checkbox" checked={skill.enabled} disabled={loading} onChange={(event) => void toggle("skill", skill.name, event.target.checked)} /><span>启用</span></label></div>) : <ExtensionEmpty text="未发现有效的 SKILL.md" />}</div>}
+    {mode === "rules" && <>
+      <div className="extension-section-label">指令优先级</div>
+      <div className="instruction-list">{overview?.instructions.length ? overview.instructions.map((source) => <div key={source.path}><span>{source.priority}</span><div><strong>{source.scope}</strong><small title={source.path}>{source.path}</small></div><em>{source.bytes} B</em></div>) : <ExtensionEmpty text="未发现全局或项目指令" />}</div>
+      <div className="extension-section-label">配置位置</div>
+      <div className="config-paths">{overview?.configPaths.map((path) => <code key={path}>{path}</code>)}</div>
+      <div className="extension-section-label">审计历史</div>
+      <div className="audit-list">{overview?.audit.length ? overview.audit.slice().reverse().slice(0, 40).map((record, index) => <div key={`${record.timestampMs}-${index}`}><span className={record.success ? "audit-ok" : "audit-failed"}>{record.success ? "成功" : "失败"}</span><div><strong>{record.event}</strong><small>{record.kind}/{record.id} · {record.detail}</small></div><time>{new Date(record.timestampMs).toLocaleString()}</time></div>) : <ExtensionEmpty text="暂无扩展审计记录" />}</div>
+    </>}
+  </section>;
+}
+
+function McpCredential({ server, name, configured, onUpdated }: { server: string; name: string; configured: boolean; onUpdated: (overview: ExtensionOverview) => void }) {
+  const [value, setValue] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  async function save() {
+    if (!value.trim()) return;
+    setBusy(true);
+    try { onUpdated(await saveMcpSecret(server, name, value)); setValue(""); setError(""); } catch (reason) { setError(String(reason)); } finally { setBusy(false); }
+  }
+  async function remove() {
+    setBusy(true);
+    try { onUpdated(await deleteMcpSecret(server, name)); setError(""); } catch (reason) { setError(String(reason)); } finally { setBusy(false); }
+  }
+  return <div className="credential-row"><div><KeyRound size={13} /><span>{name}</span><small>{configured ? "已配置" : "缺失"}</small></div><input type="password" value={value} onChange={(event) => setValue(event.target.value)} placeholder={configured ? "替换凭据" : "输入凭据"} autoComplete="off" aria-label={`${server} ${name} 凭据`} /><button type="button" disabled={busy || !value.trim()} onClick={() => void save()}>保存</button>{configured && <button type="button" disabled={busy} onClick={() => void remove()}>删除</button>}{error && <small className="credential-error" role="alert">{error}</small>}</div>;
+}
+
+function ExtensionEmpty({ text }: { text: string }) {
+  return <div className="extension-empty">{text}</div>;
+}
+
+function riskText(risk: "read" | "write" | "delete" | "external") {
+  return risk === "read" ? "只读" : risk === "write" ? "写入" : risk === "delete" ? "删除" : "外部";
 }
 
 function AppearancePage({

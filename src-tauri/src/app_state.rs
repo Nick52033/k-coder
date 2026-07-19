@@ -1,14 +1,18 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 use crate::execution::{CommandRuntime, ExecutionError, NativePtyRuntime};
+use crate::extensions::mcp::OsMcpSecretStore;
+use crate::extensions::{ExtensionError, ExtensionOverview, ExtensionService};
 use crate::logging::StructuredLogger;
 use crate::patch::{PatchError, PatchService};
+use crate::persistence::ProjectionDb;
 use crate::policy::ApprovalManager;
 use crate::protocol::{ApprovalAction, ApprovalResolution, ChangeSet, TurnState};
 use crate::providers::{
@@ -27,15 +31,18 @@ pub struct AppState {
     repository: Arc<JsonlThreadRepository>,
     provider_config: ProviderConfigStore,
     credentials: Arc<dyn CredentialStore>,
-    workspace_root: PathBuf,
-    tool_registry: ToolRegistry,
+    data_root: PathBuf,
+    workspace_root: RwLock<PathBuf>,
+    tool_registry: RwLock<ToolRegistry>,
     patch_service: PatchService,
     approvals: Arc<ApprovalManager>,
-    command_runtime: CommandRuntime,
-    pty_runtime: NativePtyRuntime,
+    command_runtime: RwLock<CommandRuntime>,
+    pty_runtime: RwLock<NativePtyRuntime>,
     logger: StructuredLogger,
     active_turns: Mutex<HashMap<String, CancellationToken>>,
     recovery_lock: Mutex<()>,
+    extensions: ExtensionService,
+    extension_workspace: Mutex<Option<(PathBuf, u64)>>,
 }
 
 impl AppState {
@@ -48,8 +55,16 @@ impl AppState {
         credentials: Arc<dyn CredentialStore>,
     ) -> Result<Self, AppStateError> {
         let data_root = data_root.as_ref().to_path_buf();
-        let workspace_root =
+        let fallback =
             std::env::current_dir().map_err(|error| AppStateError::Workspace(error.to_string()))?;
+        let projection = ProjectionDb::open(&data_root)
+            .map_err(|error| AppStateError::Workspace(error.to_string()))?;
+        let workspace_root = projection
+            .setting("active_workspace")
+            .map_err(|error| AppStateError::Workspace(error.to_string()))?
+            .map(PathBuf::from)
+            .filter(|path| path.is_dir())
+            .unwrap_or(fallback);
         Self::with_workspace_and_credentials(data_root, workspace_root, credentials)
     }
 
@@ -71,24 +86,35 @@ impl AppState {
         let patch_service = PatchService::new();
         let command_runtime = CommandRuntime::with_recovery(&workspace_root, &data_root)?;
         let pty_runtime = NativePtyRuntime::new(&workspace_root)?;
+        let repository = Arc::new(JsonlThreadRepository::new(&data_root)?);
+        let logger = StructuredLogger::new(&data_root)
+            .map_err(|error| AppStateError::Logging(error.to_string()))?;
+        let extensions = ExtensionService::new(
+            data_root.clone(),
+            repository.projection(),
+            Arc::new(OsMcpSecretStore::new()),
+            logger.clone(),
+        );
         Ok(Self {
             started_at: Instant::now(),
-            repository: Arc::new(JsonlThreadRepository::new(&data_root)?),
+            repository,
             provider_config: ProviderConfigStore::new(&data_root),
             credentials,
-            workspace_root,
-            tool_registry: ToolRegistry::workspace_tools_with_execution(
+            data_root: data_root.clone(),
+            workspace_root: RwLock::new(workspace_root),
+            tool_registry: RwLock::new(ToolRegistry::workspace_tools_with_execution(
                 patch_service.clone(),
                 command_runtime.clone(),
-            ),
+            )),
             patch_service,
             approvals: Arc::new(ApprovalManager::new(Duration::from_secs(5 * 60))),
-            command_runtime,
-            pty_runtime,
-            logger: StructuredLogger::new(&data_root)
-                .map_err(|error| AppStateError::Logging(error.to_string()))?,
+            command_runtime: RwLock::new(command_runtime),
+            pty_runtime: RwLock::new(pty_runtime),
+            logger,
             active_turns: Mutex::new(HashMap::new()),
             recovery_lock: Mutex::new(()),
+            extensions,
+            extension_workspace: Mutex::new(None),
         })
     }
 
@@ -105,11 +131,17 @@ impl AppState {
     }
 
     pub fn workspace_root(&self) -> PathBuf {
-        self.workspace_root.clone()
+        self.workspace_root
+            .read()
+            .expect("workspace lock poisoned")
+            .clone()
     }
 
     pub fn tool_registry(&self) -> ToolRegistry {
-        self.tool_registry.clone()
+        self.tool_registry
+            .read()
+            .expect("tool registry lock poisoned")
+            .clone()
     }
 
     pub fn patch_service(&self) -> PatchService {
@@ -121,11 +153,128 @@ impl AppState {
     }
 
     pub fn command_runtime(&self) -> CommandRuntime {
-        self.command_runtime.clone()
+        self.command_runtime
+            .read()
+            .expect("command runtime lock poisoned")
+            .clone()
     }
 
     pub fn pty_runtime(&self) -> NativePtyRuntime {
-        self.pty_runtime.clone()
+        self.pty_runtime
+            .read()
+            .expect("PTY runtime lock poisoned")
+            .clone()
+    }
+
+    pub async fn switch_workspace(&self, path: impl AsRef<Path>) -> Result<PathBuf, AppStateError> {
+        if !self.active_turns.lock().await.is_empty() {
+            return Err(AppStateError::Workspace(
+                "stop active turns before switching workspace".into(),
+            ));
+        }
+        let path = path
+            .as_ref()
+            .canonicalize()
+            .map_err(|error| AppStateError::Workspace(error.to_string()))?;
+        if !path.is_dir() {
+            return Err(AppStateError::Workspace(
+                "workspace root is not a directory".into(),
+            ));
+        }
+        let command = CommandRuntime::with_recovery(&path, &self.data_root)?;
+        let pty = NativePtyRuntime::new(&path)?;
+        let tool_registry = ToolRegistry::workspace_tools_with_execution(
+            self.patch_service.clone(),
+            command.clone(),
+        );
+        self.repository
+            .projection()
+            .set_setting("active_workspace", &path.to_string_lossy())
+            .map_err(|error| AppStateError::Workspace(error.to_string()))?;
+        *self
+            .workspace_root
+            .write()
+            .map_err(|_| AppStateError::Workspace("workspace lock poisoned".into()))? =
+            path.clone();
+        *self
+            .command_runtime
+            .write()
+            .map_err(|_| AppStateError::Workspace("command runtime lock poisoned".into()))? =
+            command;
+        *self
+            .pty_runtime
+            .write()
+            .map_err(|_| AppStateError::Workspace("PTY runtime lock poisoned".into()))? = pty;
+        *self
+            .tool_registry
+            .write()
+            .map_err(|_| AppStateError::Workspace("tool registry lock poisoned".into()))? =
+            tool_registry;
+        *self.extension_workspace.lock().await = None;
+        Ok(path)
+    }
+
+    pub async fn prepare_extensions(&self, force: bool) -> Result<(), AppStateError> {
+        let workspace = self.workspace_root();
+        let revision = self.extensions.revision(&workspace)?;
+        let mut prepared_for = self.extension_workspace.lock().await;
+        if !force
+            && prepared_for
+                .as_ref()
+                .is_some_and(|(path, value)| path == &workspace && *value == revision)
+        {
+            return Ok(());
+        }
+        *prepared_for = None;
+        let prepared = self
+            .extensions
+            .prepare(&workspace, CancellationToken::new())
+            .await?;
+        let registry = ToolRegistry::workspace_tools_with_execution(
+            self.patch_service.clone(),
+            self.command_runtime(),
+        )
+        .with_extensions(prepared.handlers, prepared.risks, prepared.hooks)?;
+        *self
+            .tool_registry
+            .write()
+            .map_err(|_| AppStateError::Workspace("tool registry lock poisoned".into()))? =
+            registry;
+        *prepared_for = Some((workspace, revision));
+        Ok(())
+    }
+
+    pub fn extension_instructions(&self, input: &str) -> Result<String, AppStateError> {
+        Ok(self.extensions.runtime_instructions(input)?)
+    }
+
+    pub fn extension_overview(&self) -> ExtensionOverview {
+        self.extensions.overview()
+    }
+
+    pub async fn set_extension_enabled(
+        &self,
+        kind: &str,
+        id: &str,
+        enabled: bool,
+    ) -> Result<(), AppStateError> {
+        self.extensions.set_enabled(kind, id, enabled)?;
+        self.prepare_extensions(true).await
+    }
+
+    pub async fn save_mcp_secret(
+        &self,
+        server: &str,
+        name: &str,
+        value: &str,
+    ) -> Result<(), AppStateError> {
+        self.extensions.save_secret(server, name, value)?;
+        self.prepare_extensions(true).await
+    }
+
+    pub async fn delete_mcp_secret(&self, server: &str, name: &str) -> Result<(), AppStateError> {
+        self.extensions.delete_secret(server, name)?;
+        self.prepare_extensions(true).await
     }
 
     pub fn logger(&self) -> StructuredLogger {
@@ -323,7 +472,7 @@ impl AppState {
             change_set.ok_or_else(|| AppStateError::ChangeNotFound(change_id.to_string()))?;
         let undone_change = self
             .patch_service
-            .undo(self.workspace_root.clone(), change_set)
+            .undo(self.workspace_root(), change_set)
             .await?;
         if let Err(error) = self
             .repository
@@ -339,7 +488,7 @@ impl AppState {
             let storage_error = error.to_string();
             if let Err(redo_error) = self
                 .patch_service
-                .redo(self.workspace_root.clone(), undone_change.clone())
+                .redo(self.workspace_root(), undone_change.clone())
                 .await
             {
                 return Err(AppStateError::UndoAuditCompensation {
@@ -367,6 +516,10 @@ pub enum AppStateError {
     Credential(#[from] CredentialError),
     #[error(transparent)]
     Patch(#[from] PatchError),
+    #[error(transparent)]
+    Extension(#[from] ExtensionError),
+    #[error(transparent)]
+    Tool(#[from] crate::tools::ToolError),
     #[error("provider is not configured: {0}")]
     ProviderNotConfigured(String),
     #[error("a turn is already active for thread {0}")]
@@ -457,6 +610,56 @@ mod tests {
         ));
         assert!(state.cancel_turn("thread").await);
         state.finish_turn("thread").await;
+    }
+
+    #[tokio::test]
+    async fn switching_workspace_updates_every_runtime_and_persists_the_selection() {
+        let data = tempfile::tempdir().unwrap();
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let state = AppState::with_workspace_and_credentials(
+            data.path(),
+            first.path(),
+            Arc::new(FakeCredentials::default()),
+        )
+        .unwrap();
+
+        let switched = state.switch_workspace(second.path()).await.unwrap();
+        assert_eq!(state.workspace_root(), switched);
+        assert_eq!(state.command_runtime().root(), switched);
+        assert_eq!(state.pty_runtime().root(), switched);
+        assert_eq!(
+            state
+                .repository()
+                .projection()
+                .setting("active_workspace")
+                .unwrap()
+                .as_deref(),
+            Some(switched.to_string_lossy().as_ref())
+        );
+    }
+
+    #[tokio::test]
+    async fn changed_extension_configuration_is_reloaded_and_fails_closed() {
+        let data = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let state = AppState::with_workspace_and_credentials(
+            data.path(),
+            workspace.path(),
+            Arc::new(FakeCredentials::default()),
+        )
+        .unwrap();
+        state.prepare_extensions(false).await.unwrap();
+        std::fs::create_dir_all(workspace.path().join(".k-coder")).unwrap();
+        std::fs::write(workspace.path().join(".k-coder/extensions.json"), "{broken").unwrap();
+        assert!(state.prepare_extensions(false).await.is_err());
+        assert!(state.prepare_extensions(false).await.is_err());
+        std::fs::write(
+            workspace.path().join(".k-coder/extensions.json"),
+            r#"{"mcpServers":[],"hooks":[]}"#,
+        )
+        .unwrap();
+        state.prepare_extensions(false).await.unwrap();
     }
 
     #[tokio::test]

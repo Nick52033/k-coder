@@ -169,6 +169,15 @@ fn responses_input(messages: &[ProviderMessage]) -> Vec<Value> {
                 "role": match role { MessageRole::User => "user", MessageRole::Assistant => "assistant" },
                 "content": text
             })],
+            ProviderMessage::UserContent { text, images } => vec![json!({
+                "role": "user",
+                "content": std::iter::once(json!({ "type": "input_text", "text": text }))
+                    .chain(images.iter().map(|image| json!({
+                        "type": "input_image",
+                        "image_url": image.data_url
+                    })))
+                    .collect::<Vec<_>>()
+            })],
             ProviderMessage::AssistantToolCalls { calls } => calls
                 .iter()
                 .map(|call| {
@@ -292,6 +301,7 @@ fn parse_sse_data(data: &str) -> Result<ParsedResponsesEvent, ProviderError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::providers::ProviderImage;
 
     #[test]
     fn parses_text_completion_and_tool_calls() {
@@ -319,5 +329,17 @@ mod tests {
             output: "docs".to_string(),
         }]);
         assert_eq!(input[0]["type"], "function_call_output");
+    }
+
+    #[test]
+    fn serializes_image_content() {
+        let input = responses_input(&[ProviderMessage::UserContent {
+            text: "inspect".into(),
+            images: vec![ProviderImage {
+                name: "screen.png".into(),
+                data_url: "data:image/png;base64,AA==".into(),
+            }],
+        }]);
+        assert_eq!(input[0]["content"][1]["type"], "input_image");
     }
 }

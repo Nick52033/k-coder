@@ -49,6 +49,10 @@ pub enum ProviderMessage {
         role: MessageRole,
         text: String,
     },
+    UserContent {
+        text: String,
+        images: Vec<ProviderImage>,
+    },
     AssistantToolCalls {
         calls: Vec<ToolCall>,
     },
@@ -62,6 +66,19 @@ pub enum ProviderMessage {
         provider: String,
         item: serde_json::Value,
     },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderImage {
+    pub name: String,
+    pub data_url: String,
+}
+
+pub(crate) fn split_image_data_url(data_url: &str) -> Option<(&str, &str)> {
+    let (metadata, data) = data_url.split_once(',')?;
+    let media_type = metadata.strip_prefix("data:")?.strip_suffix(";base64")?;
+    Some((media_type, data))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

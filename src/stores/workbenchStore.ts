@@ -7,6 +7,9 @@ import {
   getProviderConfig,
   listThreads,
   readThread,
+  searchThreads,
+  renameThread,
+  deleteThread,
   resolveApproval,
   retryTurn,
   runTurn,
@@ -20,6 +23,7 @@ import type {
   ChatMessage,
   ChangeSet,
   ConversationMessage,
+  ImageAttachment,
   ProviderConfigView,
   SaveProviderConfigRequest,
   ThreadSummary,
@@ -43,10 +47,13 @@ interface WorkbenchState {
   error: string;
   initialize: () => Promise<void>;
   reloadThreads: () => Promise<void>;
+  searchThreadHistory: (query: string) => Promise<void>;
+  renameConversation: (threadId: string, title: string) => Promise<void>;
+  deleteConversation: (threadId: string) => Promise<void>;
   createThread: () => Promise<void>;
   selectThread: (threadId: string) => Promise<void>;
   archiveActiveThread: () => Promise<void>;
-  sendMessage: (input: string) => Promise<void>;
+  sendMessage: (input: string, attachments?: ImageAttachment[]) => Promise<void>;
   retryLastTurn: () => Promise<void>;
   stopTurn: () => Promise<void>;
   loadProviderConfig: () => Promise<void>;
@@ -61,7 +68,10 @@ function toConversationMessage(message: ChatMessage): ConversationMessage {
   return {
     id: message.id,
     role: message.role,
-    text: message.content.map((block) => block.text).join(""),
+    text: message.content
+      .filter((block) => block.type === "text")
+      .map((block) => block.text)
+      .join(""),
     createdAtMs: message.createdAtMs,
   };
 }
@@ -108,6 +118,29 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
   reloadThreads: async () => {
     const threads = await listThreads();
     set({ threads });
+  },
+
+  searchThreadHistory: async (query) => {
+    try { set({ threads: await searchThreads(query), error: "" }); }
+    catch (error) { set({ error: errorMessage(error) }); }
+  },
+
+  renameConversation: async (threadId, title) => {
+    try {
+      const updated = await renameThread(threadId, title);
+      set((state) => ({ threads: state.threads.map((thread) => thread.id === threadId ? updated : thread), error: "" }));
+    } catch (error) { set({ error: errorMessage(error) }); }
+  },
+
+  deleteConversation: async (threadId) => {
+    try {
+      await deleteThread(threadId);
+      const threads = await listThreads();
+      set({ threads });
+      if (get().activeThreadId === threadId) {
+        if (threads[0]) await get().selectThread(threads[0].id); else await get().createThread();
+      }
+    } catch (error) { set({ error: errorMessage(error) }); }
   },
 
   createThread: async () => {
@@ -172,7 +205,7 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
     }
   },
 
-  sendMessage: async (input) => {
+  sendMessage: async (input, attachments = []) => {
     const threadId = get().activeThreadId;
     const text = input.trim();
     if (!threadId || !text || get().activeTurnId) return;
@@ -191,7 +224,7 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
       usage: null,
     }));
     try {
-      const outcome = await runTurn(threadId, text);
+      const outcome = await runTurn(threadId, text, attachments);
       await Promise.all([get().reloadThreads(), get().selectThread(threadId)]);
       if (outcome.error) set({ error: outcome.error });
     } catch (error) {

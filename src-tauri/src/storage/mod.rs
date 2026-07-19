@@ -101,6 +101,10 @@ pub enum StoredEventKind {
     },
     TurnCancelled,
     ThreadArchived,
+    ThreadRenamed {
+        title: String,
+    },
+    ThreadDeleted,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -223,6 +227,72 @@ impl JsonlThreadRepository {
             .await?;
         }
         Ok(())
+    }
+
+    pub async fn rename_thread(
+        &self,
+        thread_id: &str,
+        title: String,
+    ) -> Result<ThreadSummary, StorageError> {
+        let title = title.trim();
+        if title.is_empty() || title.chars().count() > 120 {
+            return Err(StorageError::InvalidData(
+                "thread title must contain 1 to 120 characters".into(),
+            ));
+        }
+        self.read_thread(thread_id).await?;
+        self.append(StoredEvent::new(
+            thread_id,
+            None,
+            StoredEventKind::ThreadRenamed {
+                title: title.into(),
+            },
+        ))
+        .await?;
+        Ok(self.read_thread(thread_id).await?.summary)
+    }
+
+    pub async fn delete_thread(&self, thread_id: &str) -> Result<(), StorageError> {
+        self.read_thread(thread_id).await?;
+        self.append(StoredEvent::new(
+            thread_id,
+            None,
+            StoredEventKind::ThreadDeleted,
+        ))
+        .await
+    }
+
+    pub async fn search_threads(&self, query: &str) -> Result<Vec<ThreadSummary>, StorageError> {
+        let query = query.trim().to_lowercase();
+        if query.is_empty() {
+            return self.list_threads().await;
+        }
+        let mut matches = Vec::new();
+        for entry in
+            fs::read_dir(&self.sessions_dir).map_err(|error| StorageError::Io(error.to_string()))?
+        {
+            let path = entry
+                .map_err(|error| StorageError::Io(error.to_string()))?
+                .path();
+            let Some(id) = path.file_stem().and_then(|value| value.to_str()) else {
+                continue;
+            };
+            if Uuid::parse_str(id).is_err() {
+                continue;
+            }
+            let detail = self.read_thread(id).await?;
+            if !detail.summary.archived
+                && (detail.summary.title.to_lowercase().contains(&query)
+                    || detail
+                        .messages
+                        .iter()
+                        .any(|message| message.text().to_lowercase().contains(&query)))
+            {
+                matches.push(detail.summary);
+            }
+        }
+        matches.sort_by_key(|summary| std::cmp::Reverse(summary.updated_at_ms));
+        Ok(matches)
     }
 
     fn session_path(&self, thread_id: &str) -> Result<PathBuf, StorageError> {
@@ -459,6 +529,8 @@ fn project_thread(thread_id: &str, events: &[StoredEvent]) -> Result<ThreadDetai
                 update_turn(&mut last_turn, event, TurnState::Cancelled, None)
             }
             StoredEventKind::ThreadArchived => archived = true,
+            StoredEventKind::ThreadRenamed { title: renamed } => title = renamed.clone(),
+            StoredEventKind::ThreadDeleted => archived = true,
             StoredEventKind::ThreadCreated { .. } => {}
         }
     }
