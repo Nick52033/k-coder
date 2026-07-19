@@ -8,7 +8,7 @@ use tokio_util::sync::CancellationToken;
 
 #[derive(Clone)]
 pub struct FakeProvider {
-    events: Vec<Result<ProviderEvent, ProviderError>>,
+    scripts: Vec<Vec<Result<ProviderEvent, ProviderError>>>,
     delay: Duration,
     requests: Arc<Mutex<Vec<ProviderRequest>>>,
 }
@@ -16,7 +16,19 @@ pub struct FakeProvider {
 impl FakeProvider {
     pub fn new(events: Vec<Result<ProviderEvent, ProviderError>>) -> Self {
         Self {
-            events,
+            scripts: vec![events],
+            delay: Duration::ZERO,
+            requests: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    pub fn script(scripts: Vec<Vec<Result<ProviderEvent, ProviderError>>>) -> Self {
+        assert!(
+            !scripts.is_empty(),
+            "fake provider script must not be empty"
+        );
+        Self {
+            scripts,
             delay: Duration::ZERO,
             requests: Arc::new(Mutex::new(Vec::new())),
         }
@@ -55,11 +67,21 @@ impl Provider for FakeProvider {
         request: ProviderRequest,
         cancellation: CancellationToken,
     ) -> Result<ProviderStream, ProviderError> {
-        self.requests
-            .lock()
-            .expect("fake provider request lock should not be poisoned")
-            .push(request);
-        let events = self.events.clone();
+        let request_index = {
+            let mut requests = self
+                .requests
+                .lock()
+                .expect("fake provider request lock should not be poisoned");
+            let index = requests.len();
+            requests.push(request);
+            index
+        };
+        let events = self
+            .scripts
+            .get(request_index)
+            .or_else(|| self.scripts.last())
+            .expect("fake provider has a script")
+            .clone();
         let delay = self.delay;
 
         Ok(Box::pin(async_stream::stream! {
@@ -96,6 +118,7 @@ mod tests {
             schema_version: PROTOCOL_VERSION,
             model: "test".to_string(),
             messages: Vec::new(),
+            tools: Vec::new(),
         }
     }
 

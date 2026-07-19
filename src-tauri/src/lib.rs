@@ -1,6 +1,7 @@
 pub mod agent;
 pub mod app_state;
 pub mod commands;
+pub mod patch;
 pub mod policy;
 pub mod protocol;
 pub mod providers;
@@ -33,6 +34,9 @@ pub fn run() {
             commands::run_turn,
             commands::retry_turn,
             commands::cancel_turn,
+            commands::preview_patch,
+            commands::resolve_approval,
+            commands::undo_change,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

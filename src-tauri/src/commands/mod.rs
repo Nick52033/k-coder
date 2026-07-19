@@ -5,7 +5,9 @@ use tauri::{AppHandle, Emitter, State};
 
 use crate::agent::{AgentRuntime, EventPublisher, RunTurnRequest, TurnOutcome};
 use crate::app_state::AppState;
-use crate::protocol::{AgentEventEnvelope, RuntimeStatus};
+use crate::protocol::{
+    AgentEvent, AgentEventEnvelope, ApprovalResolution, ChangeSet, PatchPreview, RuntimeStatus,
+};
 use crate::providers::{ProviderConfigView, SaveProviderConfigRequest};
 use crate::storage::{ThreadDetail, ThreadSummary};
 
@@ -43,13 +45,18 @@ impl EventPublisher for TauriEventPublisher {
 pub fn runtime_status(state: State<'_, AppState>) -> RuntimeStatus {
     RuntimeStatus {
         ready: true,
-        phase: "streaming-chat".to_string(),
+        phase: "safe-edit-review".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         uptime_seconds: state.uptime_seconds(),
         capabilities: vec![
             "streaming-chat".to_string(),
             "persistent-threads".to_string(),
             "cancellation".to_string(),
+            "native-tool-calling".to_string(),
+            "workspace-read-tools".to_string(),
+            "workspace-write-tools".to_string(),
+            "reviewable-patches".to_string(),
+            "change-undo".to_string(),
         ],
     }
 }
@@ -104,7 +111,6 @@ pub async fn read_thread(
     thread_id: String,
 ) -> CommandResult<ThreadDetail> {
     state
-        .repository()
         .read_thread(&thread_id)
         .await
         .map_err(|error| CommandError::new("storage", error))
@@ -139,7 +145,12 @@ pub async fn run_turn(
         .begin_turn(&thread_id)
         .await
         .map_err(|error| CommandError::new("turn_active", error))?;
-    let runtime = AgentRuntime::new(state.runtime_repository());
+    let runtime = AgentRuntime::with_tools_and_approvals(
+        state.runtime_repository(),
+        state.tool_registry(),
+        state.workspace_root(),
+        state.approvals(),
+    );
     let publisher: Arc<dyn EventPublisher> = Arc::new(TauriEventPublisher { app });
     let result = runtime
         .run_turn(provider, model, request, cancellation, publisher)
@@ -161,7 +172,12 @@ pub async fn retry_turn(
         .begin_turn(&thread_id)
         .await
         .map_err(|error| CommandError::new("turn_active", error))?;
-    let runtime = AgentRuntime::new(state.runtime_repository());
+    let runtime = AgentRuntime::with_tools_and_approvals(
+        state.runtime_repository(),
+        state.tool_registry(),
+        state.workspace_root(),
+        state.approvals(),
+    );
     let publisher: Arc<dyn EventPublisher> = Arc::new(TauriEventPublisher { app });
     let result = runtime
         .retry_turn(provider, model, thread_id.clone(), cancellation, publisher)
@@ -173,4 +189,53 @@ pub async fn retry_turn(
 #[tauri::command(rename_all = "camelCase")]
 pub async fn cancel_turn(state: State<'_, AppState>, thread_id: String) -> CommandResult<bool> {
     Ok(state.cancel_turn(&thread_id).await)
+}
+
+#[tauri::command]
+pub fn preview_patch(state: State<'_, AppState>, patch: String) -> CommandResult<PatchPreview> {
+    state
+        .patch_service()
+        .preview_patch(&state.workspace_root(), &patch)
+        .map_err(|error| CommandError::new("patch_preview", error))
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn resolve_approval(
+    state: State<'_, AppState>,
+    request_id: String,
+    resolution: ApprovalResolution,
+) -> CommandResult<()> {
+    state
+        .approvals()
+        .resolve(&request_id, resolution)
+        .await
+        .map_err(|error| CommandError::new("approval", error))
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn undo_change(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    thread_id: String,
+    change_id: String,
+) -> CommandResult<ChangeSet> {
+    if state.is_turn_active(&thread_id).await {
+        return Err(CommandError::new(
+            "turn_active",
+            "stop the active turn before undoing a change",
+        ));
+    }
+    let change = state
+        .undo_change(&thread_id, &change_id)
+        .await
+        .map_err(|error| CommandError::new("change_undo", error))?;
+    let _ = app.emit(
+        AGENT_EVENT_NAME,
+        AgentEventEnvelope::new(AgentEvent::ChangeUndone {
+            thread_id,
+            turn_id: change.turn_id.clone(),
+            change_id,
+        }),
+    );
+    Ok(change)
 }

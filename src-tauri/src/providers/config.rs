@@ -14,11 +14,23 @@ pub enum ProviderKind {
     OpenAiCompatible,
 }
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderTransport {
+    #[default]
+    OpenAiChatCompletions,
+    OpenAiResponses,
+    AnthropicMessages,
+    GoogleGemini,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderConfig {
     pub schema_version: u32,
     pub kind: ProviderKind,
+    #[serde(default)]
+    pub transport: ProviderTransport,
     pub base_url: String,
     pub model: String,
 }
@@ -63,9 +75,36 @@ impl ProviderConfig {
     }
 
     pub fn chat_completions_url(&self) -> Result<Url, ProviderConfigError> {
-        Url::parse(&format!("{}/chat/completions", self.base_url)).map_err(|_| {
-            ProviderConfigError::Invalid("chat completions URL is invalid".to_string())
-        })
+        self.endpoint_url("chat/completions", "chat completions")
+    }
+
+    pub fn responses_url(&self) -> Result<Url, ProviderConfigError> {
+        self.endpoint_url("responses", "responses")
+    }
+
+    pub fn anthropic_messages_url(&self) -> Result<Url, ProviderConfigError> {
+        self.endpoint_url("messages", "Anthropic messages")
+    }
+
+    pub fn gemini_stream_url(&self) -> Result<Url, ProviderConfigError> {
+        let mut url = Url::parse(&self.base_url)
+            .map_err(|_| ProviderConfigError::Invalid("Gemini URL is invalid".to_string()))?;
+        let model = self.model.strip_prefix("models/").unwrap_or(&self.model);
+        {
+            let mut segments = url.path_segments_mut().map_err(|_| {
+                ProviderConfigError::Invalid("Gemini base URL cannot be a base".to_string())
+            })?;
+            segments.pop_if_empty();
+            segments.push("models");
+            segments.push(&format!("{model}:streamGenerateContent"));
+        }
+        url.query_pairs_mut().append_pair("alt", "sse");
+        Ok(url)
+    }
+
+    fn endpoint_url(&self, path: &str, name: &str) -> Result<Url, ProviderConfigError> {
+        Url::parse(&format!("{}/{path}", self.base_url))
+            .map_err(|_| ProviderConfigError::Invalid(format!("{name} URL is invalid")))
     }
 }
 
@@ -73,6 +112,8 @@ impl ProviderConfig {
 #[serde(rename_all = "camelCase")]
 pub struct SaveProviderConfigRequest {
     pub kind: ProviderKind,
+    #[serde(default)]
+    pub transport: ProviderTransport,
     pub base_url: String,
     pub model: String,
     pub api_key: Option<String>,
@@ -83,6 +124,7 @@ impl SaveProviderConfigRequest {
         ProviderConfig {
             schema_version: PROTOCOL_VERSION,
             kind: self.kind,
+            transport: self.transport,
             base_url: self.base_url.clone(),
             model: self.model.clone(),
         }
@@ -95,6 +137,7 @@ impl SaveProviderConfigRequest {
 pub struct ProviderConfigView {
     pub schema_version: u32,
     pub kind: ProviderKind,
+    pub transport: ProviderTransport,
     pub base_url: String,
     pub model: String,
     pub has_api_key: bool,
@@ -167,6 +210,7 @@ mod tests {
         ProviderConfig {
             schema_version: PROTOCOL_VERSION,
             kind: ProviderKind::OpenAiCompatible,
+            transport: ProviderTransport::OpenAiChatCompletions,
             base_url: base_url.to_string(),
             model: " test-model ".to_string(),
         }
@@ -228,5 +272,35 @@ mod tests {
         unknown.schema_version = PROTOCOL_VERSION + 1;
 
         assert!(unknown.validate().is_err());
+    }
+
+    #[test]
+    fn old_configuration_defaults_to_chat_completions() {
+        let config: ProviderConfig = serde_json::from_str(
+            r#"{"schemaVersion":1,"kind":"open_ai_compatible","baseUrl":"https://example.com/v1","model":"test"}"#,
+        )
+        .expect("legacy configuration should deserialize");
+
+        assert_eq!(config.transport, ProviderTransport::OpenAiChatCompletions);
+    }
+
+    #[test]
+    fn builds_transport_specific_endpoints() {
+        let config = config("https://example.com/v1")
+            .validate()
+            .expect("configuration should validate");
+
+        assert_eq!(
+            config.responses_url().unwrap().as_str(),
+            "https://example.com/v1/responses"
+        );
+        assert_eq!(
+            config.anthropic_messages_url().unwrap().as_str(),
+            "https://example.com/v1/messages"
+        );
+        assert_eq!(
+            config.gemini_stream_url().unwrap().as_str(),
+            "https://example.com/v1/models/test-model:streamGenerateContent?alt=sse"
+        );
     }
 }

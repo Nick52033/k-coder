@@ -2,30 +2,54 @@ import { FormEvent, KeyboardEvent, useEffect, useRef, useState } from "react";
 import {
   Activity,
   Archive,
+  ArrowUp,
   CircleAlert,
   Code2,
+  FileDiff,
   KeyRound,
   MessageSquare,
+  Moon,
   PanelRight,
   Plus,
   RefreshCw,
-  SendHorizontal,
   Settings,
   Square,
+  Sun,
+  Undo2,
   X,
 } from "lucide-react";
 import { getRuntimeStatus, subscribeToAgentEvents } from "./api/runtime";
 import { useWorkbenchStore } from "./stores/workbenchStore";
-import type { RuntimeStatus, SaveProviderConfigRequest } from "./types/runtime";
+import { PatchReviewDialog } from "./components/PatchReviewDialog";
+import { SettingsDialog } from "./components/SettingsDialog";
+import type { RuntimeStatus } from "./types/runtime";
 import "./App.css";
 
-const DEFAULT_BASE_URL = "https://api.openai.com/v1";
+type Skin = "paper" | "midnight" | "amethyst";
+type ThemeMode = "light" | "dark";
+
+const STORAGE_SKIN = "kcoder_skin";
+const STORAGE_THEME = "kcoder_theme";
+
+function readStored<T>(key: string, fallback: T): T {
+  try {
+    const raw = localStorage.getItem(key);
+    return raw ? (raw as T) : fallback;
+  } catch {
+    return fallback;
+  }
+}
 
 function App() {
   const [runtime, setRuntime] = useState<RuntimeStatus | null>(null);
   const [runtimeError, setRuntimeError] = useState("");
   const [draft, setDraft] = useState("");
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [selectedChangeId, setSelectedChangeId] = useState<string | null>(null);
+  const [skin, setSkinState] = useState<Skin>(() => readStored(STORAGE_SKIN, "paper"));
+  const [themeMode, setThemeModeState] = useState<ThemeMode>(() =>
+    readStored(STORAGE_THEME, "light"),
+  );
   const messageAreaRef = useRef<HTMLDivElement>(null);
   const {
     threads,
@@ -34,6 +58,9 @@ function App() {
     lastTurn,
     activeTurnId,
     usage,
+    toolActivities,
+    pendingApproval,
+    changes,
     providerConfig,
     loading,
     error,
@@ -44,6 +71,8 @@ function App() {
     sendMessage,
     retryLastTurn,
     stopTurn,
+    resolvePendingApproval,
+    undoAppliedChange,
     saveProvider,
     handleAgentEvent,
     clearError,
@@ -84,7 +113,24 @@ function App() {
     if (area) area.scrollTop = area.scrollHeight;
   }, [messages]);
 
+  useEffect(() => {
+    document.documentElement.setAttribute("data-skin", skin);
+    document.documentElement.setAttribute("data-theme", themeMode);
+  }, [skin, themeMode]);
+
+  const setSkin = (next: Skin) => {
+    setSkinState(next);
+    try { localStorage.setItem(STORAGE_SKIN, next); } catch { /* noop */ }
+  };
+
+  const toggleTheme = () => {
+    const next = themeMode === "light" ? "dark" : "light";
+    setThemeModeState(next);
+    try { localStorage.setItem(STORAGE_THEME, next); } catch { /* noop */ }
+  };
+
   const activeThread = threads.find((thread) => thread.id === activeThreadId) ?? null;
+  const selectedChange = changes.find((change) => change.id === selectedChangeId) ?? null;
   const retryable = !activeTurnId && ["failed", "cancelled"].includes(lastTurn?.state ?? "");
 
   function submitMessage(event: FormEvent) {
@@ -96,7 +142,11 @@ function App() {
   }
 
   function handleComposerKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
-    if (event.key === "Enter" && (event.ctrlKey || event.metaKey)) {
+    if (
+      event.key === "Enter"
+      && !event.shiftKey
+      && !event.nativeEvent.isComposing
+    ) {
       event.preventDefault();
       event.currentTarget.form?.requestSubmit();
     }
@@ -122,8 +172,17 @@ function App() {
           <button
             className="icon-button"
             type="button"
-            aria-label="设置 Provider"
-            title="设置 Provider"
+            aria-label={themeMode === "light" ? "切换到深色模式" : "切换到浅色模式"}
+            title={themeMode === "light" ? "深色模式" : "浅色模式"}
+            onClick={toggleTheme}
+          >
+            {themeMode === "light" ? <Moon size={17} /> : <Sun size={17} />}
+          </button>
+          <button
+            className="icon-button"
+            type="button"
+            aria-label="打开设置"
+            title="设置"
             onClick={openSettings}
           >
             <Settings size={17} />
@@ -210,7 +269,7 @@ function App() {
           ) : (
             <div className="empty-thread">
               <Code2 size={26} />
-              <p>暂无消息</p>
+              <p>开始对话 — 输入消息与 AI 协作</p>
             </div>
           )}
         </div>
@@ -247,7 +306,7 @@ function App() {
                 title="发送消息"
                 disabled={!draft.trim()}
               >
-                <SendHorizontal size={17} />
+                <ArrowUp size={18} strokeWidth={2.2} />
               </button>
             )}
           </div>
@@ -270,8 +329,58 @@ function App() {
           </div>
           <div className="activity-row">
             <span className={`activity-dot ${activeTurnId ? "activity-dot--active" : ""}`} />
-            <div><strong>当前 Turn</strong><span>{activeTurnId ? "流式响应中" : lastTurn ? stateLabel(lastTurn.state) : "空闲"}</span></div>
+            <div><strong>当前 Turn</strong><span>{lastTurn ? stateLabel(lastTurn.state) : "空闲"}</span></div>
           </div>
+          {toolActivities.slice(-8).map((activity) => (
+            <div className="activity-row activity-row--tool" key={`${activity.turnId}-${activity.call.id}`}>
+              <span
+                className={`activity-dot ${
+                  activity.state === "running"
+                    ? "activity-dot--active"
+                    : activity.state === "completed"
+                      ? "activity-dot--success"
+                      : "activity-dot--error"
+                }`}
+              />
+              <div>
+                <strong>{activity.call.name}</strong>
+                <span title={toolActivityDetail(activity)}>{toolActivityDetail(activity)}</span>
+              </div>
+            </div>
+          ))}
+          {changes.length > 0 && (
+            <div className="activity-changes">
+              <div className="activity-section-title">代码变更</div>
+              {changes.slice(-4).reverse().map((change) => (
+                <div className="activity-change" key={change.id}>
+                  <button
+                    className="activity-change-main"
+                    type="button"
+                    title="查看变更"
+                    onClick={() => setSelectedChangeId(change.id)}
+                  >
+                    <FileDiff size={15} />
+                    <span>
+                      <strong>{change.files.length} 个文件</strong>
+                      <small>{change.undone ? "已撤销" : "已应用"}</small>
+                    </span>
+                  </button>
+                  {!change.undone && (
+                    <button
+                      className="activity-change-undo"
+                      type="button"
+                      title="撤销变更"
+                      aria-label="撤销变更"
+                      disabled={Boolean(activeTurnId)}
+                      onClick={() => void undoAppliedChange(change.id)}
+                    >
+                      <Undo2 size={14} />
+                    </button>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
           {usage && (
             <div className="usage-block">
               <div><span>输入</span><strong>{usage.inputTokens}</strong></div>
@@ -283,84 +392,33 @@ function App() {
       </aside>
 
       {settingsOpen && (
-        <ProviderSettings
-          initial={providerConfig}
+        <SettingsDialog
+          provider={providerConfig}
           error={error}
+          skin={skin}
+          themeMode={themeMode}
           onClose={() => setSettingsOpen(false)}
-          onSave={saveProvider}
+          onSetSkin={setSkin}
+          onToggleTheme={toggleTheme}
+          onSaveProvider={saveProvider}
+        />
+      )}
+      {pendingApproval && (
+        <PatchReviewDialog
+          request={pendingApproval}
+          error={error}
+          onResolve={resolvePendingApproval}
+        />
+      )}
+      {!pendingApproval && selectedChange && (
+        <PatchReviewDialog
+          change={selectedChange}
+          error={error}
+          onUndo={undoAppliedChange}
+          onClose={() => setSelectedChangeId(null)}
         />
       )}
     </main>
-  );
-}
-
-interface ProviderSettingsProps {
-  initial: ReturnType<typeof useWorkbenchStore.getState>["providerConfig"];
-  onClose: () => void;
-  onSave: (request: SaveProviderConfigRequest) => Promise<boolean>;
-  error: string;
-}
-
-function ProviderSettings({ initial, onClose, onSave, error }: ProviderSettingsProps) {
-  const [baseUrl, setBaseUrl] = useState(initial?.baseUrl ?? DEFAULT_BASE_URL);
-  const [model, setModel] = useState(initial?.model ?? "");
-  const [apiKey, setApiKey] = useState("");
-  const [saving, setSaving] = useState(false);
-
-  async function submit(event: FormEvent) {
-    event.preventDefault();
-    setSaving(true);
-    const saved = await onSave({
-      kind: "open_ai_compatible",
-      baseUrl,
-      model,
-      ...(apiKey.trim() ? { apiKey: apiKey.trim() } : {}),
-    });
-    setSaving(false);
-    if (saved) onClose();
-  }
-
-  return (
-    <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
-      <section className="settings-dialog" role="dialog" aria-modal="true" aria-labelledby="provider-settings-title">
-        <header>
-          <div><KeyRound size={18} /><h2 id="provider-settings-title">Provider 设置</h2></div>
-          <button className="icon-button" type="button" aria-label="关闭设置" title="关闭" onClick={onClose}><X size={17} /></button>
-        </header>
-        <form onSubmit={submit}>
-          <label>
-            <span>类型</span>
-            <select value="open_ai_compatible" disabled>
-              <option value="open_ai_compatible">OpenAI-compatible</option>
-            </select>
-          </label>
-          <label>
-            <span>API 地址</span>
-            <input type="url" required value={baseUrl} onChange={(event) => setBaseUrl(event.target.value)} />
-          </label>
-          <label>
-            <span>模型</span>
-            <input required value={model} onChange={(event) => setModel(event.target.value)} placeholder="模型名称" />
-          </label>
-          <label>
-            <span>API Key</span>
-            <input
-              type="password"
-              value={apiKey}
-              onChange={(event) => setApiKey(event.target.value)}
-              placeholder={initial?.hasApiKey ? "已安全保存" : "输入 API Key"}
-              required={!initial?.hasApiKey}
-              autoComplete="off"
-            />
-          </label>
-          {error && <div className="settings-error" role="alert"><CircleAlert size={15} /><span>{error}</span></div>}
-          <footer>
-            <button className="secondary-button" type="button" onClick={onClose}>取消</button>
-            <button className="primary-button" type="submit" disabled={saving}>{saving ? "保存中" : "保存"}</button>
-          </footer>
-        </form>
-      </section>
-    </div>
   );
 }
 
@@ -370,8 +428,21 @@ function stateLabel(state: string) {
     case "failed": return "失败";
     case "cancelled": return "已取消";
     case "streaming": return "响应中";
+    case "running_tool": return "执行工具";
+    case "awaiting_approval": return "等待审阅";
     default: return state;
   }
+}
+
+function toolActivityDetail(activity: {
+  state: "running" | "completed" | "failed";
+  call: { arguments: Record<string, unknown> };
+  result: { output: string } | null;
+}) {
+  if (activity.state === "running") return "执行中";
+  if (activity.state === "failed") return activity.result?.output || "执行失败";
+  const path = activity.call.arguments.path;
+  return typeof path === "string" ? path : "已完成";
 }
 
 export default App;

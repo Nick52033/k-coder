@@ -1,23 +1,36 @@
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
+use crate::patch::{PatchError, PatchService};
+use crate::policy::ApprovalManager;
+use crate::protocol::{ApprovalAction, ApprovalResolution, ChangeSet, TurnState};
 use crate::providers::{
-    CredentialError, CredentialStore, OpenAiChatCompletionsProvider, OsCredentialStore, Provider,
-    ProviderConfigError, ProviderConfigStore, ProviderConfigView, SaveProviderConfigRequest,
+    AnthropicMessagesProvider, CredentialError, CredentialStore, GoogleGeminiProvider,
+    OpenAiChatCompletionsProvider, OpenAiResponsesProvider, OsCredentialStore, Provider,
+    ProviderConfigError, ProviderConfigStore, ProviderConfigView, ProviderTransport,
+    SaveProviderConfigRequest,
 };
-use crate::storage::{JsonlThreadRepository, StorageError, ThreadRepository};
+use crate::storage::{
+    JsonlThreadRepository, StorageError, StoredEvent, StoredEventKind, ThreadRepository,
+};
+use crate::tools::ToolRegistry;
 
 pub struct AppState {
     started_at: Instant,
     repository: Arc<JsonlThreadRepository>,
     provider_config: ProviderConfigStore,
     credentials: Arc<dyn CredentialStore>,
+    workspace_root: PathBuf,
+    tool_registry: ToolRegistry,
+    patch_service: PatchService,
+    approvals: Arc<ApprovalManager>,
     active_turns: Mutex<HashMap<String, CancellationToken>>,
+    recovery_lock: Mutex<()>,
 }
 
 impl AppState {
@@ -29,12 +42,37 @@ impl AppState {
         data_root: impl AsRef<Path>,
         credentials: Arc<dyn CredentialStore>,
     ) -> Result<Self, AppStateError> {
+        let workspace_root =
+            std::env::current_dir().map_err(|error| AppStateError::Workspace(error.to_string()))?;
+        Self::with_workspace_and_credentials(data_root, workspace_root, credentials)
+    }
+
+    pub fn with_workspace_and_credentials(
+        data_root: impl AsRef<Path>,
+        workspace_root: impl AsRef<Path>,
+        credentials: Arc<dyn CredentialStore>,
+    ) -> Result<Self, AppStateError> {
+        let workspace_root = workspace_root
+            .as_ref()
+            .canonicalize()
+            .map_err(|error| AppStateError::Workspace(error.to_string()))?;
+        if !workspace_root.is_dir() {
+            return Err(AppStateError::Workspace(
+                "workspace root is not a directory".to_string(),
+            ));
+        }
+        let patch_service = PatchService::new();
         Ok(Self {
             started_at: Instant::now(),
             repository: Arc::new(JsonlThreadRepository::new(&data_root)?),
             provider_config: ProviderConfigStore::new(data_root),
             credentials,
+            workspace_root,
+            tool_registry: ToolRegistry::workspace_tools(patch_service.clone()),
+            patch_service,
+            approvals: Arc::new(ApprovalManager::new(Duration::from_secs(5 * 60))),
             active_turns: Mutex::new(HashMap::new()),
+            recovery_lock: Mutex::new(()),
         })
     }
 
@@ -50,6 +88,22 @@ impl AppState {
         self.repository.clone()
     }
 
+    pub fn workspace_root(&self) -> PathBuf {
+        self.workspace_root.clone()
+    }
+
+    pub fn tool_registry(&self) -> ToolRegistry {
+        self.tool_registry.clone()
+    }
+
+    pub fn patch_service(&self) -> PatchService {
+        self.patch_service.clone()
+    }
+
+    pub fn approvals(&self) -> Arc<ApprovalManager> {
+        self.approvals.clone()
+    }
+
     pub fn provider_config(&self) -> Result<Option<ProviderConfigView>, AppStateError> {
         let Some(config) = self.provider_config.load()? else {
             return Ok(None);
@@ -57,6 +111,7 @@ impl AppState {
         Ok(Some(ProviderConfigView {
             schema_version: config.schema_version,
             kind: config.kind,
+            transport: config.transport,
             base_url: config.base_url,
             model: config.model,
             has_api_key: self.credentials.get_api_key()?.is_some(),
@@ -84,6 +139,7 @@ impl AppState {
         Ok(ProviderConfigView {
             schema_version: config.schema_version,
             kind: config.kind,
+            transport: config.transport,
             base_url: config.base_url,
             model: config.model,
             has_api_key: true,
@@ -105,12 +161,25 @@ impl AppState {
             AppStateError::ProviderNotConfigured("the provider API key is missing".to_string())
         })?;
         let model = config.model.clone();
-        let provider = OpenAiChatCompletionsProvider::new(config, api_key)
-            .map_err(|error| AppStateError::ProviderNotConfigured(error.to_string()))?;
-        Ok((Arc::new(provider), model))
+        let provider: Arc<dyn Provider> = match config.transport {
+            ProviderTransport::OpenAiChatCompletions => {
+                Arc::new(OpenAiChatCompletionsProvider::new(config, api_key)?)
+            }
+            ProviderTransport::OpenAiResponses => {
+                Arc::new(OpenAiResponsesProvider::new(config, api_key)?)
+            }
+            ProviderTransport::AnthropicMessages => {
+                Arc::new(AnthropicMessagesProvider::new(config, api_key)?)
+            }
+            ProviderTransport::GoogleGemini => {
+                Arc::new(GoogleGeminiProvider::new(config, api_key)?)
+            }
+        };
+        Ok((provider, model))
     }
 
     pub async fn begin_turn(&self, thread_id: &str) -> Result<CancellationToken, AppStateError> {
+        let _recovery_guard = self.recovery_lock.lock().await;
         let mut active_turns = self.active_turns.lock().await;
         if active_turns.contains_key(thread_id) {
             return Err(AppStateError::TurnAlreadyActive(thread_id.to_string()));
@@ -137,6 +206,115 @@ impl AppState {
     pub async fn is_turn_active(&self, thread_id: &str) -> bool {
         self.active_turns.lock().await.contains_key(thread_id)
     }
+
+    pub async fn read_thread(
+        &self,
+        thread_id: &str,
+    ) -> Result<crate::storage::ThreadDetail, AppStateError> {
+        let _recovery_guard = self.recovery_lock.lock().await;
+        let detail = self.repository.read_thread(thread_id).await?;
+        let Some(last_turn) = &detail.last_turn else {
+            return Ok(detail);
+        };
+        if !matches!(
+            last_turn.state,
+            TurnState::Queued
+                | TurnState::Streaming
+                | TurnState::AwaitingApproval
+                | TurnState::RunningTool
+        ) || self.active_turns.lock().await.contains_key(thread_id)
+        {
+            return Ok(detail);
+        }
+
+        if let Some(approval) = detail
+            .approvals
+            .iter()
+            .rev()
+            .find(|approval| approval.resolution.is_none())
+        {
+            self.repository
+                .append(StoredEvent::new(
+                    thread_id,
+                    Some(last_turn.turn_id.clone()),
+                    StoredEventKind::ApprovalResolved {
+                        request_id: approval.request.id.clone(),
+                        resolution: ApprovalResolution {
+                            action: ApprovalAction::Cancelled,
+                            patch: None,
+                            selected_paths: Vec::new(),
+                            expected_hashes: Vec::new(),
+                        },
+                    },
+                ))
+                .await?;
+        }
+        self.repository
+            .append(StoredEvent::new(
+                thread_id,
+                Some(last_turn.turn_id.clone()),
+                StoredEventKind::TurnCancelled,
+            ))
+            .await?;
+        Ok(self.repository.read_thread(thread_id).await?)
+    }
+
+    pub async fn undo_change(
+        &self,
+        thread_id: &str,
+        change_id: &str,
+    ) -> Result<ChangeSet, AppStateError> {
+        let events = self.repository.load(thread_id).await?;
+        let mut change_set = None;
+        let mut undone = false;
+        for event in events {
+            match event.kind {
+                StoredEventKind::ChangeApplied { change_set: change } if change.id == change_id => {
+                    change_set = Some(change);
+                }
+                StoredEventKind::ChangeUndone {
+                    change_id: undone_id,
+                } if undone_id == change_id => {
+                    undone = true;
+                }
+                _ => {}
+            }
+        }
+        if undone {
+            return Err(AppStateError::ChangeAlreadyUndone(change_id.to_string()));
+        }
+        let change_set =
+            change_set.ok_or_else(|| AppStateError::ChangeNotFound(change_id.to_string()))?;
+        let undone_change = self
+            .patch_service
+            .undo(self.workspace_root.clone(), change_set)
+            .await?;
+        if let Err(error) = self
+            .repository
+            .append(StoredEvent::new(
+                thread_id,
+                Some(undone_change.turn_id.clone()),
+                StoredEventKind::ChangeUndone {
+                    change_id: change_id.to_string(),
+                },
+            ))
+            .await
+        {
+            let storage_error = error.to_string();
+            if let Err(redo_error) = self
+                .patch_service
+                .redo(self.workspace_root.clone(), undone_change.clone())
+                .await
+            {
+                return Err(AppStateError::UndoAuditCompensation {
+                    storage_error,
+                    redo_error: redo_error.to_string(),
+                });
+            }
+            return Err(error.into());
+        }
+        Ok(undone_change)
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -146,11 +324,28 @@ pub enum AppStateError {
     #[error(transparent)]
     ProviderConfig(#[from] ProviderConfigError),
     #[error(transparent)]
+    Provider(#[from] crate::providers::ProviderError),
+    #[error(transparent)]
     Credential(#[from] CredentialError),
+    #[error(transparent)]
+    Patch(#[from] PatchError),
     #[error("provider is not configured: {0}")]
     ProviderNotConfigured(String),
     #[error("a turn is already active for thread {0}")]
     TurnAlreadyActive(String),
+    #[error("workspace is invalid: {0}")]
+    Workspace(String),
+    #[error("change was not found: {0}")]
+    ChangeNotFound(String),
+    #[error("change was already undone: {0}")]
+    ChangeAlreadyUndone(String),
+    #[error(
+        "undo audit failed: {storage_error}; restoring the applied change also failed: {redo_error}"
+    )]
+    UndoAuditCompensation {
+        storage_error: String,
+        redo_error: String,
+    },
 }
 
 #[cfg(test)]
@@ -158,7 +353,8 @@ mod tests {
     use std::sync::Mutex as StdMutex;
 
     use super::*;
-    use crate::providers::{ProviderKind, SaveProviderConfigRequest};
+    use crate::protocol::{ApprovalRequest, ExpectedFileHash, ToolRisk};
+    use crate::providers::{ProviderKind, ProviderTransport, SaveProviderConfigRequest};
 
     #[derive(Default)]
     struct FakeCredentials {
@@ -191,6 +387,7 @@ mod tests {
         let view = state
             .save_provider_config(SaveProviderConfigRequest {
                 kind: ProviderKind::OpenAiCompatible,
+                transport: ProviderTransport::OpenAiChatCompletions,
                 base_url: "https://example.com/v1".to_string(),
                 model: "test-model".to_string(),
                 api_key: Some("super-secret".to_string()),
@@ -220,5 +417,127 @@ mod tests {
         ));
         assert!(state.cancel_turn("thread").await);
         state.finish_turn("thread").await;
+    }
+
+    #[tokio::test]
+    async fn undo_restores_the_snapshot_and_persists_the_audit_event() {
+        let data = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("review.txt"), "before\n").unwrap();
+        let state = AppState::with_workspace_and_credentials(
+            data.path(),
+            workspace.path(),
+            Arc::new(FakeCredentials::default()),
+        )
+        .unwrap();
+        let thread = state.repository().create_thread().await.unwrap();
+        let patch =
+            "*** Begin Patch\n*** Update File: review.txt\n@@\n-before\n+after\n*** End Patch\n";
+        let preview = state
+            .patch_service()
+            .preview_patch(workspace.path(), patch)
+            .unwrap();
+        let expected_hashes = preview
+            .files
+            .iter()
+            .map(|file| ExpectedFileHash {
+                path: file.path.clone(),
+                before_hash: file.before_hash.clone(),
+            })
+            .collect();
+        let selected_paths = preview.files.iter().map(|file| file.path.clone()).collect();
+        let change = state
+            .patch_service()
+            .apply_patch(
+                workspace.path().to_path_buf(),
+                thread.id.clone(),
+                "turn-1".to_string(),
+                "call-1".to_string(),
+                patch.to_string(),
+                selected_paths,
+                expected_hashes,
+            )
+            .await
+            .unwrap();
+        state
+            .repository()
+            .append(StoredEvent::new(
+                &thread.id,
+                Some("turn-1".to_string()),
+                StoredEventKind::ChangeApplied {
+                    change_set: change.clone(),
+                },
+            ))
+            .await
+            .unwrap();
+
+        let undone = state.undo_change(&thread.id, &change.id).await.unwrap();
+        assert!(undone.undone);
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join("review.txt")).unwrap(),
+            "before\n"
+        );
+        let detail = state.repository().read_thread(&thread.id).await.unwrap();
+        assert!(detail.changes[0].undone);
+        assert!(matches!(
+            state.undo_change(&thread.id, &change.id).await,
+            Err(AppStateError::ChangeAlreadyUndone(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn recovers_an_orphaned_approval_as_cancelled_once() {
+        let data = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let state = AppState::with_workspace_and_credentials(
+            data.path(),
+            workspace.path(),
+            Arc::new(FakeCredentials::default()),
+        )
+        .unwrap();
+        let thread = state.repository().create_thread().await.unwrap();
+        let turn_id = "interrupted-turn".to_string();
+        let request = ApprovalRequest {
+            id: "interrupted-approval".to_string(),
+            thread_id: thread.id.clone(),
+            turn_id: turn_id.clone(),
+            tool_call_id: "call".to_string(),
+            tool_name: "apply_patch".to_string(),
+            reason: "review".to_string(),
+            risk: ToolRisk::Write,
+            arguments: serde_json::json!({ "patch": "strict patch" }),
+            preview: None,
+            created_at_ms: 1,
+            expires_at_ms: 2,
+        };
+        for kind in [
+            StoredEventKind::TurnStarted,
+            StoredEventKind::ApprovalRequested {
+                request: request.clone(),
+            },
+        ] {
+            state
+                .repository()
+                .append(StoredEvent::new(&thread.id, Some(turn_id.clone()), kind))
+                .await
+                .unwrap();
+        }
+
+        let detail = state.read_thread(&thread.id).await.unwrap();
+        assert_eq!(detail.last_turn.unwrap().state, TurnState::Cancelled);
+        assert_eq!(
+            detail.approvals[0]
+                .resolution
+                .as_ref()
+                .map(|resolution| resolution.action),
+            Some(ApprovalAction::Cancelled)
+        );
+        let event_count = state.repository().load(&thread.id).await.unwrap().len();
+        let detail = state.read_thread(&thread.id).await.unwrap();
+        assert_eq!(detail.last_turn.unwrap().state, TurnState::Cancelled);
+        assert_eq!(
+            state.repository().load(&thread.id).await.unwrap().len(),
+            event_count
+        );
     }
 }

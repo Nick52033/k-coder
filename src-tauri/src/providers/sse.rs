@@ -27,11 +27,14 @@ impl SseDecoder {
         Ok(events)
     }
 
-    pub(super) fn finish(self) -> Result<(), ProviderError> {
+    pub(super) fn finish(self) -> Result<Vec<String>, ProviderError> {
         if self.buffer.iter().all(u8::is_ascii_whitespace) {
-            Ok(())
-        } else {
-            Err(ProviderError::Interrupted)
+            return Ok(Vec::new());
+        }
+
+        match decode_frame(&self.buffer)? {
+            Some(data) if data.trim() == "[DONE]" => Ok(vec![data]),
+            _ => Err(ProviderError::Interrupted),
         }
     }
 }
@@ -82,7 +85,12 @@ mod tests {
             events.extend(decoder.push(byte).expect("chunk should decode"));
         }
 
-        decoder.finish().expect("stream should end cleanly");
+        assert!(
+            decoder
+                .finish()
+                .expect("stream should end cleanly")
+                .is_empty()
+        );
         assert_eq!(events.len(), 2);
         assert!(events[0].contains("你好"));
         assert_eq!(events[1], "[DONE]");
@@ -106,5 +114,15 @@ mod tests {
             .expect("chunk buffers");
 
         assert_eq!(decoder.finish(), Err(ProviderError::Interrupted));
+    }
+
+    #[test]
+    fn decodes_a_complete_final_frame_without_a_blank_line() {
+        let mut decoder = SseDecoder::default();
+        decoder
+            .push(b"data: [DONE]")
+            .expect("final frame should buffer");
+
+        assert_eq!(decoder.finish(), Ok(vec!["[DONE]".to_string()]));
     }
 }

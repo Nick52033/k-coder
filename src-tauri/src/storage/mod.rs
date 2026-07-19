@@ -9,7 +9,10 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-use crate::protocol::{ChatMessage, MessageRole, PROTOCOL_VERSION, TokenUsage, TurnState};
+use crate::protocol::{
+    ApprovalRequest, ApprovalResolution, ApprovalSnapshot, ChangeSet, ChatMessage, MessageRole,
+    PROTOCOL_VERSION, TokenUsage, ToolCall, ToolResult, TurnState,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -43,12 +46,47 @@ impl StoredEvent {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum StoredEventKind {
-    ThreadCreated { title: String },
-    UserMessage { message: ChatMessage },
+    ThreadCreated {
+        title: String,
+    },
+    UserMessage {
+        message: ChatMessage,
+    },
     TurnStarted,
-    AssistantMessage { message: ChatMessage },
-    TurnCompleted { usage: Option<TokenUsage> },
-    TurnFailed { message: String },
+    AssistantMessage {
+        message: ChatMessage,
+    },
+    AssistantToolCalls {
+        calls: Vec<ToolCall>,
+    },
+    ToolResult {
+        call_id: String,
+        name: String,
+        result: ToolResult,
+    },
+    ProviderContext {
+        provider: String,
+        item: serde_json::Value,
+    },
+    ApprovalRequested {
+        request: ApprovalRequest,
+    },
+    ApprovalResolved {
+        request_id: String,
+        resolution: ApprovalResolution,
+    },
+    ChangeApplied {
+        change_set: ChangeSet,
+    },
+    ChangeUndone {
+        change_id: String,
+    },
+    TurnCompleted {
+        usage: Option<TokenUsage>,
+    },
+    TurnFailed {
+        message: String,
+    },
     TurnCancelled,
     ThreadArchived,
 }
@@ -79,6 +117,26 @@ pub struct ThreadDetail {
     pub summary: ThreadSummary,
     pub messages: Vec<ChatMessage>,
     pub last_turn: Option<TurnSnapshot>,
+    pub tool_activities: Vec<ToolActivitySnapshot>,
+    pub approvals: Vec<ApprovalSnapshot>,
+    pub changes: Vec<ChangeSet>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolActivityState {
+    Running,
+    Completed,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolActivitySnapshot {
+    pub turn_id: String,
+    pub call: ToolCall,
+    pub state: ToolActivityState,
+    pub result: Option<ToolResult>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -268,6 +326,9 @@ fn project_thread(thread_id: &str, events: &[StoredEvent]) -> Result<ThreadDetai
     let mut messages = Vec::new();
     let mut archived = false;
     let mut last_turn = None;
+    let mut tool_activities: Vec<ToolActivitySnapshot> = Vec::new();
+    let mut approvals: Vec<ApprovalSnapshot> = Vec::new();
+    let mut changes: Vec<ChangeSet> = Vec::new();
     let mut updated_at_ms = created.1;
 
     for event in events {
@@ -285,6 +346,65 @@ fn project_thread(thread_id: &str, events: &[StoredEvent]) -> Result<ThreadDetai
                 messages.push(message.clone());
             }
             StoredEventKind::AssistantMessage { message } => messages.push(message.clone()),
+            StoredEventKind::AssistantToolCalls { calls } => {
+                if let Some(turn_id) = &event.turn_id {
+                    tool_activities.extend(calls.iter().cloned().map(|call| {
+                        ToolActivitySnapshot {
+                            turn_id: turn_id.clone(),
+                            call,
+                            state: ToolActivityState::Running,
+                            result: None,
+                        }
+                    }));
+                }
+            }
+            StoredEventKind::ToolResult {
+                call_id, result, ..
+            } => {
+                if let Some(activity) = tool_activities
+                    .iter_mut()
+                    .rev()
+                    .find(|activity| activity.call.id == *call_id)
+                {
+                    activity.state = if result.success {
+                        ToolActivityState::Completed
+                    } else {
+                        ToolActivityState::Failed
+                    };
+                    activity.result = Some(result.clone());
+                }
+            }
+            StoredEventKind::ProviderContext { .. } => {}
+            StoredEventKind::ApprovalRequested { request } => {
+                approvals.push(ApprovalSnapshot {
+                    request: request.clone(),
+                    resolution: None,
+                });
+                update_turn(&mut last_turn, event, TurnState::AwaitingApproval, None);
+            }
+            StoredEventKind::ApprovalResolved {
+                request_id,
+                resolution,
+            } => {
+                if let Some(approval) = approvals
+                    .iter_mut()
+                    .rev()
+                    .find(|approval| approval.request.id == *request_id)
+                {
+                    approval.resolution = Some(resolution.clone());
+                }
+                update_turn(&mut last_turn, event, TurnState::Streaming, None);
+            }
+            StoredEventKind::ChangeApplied { change_set } => changes.push(change_set.clone()),
+            StoredEventKind::ChangeUndone { change_id } => {
+                if let Some(change) = changes
+                    .iter_mut()
+                    .rev()
+                    .find(|change| change.id == *change_id)
+                {
+                    change.undone = true;
+                }
+            }
             StoredEventKind::TurnStarted => {
                 if let Some(turn_id) = &event.turn_id {
                     last_turn = Some(TurnSnapshot {
@@ -323,6 +443,9 @@ fn project_thread(thread_id: &str, events: &[StoredEvent]) -> Result<ThreadDetai
         },
         messages,
         last_turn,
+        tool_activities,
+        approvals,
+        changes,
     })
 }
 
@@ -364,7 +487,10 @@ pub fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::{ContentBlock, MessageRole};
+    use crate::protocol::{
+        ApprovalAction, ChangeFileSnapshot, ContentBlock, ExpectedFileHash, FileOperation,
+        MessageRole, PatchFilePreview, PatchPreview, ToolRisk,
+    };
 
     fn message(role: MessageRole, text: &str) -> ChatMessage {
         ChatMessage {
@@ -460,5 +586,95 @@ mod tests {
             repository.load(&thread.id).await,
             Err(StorageError::InvalidData(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn rebuilds_approval_and_change_history_from_events() {
+        let directory = tempfile::tempdir().unwrap();
+        let repository = JsonlThreadRepository::new(directory.path()).unwrap();
+        let thread = repository.create_thread().await.unwrap();
+        let turn_id = "turn-review".to_string();
+        let preview_file = PatchFilePreview {
+            path: "src/main.rs".to_string(),
+            destination_path: None,
+            operation: FileOperation::Modify,
+            before_hash: Some("before-hash".to_string()),
+            after_hash: Some("after-hash".to_string()),
+            before_content: Some("before\n".to_string()),
+            after_content: Some("after\n".to_string()),
+            unified_diff: "-before\n+after\n".to_string(),
+        };
+        let request = ApprovalRequest {
+            id: "approval-1".to_string(),
+            thread_id: thread.id.clone(),
+            turn_id: turn_id.clone(),
+            tool_call_id: "call-1".to_string(),
+            tool_name: "apply_patch".to_string(),
+            reason: "review change".to_string(),
+            risk: ToolRisk::Write,
+            arguments: serde_json::json!({ "patch": "strict patch" }),
+            preview: Some(PatchPreview {
+                patch: "strict patch".to_string(),
+                files: vec![preview_file.clone()],
+                total_snapshot_bytes: 13,
+            }),
+            created_at_ms: now_ms(),
+            expires_at_ms: now_ms() + 60_000,
+        };
+        let resolution = ApprovalResolution {
+            action: ApprovalAction::Approved,
+            patch: None,
+            selected_paths: vec!["src/main.rs".to_string()],
+            expected_hashes: vec![ExpectedFileHash {
+                path: "src/main.rs".to_string(),
+                before_hash: Some("before-hash".to_string()),
+            }],
+        };
+        let change = ChangeSet {
+            id: "change-1".to_string(),
+            thread_id: thread.id.clone(),
+            turn_id: turn_id.clone(),
+            tool_call_id: "call-1".to_string(),
+            created_at_ms: now_ms(),
+            files: vec![ChangeFileSnapshot {
+                path: preview_file.path,
+                destination_path: preview_file.destination_path,
+                operation: preview_file.operation,
+                before_hash: preview_file.before_hash,
+                after_hash: preview_file.after_hash,
+                before_content: preview_file.before_content,
+                after_content: preview_file.after_content,
+                unified_diff: preview_file.unified_diff,
+            }],
+            undone: false,
+        };
+        for kind in [
+            StoredEventKind::TurnStarted,
+            StoredEventKind::ApprovalRequested {
+                request: request.clone(),
+            },
+            StoredEventKind::ApprovalResolved {
+                request_id: request.id.clone(),
+                resolution: resolution.clone(),
+            },
+            StoredEventKind::ChangeApplied {
+                change_set: change.clone(),
+            },
+            StoredEventKind::ChangeUndone {
+                change_id: change.id.clone(),
+            },
+        ] {
+            repository
+                .append(StoredEvent::new(&thread.id, Some(turn_id.clone()), kind))
+                .await
+                .unwrap();
+        }
+
+        let detail = repository.read_thread(&thread.id).await.unwrap();
+        assert_eq!(detail.approvals.len(), 1);
+        assert_eq!(detail.approvals[0].request, request);
+        assert_eq!(detail.approvals[0].resolution, Some(resolution));
+        assert_eq!(detail.changes.len(), 1);
+        assert!(detail.changes[0].undone);
     }
 }

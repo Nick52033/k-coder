@@ -2,6 +2,9 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
   AgentEvent,
+  ApprovalResolution,
+  ChangeSet,
+  PatchPreview,
   ProviderConfigView,
   RuntimeStatus,
   SaveProviderConfigRequest,
@@ -52,6 +55,18 @@ export function retryTurn(threadId: string) {
 
 export function cancelTurn(threadId: string) {
   return invoke<boolean>("cancel_turn", { threadId });
+}
+
+export function previewPatch(patch: string) {
+  return invoke<PatchPreview>("preview_patch", { patch });
+}
+
+export function resolveApproval(requestId: string, resolution: ApprovalResolution) {
+  return invoke<void>("resolve_approval", { requestId, resolution });
+}
+
+export function undoChange(threadId: string, changeId: string) {
+  return invoke<ChangeSet>("undo_change", { threadId, changeId });
 }
 
 export function subscribeToAgentEvents(
