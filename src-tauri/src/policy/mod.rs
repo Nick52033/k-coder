@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, oneshot};
 use tokio_util::sync::CancellationToken;
 
+use crate::execution::{CommandMode, CommandRuntime, StartCommandRequest};
 use crate::protocol::{ApprovalAction, ApprovalResolution, ToolRisk};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -84,7 +85,65 @@ impl PolicyEngine for WorkspacePolicy {
                 ToolRisk::Delete
             }
             "apply_patch" => ToolRisk::Write,
+            "run_command" => ToolRisk::External,
             _ => ToolRisk::External,
+        }
+    }
+}
+
+pub struct ExecutionWorkspacePolicy {
+    pub runtime: CommandRuntime,
+}
+
+impl PolicyEngine for ExecutionWorkspacePolicy {
+    fn authorize(&self, tool_name: &str, arguments: &serde_json::Value) -> PolicyDecision {
+        if tool_name != "run_command" {
+            return WorkspacePolicy.authorize(tool_name, arguments);
+        }
+        let request = StartCommandRequest {
+            program: arguments
+                .get("program")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            args: arguments
+                .get("args")
+                .and_then(serde_json::Value::as_array)
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default(),
+            cwd: arguments
+                .get("cwd")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            env: HashMap::new(),
+            mode: CommandMode::Foreground,
+            timeout_ms: arguments
+                .get("timeoutMs")
+                .and_then(serde_json::Value::as_u64),
+            buffer_bytes: None,
+        };
+        let assessment = self.runtime.assess(&request);
+        if assessment.requires_approval {
+            PolicyDecision::RequireApproval {
+                reason: assessment.reason,
+            }
+        } else {
+            PolicyDecision::Allow
+        }
+    }
+
+    fn risk(&self, tool_name: &str, arguments: &serde_json::Value) -> ToolRisk {
+        if tool_name == "run_command" {
+            ToolRisk::External
+        } else {
+            WorkspacePolicy.risk(tool_name, arguments)
         }
     }
 }

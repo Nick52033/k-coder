@@ -9,10 +9,14 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
+use crate::context::CompactionSummary;
+use crate::persistence::ProjectionDb;
 use crate::protocol::{
     ApprovalRequest, ApprovalResolution, ApprovalSnapshot, ChangeSet, ChatMessage, MessageRole,
     PROTOCOL_VERSION, TokenUsage, ToolCall, ToolResult, TurnState,
 };
+
+pub const EVENT_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -33,7 +37,7 @@ impl StoredEvent {
         kind: StoredEventKind,
     ) -> Self {
         Self {
-            schema_version: PROTOCOL_VERSION,
+            schema_version: EVENT_SCHEMA_VERSION,
             event_id: Uuid::new_v4().to_string(),
             thread_id: thread_id.into(),
             turn_id,
@@ -67,6 +71,14 @@ pub enum StoredEventKind {
     ProviderContext {
         provider: String,
         item: serde_json::Value,
+    },
+    ProviderCallUsage {
+        call_index: u32,
+        usage: TokenUsage,
+    },
+    ContextCompacted {
+        summary: CompactionSummary,
+        automatic: bool,
     },
     ApprovalRequested {
         request: ApprovalRequest,
@@ -159,16 +171,21 @@ pub trait ThreadRepository: Send + Sync {
 pub struct JsonlThreadRepository {
     sessions_dir: PathBuf,
     append_lock: Arc<Mutex<()>>,
+    projection: ProjectionDb,
 }
 
 impl JsonlThreadRepository {
     pub fn new(data_root: impl AsRef<Path>) -> Result<Self, StorageError> {
         let sessions_dir = data_root.as_ref().join("sessions");
         fs::create_dir_all(&sessions_dir).map_err(|error| StorageError::Io(error.to_string()))?;
-        Ok(Self {
+        let repository = Self {
             sessions_dir,
             append_lock: Arc::new(Mutex::new(())),
-        })
+            projection: ProjectionDb::open(data_root.as_ref())
+                .map_err(|error| StorageError::Io(error.to_string()))?,
+        };
+        repository.rebuild_projection()?;
+        Ok(repository)
     }
 
     pub async fn create_thread(&self) -> Result<ThreadSummary, StorageError> {
@@ -185,34 +202,9 @@ impl JsonlThreadRepository {
     }
 
     pub async fn list_threads(&self) -> Result<Vec<ThreadSummary>, StorageError> {
-        let sessions_dir = self.sessions_dir.clone();
-        tokio::task::spawn_blocking(move || {
-            let mut summaries = Vec::new();
-            for entry in
-                fs::read_dir(&sessions_dir).map_err(|error| StorageError::Io(error.to_string()))?
-            {
-                let entry = entry.map_err(|error| StorageError::Io(error.to_string()))?;
-                let path = entry.path();
-                if path.extension().and_then(|value| value.to_str()) != Some("jsonl") {
-                    continue;
-                }
-                let Some(thread_id) = path.file_stem().and_then(|value| value.to_str()) else {
-                    continue;
-                };
-                if Uuid::parse_str(thread_id).is_err() {
-                    continue;
-                }
-                let events = load_path(&path)?;
-                let detail = project_thread(thread_id, &events)?;
-                if !detail.summary.archived {
-                    summaries.push(detail.summary);
-                }
-            }
-            summaries.sort_by_key(|summary| std::cmp::Reverse(summary.updated_at_ms));
-            Ok(summaries)
-        })
-        .await
-        .map_err(|error| StorageError::Io(error.to_string()))?
+        self.projection
+            .list_threads()
+            .map_err(|error| StorageError::Io(error.to_string()))
     }
 
     pub async fn read_thread(&self, thread_id: &str) -> Result<ThreadDetail, StorageError> {
@@ -238,12 +230,41 @@ impl JsonlThreadRepository {
             .map_err(|_| StorageError::InvalidData("thread ID must be a UUID".to_string()))?;
         Ok(self.sessions_dir.join(format!("{id}.jsonl")))
     }
+
+    pub fn rebuild_projection(&self) -> Result<(), StorageError> {
+        for entry in
+            fs::read_dir(&self.sessions_dir).map_err(|error| StorageError::Io(error.to_string()))?
+        {
+            let path = entry
+                .map_err(|error| StorageError::Io(error.to_string()))?
+                .path();
+            if path.extension().and_then(|value| value.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let Some(thread_id) = path.file_stem().and_then(|value| value.to_str()) else {
+                continue;
+            };
+            if Uuid::parse_str(thread_id).is_err() {
+                continue;
+            }
+            let events = load_path(&path)?;
+            let detail = project_thread(thread_id, &events)?;
+            self.projection
+                .replace_thread(&detail.summary, &events)
+                .map_err(|error| StorageError::Io(error.to_string()))?;
+        }
+        Ok(())
+    }
+
+    pub fn projection(&self) -> ProjectionDb {
+        self.projection.clone()
+    }
 }
 
 #[async_trait]
 impl ThreadRepository for JsonlThreadRepository {
     async fn append(&self, event: StoredEvent) -> Result<(), StorageError> {
-        if event.schema_version != PROTOCOL_VERSION {
+        if event.schema_version != EVENT_SCHEMA_VERSION {
             return Err(StorageError::InvalidData(format!(
                 "unsupported event schema version {}",
                 event.schema_version
@@ -266,7 +287,13 @@ impl ThreadRepository for JsonlThreadRepository {
                 .map_err(|error| StorageError::Io(error.to_string()))
         })
         .await
-        .map_err(|error| StorageError::Io(error.to_string()))?
+        .map_err(|error| StorageError::Io(error.to_string()))??;
+        let events = self.load(&event.thread_id).await?;
+        let detail = project_thread(&event.thread_id, &events)?;
+        self.projection
+            .replace_thread(&detail.summary, &events)
+            .map_err(|error| StorageError::Io(error.to_string()))?;
+        Ok(())
     }
 
     async fn load(&self, thread_id: &str) -> Result<Vec<StoredEvent>, StorageError> {
@@ -297,8 +324,11 @@ fn load_path(path: &Path) -> Result<Vec<StoredEvent>, StorageError> {
     for (index, line) in nonempty {
         let line = line.strip_suffix(b"\r").unwrap_or(line);
         match serde_json::from_slice::<StoredEvent>(line) {
-            Ok(event) => {
-                if event.schema_version != PROTOCOL_VERSION {
+            Ok(mut event) => {
+                if event.schema_version == 1 {
+                    event.schema_version = EVENT_SCHEMA_VERSION;
+                }
+                if event.schema_version != EVENT_SCHEMA_VERSION {
                     return Err(StorageError::InvalidData(format!(
                         "unsupported event schema version {}",
                         event.schema_version
@@ -375,6 +405,8 @@ fn project_thread(thread_id: &str, events: &[StoredEvent]) -> Result<ThreadDetai
                 }
             }
             StoredEventKind::ProviderContext { .. } => {}
+            StoredEventKind::ProviderCallUsage { .. } => {}
+            StoredEventKind::ContextCompacted { .. } => {}
             StoredEventKind::ApprovalRequested { request } => {
                 approvals.push(ApprovalSnapshot {
                     request: request.clone(),
@@ -676,5 +708,38 @@ mod tests {
         assert_eq!(detail.approvals[0].resolution, Some(resolution));
         assert_eq!(detail.changes.len(), 1);
         assert!(detail.changes[0].undone);
+    }
+
+    #[tokio::test]
+    async fn migrates_v1_events_and_rebuilds_sqlite_from_jsonl() {
+        let directory = tempfile::tempdir().unwrap();
+        let thread_id = Uuid::new_v4().to_string();
+        let sessions = directory.path().join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+        let event = StoredEvent::new(
+            &thread_id,
+            None,
+            StoredEventKind::ThreadCreated {
+                title: "legacy".into(),
+            },
+        );
+        let mut value = serde_json::to_value(event).unwrap();
+        value["schemaVersion"] = serde_json::json!(1);
+        fs::write(
+            sessions.join(format!("{thread_id}.jsonl")),
+            format!("{}\n", value),
+        )
+        .unwrap();
+
+        let repository = JsonlThreadRepository::new(directory.path()).unwrap();
+        assert_eq!(
+            repository.load(&thread_id).await.unwrap()[0].schema_version,
+            EVENT_SCHEMA_VERSION
+        );
+        assert_eq!(repository.list_threads().await.unwrap()[0].title, "legacy");
+        drop(repository);
+        fs::remove_file(directory.path().join("k-coder.db")).unwrap();
+        let rebuilt = JsonlThreadRepository::new(directory.path()).unwrap();
+        assert_eq!(rebuilt.list_threads().await.unwrap()[0].id, thread_id);
     }
 }

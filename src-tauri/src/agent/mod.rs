@@ -8,6 +8,7 @@ use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use crate::context::{self, CompactionSummary, DEFAULT_CONTEXT_LIMIT};
 use crate::policy::{ApprovalError, ApprovalManager, PolicyDecision};
 use crate::protocol::{
     AgentEvent, AgentEventEnvelope, ApprovalAction, ApprovalRequest, ApprovalResolution, ChangeSet,
@@ -156,6 +157,27 @@ impl AgentRuntime {
             .await
     }
 
+    pub async fn compact_thread(
+        &self,
+        thread_id: &str,
+    ) -> Result<CompactionSummary, AgentRuntimeError> {
+        let history = provider_history(self.repository.load(thread_id).await?);
+        let (summary, _) = context::compact(&history, DEFAULT_CONTEXT_LIMIT);
+        if summary.compacted_message_count > 0 {
+            self.repository
+                .append(StoredEvent::new(
+                    thread_id,
+                    None,
+                    StoredEventKind::ContextCompacted {
+                        summary: summary.clone(),
+                        automatic: false,
+                    },
+                ))
+                .await?;
+        }
+        Ok(summary)
+    }
+
     async fn run_turn_inner(
         &self,
         provider: Arc<dyn Provider>,
@@ -212,7 +234,23 @@ impl AgentRuntime {
         let mut repeated_calls = HashMap::<String, usize>::new();
 
         for iteration in 0..MAX_TOOL_ITERATIONS {
-            let history = provider_history(self.repository.load(&thread_id).await?);
+            let mut history = provider_history(self.repository.load(&thread_id).await?);
+            if context::needs_compaction(&history, DEFAULT_CONTEXT_LIMIT) {
+                let (summary, compacted) = context::compact(&history, DEFAULT_CONTEXT_LIMIT);
+                if summary.compacted_message_count > 0 {
+                    self.repository
+                        .append(StoredEvent::new(
+                            &thread_id,
+                            Some(turn_id.clone()),
+                            StoredEventKind::ContextCompacted {
+                                summary,
+                                automatic: true,
+                            },
+                        ))
+                        .await?;
+                    history = compacted;
+                }
+            }
             let request = ProviderRequest {
                 schema_version: PROTOCOL_VERSION,
                 model: model.clone(),
@@ -310,6 +348,16 @@ impl AgentRuntime {
             if let Some(usage) = iteration_usage {
                 total_usage = add_usage(total_usage, usage);
                 has_usage = true;
+                self.repository
+                    .append(StoredEvent::new(
+                        &thread_id,
+                        Some(turn_id.clone()),
+                        StoredEventKind::ProviderCallUsage {
+                            call_index: iteration as u32,
+                            usage,
+                        },
+                    ))
+                    .await?;
             }
 
             if calls.is_empty() {
@@ -808,9 +856,9 @@ impl AgentRuntime {
 }
 
 fn provider_history(events: Vec<StoredEvent>) -> Vec<ProviderMessage> {
-    events
-        .into_iter()
-        .filter_map(|event| match event.kind {
+    let mut history = Vec::new();
+    for event in events {
+        let message = match event.kind {
             StoredEventKind::UserMessage { message }
             | StoredEventKind::AssistantMessage { message } => {
                 let text = message.text();
@@ -835,9 +883,22 @@ fn provider_history(events: Vec<StoredEvent>) -> Vec<ProviderMessage> {
             StoredEventKind::ProviderContext { provider, item } => {
                 Some(ProviderMessage::ProviderContext { provider, item })
             }
+            StoredEventKind::ContextCompacted { summary, .. } => {
+                history.clear();
+                history.push(ProviderMessage::Text {
+                    role: MessageRole::User,
+                    text: context::render_summary(&summary),
+                });
+                history.extend(summary.recent_tool_results);
+                None
+            }
             _ => None,
-        })
-        .collect()
+        };
+        if let Some(message) = message {
+            history.push(message);
+        }
+    }
+    history
 }
 
 fn preview_hashes(preview: &PatchPreview) -> Vec<ExpectedFileHash> {

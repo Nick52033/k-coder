@@ -5,6 +5,11 @@ use tauri::{AppHandle, Emitter, State};
 
 use crate::agent::{AgentRuntime, EventPublisher, RunTurnRequest, TurnOutcome};
 use crate::app_state::AppState;
+use crate::context::CompactionSummary;
+use crate::execution::{
+    CommandSessionView, OutputPage, PtyOutputPage, PtySessionView, StartCommandRequest,
+    StartPtyRequest,
+};
 use crate::protocol::{
     AgentEvent, AgentEventEnvelope, ApprovalResolution, ChangeSet, PatchPreview, RuntimeStatus,
 };
@@ -45,7 +50,7 @@ impl EventPublisher for TauriEventPublisher {
 pub fn runtime_status(state: State<'_, AppState>) -> RuntimeStatus {
     RuntimeStatus {
         ready: true,
-        phase: "safe-edit-review".to_string(),
+        phase: "resilient-context".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         uptime_seconds: state.uptime_seconds(),
         capabilities: vec![
@@ -57,6 +62,16 @@ pub fn runtime_status(state: State<'_, AppState>) -> RuntimeStatus {
             "workspace-write-tools".to_string(),
             "reviewable-patches".to_string(),
             "change-undo".to_string(),
+            "command-sessions".to_string(),
+            "bounded-command-output".to_string(),
+            "process-tree-cancellation".to_string(),
+            "command-risk-policy".to_string(),
+            "pty-terminal".to_string(),
+            "sqlite-projections".to_string(),
+            "context-budgeting".to_string(),
+            "context-compaction".to_string(),
+            "crash-recovery".to_string(),
+            "structured-logging".to_string(),
         ],
     }
 }
@@ -131,6 +146,37 @@ pub async fn archive_thread(state: State<'_, AppState>, thread_id: String) -> Co
         .map_err(|error| CommandError::new("storage", error))
 }
 
+#[tauri::command(rename_all = "camelCase")]
+pub async fn compact_thread(
+    state: State<'_, AppState>,
+    thread_id: String,
+) -> CommandResult<CompactionSummary> {
+    if state.is_turn_active(&thread_id).await {
+        return Err(CommandError::new(
+            "turn_active",
+            "stop the active turn before compacting",
+        ));
+    }
+    let runtime = AgentRuntime::with_tools_and_approvals(
+        state.runtime_repository(),
+        state.tool_registry(),
+        state.workspace_root(),
+        state.approvals(),
+    );
+    runtime
+        .compact_thread(&thread_id)
+        .await
+        .map_err(|error| CommandError::new("context_compaction", error))
+}
+
+#[tauri::command]
+pub fn rebuild_session_projection(state: State<'_, AppState>) -> CommandResult<()> {
+    state
+        .repository()
+        .rebuild_projection()
+        .map_err(|error| CommandError::new("projection_rebuild", error))
+}
+
 #[tauri::command]
 pub async fn run_turn(
     app: AppHandle,
@@ -138,6 +184,11 @@ pub async fn run_turn(
     request: RunTurnRequest,
 ) -> CommandResult<TurnOutcome> {
     let thread_id = request.thread_id.clone();
+    let _ = state.logger().log(
+        "info",
+        "turn_requested",
+        serde_json::json!({"threadId": thread_id}),
+    );
     let (provider, model) = state
         .build_provider()
         .map_err(|error| CommandError::new("provider_config", error))?;
@@ -156,6 +207,11 @@ pub async fn run_turn(
         .run_turn(provider, model, request, cancellation, publisher)
         .await;
     state.finish_turn(&thread_id).await;
+    let _ = state.logger().log(
+        if result.is_ok() { "info" } else { "error" },
+        "turn_finished",
+        serde_json::json!({"threadId": thread_id, "success": result.is_ok()}),
+    );
     result.map_err(|error| CommandError::new("agent_runtime", error))
 }
 
@@ -238,4 +294,178 @@ pub async fn undo_change(
         }),
     );
     Ok(change)
+}
+
+#[tauri::command]
+pub async fn start_command(
+    state: State<'_, AppState>,
+    request: StartCommandRequest,
+) -> CommandResult<CommandSessionView> {
+    let runtime = state.command_runtime();
+    let assessment = runtime.assess(&request);
+    if assessment.requires_approval {
+        return Err(CommandError::new(
+            "command_approval_required",
+            assessment.reason,
+        ));
+    }
+    runtime
+        .start(request)
+        .await
+        .map_err(|error| CommandError::new("command_runtime", error))
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn command_status(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> CommandResult<CommandSessionView> {
+    state
+        .command_runtime()
+        .status(&session_id)
+        .await
+        .map_err(|error| CommandError::new("command_runtime", error))
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn read_command_output(
+    state: State<'_, AppState>,
+    session_id: String,
+    cursor: u64,
+    limit: usize,
+) -> CommandResult<OutputPage> {
+    state
+        .command_runtime()
+        .read(&session_id, cursor, limit)
+        .await
+        .map_err(|error| CommandError::new("command_runtime", error))
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn wait_command(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> CommandResult<CommandSessionView> {
+    state
+        .command_runtime()
+        .wait(&session_id)
+        .await
+        .map_err(|error| CommandError::new("command_runtime", error))
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn write_command_stdin(
+    state: State<'_, AppState>,
+    session_id: String,
+    input: String,
+) -> CommandResult<()> {
+    state
+        .command_runtime()
+        .write_stdin(&session_id, &input)
+        .await
+        .map_err(|error| CommandError::new("command_runtime", error))
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn cancel_command(state: State<'_, AppState>, session_id: String) -> CommandResult<bool> {
+    state
+        .command_runtime()
+        .cancel(&session_id)
+        .await
+        .map_err(|error| CommandError::new("command_runtime", error))
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn close_command(state: State<'_, AppState>, session_id: String) -> CommandResult<()> {
+    state
+        .command_runtime()
+        .close(&session_id)
+        .await
+        .map_err(|error| CommandError::new("command_runtime", error))
+}
+
+#[tauri::command]
+pub async fn start_pty(
+    state: State<'_, AppState>,
+    request: StartPtyRequest,
+) -> CommandResult<PtySessionView> {
+    state
+        .pty_runtime()
+        .start(request)
+        .await
+        .map_err(|error| CommandError::new("pty_runtime", error))
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn pty_status(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> CommandResult<PtySessionView> {
+    state
+        .pty_runtime()
+        .status(&session_id)
+        .await
+        .map_err(|error| CommandError::new("pty_runtime", error))
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn read_pty_output(
+    state: State<'_, AppState>,
+    session_id: String,
+    cursor: u64,
+    limit: usize,
+) -> CommandResult<PtyOutputPage> {
+    state
+        .pty_runtime()
+        .read(&session_id, cursor, limit)
+        .await
+        .map_err(|error| CommandError::new("pty_runtime", error))
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn write_pty(
+    state: State<'_, AppState>,
+    session_id: String,
+    input: String,
+) -> CommandResult<()> {
+    state
+        .pty_runtime()
+        .write(&session_id, &input)
+        .await
+        .map_err(|error| CommandError::new("pty_runtime", error))
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn resize_pty(
+    state: State<'_, AppState>,
+    session_id: String,
+    rows: u16,
+    cols: u16,
+) -> CommandResult<()> {
+    state
+        .pty_runtime()
+        .resize(&session_id, rows, cols)
+        .await
+        .map_err(|error| CommandError::new("pty_runtime", error))
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn wait_pty(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> CommandResult<PtySessionView> {
+    state
+        .pty_runtime()
+        .wait(&session_id)
+        .await
+        .map_err(|error| CommandError::new("pty_runtime", error))
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn close_pty(state: State<'_, AppState>, session_id: String) -> CommandResult<()> {
+    state
+        .pty_runtime()
+        .close(&session_id)
+        .await
+        .map_err(|error| CommandError::new("pty_runtime", error))
 }

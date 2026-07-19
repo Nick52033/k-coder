@@ -6,6 +6,82 @@ export interface RuntimeStatus {
   capabilities: string[];
 }
 
+export type CommandMode = "foreground" | "background";
+export type CommandState =
+  | { state: "running" }
+  | { state: "exited"; code: number }
+  | { state: "timed_out" }
+  | { state: "cancelled" }
+  | { state: "failed"; message: string };
+
+export interface StartCommandRequest {
+  program: string;
+  args?: string[];
+  cwd?: string;
+  env?: Record<string, string>;
+  mode: CommandMode;
+  timeoutMs?: number;
+  bufferBytes?: number;
+}
+
+export interface CommandSessionView {
+  id: string;
+  mode: CommandMode;
+  state: CommandState;
+  startedAtMs: number;
+  finishedAtMs: number | null;
+  nextCursor: number;
+  oldestCursor: number;
+  outputTruncated: boolean;
+}
+
+export interface CommandOutputChunk {
+  cursor: number;
+  stream: "stdout" | "stderr";
+  text: string;
+}
+
+export interface CommandOutputPage {
+  chunks: CommandOutputChunk[];
+  nextCursor: number;
+  oldestCursor: number;
+  truncatedBeforeCursor: boolean;
+}
+
+export interface StartPtyRequest {
+  program: string;
+  args?: string[];
+  cwd?: string;
+  env?: Record<string, string>;
+  rows: number;
+  cols: number;
+  bufferBytes?: number;
+}
+
+export interface PtySessionView {
+  id: string;
+  state: CommandState;
+  startedAtMs: number;
+  finishedAtMs: number | null;
+  rows: number;
+  cols: number;
+  nextCursor: number;
+  oldestCursor: number;
+  outputTruncated: boolean;
+}
+
+export interface PtyOutputChunk {
+  cursor: number;
+  text: string;
+}
+
+export interface PtyOutputPage {
+  chunks: PtyOutputChunk[];
+  nextCursor: number;
+  oldestCursor: number;
+  truncatedBeforeCursor: boolean;
+}
+
 export type MessageRole = "user" | "assistant";
 export type TurnState =
   | "queued"
@@ -33,6 +109,14 @@ export interface TokenUsage {
   inputTokens: number;
   outputTokens: number;
   totalTokens: number;
+}
+
+export interface ContextCompactionSummary {
+  contractVersion: number;
+  summary: string;
+  userConstraints: string[];
+  recentToolResults: unknown[];
+  compactedMessageCount: number;
 }
 
 export interface ThreadSummary {

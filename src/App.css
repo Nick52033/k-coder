@@ -295,10 +295,44 @@ button {
   color: var(--color-surface);
   background: var(--color-brand);
   border-radius: 6px;
+  font-size: 16px;
+  font-weight: 700;
+  line-height: 1;
 }
 
 .titlebar-actions {
   gap: 10px;
+  height: 100%;
+}
+
+.window-controls {
+  display: flex;
+  align-self: stretch;
+  margin: 0 -12px 0 2px;
+}
+
+.window-control {
+  display: grid;
+  width: 46px;
+  height: 100%;
+  padding: 0;
+  place-items: center;
+  border: 0;
+  border-radius: 0;
+  color: var(--color-ink-muted);
+  background: transparent;
+  cursor: pointer;
+  transition: color var(--transition-fast), background-color var(--transition-fast);
+}
+
+.window-control:hover {
+  color: var(--color-ink);
+  background: var(--color-surface-hover);
+}
+
+.window-control--close:hover {
+  color: #ffffff;
+  background: #c42b1c;
 }
 
 .runtime-state {

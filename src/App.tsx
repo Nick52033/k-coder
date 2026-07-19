@@ -7,7 +7,9 @@ import {
   Code2,
   FileDiff,
   KeyRound,
+  Maximize2,
   MessageSquare,
+  Minus,
   Moon,
   PanelRight,
   Plus,
@@ -18,6 +20,7 @@ import {
   Undo2,
   X,
 } from "lucide-react";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { getRuntimeStatus, subscribeToAgentEvents } from "./api/runtime";
 import { useWorkbenchStore } from "./stores/workbenchStore";
 import { PatchReviewDialog } from "./components/PatchReviewDialog";
@@ -30,6 +33,7 @@ type ThemeMode = "light" | "dark";
 
 const STORAGE_SKIN = "kcoder_skin";
 const STORAGE_THEME = "kcoder_theme";
+const appWindow = getCurrentWindow();
 
 function readStored<T>(key: string, fallback: T): T {
   try {
@@ -159,9 +163,9 @@ function App() {
 
   return (
     <main className="workbench">
-      <header className="titlebar">
-        <div className="brand">
-          <span className="brand-mark" aria-hidden="true"><Code2 size={17} /></span>
+      <header className="titlebar" data-tauri-drag-region>
+        <div className="brand" data-tauri-drag-region>
+          <span className="brand-mark" aria-hidden="true">K</span>
           <strong>k-Coder</strong>
         </div>
         <div className="titlebar-actions">
@@ -187,6 +191,35 @@ function App() {
           >
             <Settings size={17} />
           </button>
+          <div className="window-controls">
+            <button
+              className="window-control"
+              type="button"
+              aria-label="最小化窗口"
+              title="最小化"
+              onClick={() => void appWindow.minimize()}
+            >
+              <Minus size={16} />
+            </button>
+            <button
+              className="window-control"
+              type="button"
+              aria-label="最大化或还原窗口"
+              title="最大化或还原"
+              onClick={() => void appWindow.toggleMaximize()}
+            >
+              <Maximize2 size={14} />
+            </button>
+            <button
+              className="window-control window-control--close"
+              type="button"
+              aria-label="关闭窗口"
+              title="关闭"
+              onClick={() => void appWindow.close()}
+            >
+              <X size={16} />
+            </button>
+          </div>
         </div>
       </header>
 

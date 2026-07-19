@@ -4,10 +4,17 @@ import type {
   AgentEvent,
   ApprovalResolution,
   ChangeSet,
+  CommandOutputPage,
+  CommandSessionView,
+  ContextCompactionSummary,
+  PtyOutputPage,
+  PtySessionView,
   PatchPreview,
   ProviderConfigView,
   RuntimeStatus,
   SaveProviderConfigRequest,
+  StartCommandRequest,
+  StartPtyRequest,
   ThreadDetail,
   ThreadSummary,
   TurnOutcome,
@@ -67,6 +74,70 @@ export function resolveApproval(requestId: string, resolution: ApprovalResolutio
 
 export function undoChange(threadId: string, changeId: string) {
   return invoke<ChangeSet>("undo_change", { threadId, changeId });
+}
+
+export function compactThread(threadId: string) {
+  return invoke<ContextCompactionSummary>("compact_thread", { threadId });
+}
+
+export function rebuildSessionProjection() {
+  return invoke<void>("rebuild_session_projection");
+}
+
+export function startCommand(request: StartCommandRequest) {
+  return invoke<CommandSessionView>("start_command", { request });
+}
+
+export function commandStatus(sessionId: string) {
+  return invoke<CommandSessionView>("command_status", { sessionId });
+}
+
+export function readCommandOutput(sessionId: string, cursor = 0, limit = 200) {
+  return invoke<CommandOutputPage>("read_command_output", { sessionId, cursor, limit });
+}
+
+export function waitCommand(sessionId: string) {
+  return invoke<CommandSessionView>("wait_command", { sessionId });
+}
+
+export function writeCommandStdin(sessionId: string, input: string) {
+  return invoke<void>("write_command_stdin", { sessionId, input });
+}
+
+export function cancelCommand(sessionId: string) {
+  return invoke<boolean>("cancel_command", { sessionId });
+}
+
+export function closeCommand(sessionId: string) {
+  return invoke<void>("close_command", { sessionId });
+}
+
+export function startPty(request: StartPtyRequest) {
+  return invoke<PtySessionView>("start_pty", { request });
+}
+
+export function ptyStatus(sessionId: string) {
+  return invoke<PtySessionView>("pty_status", { sessionId });
+}
+
+export function readPtyOutput(sessionId: string, cursor = 0, limit = 200) {
+  return invoke<PtyOutputPage>("read_pty_output", { sessionId, cursor, limit });
+}
+
+export function writePty(sessionId: string, input: string) {
+  return invoke<void>("write_pty", { sessionId, input });
+}
+
+export function resizePty(sessionId: string, rows: number, cols: number) {
+  return invoke<void>("resize_pty", { sessionId, rows, cols });
+}
+
+export function waitPty(sessionId: string) {
+  return invoke<PtySessionView>("wait_pty", { sessionId });
+}
+
+export function closePty(sessionId: string) {
+  return invoke<void>("close_pty", { sessionId });
 }
 
 export function subscribeToAgentEvents(

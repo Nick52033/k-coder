@@ -7,9 +7,11 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
+use crate::execution::{CommandMode, CommandRuntime, CommandState, StartCommandRequest};
 use crate::patch::{PatchError, PatchService};
 use crate::policy::{
-    AllowRegisteredTools, PolicyDecision, PolicyEngine, ReadOnlyWorkspacePolicy, WorkspacePolicy,
+    AllowRegisteredTools, ExecutionWorkspacePolicy, PolicyDecision, PolicyEngine,
+    ReadOnlyWorkspacePolicy, WorkspacePolicy,
 };
 use crate::protocol::{
     ChangeSet, ExpectedFileHash, PatchPreview, ToolDefinition, ToolResult, ToolRisk,
@@ -107,6 +109,33 @@ impl ToolRegistry {
             Arc::new(WorkspacePolicy),
         )
         .expect("built-in workspace tool names and schemas must be valid");
+        registry.patch_service = Some(patch_service);
+        registry
+    }
+
+    pub fn workspace_tools_with_execution(
+        patch_service: PatchService,
+        command_runtime: CommandRuntime,
+    ) -> Self {
+        let mut registry = Self::new_with_policy(
+            vec![
+                Arc::new(ListDirectoryTool) as Arc<dyn ToolHandler>,
+                Arc::new(ReadFileTool) as Arc<dyn ToolHandler>,
+                Arc::new(ApplyPatchTool {
+                    service: patch_service.clone(),
+                }) as Arc<dyn ToolHandler>,
+                Arc::new(WriteFileTool {
+                    service: patch_service.clone(),
+                }) as Arc<dyn ToolHandler>,
+                Arc::new(RunCommandTool {
+                    runtime: command_runtime.clone(),
+                }) as Arc<dyn ToolHandler>,
+            ],
+            Arc::new(ExecutionWorkspacePolicy {
+                runtime: command_runtime,
+            }),
+        )
+        .expect("built-in workspace and execution tool schemas must be valid");
         registry.patch_service = Some(patch_service);
         registry
     }
@@ -540,6 +569,105 @@ impl ToolHandler for ApplyPatchTool {
 
 struct WriteFileTool {
     service: PatchService,
+}
+
+struct RunCommandTool {
+    runtime: CommandRuntime,
+}
+
+#[derive(Deserialize)]
+struct RunCommandArguments {
+    program: String,
+    #[serde(default)]
+    args: Vec<String>,
+    #[serde(default)]
+    cwd: String,
+    #[serde(default = "default_command_timeout_ms")]
+    timeout_ms: u64,
+}
+
+fn default_command_timeout_ms() -> u64 {
+    120_000
+}
+
+#[async_trait]
+impl ToolHandler for RunCommandTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "run_command".to_string(),
+            description: "Run one project build or test program using a structured executable and argument array. Do not place shell pipelines or chained commands in arguments.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "program": { "type": "string", "minLength": 1, "maxLength": 260 },
+                    "args": { "type": "array", "items": { "type": "string", "maxLength": 8192 }, "maxItems": 128 },
+                    "cwd": { "type": "string", "maxLength": 1024 },
+                    "timeoutMs": { "type": "integer", "minimum": 1, "maximum": 3600000 }
+                },
+                "required": ["program"],
+                "additionalProperties": false
+            }),
+        }
+    }
+
+    async fn execute(
+        &self,
+        _context: &ToolContext,
+        arguments: Value,
+        cancellation: CancellationToken,
+    ) -> Result<ToolResult, ToolError> {
+        let arguments: RunCommandArguments = serde_json::from_value(arguments)
+            .map_err(|error| ToolError::InvalidArguments(error.to_string()))?;
+        let session = self
+            .runtime
+            .start(StartCommandRequest {
+                program: arguments.program,
+                args: arguments.args,
+                cwd: arguments.cwd,
+                env: HashMap::new(),
+                mode: CommandMode::Foreground,
+                timeout_ms: Some(arguments.timeout_ms),
+                buffer_bytes: None,
+            })
+            .await
+            .map_err(|error| ToolError::Execution(error.to_string()))?;
+        let id = session.id;
+        let status = tokio::select! {
+            status = self.runtime.wait(&id) => status.map_err(|error| ToolError::Execution(error.to_string()))?,
+            _ = cancellation.cancelled() => {
+                let _ = self.runtime.cancel(&id).await;
+                let _ = self.runtime.wait(&id).await;
+                let _ = self.runtime.close(&id).await;
+                return Err(ToolError::Cancelled);
+            }
+        };
+        let output = self
+            .runtime
+            .read(&id, 0, 1000)
+            .await
+            .map_err(|error| ToolError::Execution(error.to_string()))?;
+        let text = output
+            .chunks
+            .iter()
+            .map(|chunk| chunk.text.as_str())
+            .collect::<String>();
+        let success = matches!(status.state, CommandState::Exited { code: 0 });
+        let metadata = json!({
+            "sessionId": id,
+            "state": status.state,
+            "outputTruncated": status.output_truncated,
+            "nextCursor": output.next_cursor
+        });
+        self.runtime
+            .close(&id)
+            .await
+            .map_err(|error| ToolError::Execution(error.to_string()))?;
+        Ok(ToolResult {
+            success,
+            output: text,
+            metadata,
+        })
+    }
 }
 
 #[derive(Deserialize)]

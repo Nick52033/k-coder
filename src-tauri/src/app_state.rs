@@ -6,6 +6,8 @@ use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
+use crate::execution::{CommandRuntime, ExecutionError, NativePtyRuntime};
+use crate::logging::StructuredLogger;
 use crate::patch::{PatchError, PatchService};
 use crate::policy::ApprovalManager;
 use crate::protocol::{ApprovalAction, ApprovalResolution, ChangeSet, TurnState};
@@ -29,6 +31,9 @@ pub struct AppState {
     tool_registry: ToolRegistry,
     patch_service: PatchService,
     approvals: Arc<ApprovalManager>,
+    command_runtime: CommandRuntime,
+    pty_runtime: NativePtyRuntime,
+    logger: StructuredLogger,
     active_turns: Mutex<HashMap<String, CancellationToken>>,
     recovery_lock: Mutex<()>,
 }
@@ -42,6 +47,7 @@ impl AppState {
         data_root: impl AsRef<Path>,
         credentials: Arc<dyn CredentialStore>,
     ) -> Result<Self, AppStateError> {
+        let data_root = data_root.as_ref().to_path_buf();
         let workspace_root =
             std::env::current_dir().map_err(|error| AppStateError::Workspace(error.to_string()))?;
         Self::with_workspace_and_credentials(data_root, workspace_root, credentials)
@@ -52,6 +58,7 @@ impl AppState {
         workspace_root: impl AsRef<Path>,
         credentials: Arc<dyn CredentialStore>,
     ) -> Result<Self, AppStateError> {
+        let data_root = data_root.as_ref().to_path_buf();
         let workspace_root = workspace_root
             .as_ref()
             .canonicalize()
@@ -62,15 +69,24 @@ impl AppState {
             ));
         }
         let patch_service = PatchService::new();
+        let command_runtime = CommandRuntime::with_recovery(&workspace_root, &data_root)?;
+        let pty_runtime = NativePtyRuntime::new(&workspace_root)?;
         Ok(Self {
             started_at: Instant::now(),
             repository: Arc::new(JsonlThreadRepository::new(&data_root)?),
-            provider_config: ProviderConfigStore::new(data_root),
+            provider_config: ProviderConfigStore::new(&data_root),
             credentials,
             workspace_root,
-            tool_registry: ToolRegistry::workspace_tools(patch_service.clone()),
+            tool_registry: ToolRegistry::workspace_tools_with_execution(
+                patch_service.clone(),
+                command_runtime.clone(),
+            ),
             patch_service,
             approvals: Arc::new(ApprovalManager::new(Duration::from_secs(5 * 60))),
+            command_runtime,
+            pty_runtime,
+            logger: StructuredLogger::new(&data_root)
+                .map_err(|error| AppStateError::Logging(error.to_string()))?,
             active_turns: Mutex::new(HashMap::new()),
             recovery_lock: Mutex::new(()),
         })
@@ -102,6 +118,18 @@ impl AppState {
 
     pub fn approvals(&self) -> Arc<ApprovalManager> {
         self.approvals.clone()
+    }
+
+    pub fn command_runtime(&self) -> CommandRuntime {
+        self.command_runtime.clone()
+    }
+
+    pub fn pty_runtime(&self) -> NativePtyRuntime {
+        self.pty_runtime.clone()
+    }
+
+    pub fn logger(&self) -> StructuredLogger {
+        self.logger.clone()
     }
 
     pub fn provider_config(&self) -> Result<Option<ProviderConfigView>, AppStateError> {
@@ -136,6 +164,14 @@ impl AppState {
             ));
         }
         self.provider_config.save(&config)?;
+        self.repository
+            .projection()
+            .set_setting(
+                "provider",
+                &serde_json::to_string(&config)
+                    .map_err(|error| AppStateError::ProviderNotConfigured(error.to_string()))?,
+            )
+            .map_err(|error| AppStateError::Storage(StorageError::Io(error.to_string())))?;
         Ok(ProviderConfigView {
             schema_version: config.schema_version,
             kind: config.kind,
@@ -320,6 +356,8 @@ impl AppState {
 #[derive(Debug, thiserror::Error)]
 pub enum AppStateError {
     #[error(transparent)]
+    Execution(#[from] ExecutionError),
+    #[error(transparent)]
     Storage(#[from] StorageError),
     #[error(transparent)]
     ProviderConfig(#[from] ProviderConfigError),
@@ -335,6 +373,8 @@ pub enum AppStateError {
     TurnAlreadyActive(String),
     #[error("workspace is invalid: {0}")]
     Workspace(String),
+    #[error("structured logging failed: {0}")]
+    Logging(String),
     #[error("change was not found: {0}")]
     ChangeNotFound(String),
     #[error("change was already undone: {0}")]
