@@ -17,6 +17,7 @@ import {
   Pencil,
   Plus,
   RefreshCw,
+  Search,
   Settings,
   Square,
   Sun,
@@ -283,21 +284,41 @@ function App() {
             <Plus size={18} />
           </button>
         </div>
-        <div className="section-label section-label--search"><span>会话</span><input aria-label="搜索会话" placeholder="搜索" value={threadQuery} onChange={(event) => { const query = event.target.value; setThreadQuery(query); void searchThreadHistory(query); }} /></div>
-        <nav className="thread-list" aria-label="会话列表">
-          {threads.map((thread) => (
-            <div className={cn("thread-item", thread.id === activeThreadId && "thread-item--active")} key={thread.id}>
-              <button className="thread-item-main" type="button" onClick={() => void selectThread(thread.id)}>
-                <MessageSquare size={15} />
-                <span>{thread.title}</span>
+        <section className="thread-section" aria-labelledby="thread-section-title">
+          <div className="thread-section-heading">
+            <span id="thread-section-title">会话</span>
+            <span className="thread-count" aria-label={`${threads.length} 个会话`}>{threads.length}</span>
+          </div>
+          <label className="thread-search">
+            <Search size={14} aria-hidden="true" />
+            <input aria-label="搜索会话" placeholder="搜索会话" value={threadQuery} onChange={(event) => { const query = event.target.value; setThreadQuery(query); void searchThreadHistory(query); }} />
+            {threadQuery && (
+              <button type="button" title="清除搜索" aria-label="清除搜索" onClick={() => { setThreadQuery(""); void searchThreadHistory(""); }}>
+                <X size={13} />
               </button>
-              <span className="thread-actions">
-                <button type="button" title="重命名" aria-label={`重命名会话 ${thread.title}`} onClick={() => { const title = window.prompt("会话名称", thread.title); if (title) void renameConversation(thread.id, title); }}><Pencil size={12} /></button>
-                <button type="button" title="删除" aria-label={`删除会话 ${thread.title}`} onClick={async () => { if (window.confirm(`删除会话"${thread.title}"？`)) await deleteConversation(thread.id); }}><Trash2 size={12} /></button>
-              </span>
-            </div>
-          ))}
-        </nav>
+            )}
+          </label>
+          <nav className="thread-list" aria-label="会话列表">
+            {threads.map((thread) => (
+              <div className={cn("thread-item", thread.id === activeThreadId && "thread-item--active")} key={thread.id}>
+                <button className="thread-item-main" type="button" onClick={() => void selectThread(thread.id)}>
+                  <MessageSquare size={15} />
+                  <span>{thread.title}</span>
+                </button>
+                <span className="thread-actions">
+                  <button type="button" title="重命名" aria-label={`重命名会话 ${thread.title}`} onClick={() => { const title = window.prompt("会话名称", thread.title); if (title) void renameConversation(thread.id, title); }}><Pencil size={12} /></button>
+                  <button type="button" title="删除" aria-label={`删除会话 ${thread.title}`} onClick={async () => { if (window.confirm(`删除会话"${thread.title}"？`)) await deleteConversation(thread.id); }}><Trash2 size={12} /></button>
+                </span>
+              </div>
+            ))}
+            {!threads.length && (
+              <div className="thread-empty">
+                <MessageSquare size={16} />
+                <span>{threadQuery ? "没有匹配的会话" : "还没有会话"}</span>
+              </div>
+            )}
+          </nav>
+        </section>
 
         <div className="sidebar-footer">
           <button
