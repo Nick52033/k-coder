@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
@@ -236,6 +236,72 @@ impl ToolRegistry {
         self.extension_risks = Arc::new(risks);
         self.hooks = hooks;
         Ok(self)
+    }
+
+    pub fn with_additional_handlers(
+        mut self,
+        handlers: Vec<Arc<dyn ToolHandler>>,
+        risks: HashMap<String, ToolRisk>,
+    ) -> Result<Self, ToolError> {
+        let mut registered = self.handlers.as_ref().clone();
+        let mut registered_risks = self.extension_risks.as_ref().clone();
+        for handler in handlers {
+            let definition = handler.definition();
+            if registered.contains_key(&definition.name) {
+                return Err(ToolError::InvalidArguments(format!(
+                    "additional tool conflicts with an existing tool: {}",
+                    definition.name
+                )));
+            }
+            jsonschema::validator_for(&definition.input_schema).map_err(|error| {
+                ToolError::InvalidArguments(format!(
+                    "additional tool {} has an invalid JSON schema: {error}",
+                    definition.name
+                ))
+            })?;
+            let risk = risks.get(&definition.name).copied().ok_or_else(|| {
+                ToolError::InvalidArguments(format!(
+                    "additional tool is missing risk metadata: {}",
+                    definition.name
+                ))
+            })?;
+            registered_risks.insert(definition.name.clone(), risk);
+            registered.insert(definition.name, handler);
+        }
+        self.handlers = Arc::new(registered);
+        self.extension_risks = Arc::new(registered_risks);
+        Ok(self)
+    }
+
+    pub fn restricted_to(&self, allowed: &[String]) -> Result<Self, ToolError> {
+        let allowed = allowed.iter().cloned().collect::<HashSet<_>>();
+        if let Some(name) = allowed
+            .iter()
+            .find(|name| !self.handlers.contains_key(name.as_str()))
+        {
+            return Err(ToolError::InvalidArguments(format!(
+                "tool capability is not available to the parent: {name}"
+            )));
+        }
+        let handlers = self
+            .handlers
+            .iter()
+            .filter(|(name, _)| allowed.contains(name.as_str()))
+            .map(|(name, handler)| (name.clone(), handler.clone()))
+            .collect();
+        let extension_risks = self
+            .extension_risks
+            .iter()
+            .filter(|(name, _)| allowed.contains(name.as_str()))
+            .map(|(name, risk)| (name.clone(), *risk))
+            .collect();
+        Ok(Self {
+            handlers: Arc::new(handlers),
+            policy: self.policy.clone(),
+            patch_service: self.patch_service.clone(),
+            extension_risks: Arc::new(extension_risks),
+            hooks: self.hooks.clone(),
+        })
     }
 
     pub fn definitions(&self) -> Vec<ToolDefinition> {

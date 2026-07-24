@@ -7,19 +7,21 @@ use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
+use crate::advanced::AdvancedServices;
 use crate::execution::{CommandRuntime, ExecutionError, NativePtyRuntime};
 use crate::extensions::mcp::OsMcpSecretStore;
 use crate::extensions::{ExtensionError, ExtensionOverview, ExtensionService};
 use crate::logging::StructuredLogger;
+use crate::multi_agent::MultiAgentCoordinator;
 use crate::patch::{PatchError, PatchService};
 use crate::persistence::ProjectionDb;
 use crate::policy::ApprovalManager;
 use crate::protocol::{ApprovalAction, ApprovalResolution, ChangeSet, TurnState};
 use crate::providers::{
-    AnthropicMessagesProvider, CredentialError, CredentialStore, GoogleGeminiProvider,
-    OpenAiChatCompletionsProvider, OpenAiResponsesProvider, OsCredentialStore, Provider,
-    ProviderConfigError, ProviderConfigStore, ProviderConfigView, ProviderTransport,
-    SaveProviderConfigRequest,
+    AnthropicMessagesProvider, CredentialError, CredentialStore, FallbackProvider, FallbackTarget,
+    GoogleGeminiProvider, OpenAiChatCompletionsProvider, OpenAiResponsesProvider,
+    OsCredentialStore, Provider, ProviderConfig, ProviderConfigError, ProviderConfigStore,
+    ProviderConfigView, ProviderTransport, SaveProviderConfigRequest,
 };
 use crate::storage::{
     JsonlThreadRepository, StorageError, StoredEvent, StoredEventKind, ThreadRepository,
@@ -43,6 +45,8 @@ pub struct AppState {
     recovery_lock: Mutex<()>,
     extensions: ExtensionService,
     extension_workspace: Mutex<Option<(PathBuf, u64)>>,
+    subagents: MultiAgentCoordinator,
+    advanced: AdvancedServices,
 }
 
 impl AppState {
@@ -95,6 +99,15 @@ impl AppState {
             Arc::new(OsMcpSecretStore::new()),
             logger.clone(),
         );
+        let subagents = MultiAgentCoordinator::new(&data_root)
+            .map_err(|error| AppStateError::MultiAgent(error.to_string()))?;
+        let advanced = AdvancedServices::new(&data_root).map_err(AppStateError::Advanced)?;
+        let (advanced_handlers, advanced_risks) = advanced.tool_handlers(&workspace_root);
+        let tool_registry = ToolRegistry::workspace_tools_with_execution(
+            patch_service.clone(),
+            command_runtime.clone(),
+        )
+        .with_additional_handlers(advanced_handlers, advanced_risks)?;
         Ok(Self {
             started_at: Instant::now(),
             repository,
@@ -102,10 +115,7 @@ impl AppState {
             credentials,
             data_root: data_root.clone(),
             workspace_root: RwLock::new(workspace_root),
-            tool_registry: RwLock::new(ToolRegistry::workspace_tools_with_execution(
-                patch_service.clone(),
-                command_runtime.clone(),
-            )),
+            tool_registry: RwLock::new(tool_registry),
             patch_service,
             approvals: Arc::new(ApprovalManager::new(Duration::from_secs(5 * 60))),
             command_runtime: RwLock::new(command_runtime),
@@ -115,6 +125,8 @@ impl AppState {
             recovery_lock: Mutex::new(()),
             extensions,
             extension_workspace: Mutex::new(None),
+            subagents,
+            advanced,
         })
     }
 
@@ -144,6 +156,10 @@ impl AppState {
             .clone()
     }
 
+    pub fn advanced(&self) -> AdvancedServices {
+        self.advanced.clone()
+    }
+
     pub fn patch_service(&self) -> PatchService {
         self.patch_service.clone()
     }
@@ -167,9 +183,9 @@ impl AppState {
     }
 
     pub async fn switch_workspace(&self, path: impl AsRef<Path>) -> Result<PathBuf, AppStateError> {
-        if !self.active_turns.lock().await.is_empty() {
+        if !self.active_turns.lock().await.is_empty() || self.subagents.has_active() {
             return Err(AppStateError::Workspace(
-                "stop active turns before switching workspace".into(),
+                "stop active turns and subagents before switching workspace".into(),
             ));
         }
         let path = path
@@ -183,10 +199,12 @@ impl AppState {
         }
         let command = CommandRuntime::with_recovery(&path, &self.data_root)?;
         let pty = NativePtyRuntime::new(&path)?;
+        let (advanced_handlers, advanced_risks) = self.advanced.tool_handlers(&path);
         let tool_registry = ToolRegistry::workspace_tools_with_execution(
             self.patch_service.clone(),
             command.clone(),
-        );
+        )
+        .with_additional_handlers(advanced_handlers, advanced_risks)?;
         self.repository
             .projection()
             .set_setting("active_workspace", &path.to_string_lossy())
@@ -230,10 +248,12 @@ impl AppState {
             .extensions
             .prepare(&workspace, CancellationToken::new())
             .await?;
+        let (advanced_handlers, advanced_risks) = self.advanced.tool_handlers(&workspace);
         let registry = ToolRegistry::workspace_tools_with_execution(
             self.patch_service.clone(),
             self.command_runtime(),
         )
+        .with_additional_handlers(advanced_handlers, advanced_risks)?
         .with_extensions(prepared.handlers, prepared.risks, prepared.hooks)?;
         *self
             .tool_registry
@@ -281,6 +301,10 @@ impl AppState {
         self.logger.clone()
     }
 
+    pub fn subagents(&self) -> MultiAgentCoordinator {
+        self.subagents.clone()
+    }
+
     pub fn provider_config(&self) -> Result<Option<ProviderConfigView>, AppStateError> {
         let Some(config) = self.provider_config.load()? else {
             return Ok(None);
@@ -289,8 +313,11 @@ impl AppState {
             schema_version: config.schema_version,
             kind: config.kind,
             transport: config.transport,
+            name: config.name,
             base_url: config.base_url,
             model: config.model,
+            models: config.models,
+            endpoints: config.endpoints,
             has_api_key: self.credentials.get_api_key()?.is_some(),
         }))
     }
@@ -325,8 +352,11 @@ impl AppState {
             schema_version: config.schema_version,
             kind: config.kind,
             transport: config.transport,
+            name: config.name,
             base_url: config.base_url,
             model: config.model,
+            models: config.models,
+            endpoints: config.endpoints,
             has_api_key: true,
         })
     }
@@ -336,7 +366,15 @@ impl AppState {
         Ok(())
     }
 
-    pub fn build_provider(&self) -> Result<(Arc<dyn Provider>, String), AppStateError> {
+    pub fn provider_context_limit(&self) -> Result<usize, AppStateError> {
+        Ok(self
+            .provider_config
+            .load()?
+            .map(|config| config.active_model().context_window as usize)
+            .unwrap_or(crate::context::DEFAULT_CONTEXT_LIMIT))
+    }
+
+    pub fn build_provider(&self) -> Result<(Arc<dyn Provider>, String, usize), AppStateError> {
         let config = self.provider_config.load()?.ok_or_else(|| {
             AppStateError::ProviderNotConfigured(
                 "configure a provider before starting a turn".to_string(),
@@ -346,6 +384,57 @@ impl AppState {
             AppStateError::ProviderNotConfigured("the provider API key is missing".to_string())
         })?;
         let model = config.model.clone();
+        let context_limit = config.active_model().context_window as usize;
+        let mut target_specs = vec![(config.base_url.clone(), model.clone(), config.name.clone())];
+        for fallback in config.fallback_models() {
+            target_specs.push((
+                config.base_url.clone(),
+                fallback.id.clone(),
+                format!("{} / {}", config.name, fallback.display_name),
+            ));
+        }
+        for endpoint in config.enabled_endpoints() {
+            target_specs.push((
+                endpoint.base_url.clone(),
+                model.clone(),
+                endpoint.name.clone(),
+            ));
+            for fallback in config.fallback_models() {
+                target_specs.push((
+                    endpoint.base_url.clone(),
+                    fallback.id.clone(),
+                    format!("{} / {}", endpoint.name, fallback.display_name),
+                ));
+            }
+        }
+        let mut seen = std::collections::HashSet::new();
+        target_specs.retain(|(base_url, model, _)| seen.insert((base_url.clone(), model.clone())));
+        let mut targets = Vec::new();
+        for (base_url, target_model, label) in target_specs {
+            let mut target_config = config.clone();
+            target_config.base_url = base_url;
+            target_config.model = target_model.clone();
+            targets.push(FallbackTarget {
+                provider: Self::provider_for_config(target_config, api_key.clone())?,
+                model: target_model,
+                label,
+            });
+        }
+        let provider = if targets.len() == 1 {
+            targets.remove(0).provider
+        } else {
+            Arc::new(FallbackProvider::new(
+                targets,
+                self.advanced.metrics.clone(),
+            )?) as Arc<dyn Provider>
+        };
+        Ok((provider, model, context_limit))
+    }
+
+    fn provider_for_config(
+        config: ProviderConfig,
+        api_key: String,
+    ) -> Result<Arc<dyn Provider>, AppStateError> {
         let provider: Arc<dyn Provider> = match config.transport {
             ProviderTransport::OpenAiChatCompletions => {
                 Arc::new(OpenAiChatCompletionsProvider::new(config, api_key)?)
@@ -360,7 +449,7 @@ impl AppState {
                 Arc::new(GoogleGeminiProvider::new(config, api_key)?)
             }
         };
-        Ok((provider, model))
+        Ok(provider)
     }
 
     pub async fn begin_turn(&self, thread_id: &str) -> Result<CancellationToken, AppStateError> {
@@ -382,6 +471,7 @@ impl AppState {
         let active_turns = self.active_turns.lock().await;
         if let Some(cancellation) = active_turns.get(thread_id) {
             cancellation.cancel();
+            self.subagents.cancel_for_parent(thread_id);
             true
         } else {
             false
@@ -520,6 +610,10 @@ pub enum AppStateError {
     Extension(#[from] ExtensionError),
     #[error(transparent)]
     Tool(#[from] crate::tools::ToolError),
+    #[error("multi-agent runtime failed: {0}")]
+    MultiAgent(String),
+    #[error("advanced agent runtime failed: {0}")]
+    Advanced(String),
     #[error("provider is not configured: {0}")]
     ProviderNotConfigured(String),
     #[error("a turn is already active for thread {0}")]
@@ -581,14 +675,36 @@ mod tests {
             .save_provider_config(SaveProviderConfigRequest {
                 kind: ProviderKind::OpenAiCompatible,
                 transport: ProviderTransport::OpenAiChatCompletions,
+                name: "测试供应商".to_string(),
                 base_url: "https://example.com/v1".to_string(),
                 model: "test-model".to_string(),
+                models: vec![
+                    crate::providers::ProviderModelConfig {
+                        id: "test-model".to_string(),
+                        display_name: "Test model".to_string(),
+                        context_window: 128_000,
+                        fallback: false,
+                    },
+                    crate::providers::ProviderModelConfig {
+                        id: "test-model-fast".to_string(),
+                        display_name: "Test model fast".to_string(),
+                        context_window: 64_000,
+                        fallback: true,
+                    },
+                ],
+                endpoints: vec![],
                 api_key: Some("super-secret".to_string()),
             })
             .expect("configuration should save");
         let serialized = serde_json::to_string(&view).expect("view should serialize");
 
         assert!(view.has_api_key);
+        assert_eq!(view.name, "测试供应商");
+        assert_eq!(view.models.len(), 2);
+        assert_eq!(view.models[0].id, "test-model");
+        assert_eq!(view.models[0].display_name, "Test model");
+        assert_eq!(view.models[0].context_window, 128_000);
+        assert_eq!(state.provider_context_limit().unwrap(), 128_000);
         assert!(!serialized.contains("super-secret"));
         assert_eq!(
             credentials.get_api_key().unwrap().as_deref(),

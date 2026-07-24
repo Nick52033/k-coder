@@ -25,6 +25,36 @@ export interface HookDiagnostic { id: string; phase: string; tool: string; enabl
 export interface ExtensionAudit { timestampMs: number; event: string; kind: string; id: string; success: boolean; detail: string; }
 export interface ExtensionOverview { schemaVersion: number; configPaths: string[]; instructions: InstructionSource[]; skills: SkillDiagnostic[]; mcpServers: McpDiagnostic[]; hooks: HookDiagnostic[]; audit: ExtensionAudit[]; error: string | null; }
 
+export type SubagentState = "queued" | "running" | "blocked" | "completed" | "failed" | "cancelled" | "timed_out";
+export interface CreateSubagentRequest {
+  parentThreadId: string;
+  task: string;
+  label?: string;
+  capabilities?: string[];
+  tokenBudget?: number;
+  timeoutMs?: number;
+}
+export interface SubagentView {
+  schemaVersion: number;
+  id: string;
+  parentAgentId: string | null;
+  parentThreadId: string;
+  threadId: string;
+  label: string;
+  task: string;
+  state: SubagentState;
+  depth: number;
+  workspaceRoot: string;
+  capabilities: string[];
+  tokenBudget: number;
+  tokensUsed: number;
+  timeoutMs: number;
+  createdAtMs: number;
+  updatedAtMs: number;
+  summary: string | null;
+  error: string | null;
+}
+
 export type CommandMode = "foreground" | "background";
 export type CommandState =
   | { state: "running" }
@@ -262,22 +292,66 @@ export type ProviderTransport =
   | "anthropic_messages"
   | "google_gemini";
 
+export interface ProviderModelConfig {
+  id: string;
+  displayName: string;
+  contextWindow: number;
+  fallback: boolean;
+}
+
+export interface ProviderEndpointConfig {
+  id: string;
+  name: string;
+  baseUrl: string;
+  enabled: boolean;
+}
+
 export interface ProviderConfigView {
   schemaVersion: number;
   kind: ProviderKind;
   transport: ProviderTransport;
+  name: string;
   baseUrl: string;
   model: string;
+  models: ProviderModelConfig[];
+  endpoints: ProviderEndpointConfig[];
   hasApiKey: boolean;
 }
 
 export interface SaveProviderConfigRequest {
   kind: ProviderKind;
   transport: ProviderTransport;
+  name: string;
   baseUrl: string;
   model: string;
+  models: ProviderModelConfig[];
+  endpoints: ProviderEndpointConfig[];
   apiKey?: string;
 }
+
+export type PlanStepState = "pending" | "in_progress" | "completed" | "failed" | "skipped";
+export interface PlanStep { id: string; step: string; status: PlanStepState; detail: string | null; }
+export interface PlanView { schemaVersion: number; threadId: string; revision: number; updatedAtMs: number; steps: PlanStep[]; }
+export interface PlanUpdateRequest { threadId: string; steps: Array<{ id?: string; step: string; status: PlanStepState; detail?: string }>; }
+
+export type GoalState = "active" | "paused" | "blocked" | "completed" | "budget_exhausted";
+export interface GoalView {
+  schemaVersion: number; id: string; threadId: string; objective: string; state: GoalState;
+  tokenBudget: number; tokensUsed: number; timeBudgetMs: number; elapsedMs: number;
+  reason: string | null; createdAtMs: number; updatedAtMs: number; revision: number;
+}
+export interface CreateGoalRequest { threadId: string; objective: string; tokenBudget: number; timeBudgetMs: number; }
+
+export interface SearchResult { path: string; line: number; column: number; preview: string; score: number; }
+export interface MemorySettings { enabled: boolean; }
+export interface MemoryView { schemaVersion: number; id: string; content: string; source: string; expiresAtMs: number; createdAtMs: number; updatedAtMs: number; deleted: boolean; revision: number; }
+export interface MemoryUpsertRequest { id?: string; content: string; source: string; retentionDays: number; }
+export interface BrowserSettings { enabled: boolean; allowLocalhost: boolean; }
+export interface BrowserAuditEvent { timestampMs: number; action: string; target: string; success: boolean; detail: string; }
+export interface BrowserArtifact { id: string; name: string; mediaType: string; sizeBytes: number; createdAtMs: number; }
+export interface DocumentContent { path: string; name: string; mediaType: string; content: string; sourceBytes: number; extractedBytes: number; truncated: boolean; }
+export interface MetricsSnapshot { providerCalls: number; providerFailures: number; averageProviderLatencyMs: number; inputTokens: number; outputTokens: number; toolCalls: number; toolSuccessRate: number; fallbackCount: number; completedTasks: number; failedTasks: number; estimatedCostUsd: number | null; }
+export interface EvaluationReport { total: number; passed: number; passRate: number; failures: string[]; }
 
 export interface TurnOutcome {
   schemaVersion: number;

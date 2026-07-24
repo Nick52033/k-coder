@@ -5,6 +5,12 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter, State};
 use tokio_util::sync::CancellationToken;
 
+use crate::advanced::{
+    BrowserArtifact, BrowserAuditEvent, BrowserSettings, CreateGoalRequest, DocumentContent,
+    EvaluationReport, GoalTransitionRequest, GoalView, MemorySettings, MemoryUpsertRequest,
+    MemoryView, MetricsSnapshot, PlanUpdateRequest, PlanView, RepositorySearchIndex, SearchResult,
+    extract_document, run_recorded_evaluation,
+};
 use crate::agent::{AgentRuntime, EventPublisher, RunTurnRequest, TurnOutcome};
 use crate::app_state::AppState;
 use crate::context::CompactionSummary;
@@ -13,6 +19,10 @@ use crate::execution::{
     StartPtyRequest,
 };
 use crate::extensions::ExtensionOverview;
+use crate::multi_agent::{
+    CreateSubagentRequest, MultiAgentError, SubagentEventPublisher, SubagentExecutionContext,
+    SubagentView, delegation_tools,
+};
 use crate::persistence::{ProjectRecord, UsageSummary};
 use crate::protocol::{
     AgentEvent, AgentEventEnvelope, ApprovalResolution, ChangeSet, ImageAttachment, MessageRole,
@@ -21,12 +31,13 @@ use crate::protocol::{
 use crate::providers::{
     ProviderConfigView, ProviderEvent, ProviderMessage, ProviderRequest, SaveProviderConfigRequest,
 };
-use crate::storage::{ThreadDetail, ThreadSummary};
+use crate::storage::{StoredEventKind, ThreadDetail, ThreadSummary};
 use crate::workbench::{
     self, AttachmentContent, FileEntry, FilePreview, GitBranchView, GitStatusView, WorkspaceState,
 };
 
 const AGENT_EVENT_NAME: &str = "agent-event";
+const SUBAGENT_EVENT_NAME: &str = "subagent-event";
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -56,11 +67,66 @@ impl EventPublisher for TauriEventPublisher {
     }
 }
 
+struct TauriSubagentEventPublisher {
+    app: AppHandle,
+}
+
+impl SubagentEventPublisher for TauriSubagentEventPublisher {
+    fn publish(&self, view: SubagentView) {
+        let _ = self.app.emit(SUBAGENT_EVENT_NAME, view);
+    }
+}
+
+fn subagent_context(
+    app: &AppHandle,
+    state: &AppState,
+    provider: Arc<dyn crate::providers::Provider>,
+    model: String,
+    context_limit: usize,
+    tools: crate::tools::ToolRegistry,
+) -> SubagentExecutionContext {
+    SubagentExecutionContext {
+        repository: state.repository(),
+        provider,
+        model,
+        context_limit,
+        tools,
+        workspace_root: state.workspace_root(),
+        approvals: state.approvals(),
+        agent_events: Arc::new(TauriEventPublisher { app: app.clone() }),
+        lifecycle_events: Arc::new(TauriSubagentEventPublisher { app: app.clone() }),
+    }
+}
+
+fn append_runtime_instructions(base: String, memory: String) -> String {
+    match (base.trim().is_empty(), memory.trim().is_empty()) {
+        (true, true) => String::new(),
+        (false, true) => base,
+        (true, false) => memory,
+        (false, false) => format!("{base}\n\n{memory}"),
+    }
+}
+
+async fn turn_tokens(state: &AppState, thread_id: &str, turn_id: &str) -> u64 {
+    state
+        .runtime_repository()
+        .load(thread_id)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|event| event.turn_id.as_deref() == Some(turn_id))
+        .filter_map(|event| match event.kind {
+            StoredEventKind::ProviderCallUsage { usage, .. } => Some(usage.total_tokens),
+            _ => None,
+        })
+        .sum()
+}
+
 #[tauri::command]
 pub fn runtime_status(state: State<'_, AppState>) -> RuntimeStatus {
     RuntimeStatus {
         ready: true,
-        phase: "extensible-agent".to_string(),
+        phase: "advanced-agent".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         uptime_seconds: state.uptime_seconds(),
         capabilities: vec![
@@ -90,8 +156,204 @@ pub fn runtime_status(state: State<'_, AppState>) -> RuntimeStatus {
             "tool-hooks".to_string(),
             "extension-diagnostics".to_string(),
             "extension-audit".to_string(),
+            "multi-agent-delegation".to_string(),
+            "bounded-subagents".to_string(),
+            "subagent-cancellation".to_string(),
+            "subagent-persistence".to_string(),
+            "persistent-plans".to_string(),
+            "budgeted-goals".to_string(),
+            "browser-automation".to_string(),
+            "repository-search".to_string(),
+            "opt-in-memory".to_string(),
+            "bounded-document-extraction".to_string(),
+            "runtime-metrics".to_string(),
         ],
     }
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub fn get_plan(state: State<'_, AppState>, thread_id: String) -> CommandResult<Option<PlanView>> {
+    state
+        .advanced()
+        .plans
+        .get(&thread_id)
+        .map_err(|error| CommandError::new("plan", error))
+}
+
+#[tauri::command]
+pub fn update_plan(
+    state: State<'_, AppState>,
+    request: PlanUpdateRequest,
+) -> CommandResult<PlanView> {
+    state
+        .advanced()
+        .plans
+        .update(request)
+        .map_err(|error| CommandError::new("plan", error))
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub fn get_goal(state: State<'_, AppState>, thread_id: String) -> CommandResult<Option<GoalView>> {
+    state
+        .advanced()
+        .goals
+        .current(&thread_id)
+        .map_err(|error| CommandError::new("goal", error))
+}
+
+#[tauri::command]
+pub fn create_goal(
+    state: State<'_, AppState>,
+    request: CreateGoalRequest,
+) -> CommandResult<GoalView> {
+    state
+        .advanced()
+        .goals
+        .create(request)
+        .map_err(|error| CommandError::new("goal", error))
+}
+
+#[tauri::command]
+pub fn transition_goal(
+    state: State<'_, AppState>,
+    request: GoalTransitionRequest,
+) -> CommandResult<GoalView> {
+    state
+        .advanced()
+        .goals
+        .transition(request)
+        .map_err(|error| CommandError::new("goal", error))
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub fn search_repository(
+    state: State<'_, AppState>,
+    query: String,
+    limit: Option<usize>,
+) -> CommandResult<Vec<SearchResult>> {
+    RepositorySearchIndex::new(state.workspace_root())
+        .search(&query, limit.unwrap_or(50))
+        .map_err(|error| CommandError::new("repository_search", error))
+}
+
+#[tauri::command]
+pub fn get_memory_settings(state: State<'_, AppState>) -> CommandResult<MemorySettings> {
+    state
+        .advanced()
+        .memory
+        .settings()
+        .map_err(|error| CommandError::new("memory", error))
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub fn set_memory_enabled(
+    state: State<'_, AppState>,
+    enabled: bool,
+) -> CommandResult<MemorySettings> {
+    state
+        .advanced()
+        .memory
+        .set_enabled(enabled)
+        .map_err(|error| CommandError::new("memory", error))
+}
+
+#[tauri::command]
+pub fn list_memories(state: State<'_, AppState>) -> CommandResult<Vec<MemoryView>> {
+    state
+        .advanced()
+        .memory
+        .list()
+        .map_err(|error| CommandError::new("memory", error))
+}
+
+#[tauri::command]
+pub fn upsert_memory(
+    state: State<'_, AppState>,
+    request: MemoryUpsertRequest,
+) -> CommandResult<MemoryView> {
+    state
+        .advanced()
+        .memory
+        .upsert(request)
+        .map_err(|error| CommandError::new("memory", error))
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub fn delete_memory(state: State<'_, AppState>, memory_id: String) -> CommandResult<MemoryView> {
+    state
+        .advanced()
+        .memory
+        .delete(&memory_id)
+        .map_err(|error| CommandError::new("memory", error))
+}
+
+#[tauri::command]
+pub async fn get_browser_settings(state: State<'_, AppState>) -> CommandResult<BrowserSettings> {
+    Ok(state.advanced().browser.settings().await)
+}
+
+#[tauri::command]
+pub async fn save_browser_settings(
+    state: State<'_, AppState>,
+    settings: BrowserSettings,
+) -> CommandResult<BrowserSettings> {
+    state
+        .advanced()
+        .browser
+        .save_settings(settings)
+        .await
+        .map_err(|error| CommandError::new("browser", error))
+}
+
+#[tauri::command]
+pub fn list_browser_audit(state: State<'_, AppState>) -> CommandResult<Vec<BrowserAuditEvent>> {
+    state
+        .advanced()
+        .browser
+        .audit_events()
+        .map_err(|error| CommandError::new("browser", error))
+}
+
+#[tauri::command]
+pub fn list_browser_artifacts(state: State<'_, AppState>) -> CommandResult<Vec<BrowserArtifact>> {
+    state
+        .advanced()
+        .browser
+        .artifacts()
+        .map_err(|error| CommandError::new("browser", error))
+}
+
+#[tauri::command]
+pub async fn close_browser_session(state: State<'_, AppState>) -> CommandResult<()> {
+    state
+        .advanced()
+        .browser
+        .close()
+        .await
+        .map_err(|error| CommandError::new("browser", error))
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub fn extract_document_content(
+    state: State<'_, AppState>,
+    relative_path: String,
+) -> CommandResult<DocumentContent> {
+    extract_document(&state.workspace_root(), &relative_path)
+        .map_err(|error| CommandError::new("document", error))
+}
+
+#[tauri::command]
+pub fn advanced_metrics(state: State<'_, AppState>) -> CommandResult<MetricsSnapshot> {
+    state
+        .advanced()
+        .metrics
+        .snapshot()
+        .map_err(|error| CommandError::new("metrics", error))
+}
+
+#[tauri::command]
+pub fn run_regression_evaluation() -> CommandResult<EvaluationReport> {
+    run_recorded_evaluation().map_err(|error| CommandError::new("evaluation", error))
 }
 
 #[tauri::command]
@@ -125,7 +387,7 @@ pub struct ProviderConnectionTest {
 pub async fn test_provider_connection(
     state: State<'_, AppState>,
 ) -> CommandResult<ProviderConnectionTest> {
-    let (provider, model) = state
+    let (provider, model, _) = state
         .build_provider()
         .map_err(|error| CommandError::new("provider_config", error))?;
     let started = std::time::Instant::now();
@@ -345,6 +607,26 @@ pub fn extract_attachment(
     state: State<'_, AppState>,
     path: String,
 ) -> CommandResult<AttachmentContent> {
+    let extension = std::path::Path::new(&path)
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if !matches!(
+        extension.as_str(),
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp"
+    ) {
+        let document = extract_document(&state.workspace_root(), &path)
+            .map_err(|error| CommandError::new("attachment", error))?;
+        return Ok(AttachmentContent {
+            path: document.path,
+            name: document.name,
+            kind: "document".into(),
+            content: document.content,
+            size: document.source_bytes,
+            truncated: document.truncated,
+        });
+    }
     workbench::extract_attachment(&state.workspace_root(), &path)
         .map_err(|error| CommandError::new("attachment", error))
 }
@@ -448,12 +730,16 @@ pub async fn compact_thread(
             "stop the active turn before compacting",
         ));
     }
+    let context_limit = state
+        .provider_context_limit()
+        .map_err(|error| CommandError::new("provider_config", error))?;
     let runtime = AgentRuntime::with_tools_and_approvals(
         state.runtime_repository(),
         state.tool_registry(),
         state.workspace_root(),
         state.approvals(),
-    );
+    )
+    .with_context_limit(context_limit);
     runtime
         .compact_thread(&thread_id)
         .await
@@ -480,29 +766,82 @@ pub async fn run_turn(
         .prepare_extensions(false)
         .await
         .map_err(|error| CommandError::new("extensions", error))?;
+    let advanced = state.advanced();
     let runtime_instructions = state
         .extension_instructions(&request.input)
         .map_err(|error| CommandError::new("extensions", error))?;
+    let advanced_instructions = advanced
+        .runtime_instructions(&thread_id)
+        .map_err(|error| CommandError::new("advanced_runtime", error))?;
+    let runtime_instructions =
+        append_runtime_instructions(runtime_instructions, advanced_instructions);
+    let memory_instructions = advanced
+        .memory
+        .context()
+        .map_err(|error| CommandError::new("memory", error))?;
+    let runtime_instructions =
+        append_runtime_instructions(runtime_instructions, memory_instructions);
+    let goal_budget = advanced
+        .goals
+        .turn_budget(&thread_id)
+        .map_err(|error| CommandError::new("goal", error))?;
+    let goal_timeout_ms = advanced
+        .goals
+        .current(&thread_id)
+        .map_err(|error| CommandError::new("goal", error))?
+        .filter(|goal| goal.state == crate::advanced::GoalState::Active)
+        .map(|goal| goal.time_budget_ms.saturating_sub(goal.elapsed_ms));
     let _ = state.logger().log(
         "info",
         "turn_requested",
         serde_json::json!({"threadId": thread_id}),
     );
-    let (provider, model) = state
+    let (provider, model, context_limit) = state
         .build_provider()
         .map_err(|error| CommandError::new("provider_config", error))?;
     let cancellation = state
         .begin_turn(&thread_id)
         .await
         .map_err(|error| CommandError::new("turn_active", error))?;
-    let runtime = AgentRuntime::with_tools_and_approvals(
+    let goal_timeout = goal_timeout_ms.map(|timeout_ms| {
+        let cancellation = cancellation.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(timeout_ms)).await;
+            cancellation.cancel();
+        })
+    });
+    let base_tools = state.tool_registry();
+    let child_context = subagent_context(
+        &app,
+        &state,
+        provider.clone(),
+        model.clone(),
+        context_limit,
+        base_tools.clone(),
+    );
+    let (agent_handlers, agent_risks) = delegation_tools(
+        state.subagents(),
+        child_context,
+        thread_id.clone(),
+        cancellation.child_token(),
+    );
+    let tools = base_tools
+        .with_additional_handlers(agent_handlers, agent_risks)
+        .map_err(|error| CommandError::new("multi_agent", error))?;
+    let mut runtime = AgentRuntime::with_tools_and_approvals(
         state.runtime_repository(),
-        state.tool_registry(),
+        tools,
         state.workspace_root(),
         state.approvals(),
     )
-    .with_runtime_instructions(runtime_instructions);
+    .with_runtime_instructions(runtime_instructions)
+    .with_context_limit(context_limit)
+    .with_metrics(advanced.metrics.clone());
+    if let Some((_, remaining_tokens)) = &goal_budget {
+        runtime = runtime.with_token_budget(*remaining_tokens);
+    }
     let publisher: Arc<dyn EventPublisher> = Arc::new(TauriEventPublisher { app });
+    let started = std::time::Instant::now();
     let result = runtime
         .run_turn_with_attachments(
             provider,
@@ -513,6 +852,18 @@ pub async fn run_turn(
             publisher,
         )
         .await;
+    if let Some(timeout) = goal_timeout {
+        timeout.abort();
+    }
+    if let Some((goal_id, _)) = goal_budget {
+        let tokens = match &result {
+            Ok(outcome) => turn_tokens(&state, &thread_id, &outcome.turn_id).await,
+            Err(_) => 0,
+        };
+        let _ = advanced
+            .goals
+            .record_turn(&goal_id, tokens, started.elapsed().as_millis() as u64);
+    }
     state.finish_turn(&thread_id).await;
     let _ = state.logger().log(
         if result.is_ok() { "info" } else { "error" },
@@ -543,27 +894,74 @@ pub async fn retry_turn(
         .find(|message| message.role == MessageRole::User)
         .map(|message| message.text())
         .unwrap_or_default();
+    let advanced = state.advanced();
     let runtime_instructions = state
         .extension_instructions(&retry_input)
         .map_err(|error| CommandError::new("extensions", error))?;
-    let (provider, model) = state
+    let advanced_instructions = advanced
+        .runtime_instructions(&thread_id)
+        .map_err(|error| CommandError::new("advanced_runtime", error))?;
+    let runtime_instructions =
+        append_runtime_instructions(runtime_instructions, advanced_instructions);
+    let memory_instructions = advanced
+        .memory
+        .context()
+        .map_err(|error| CommandError::new("memory", error))?;
+    let runtime_instructions =
+        append_runtime_instructions(runtime_instructions, memory_instructions);
+    let goal_budget = advanced
+        .goals
+        .turn_budget(&thread_id)
+        .map_err(|error| CommandError::new("goal", error))?;
+    let goal_timeout_ms = advanced
+        .goals
+        .current(&thread_id)
+        .map_err(|error| CommandError::new("goal", error))?
+        .filter(|goal| goal.state == crate::advanced::GoalState::Active)
+        .map(|goal| goal.time_budget_ms.saturating_sub(goal.elapsed_ms));
+    let (provider, model, context_limit) = state
         .build_provider()
         .map_err(|error| CommandError::new("provider_config", error))?;
     let cancellation = state
         .begin_turn(&thread_id)
         .await
         .map_err(|error| CommandError::new("turn_active", error))?;
-    let runtime = AgentRuntime::with_tools_and_approvals(
+    let goal_timeout = goal_timeout_ms.map(|timeout_ms| {
+        let cancellation = cancellation.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(timeout_ms)).await;
+            cancellation.cancel();
+        })
+    });
+    let mut runtime = AgentRuntime::with_tools_and_approvals(
         state.runtime_repository(),
         state.tool_registry(),
         state.workspace_root(),
         state.approvals(),
     )
-    .with_runtime_instructions(runtime_instructions);
+    .with_runtime_instructions(runtime_instructions)
+    .with_context_limit(context_limit)
+    .with_metrics(advanced.metrics.clone());
+    if let Some((_, remaining_tokens)) = &goal_budget {
+        runtime = runtime.with_token_budget(*remaining_tokens);
+    }
     let publisher: Arc<dyn EventPublisher> = Arc::new(TauriEventPublisher { app });
+    let started = std::time::Instant::now();
     let result = runtime
         .retry_turn(provider, model, thread_id.clone(), cancellation, publisher)
         .await;
+    if let Some(timeout) = goal_timeout {
+        timeout.abort();
+    }
+    if let Some((goal_id, _)) = goal_budget {
+        let tokens = match &result {
+            Ok(outcome) => turn_tokens(&state, &thread_id, &outcome.turn_id).await,
+            Err(_) => 0,
+        };
+        let _ = advanced
+            .goals
+            .record_turn(&goal_id, tokens, started.elapsed().as_millis() as u64);
+    }
     state.finish_turn(&thread_id).await;
     result.map_err(|error| CommandError::new("agent_runtime", error))
 }
@@ -571,6 +969,122 @@ pub async fn retry_turn(
 #[tauri::command(rename_all = "camelCase")]
 pub async fn cancel_turn(state: State<'_, AppState>, thread_id: String) -> CommandResult<bool> {
     Ok(state.cancel_turn(&thread_id).await)
+}
+
+#[tauri::command]
+pub async fn create_subagent(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    request: CreateSubagentRequest,
+) -> CommandResult<SubagentView> {
+    state
+        .repository()
+        .read_thread(&request.parent_thread_id)
+        .await
+        .map_err(|error| CommandError::new("storage", error))?;
+    state
+        .prepare_extensions(false)
+        .await
+        .map_err(|error| CommandError::new("extensions", error))?;
+    let (provider, model, context_limit) = state
+        .build_provider()
+        .map_err(|error| CommandError::new("provider_config", error))?;
+    let context = subagent_context(
+        &app,
+        &state,
+        provider,
+        model,
+        context_limit,
+        state.tool_registry(),
+    );
+    state
+        .subagents()
+        .create(request, None, context, CancellationToken::new())
+        .await
+        .map_err(multi_agent_command_error)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub fn list_subagents(
+    state: State<'_, AppState>,
+    parent_thread_id: Option<String>,
+) -> Vec<SubagentView> {
+    state.subagents().list(parent_thread_id.as_deref())
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn wait_subagent(
+    state: State<'_, AppState>,
+    agent_id: String,
+    timeout_ms: u64,
+) -> CommandResult<SubagentView> {
+    state
+        .subagents()
+        .wait(&agent_id, timeout_ms, CancellationToken::new())
+        .await
+        .map_err(multi_agent_command_error)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn send_subagent_message(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    agent_id: String,
+    message: String,
+) -> CommandResult<SubagentView> {
+    let (provider, model, context_limit) = state
+        .build_provider()
+        .map_err(|error| CommandError::new("provider_config", error))?;
+    let context = subagent_context(
+        &app,
+        &state,
+        provider,
+        model,
+        context_limit,
+        state.tool_registry(),
+    );
+    state
+        .subagents()
+        .send_message(&agent_id, message, context)
+        .await
+        .map_err(multi_agent_command_error)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn resume_subagent(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    agent_id: String,
+    message: Option<String>,
+) -> CommandResult<SubagentView> {
+    let (provider, model, context_limit) = state
+        .build_provider()
+        .map_err(|error| CommandError::new("provider_config", error))?;
+    let context = subagent_context(
+        &app,
+        &state,
+        provider,
+        model,
+        context_limit,
+        state.tool_registry(),
+    );
+    state
+        .subagents()
+        .resume(&agent_id, message, context)
+        .await
+        .map_err(multi_agent_command_error)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub fn close_subagent(state: State<'_, AppState>, agent_id: String) -> CommandResult<SubagentView> {
+    state
+        .subagents()
+        .close(&agent_id)
+        .map_err(multi_agent_command_error)
+}
+
+fn multi_agent_command_error(error: MultiAgentError) -> CommandError {
+    CommandError::new("multi_agent", error)
 }
 
 #[tauri::command]

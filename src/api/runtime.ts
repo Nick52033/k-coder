@@ -29,6 +29,23 @@ import type {
   TurnOutcome,
   UsageSummary,
   WorkspaceState,
+  CreateSubagentRequest,
+  SubagentView,
+  BrowserArtifact,
+  BrowserAuditEvent,
+  BrowserSettings,
+  CreateGoalRequest,
+  DocumentContent,
+  EvaluationReport,
+  GoalState,
+  GoalView,
+  MemorySettings,
+  MemoryUpsertRequest,
+  MemoryView,
+  MetricsSnapshot,
+  PlanUpdateRequest,
+  PlanView,
+  SearchResult,
 } from "../types/runtime";
 
 export function getRuntimeStatus() {
@@ -73,6 +90,50 @@ export function retryTurn(threadId: string) {
 
 export function cancelTurn(threadId: string) {
   return invoke<boolean>("cancel_turn", { threadId });
+}
+
+export function getPlan(threadId: string) { return invoke<PlanView | null>("get_plan", { threadId }); }
+export function updatePlan(request: PlanUpdateRequest) { return invoke<PlanView>("update_plan", { request }); }
+export function getGoal(threadId: string) { return invoke<GoalView | null>("get_goal", { threadId }); }
+export function createGoal(request: CreateGoalRequest) { return invoke<GoalView>("create_goal", { request }); }
+export function transitionGoal(goalId: string, state: GoalState, reason?: string) { return invoke<GoalView>("transition_goal", { request: { goalId, state, reason } }); }
+export function searchRepository(query: string, limit = 50) { return invoke<SearchResult[]>("search_repository", { query, limit }); }
+export function getMemorySettings() { return invoke<MemorySettings>("get_memory_settings"); }
+export function setMemoryEnabled(enabled: boolean) { return invoke<MemorySettings>("set_memory_enabled", { enabled }); }
+export function listMemories() { return invoke<MemoryView[]>("list_memories"); }
+export function upsertMemory(request: MemoryUpsertRequest) { return invoke<MemoryView>("upsert_memory", { request }); }
+export function deleteMemory(memoryId: string) { return invoke<MemoryView>("delete_memory", { memoryId }); }
+export function getBrowserSettings() { return invoke<BrowserSettings>("get_browser_settings"); }
+export function saveBrowserSettings(settings: BrowserSettings) { return invoke<BrowserSettings>("save_browser_settings", { settings }); }
+export function listBrowserAudit() { return invoke<BrowserAuditEvent[]>("list_browser_audit"); }
+export function listBrowserArtifacts() { return invoke<BrowserArtifact[]>("list_browser_artifacts"); }
+export function closeBrowserSession() { return invoke<void>("close_browser_session"); }
+export function extractDocumentContent(relativePath: string) { return invoke<DocumentContent>("extract_document_content", { relativePath }); }
+export function getAdvancedMetrics() { return invoke<MetricsSnapshot>("advanced_metrics"); }
+export function runRegressionEvaluation() { return invoke<EvaluationReport>("run_regression_evaluation"); }
+
+export function createSubagent(request: CreateSubagentRequest) {
+  return invoke<SubagentView>("create_subagent", { request });
+}
+
+export function listSubagents(parentThreadId?: string) {
+  return invoke<SubagentView[]>("list_subagents", { parentThreadId });
+}
+
+export function waitSubagent(agentId: string, timeoutMs = 30_000) {
+  return invoke<SubagentView>("wait_subagent", { agentId, timeoutMs });
+}
+
+export function sendSubagentMessage(agentId: string, message: string) {
+  return invoke<SubagentView>("send_subagent_message", { agentId, message });
+}
+
+export function resumeSubagent(agentId: string, message?: string) {
+  return invoke<SubagentView>("resume_subagent", { agentId, message });
+}
+
+export function closeSubagent(agentId: string) {
+  return invoke<SubagentView>("close_subagent", { agentId });
 }
 
 export function previewPatch(patch: string) {
@@ -181,6 +242,12 @@ export function subscribeToAgentEvents(
   handler: (event: AgentEvent) => void,
 ): Promise<UnlistenFn> {
   return listen<AgentEvent>("agent-event", ({ payload }) => handler(payload));
+}
+
+export function subscribeToSubagentEvents(
+  handler: (event: SubagentView) => void,
+): Promise<UnlistenFn> {
+  return listen<SubagentView>("subagent-event", ({ payload }) => handler(payload));
 }
 
 export function errorMessage(error: unknown): string {

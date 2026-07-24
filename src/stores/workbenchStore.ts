@@ -15,6 +15,10 @@ import {
   runTurn,
   saveProviderConfig,
   undoChange,
+  createGoal,
+  getGoal,
+  getPlan,
+  transitionGoal,
 } from "../api/runtime";
 import type {
   AgentEvent,
@@ -30,6 +34,9 @@ import type {
   ToolActivity,
   TokenUsage,
   TurnSnapshot,
+  GoalState,
+  GoalView,
+  PlanView,
 } from "../types/runtime";
 
 interface WorkbenchState {
@@ -43,6 +50,8 @@ interface WorkbenchState {
   pendingApproval: ApprovalRequest | null;
   changes: ChangeSet[];
   providerConfig: ProviderConfigView | null;
+  plan: PlanView | null;
+  goal: GoalView | null;
   loading: boolean;
   error: string;
   initialize: () => Promise<void>;
@@ -58,6 +67,8 @@ interface WorkbenchState {
   stopTurn: () => Promise<void>;
   loadProviderConfig: () => Promise<void>;
   saveProvider: (request: SaveProviderConfigRequest) => Promise<boolean>;
+  createActiveGoal: (objective: string, tokenBudget: number, timeBudgetMs: number) => Promise<boolean>;
+  transitionActiveGoal: (state: GoalState, reason?: string) => Promise<boolean>;
   resolvePendingApproval: (resolution: ApprovalResolution) => Promise<boolean>;
   undoAppliedChange: (changeId: string) => Promise<boolean>;
   handleAgentEvent: (event: AgentEvent) => void;
@@ -89,6 +100,8 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
   pendingApproval: null,
   changes: [],
   providerConfig: null,
+  plan: null,
+  goal: null,
   loading: true,
   error: "",
 
@@ -156,6 +169,8 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
         toolActivities: [],
         pendingApproval: null,
         changes: [],
+        plan: null,
+        goal: null,
         error: "",
       }));
     } catch (error) {
@@ -166,7 +181,11 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
   selectThread: async (threadId) => {
     set({ activeThreadId: threadId, loading: true, error: "" });
     try {
-      const detail = await readThread(threadId);
+      const [detail, plan, goal] = await Promise.all([
+        readThread(threadId),
+        getPlan(threadId),
+        getGoal(threadId),
+      ]);
       if (get().activeThreadId !== threadId) return;
       set({
         messages: detail.messages.map(toConversationMessage),
@@ -175,6 +194,8 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
         pendingApproval:
           [...detail.approvals].reverse().find((approval) => !approval.resolution)?.request ?? null,
         changes: detail.changes,
+        plan,
+        goal,
         activeTurnId:
           detail.lastTurn
           && ["queued", "streaming", "running_tool", "awaiting_approval"].includes(detail.lastTurn.state)
@@ -272,6 +293,32 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
     }
   },
 
+  createActiveGoal: async (objective, tokenBudget, timeBudgetMs) => {
+    const threadId = get().activeThreadId;
+    if (!threadId) return false;
+    try {
+      const goal = await createGoal({ threadId, objective, tokenBudget, timeBudgetMs });
+      set({ goal, error: "" });
+      return true;
+    } catch (error) {
+      set({ error: errorMessage(error) });
+      return false;
+    }
+  },
+
+  transitionActiveGoal: async (state, reason) => {
+    const goal = get().goal;
+    if (!goal) return false;
+    try {
+      const updated = await transitionGoal(goal.id, state, reason);
+      set({ goal: updated, error: "" });
+      return true;
+    } catch (error) {
+      set({ error: errorMessage(error) });
+      return false;
+    }
+  },
+
   resolvePendingApproval: async (resolution) => {
     const approval = get().pendingApproval;
     if (!approval) return false;
@@ -305,6 +352,14 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
 
   handleAgentEvent: (event) => {
     if (event.threadId !== get().activeThreadId) {
+      if (event.type === "approval_requested") {
+        set({ pendingApproval: event.request });
+      } else if (event.type === "approval_resolved") {
+        set((state) => ({
+          pendingApproval:
+            state.pendingApproval?.id === event.requestId ? null : state.pendingApproval,
+        }));
+      }
       if (event.type === "turn_completed") void get().reloadThreads();
       return;
     }

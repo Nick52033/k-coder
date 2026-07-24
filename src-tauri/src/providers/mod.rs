@@ -2,6 +2,7 @@ mod anthropic;
 mod common;
 mod config;
 mod credentials;
+mod fallback;
 mod gemini;
 mod openai;
 mod responses;
@@ -21,10 +22,12 @@ use crate::protocol::{MessageRole, TokenUsage, ToolCall, ToolDefinition};
 
 pub use anthropic::AnthropicMessagesProvider;
 pub use config::{
-    ProviderConfig, ProviderConfigError, ProviderConfigStore, ProviderConfigView, ProviderKind,
+    DEFAULT_MODEL_CONTEXT_WINDOW, ProviderConfig, ProviderConfigError, ProviderConfigStore,
+    ProviderConfigView, ProviderEndpointConfig, ProviderKind, ProviderModelConfig,
     ProviderTransport, SaveProviderConfigRequest,
 };
 pub use credentials::{CredentialError, CredentialStore, OsCredentialStore};
+pub use fallback::{FallbackProvider, FallbackTarget};
 pub use gemini::GoogleGeminiProvider;
 pub use openai::OpenAiChatCompletionsProvider;
 pub use responses::OpenAiResponsesProvider;

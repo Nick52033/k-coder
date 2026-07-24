@@ -6,12 +6,12 @@ k-Coder 是一个使用 Tauri、Rust、React 和 TypeScript 构建的本地优�
 
 ## 当前状态
 
-- 阶段：`Phase 2 - 原生工具调用循环`
+- 阶段：`Phase 10 - 生产加固`
 - 运行时：Tauri 2 + Rust
 - 界面：React + TypeScript + Vite + Zustand
-- 当前版本：`0.2.0-chat`
-- 已具备：OpenAI-compatible 流式纯文本对话、会话恢复、重试和取消
-- 下一项任务：包含稳定工具名和 JSON Schema 的 `ToolRegistry`
+- 当前版本：`0.10.0-advanced-agent`
+- 已具备：流式多 Provider 对话、安全读写与命令、持久化工作台、Skills/MCP/Hooks、受预算和权限约束的多智能体委派，以及可审计的计划、Goal、浏览器、记忆、搜索、文档提取、故障切换和运行指标
+- 下一项任务：`P10-001` 威胁建模
 
 ## 本地开发
 

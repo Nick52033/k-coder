@@ -8,6 +8,7 @@ use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use crate::advanced::RuntimeMetrics;
 use crate::context::{self, CompactionSummary, DEFAULT_CONTEXT_LIMIT};
 use crate::policy::{ApprovalError, ApprovalManager, PolicyDecision};
 use crate::protocol::{
@@ -73,6 +74,9 @@ pub struct AgentRuntime {
     workspace_root: PathBuf,
     approvals: Arc<ApprovalManager>,
     runtime_instructions: String,
+    max_total_tokens: Option<u64>,
+    context_limit: usize,
+    metrics: Option<RuntimeMetrics>,
 }
 
 impl AgentRuntime {
@@ -109,11 +113,29 @@ impl AgentRuntime {
             workspace_root,
             approvals,
             runtime_instructions: String::new(),
+            max_total_tokens: None,
+            context_limit: DEFAULT_CONTEXT_LIMIT,
+            metrics: None,
         }
     }
 
     pub fn with_runtime_instructions(mut self, instructions: String) -> Self {
         self.runtime_instructions = instructions;
+        self
+    }
+
+    pub fn with_token_budget(mut self, max_total_tokens: u64) -> Self {
+        self.max_total_tokens = Some(max_total_tokens);
+        self
+    }
+
+    pub fn with_context_limit(mut self, context_limit: usize) -> Self {
+        self.context_limit = context_limit.max(1_024);
+        self
+    }
+
+    pub fn with_metrics(mut self, metrics: RuntimeMetrics) -> Self {
+        self.metrics = Some(metrics);
         self
     }
 
@@ -195,7 +217,7 @@ impl AgentRuntime {
         thread_id: &str,
     ) -> Result<CompactionSummary, AgentRuntimeError> {
         let history = provider_history(self.repository.load(thread_id).await?);
-        let (summary, _) = context::compact(&history, DEFAULT_CONTEXT_LIMIT);
+        let (summary, _) = context::compact(&history, self.context_limit);
         if summary.compacted_message_count > 0 {
             self.repository
                 .append(StoredEvent::new(
@@ -266,8 +288,8 @@ impl AgentRuntime {
 
         for iteration in 0..MAX_TOOL_ITERATIONS {
             let mut history = provider_history(self.repository.load(&thread_id).await?);
-            if context::needs_compaction(&history, DEFAULT_CONTEXT_LIMIT) {
-                let (summary, compacted) = context::compact(&history, DEFAULT_CONTEXT_LIMIT);
+            if context::needs_compaction(&history, self.context_limit) {
+                let (summary, compacted) = context::compact(&history, self.context_limit);
                 if summary.compacted_message_count > 0 {
                     self.repository
                         .append(StoredEvent::new(
@@ -297,14 +319,17 @@ impl AgentRuntime {
                 messages: history,
                 tools: self.tools.definitions(),
             };
+            let provider_started = std::time::Instant::now();
             let mut stream = match provider.stream(request, cancellation.clone()).await {
                 Ok(stream) => stream,
                 Err(ProviderError::Cancelled) => {
+                    self.record_provider_metric(provider_started, false, None);
                     return self
                         .finish_cancelled(&thread_id, &turn_id, &publisher)
                         .await;
                 }
                 Err(error) => {
+                    self.record_provider_metric(provider_started, false, None);
                     return self
                         .finish_failed(&thread_id, &turn_id, error.to_string(), &publisher)
                         .await;
@@ -354,24 +379,59 @@ impl AgentRuntime {
                     Some(Ok(ProviderEvent::Usage { usage })) => {
                         iteration_usage = Some(usage);
                         let aggregate = add_usage(total_usage, usage);
+                        if self
+                            .max_total_tokens
+                            .is_some_and(|limit| aggregate.total_tokens > limit)
+                        {
+                            self.repository
+                                .append(StoredEvent::new(
+                                    &thread_id,
+                                    Some(turn_id.clone()),
+                                    StoredEventKind::ProviderCallUsage {
+                                        call_index: iteration as u32,
+                                        usage,
+                                    },
+                                ))
+                                .await?;
+                            return self
+                                .finish_failed(
+                                    &thread_id,
+                                    &turn_id,
+                                    format!(
+                                        "token_budget_exceeded: used {} of {} tokens",
+                                        aggregate.total_tokens,
+                                        self.max_total_tokens.unwrap_or_default()
+                                    ),
+                                    &publisher,
+                                )
+                                .await;
+                        }
                         publisher.publish(AgentEventEnvelope::new(AgentEvent::UsageUpdated {
                             thread_id: thread_id.clone(),
                             turn_id: turn_id.clone(),
                             usage: aggregate,
                         }));
                     }
-                    Some(Ok(ProviderEvent::Completed)) => break true,
+                    Some(Ok(ProviderEvent::Completed)) => {
+                        self.record_provider_metric(provider_started, true, iteration_usage);
+                        break true;
+                    }
                     Some(Err(ProviderError::Cancelled)) => {
+                        self.record_provider_metric(provider_started, false, iteration_usage);
                         return self
                             .finish_cancelled(&thread_id, &turn_id, &publisher)
                             .await;
                     }
                     Some(Err(error)) => {
+                        self.record_provider_metric(provider_started, false, iteration_usage);
                         return self
                             .finish_failed(&thread_id, &turn_id, error.to_string(), &publisher)
                             .await;
                     }
-                    None => break false,
+                    None => {
+                        self.record_provider_metric(provider_started, false, iteration_usage);
+                        break false;
+                    }
                 }
             };
 
@@ -496,6 +556,9 @@ impl AgentRuntime {
                         }
                     }
                 };
+                if let Some(metrics) = &self.metrics {
+                    metrics.tool(result.success);
+                }
                 self.persist_tool_result(&thread_id, &turn_id, &call, &result, &publisher)
                     .await?;
             }
@@ -865,6 +928,9 @@ impl AgentRuntime {
             message,
             usage,
         }));
+        if let Some(metrics) = &self.metrics {
+            metrics.task(true);
+        }
         Ok(outcome(thread_id, turn_id, TurnState::Completed, None))
     }
 
@@ -889,6 +955,9 @@ impl AgentRuntime {
             turn_id: turn_id.to_string(),
             message: message.clone(),
         }));
+        if let Some(metrics) = &self.metrics {
+            metrics.task(false);
+        }
         Ok(outcome(
             thread_id,
             turn_id,
@@ -914,7 +983,27 @@ impl AgentRuntime {
             thread_id: thread_id.to_string(),
             turn_id: turn_id.to_string(),
         }));
+        if let Some(metrics) = &self.metrics {
+            metrics.task(false);
+        }
         Ok(outcome(thread_id, turn_id, TurnState::Cancelled, None))
+    }
+
+    fn record_provider_metric(
+        &self,
+        started: std::time::Instant,
+        success: bool,
+        usage: Option<TokenUsage>,
+    ) {
+        if let Some(metrics) = &self.metrics {
+            let usage = usage.unwrap_or_default();
+            metrics.provider(
+                started.elapsed().as_millis() as u64,
+                success,
+                usage.input_tokens,
+                usage.output_tokens,
+            );
+        }
     }
 }
 
@@ -1394,6 +1483,13 @@ mod tests {
             directory.path().to_path_buf(),
         );
         (directory, repository, runtime, thread.id)
+    }
+
+    #[tokio::test]
+    async fn runtime_uses_the_configured_model_context_limit() {
+        let (_directory, _repository, runtime, _thread_id) = runtime_fixture().await;
+
+        assert_eq!(runtime.with_context_limit(32_000).context_limit, 32_000);
     }
 
     #[tokio::test]

@@ -4,15 +4,21 @@ import {
   ArrowDownToLine, ChevronDown, ChevronRight, CircleCheck, File, FileCode2, FileDiff, Folder,
   FolderOpen, GitBranch, Image, ListChecks, LocateFixed, Paperclip, RefreshCw,
   Plus, Upload, X,
+  Search,
+  Circle,
+  CircleDot,
 } from "lucide-react";
 import {
   extractAttachment, getGitBranches, getGitDiff, getGitStatus, getWorkspaceState,
   listWorkspaceDirectory, openWorkspaceFile, previewWorkspaceFile, revealWorkspaceFile,
   runGitAction, switchGitBranch, switchWorkspace,
+  searchRepository,
 } from "../api/runtime";
 import type {
   AttachmentContent, ChangeSet, FileEntry, FilePreview, GitBranchView, GitStatusView,
   ProjectRecord, ToolActivity, WorkspaceState,
+  PlanView as PersistentPlan,
+  SearchResult,
 } from "../types/runtime";
 
 type Tab = "files" | "git" | "plan";
@@ -47,9 +53,12 @@ export function WorkspacePicker({ onChanged }: { onChanged: () => void }) {
 
   return (
     <div className="workspace-picker">
-      <button className="workspace-current" type="button" onClick={() => setExpanded(!expanded)} aria-expanded={expanded}>
+      <button className="workspace-current" type="button" onClick={() => setExpanded(!expanded)} aria-expanded={expanded} title={state?.current.path ?? "工作区路径"}>
         <span className="workspace-glyph"><FolderOpen size={15} /></span>
-        <span><strong>{state?.current.name ?? "工作区"}</strong><small>{state?.current.path ?? "正在读取"}</small></span>
+        <span className="workspace-info">
+          <strong>{state?.current.name ?? "工作区"}</strong>
+          {state?.current.path && <small>{state.current.path.replace(/^\\\\\?\\/, '').replace(/\\/g, '/')}</small>}
+        </span>
         <ChevronDown size={14} />
       </button>
       {expanded && (
@@ -57,7 +66,7 @@ export function WorkspacePicker({ onChanged }: { onChanged: () => void }) {
           <div className="workspace-menu-label">最近项目</div>
           {state?.recent.slice(0, 6).map((project) => (
             <button type="button" key={project.id} onClick={() => void select(project)}>
-              <Folder size={14} /><span><strong>{project.name}</strong><small>{project.path}</small></span>
+              <Folder size={14} /><span><strong>{project.name}</strong><small>{project.path.replace(/^\\\\\?\\/, '').replace(/\\/g, '/')}</small></span>
               {project.id === state.current.id && <CircleCheck size={14} />}
             </button>
           ))}
@@ -69,7 +78,7 @@ export function WorkspacePicker({ onChanged }: { onChanged: () => void }) {
   );
 }
 
-export function WorkbenchPanel({ toolActivities, changes, onAttach, onSelectChange, open = false }: { toolActivities: ToolActivity[]; changes: ChangeSet[]; onAttach: (attachment: AttachmentContent) => void; onSelectChange: (changeId: string) => void; open?: boolean }) {
+export function WorkbenchPanel({ plan, toolActivities, changes, onAttach, onSelectChange, open = false }: { plan: PersistentPlan | null; toolActivities: ToolActivity[]; changes: ChangeSet[]; onAttach: (attachment: AttachmentContent) => void; onSelectChange: (changeId: string) => void; open?: boolean }) {
   const [tab, setTab] = useState<Tab>("files");
   return (
     <aside className={`workbench-panel ${open ? "workbench-panel--open" : ""}`}>
@@ -80,7 +89,7 @@ export function WorkbenchPanel({ toolActivities, changes, onAttach, onSelectChan
       </div>
       {tab === "files" && <FilesView onAttach={onAttach} />}
       {tab === "git" && <GitView />}
-      {tab === "plan" && <PlanView activities={toolActivities} changes={changes} onSelectChange={onSelectChange} />}
+      {tab === "plan" && <PlanView plan={plan} activities={toolActivities} changes={changes} onSelectChange={onSelectChange} />}
     </aside>
   );
 }
@@ -93,12 +102,19 @@ function FilesView({ onAttach }: { onAttach: (attachment: AttachmentContent) => 
   const [revision, setRevision] = useState(0);
   const [preview, setPreview] = useState<FilePreview | null>(null);
   const [error, setError] = useState("");
+  const [query, setQuery] = useState("");
+  const [results, setResults] = useState<SearchResult[]>([]);
   async function select(path: string) { try { setPreview(await previewWorkspaceFile(path)); setError(""); } catch (error) { setError(String(error)); } }
   async function attach() { if (preview) onAttach(await extractAttachment(preview.path)); }
   return (
     <div className="files-view">
       <div className="panel-toolbar"><strong>资源管理器</strong><button type="button" title="刷新" aria-label="刷新文件树" onClick={() => setRevision((value) => value + 1)}><RefreshCw size={14} /></button></div>
-      <div className="file-tree" key={revision}><DirectoryNode path="" depth={0} onSelect={(path) => void select(path)} /></div>
+      <form className="repository-search" onSubmit={(event) => { event.preventDefault(); if (query.trim()) void searchRepository(query.trim()).then(setResults).catch((reason) => setError(String(reason))); }}>
+        <Search size={14} />
+        <input value={query} onChange={(event) => { setQuery(event.target.value); if (!event.target.value) setResults([]); }} placeholder="搜索仓库" aria-label="搜索仓库" />
+        <button type="submit" aria-label="执行搜索"><Search size={13} /></button>
+      </form>
+      {results.length > 0 ? <div className="repository-results">{results.map((result) => <button type="button" key={`${result.path}:${result.line}`} onClick={() => void select(result.path)}><strong>{result.path}:{result.line}</strong><span>{result.preview}</span></button>)}</div> : <div className="file-tree" key={revision}><DirectoryNode path="" depth={0} onSelect={(path) => void select(path)} /></div>}
       {error && <div className="panel-error">{error}</div>}
       {preview && (
         <div className="file-preview">
@@ -178,10 +194,11 @@ function GitView() {
   </div>;
 }
 
-function PlanView({ activities, changes, onSelectChange }: { activities: ToolActivity[]; changes: ChangeSet[]; onSelectChange: (changeId: string) => void }) {
-  if (!activities.length && !changes.length) return <div className="panel-empty"><ListChecks size={22} /><span>工具步骤会在这里形成执行计划</span></div>;
+function PlanView({ plan, activities, changes, onSelectChange }: { plan: PersistentPlan | null; activities: ToolActivity[]; changes: ChangeSet[]; onSelectChange: (changeId: string) => void }) {
+  if (!plan?.steps.length && !activities.length && !changes.length) return <div className="panel-empty"><ListChecks size={22} /><span>智能体创建计划后会显示在这里</span></div>;
   return <div className="plan-list">
-    {activities.map((activity, index) => <div className="plan-step" key={`${activity.turnId}-${activity.call.id}`}><span>{activity.state === "completed" ? <CircleCheck size={14} /> : <span className="plan-index">{index + 1}</span>}</span><div><strong>{activity.call.name}</strong><small>{activity.state === "running" ? "执行中" : activity.state === "failed" ? "失败" : "已完成"}</small></div></div>)}
+    {plan?.steps.map((step, index) => <div className={`plan-step plan-step--${step.status}`} key={step.id}><span>{step.status === "completed" ? <CircleCheck size={14} /> : step.status === "in_progress" ? <CircleDot size={14} /> : step.status === "failed" ? <X size={14} /> : <Circle size={14} />}</span><div><strong>{index + 1}. {step.step}</strong><small>{step.detail ?? (step.status === "in_progress" ? "执行中" : step.status === "completed" ? "已完成" : step.status === "failed" ? "失败" : step.status === "skipped" ? "已跳过" : "待处理")}</small></div></div>)}
+    {!plan?.steps.length && activities.map((activity, index) => <div className="plan-step" key={`${activity.turnId}-${activity.call.id}`}><span>{activity.state === "completed" ? <CircleCheck size={14} /> : <span className="plan-index">{index + 1}</span>}</span><div><strong>{activity.call.name}</strong><small>{activity.state}</small></div></div>)}
     {changes.length > 0 && <div className="plan-changes"><div className="plan-section-label">代码变更</div>{changes.slice().reverse().map((change) => <button type="button" key={change.id} onClick={() => onSelectChange(change.id)}><FileDiff size={14} /><span><strong>{change.files.length} 个文件</strong><small>{change.undone ? "已撤销" : "查看 Diff"}</small></span></button>)}</div>}
   </div>;
 }

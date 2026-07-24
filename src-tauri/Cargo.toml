@@ -1,6 +1,6 @@
 [package]
 name = "k-coder"
-version = "0.8.0"
+version = "0.10.0"
 description = "本地优先的编程智能体桌面应用"
 authors = ["k-Coder contributors"]
 edition = "2024"
@@ -24,9 +24,12 @@ tauri-plugin-dialog = "2"
 async-trait = "0.1"
 async-stream = "0.3"
 base64 = "0.22"
+chromiumoxide = "0.9.1"
 futures-util = "0.3"
 jsonschema = { version = "0.48.1", default-features = false }
 portable-pty = "0.9.0"
+pdf-extract = "0.12.0"
+quick-xml = "0.41.0"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
@@ -35,10 +38,11 @@ serde_yaml = "0.9"
 sha2 = "0.11.0"
 similar = "3.1.1"
 thiserror = "2"
-tokio = { version = "1", features = ["fs", "io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
 tokio-util = "0.7"
 url = "2"
 uuid = { version = "1", features = ["serde", "v4"] }
+zip = { version = "8.4.0", default-features = false, features = ["deflate"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

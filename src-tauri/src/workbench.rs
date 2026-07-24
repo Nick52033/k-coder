@@ -14,6 +14,14 @@ const MAX_PREVIEW_BYTES: usize = 256 * 1024;
 const MAX_ATTACHMENT_BYTES: usize = 4 * 1024 * 1024;
 const IGNORED: &[&str] = &[".git", "node_modules", "target", "dist", "build", ".next"];
 
+pub(crate) fn resolve_workspace_path(
+    root: &Path,
+    relative: &str,
+    allow_directory: bool,
+) -> Result<PathBuf, WorkbenchError> {
+    resolve(root, relative, allow_directory)
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum WorkbenchError {
     #[error("invalid workspace request: {0}")]

@@ -1,3 +1,4 @@
+pub mod advanced;
 pub mod agent;
 pub mod app_state;
 pub mod commands;
@@ -5,6 +6,7 @@ pub mod context;
 pub mod execution;
 pub mod extensions;
 pub mod logging;
+pub mod multi_agent;
 pub mod patch;
 pub mod persistence;
 pub mod policy;
@@ -31,6 +33,25 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::runtime_status,
+            commands::get_plan,
+            commands::update_plan,
+            commands::get_goal,
+            commands::create_goal,
+            commands::transition_goal,
+            commands::search_repository,
+            commands::get_memory_settings,
+            commands::set_memory_enabled,
+            commands::list_memories,
+            commands::upsert_memory,
+            commands::delete_memory,
+            commands::get_browser_settings,
+            commands::save_browser_settings,
+            commands::list_browser_audit,
+            commands::list_browser_artifacts,
+            commands::close_browser_session,
+            commands::extract_document_content,
+            commands::advanced_metrics,
+            commands::run_regression_evaluation,
             commands::get_provider_config,
             commands::save_provider_config,
             commands::test_provider_connection,
@@ -64,6 +85,12 @@ pub fn run() {
             commands::run_turn,
             commands::retry_turn,
             commands::cancel_turn,
+            commands::create_subagent,
+            commands::list_subagents,
+            commands::wait_subagent,
+            commands::send_subagent_message,
+            commands::resume_subagent,
+            commands::close_subagent,
             commands::preview_patch,
             commands::resolve_approval,
             commands::undo_change,

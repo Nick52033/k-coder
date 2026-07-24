@@ -4,9 +4,9 @@ import {
   Archive,
   ArrowUp,
   CircleAlert,
+  Bot,
   Code2,
   FileDiff,
-  KeyRound,
   Loader2,
   Maximize2,
   MessageSquare,
@@ -23,6 +23,10 @@ import {
   Trash2,
   Undo2,
   X,
+  Target,
+  Pause,
+  Play,
+  CircleCheck,
 } from "lucide-react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { getRuntimeStatus, subscribeToAgentEvents } from "./api/runtime";
@@ -30,11 +34,14 @@ import { useWorkbenchStore } from "./stores/workbenchStore";
 import { PatchReviewDialog } from "./components/PatchReviewDialog";
 import { SettingsDialog } from "./components/SettingsDialog";
 import { WorkbenchPanel, WorkspacePicker } from "./components/WorkbenchPanel";
+import { AgentActivityPanel } from "./components/AgentActivityPanel";
+import { ModelSelector } from "./components/ModelSelector";
 import { cn } from "./lib/cn";
-import type { AttachmentContent, RuntimeStatus } from "./types/runtime";
+import type { AttachmentContent, GoalState, GoalView, RuntimeStatus } from "./types/runtime";
 import "./App.css";
+import "./enhanced-animations.css"; // UI 增强动画
 
-type Skin = "paper" | "midnight" | "amethyst" | "indigo" | "amber";
+type Skin = "paper" | "midnight" | "vscode" | "amber";
 type ThemeMode = "light" | "dark";
 
 const STORAGE_SKIN = "kcoder_skin";
@@ -59,6 +66,7 @@ function App() {
   const [attachments, setAttachments] = useState<AttachmentContent[]>([]);
   const [threadQuery, setThreadQuery] = useState("");
   const [workbenchOpen, setWorkbenchOpen] = useState(false);
+  const [agentPanelOpen, setAgentPanelOpen] = useState(false);
   const [workspaceRevision, setWorkspaceRevision] = useState(0);
   const [skin, setSkinState] = useState<Skin>(() => readStored(STORAGE_SKIN, "paper"));
   const [themeMode, setThemeModeState] = useState<ThemeMode>(() =>
@@ -76,6 +84,8 @@ function App() {
     pendingApproval,
     changes,
     providerConfig,
+    plan,
+    goal,
     loading,
     error,
     initialize,
@@ -93,6 +103,8 @@ function App() {
     searchThreadHistory,
     renameConversation,
     deleteConversation,
+    createActiveGoal,
+    transitionActiveGoal,
   } = useWorkbenchStore();
 
   useEffect(() => {
@@ -145,7 +157,10 @@ function App() {
         event.preventDefault();
         setSettingsOpen(true);
       }
-      if (event.key === "Escape") setWorkbenchOpen(false);
+      if (event.key === "Escape") {
+        setWorkbenchOpen(false);
+        setAgentPanelOpen(false);
+      }
     }
     window.addEventListener("keydown", handleShortcut);
     return () => window.removeEventListener("keydown", handleShortcut);
@@ -195,6 +210,7 @@ function App() {
   function openSettings() {
     clearError();
     setWorkbenchOpen(false);
+    setAgentPanelOpen(false);
     setSettingsOpen(true);
   }
 
@@ -220,10 +236,10 @@ function App() {
             {themeMode === "light" ? <Moon size={17} /> : <Sun size={17} />}
           </button>
           <button
-            className="icon-button"
+            className="icon-button mobile-settings-button"
             type="button"
-            aria-label="打开设置"
-            title="设置"
+            aria-label="设置"
+            title="打开设置"
             onClick={openSettings}
           >
             <Settings size={17} />
@@ -261,11 +277,12 @@ function App() {
       </header>
 
       <aside className="sidebar">
-        <WorkspacePicker onChanged={() => { setWorkspaceRevision((value) => value + 1); void initialize(); }} />
-        <button className="new-thread-button" type="button" onClick={() => void createThread()}>
-          <Plus size={16} />
-          新建会话
-        </button>
+        <div className="sidebar-header">
+          <WorkspacePicker onChanged={() => { setWorkspaceRevision((value) => value + 1); void initialize(); }} />
+          <button className="new-thread-button" type="button" onClick={() => void createThread()} title="新建会话" aria-label="新建会话">
+            <Plus size={18} />
+          </button>
+        </div>
         <div className="section-label section-label--search"><span>会话</span><input aria-label="搜索会话" placeholder="搜索" value={threadQuery} onChange={(event) => { const query = event.target.value; setThreadQuery(query); void searchThreadHistory(query); }} /></div>
         <nav className="thread-list" aria-label="会话列表">
           {threads.map((thread) => (
@@ -281,14 +298,19 @@ function App() {
             </div>
           ))}
         </nav>
-        <button
-          className={cn("provider-button", providerConfig && "provider-button--ready")}
-          type="button"
-          onClick={openSettings}
-        >
-          <KeyRound size={16} />
-          <span>{providerConfig?.model ?? "配置 Provider"}</span>
-        </button>
+
+        <div className="sidebar-footer">
+          <button
+            className="sidebar-settings-button"
+            type="button"
+            onClick={openSettings}
+            aria-label="设置"
+            title="打开设置"
+          >
+            <Settings size={16} />
+            <span>设置</span>
+          </button>
+        </div>
       </aside>
 
       <section className="conversation">
@@ -300,7 +322,10 @@ function App() {
             </span>
           </div>
           <div className="conversation-actions">
-            <button className="icon-button" type="button" aria-label="切换工作台面板" title="切换工作台面板" onClick={() => setWorkbenchOpen((value) => !value)}>
+            <button className={cn("icon-button", agentPanelOpen && "icon-button--active")} type="button" aria-label="切换子智能体面板" title="子智能体" onClick={() => { setAgentPanelOpen((value) => !value); setWorkbenchOpen(false); }}>
+              <Bot size={17} />
+            </button>
+            <button className={cn("icon-button", workbenchOpen && "icon-button--active")} type="button" aria-label="切换工作台面板" title="切换工作台面板" onClick={() => { setWorkbenchOpen((value) => !value); setAgentPanelOpen(false); }}>
               <PanelRight size={17} />
             </button>
             <button
@@ -354,6 +379,12 @@ function App() {
           </div>
         )}
 
+        <GoalControl
+          goal={goal}
+          disabled={Boolean(activeTurnId)}
+          onCreate={createActiveGoal}
+          onTransition={transitionActiveGoal}
+        />
         <form className="composer" onSubmit={submitMessage}>
           {attachments.length > 0 && <div className="attachment-strip">{attachments.map((attachment) => <span key={attachment.path}><Paperclip size={12} />{attachment.name}<button type="button" aria-label={`移除 ${attachment.name}`} onClick={() => setAttachments((items) => items.filter((item) => item.path !== attachment.path))}><X size={12} /></button></span>)}</div>}
           <textarea
@@ -366,7 +397,7 @@ function App() {
             disabled={Boolean(activeTurnId)}
           />
           <div className="composer-footer">
-            <span className="composer-mode">{providerConfig?.model ?? "未配置模型"}</span>
+            <ModelSelector provider={providerConfig} onSaveProvider={saveProvider} />
             {activeTurnId ? (
               <button className="stop-button" type="button" aria-label="停止生成" title="停止生成" onClick={() => void stopTurn()}>
                 {lastTurn?.state === "streaming" ? (
@@ -390,7 +421,8 @@ function App() {
         </form>
       </section>
 
-      <WorkbenchPanel key={workspaceRevision} open={workbenchOpen} toolActivities={toolActivities} changes={changes} onSelectChange={setSelectedChangeId} onAttach={(attachment) => setAttachments((items) => items.some((item) => item.path === attachment.path) ? items : [...items, attachment])} />
+      <WorkbenchPanel key={workspaceRevision} open={workbenchOpen} plan={plan} toolActivities={toolActivities} changes={changes} onSelectChange={setSelectedChangeId} onAttach={(attachment) => setAttachments((items) => items.some((item) => item.path === attachment.path) ? items : [...items, attachment])} />
+      <AgentActivityPanel open={agentPanelOpen} parentThreadId={activeThreadId} onClose={() => setAgentPanelOpen(false)} />
       <aside className="activity-panel activity-panel--overlay" aria-hidden="true">
         <div className="activity-list activity-list--hidden">
           <div className="activity-row">
@@ -492,6 +524,53 @@ function App() {
         />
       )}
     </main>
+  );
+}
+
+function GoalControl({
+  goal,
+  disabled,
+  onCreate,
+  onTransition,
+}: {
+  goal: GoalView | null;
+  disabled: boolean;
+  onCreate: (objective: string, tokenBudget: number, timeBudgetMs: number) => Promise<boolean>;
+  onTransition: (state: GoalState, reason?: string) => Promise<boolean>;
+}) {
+  if (!goal || goal.state === "completed" || goal.state === "budget_exhausted") {
+    return (
+      <div className="goal-bar goal-bar--idle">
+        <button
+          type="button"
+          disabled={disabled}
+          onClick={() => {
+            const objective = window.prompt("目标说明");
+            if (objective?.trim()) void onCreate(objective.trim(), 100_000, 60 * 60 * 1000);
+          }}
+        >
+          <Target size={14} /> 创建 Goal
+        </button>
+        {goal?.state === "budget_exhausted" && <span>预算已耗尽</span>}
+      </div>
+    );
+  }
+  const percent = Math.min(100, Math.round((goal.tokensUsed / goal.tokenBudget) * 100));
+  return (
+    <div className="goal-bar">
+      <Target size={14} />
+      <div className="goal-copy">
+        <strong title={goal.objective}>{goal.objective}</strong>
+        <span>{goal.state === "active" ? "运行中" : goal.state === "paused" ? "已暂停" : "已阻塞"} · {goal.tokensUsed.toLocaleString()} / {goal.tokenBudget.toLocaleString()} tokens</span>
+      </div>
+      <div className="goal-progress" aria-label={`Goal 预算已使用 ${percent}%`}><span style={{ width: `${percent}%` }} /></div>
+      {goal.state === "active" ? (
+        <button type="button" title="暂停 Goal" aria-label="暂停 Goal" disabled={disabled} onClick={() => void onTransition("paused")}><Pause size={14} /></button>
+      ) : (
+        <button type="button" title="继续 Goal" aria-label="继续 Goal" disabled={disabled} onClick={() => void onTransition("active")}><Play size={14} /></button>
+      )}
+      <button type="button" title="完成 Goal" aria-label="完成 Goal" disabled={disabled} onClick={() => void onTransition("completed")}><CircleCheck size={14} /></button>
+    </div>
   );
 }
 

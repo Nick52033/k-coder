@@ -1,0 +1,38 @@
+[
+  {
+    "name": "repository-search-before-edit",
+    "task": "Find the provider configuration and explain its validation boundary.",
+    "providerEvents": [
+      { "type": "tool_call", "name": "search_repository" },
+      { "type": "tool_call", "name": "read_file" },
+      { "type": "text", "value": "The provider configuration is validated before persistence." },
+      { "type": "completed" }
+    ],
+    "expectedTools": ["search_repository", "read_file"],
+    "expectedCompletion": "The provider configuration is validated before persistence."
+  },
+  {
+    "name": "plan-lifecycle",
+    "task": "Plan and implement a bounded two-file change.",
+    "providerEvents": [
+      { "type": "tool_call", "name": "update_plan" },
+      { "type": "tool_call", "name": "apply_patch" },
+      { "type": "tool_call", "name": "update_plan" },
+      { "type": "text", "value": "The planned change is complete." },
+      { "type": "completed" }
+    ],
+    "expectedTools": ["update_plan", "apply_patch", "update_plan"],
+    "expectedCompletion": "The planned change is complete."
+  },
+  {
+    "name": "goal-blocked",
+    "task": "Complete the task or report the deterministic blocker.",
+    "providerEvents": [
+      { "type": "tool_call", "name": "update_goal" },
+      { "type": "text", "value": "The goal is blocked by a missing external credential." },
+      { "type": "completed" }
+    ],
+    "expectedTools": ["update_goal"],
+    "expectedCompletion": "The goal is blocked by a missing external credential."
+  }
+]

@@ -1,0 +1,572 @@
+/* ═══════════════════════════════════════════════════════════
+   Enhanced Animations & Interactions
+   基于 emil-design-eng 原则的动画增强
+   添加到 App.css 或作为独立文件导入
+   ═══════════════════════════════════════════════════════════ */
+
+/* ── 全局动画变量 ── */
+:root {
+  /* 使用 expo.out 缓动 - Emil 推荐 */
+  --ease-out-expo: cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-in-out-expo: cubic-bezier(0.77, 0, 0.175, 1);
+
+  /* 动画时长 - UI 元素保持 150-300ms */
+  --duration-fast: 150ms;
+  --duration-base: 200ms;
+  --duration-modal: 250ms;
+  --duration-slow: 300ms;
+
+  /* 按压缩放值 */
+  --scale-press: 0.97;
+
+  /* 悬停提升距离 */
+  --lift-sm: -1px;
+  --lift-md: -2px;
+  --lift-lg: -4px;
+}
+
+/* ── 通用交互类 ── */
+
+/* 所有可点击元素添加 cursor */
+button,
+[role="button"],
+.clickable {
+  cursor: pointer;
+}
+
+/* 按压反馈 - Emil 原则：所有可按压元素 */
+.pressable {
+  transition: transform var(--duration-fast) var(--ease-out-expo);
+}
+
+.pressable:active:not(:disabled) {
+  transform: scale(var(--scale-press));
+}
+
+/* 悬停提升效果 */
+.hoverable {
+  transition: all var(--duration-base) var(--ease-out-expo);
+}
+
+.hoverable:hover:not(:disabled) {
+  transform: translateY(var(--lift-md));
+}
+
+/* ── 改进现有动画 ── */
+
+/* 模态框进入动画优化 */
+@keyframes modal-enter {
+  from {
+    opacity: 0;
+    transform: scale(0.95); /* 从 0.95 开始，不是 0.96 或 0 */
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+/* 模态框背景增加模糊 */
+.modal-backdrop {
+  animation: modal-backdrop-enter var(--duration-modal) var(--ease-out-expo);
+  backdrop-filter: blur(4px);
+}
+
+@keyframes modal-backdrop-enter {
+  from {
+    opacity: 0;
+    backdrop-filter: blur(0);
+  }
+  to {
+    opacity: 1;
+    backdrop-filter: blur(4px);
+  }
+}
+
+/* 消息进入动画改进 */
+@keyframes message-enter {
+  from {
+    opacity: 0;
+    transform: translateY(12px) scale(0.95); /* 添加缩放 */
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+/* ── Toast 通知增强 ── */
+.toast {
+  animation: toast-slide-in var(--duration-slow) var(--ease-out-expo);
+}
+
+@keyframes toast-slide-in {
+  from {
+    opacity: 0;
+    transform: translateX(100%);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+/* Toast 退出动画 */
+.toast--exiting {
+  animation: toast-slide-out var(--duration-base) var(--ease-out-expo) forwards;
+}
+
+@keyframes toast-slide-out {
+  from {
+    opacity: 1;
+    transform: translateX(0) scale(1);
+  }
+  to {
+    opacity: 0;
+    transform: translateX(100%) scale(0.9);
+  }
+}
+
+/* ── 设置对话框特定增强 ── */
+
+/* 导航项改进 */
+.settings-nav-item {
+  position: relative;
+  transition: all var(--duration-base) var(--ease-out-expo);
+}
+
+.settings-nav-item:hover:not(.settings-nav-item--active) {
+  background: var(--color-surface-hover);
+  transform: translateX(3px);
+}
+
+.settings-nav-item:active {
+  transform: scale(0.97);
+}
+
+/* 活动状态左侧指示器 */
+.settings-nav-item--active::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 3px;
+  background: var(--color-brand);
+  border-radius: 0 2px 2px 0;
+  transition: width var(--duration-base) var(--ease-out-expo);
+}
+
+.settings-nav-item--active:hover::before {
+  width: 5px;
+}
+
+/* 图标动画 */
+.settings-nav-item svg {
+  transition: transform var(--duration-base) var(--ease-out-expo);
+}
+
+.settings-nav-item:hover svg {
+  transform: scale(1.1);
+}
+
+/* ── 表单元素增强 ── */
+
+/* 输入框焦点状态 */
+input:not([type="checkbox"]):not([type="radio"]),
+select,
+textarea {
+  transition: all var(--duration-base) var(--ease-out-expo);
+}
+
+input:focus:not([type="checkbox"]):not([type="radio"]),
+select:focus,
+textarea:focus {
+  border-color: var(--color-brand);
+  box-shadow: 0 0 0 3px var(--color-brand-ring);
+  transform: translateY(-1px);
+}
+
+/* 成功状态脉动 */
+.input--success {
+  animation: success-pulse 600ms ease-out;
+}
+
+@keyframes success-pulse {
+  0% {
+    box-shadow: 0 0 0 0 rgba(44, 155, 112, 0.4);
+  }
+  100% {
+    box-shadow: 0 0 0 8px rgba(44, 155, 112, 0);
+  }
+}
+
+/* ── 按钮增强 ── */
+
+/* 主按钮 */
+.primary-button,
+.settings-command {
+  position: relative;
+  transition: all 160ms var(--ease-out-expo);
+}
+
+.primary-button:hover:not(:disabled),
+.settings-command:hover:not(:disabled) {
+  transform: translateY(-2px);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+}
+
+.primary-button:active:not(:disabled),
+.settings-command:active:not(:disabled) {
+  transform: scale(0.97);
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.1);
+}
+
+/* 次要按钮 */
+.secondary-button {
+  transition: all 160ms var(--ease-out-expo);
+}
+
+.secondary-button:hover:not(:disabled) {
+  background: var(--color-surface-hover);
+  transform: translateY(-1px);
+}
+
+.secondary-button:active:not(:disabled) {
+  transform: scale(0.97);
+}
+
+/* 图标按钮 */
+.icon-button {
+  transition: all 160ms var(--ease-out-expo);
+}
+
+.icon-button:hover:not(:disabled) {
+  background: var(--color-surface-hover);
+  transform: scale(1.1);
+}
+
+.icon-button:active:not(:disabled) {
+  transform: scale(0.95);
+}
+
+/* ── 皮肤卡片增强 ── */
+.skin-card {
+  transition: all var(--duration-base) var(--ease-out-expo);
+  position: relative;
+}
+
+.skin-card:hover {
+  transform: translateY(-4px);
+  box-shadow: 0 8px 20px rgba(0, 0, 0, 0.12);
+}
+
+.skin-card:active {
+  transform: scale(0.97);
+}
+
+/* 选中状态 */
+.skin-card--active {
+  box-shadow: 0 0 0 3px var(--color-brand-ring),
+              0 4px 12px rgba(0, 0, 0, 0.1);
+}
+
+/* 选中指示器 */
+.skin-card--active::after {
+  content: '✓';
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  width: 24px;
+  height: 24px;
+  display: grid;
+  place-items: center;
+  background: var(--color-brand);
+  color: white;
+  border-radius: 50%;
+  font-size: 13px;
+  font-weight: 700;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
+  animation: checkmark-pop 400ms var(--ease-out-expo);
+}
+
+@keyframes checkmark-pop {
+  0% {
+    transform: scale(0) rotate(-45deg);
+    opacity: 0;
+  }
+  50% {
+    transform: scale(1.15) rotate(5deg);
+  }
+  100% {
+    transform: scale(1) rotate(0);
+    opacity: 1;
+  }
+}
+
+/* 颜色预览球 */
+.skin-card__preview {
+  transition: transform var(--duration-slow) var(--ease-out-expo);
+}
+
+.skin-card:hover .skin-card__preview {
+  transform: scale(1.15) rotate(8deg);
+}
+
+/* ── 聊天界面增强 ── */
+
+/* 消息输入容器 */
+.message-input-container {
+  transition: all var(--duration-base) var(--ease-out-expo);
+}
+
+.message-input-container:focus-within {
+  box-shadow: 0 0 0 3px var(--color-brand-ring),
+              0 4px 12px rgba(0, 0, 0, 0.08);
+}
+
+/* 发送按钮状态 */
+.send-button {
+  transition: all 160ms var(--ease-out-expo);
+}
+
+.send-button:hover:not(:disabled) {
+  transform: translateY(-2px) scale(1.05);
+}
+
+.send-button:active:not(:disabled) {
+  transform: scale(0.95);
+}
+
+/* 发送动画 */
+.send-button--sending svg {
+  animation: send-arrow 600ms var(--ease-out-expo);
+}
+
+@keyframes send-arrow {
+  0% {
+    transform: translateX(0) translateY(0);
+  }
+  50% {
+    transform: translateX(4px) translateY(-4px);
+  }
+  100% {
+    transform: translateX(0) translateY(0);
+  }
+}
+
+/* ── 消息列表 stagger 动画 ── */
+.message-item {
+  animation: message-enter var(--duration-slow) var(--ease-out-expo) backwards;
+}
+
+/* 为最近的消息添加延迟 */
+.message-item:nth-last-child(1) { animation-delay: 0ms; }
+.message-item:nth-last-child(2) { animation-delay: 50ms; }
+.message-item:nth-last-child(3) { animation-delay: 100ms; }
+.message-item:nth-last-child(4) { animation-delay: 150ms; }
+.message-item:nth-last-child(5) { animation-delay: 200ms; }
+
+/* ── AI 思考指示器 ── */
+.thinking-indicator {
+  display: flex;
+  gap: 6px;
+  padding: 12px 16px;
+}
+
+.thinking-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--color-brand);
+  animation: thinking-pulse 1.4s ease-in-out infinite;
+}
+
+.thinking-dot:nth-child(2) { animation-delay: 0.2s; }
+.thinking-dot:nth-child(3) { animation-delay: 0.4s; }
+
+@keyframes thinking-pulse {
+  0%, 60%, 100% {
+    transform: scale(1);
+    opacity: 0.5;
+  }
+  30% {
+    transform: scale(1.2);
+    opacity: 1;
+  }
+}
+
+/* ── 扩展列表 stagger ── */
+.extension-row {
+  animation: extension-enter var(--duration-slow) var(--ease-out-expo) backwards;
+  transition: all var(--duration-base) var(--ease-out-expo);
+}
+
+.extension-row:nth-child(1) { animation-delay: 0ms; }
+.extension-row:nth-child(2) { animation-delay: 50ms; }
+.extension-row:nth-child(3) { animation-delay: 100ms; }
+.extension-row:nth-child(4) { animation-delay: 150ms; }
+.extension-row:nth-child(5) { animation-delay: 200ms; }
+
+@keyframes extension-enter {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.extension-row:hover {
+  background: var(--color-surface-hover);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.04);
+  transform: translateX(2px);
+}
+
+/* ── 状态指示器动画 ── */
+
+/* 成功状态 */
+.status--success {
+  animation: status-fade-in var(--duration-slow) var(--ease-out-expo);
+}
+
+@keyframes status-fade-in {
+  from {
+    opacity: 0;
+    transform: translateX(-8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+/* 脉动效果 */
+.pulse {
+  animation: pulse 2s ease-in-out infinite;
+}
+
+@keyframes pulse {
+  0%, 100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.5;
+  }
+}
+
+/* 旋转加载 */
+.spin {
+  animation: spin 1s linear infinite;
+}
+
+@keyframes spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* ── 错误抖动 ── */
+.shake {
+  animation: shake 400ms var(--ease-out-expo);
+}
+
+@keyframes shake {
+  0%, 100% {
+    transform: translateX(0);
+  }
+  25% {
+    transform: translateX(-4px);
+  }
+  75% {
+    transform: translateX(4px);
+  }
+}
+
+/* ── 响应式调整 ── */
+@media (max-width: 768px) {
+  /* 移动端减少动画距离 */
+  :root {
+    --lift-sm: 0;
+    --lift-md: -1px;
+    --lift-lg: -2px;
+  }
+
+  /* 设置对话框从底部滑入 */
+  .settings-dialog {
+    animation: modal-slide-up var(--duration-slow) var(--ease-out-expo);
+  }
+
+  @keyframes modal-slide-up {
+    from {
+      transform: translateY(100%);
+    }
+    to {
+      transform: translateY(0);
+    }
+  }
+
+  /* 增大触摸目标 */
+  .settings-nav-item,
+  button,
+  .icon-button {
+    min-height: 44px;
+  }
+}
+
+/* ── 深色模式调整 ── */
+[data-theme="dark"] {
+  /* 增强阴影 */
+  .hoverable:hover {
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.3);
+  }
+
+  /* 调整发光效果 */
+  input:focus:not([type="checkbox"]):not([type="radio"]),
+  select:focus,
+  textarea:focus {
+    box-shadow: 0 0 0 3px var(--color-brand-ring),
+                0 0 20px rgba(47, 184, 128, 0.15);
+  }
+}
+
+/* ── 可访问性：减少动画 ── */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+
+  /* 保留按压反馈但移除时长 */
+  .pressable:active,
+  button:active,
+  .icon-button:active {
+    transition: none;
+  }
+}
+
+/* ── 高对比度模式 ── */
+@media (prefers-contrast: high) {
+  /* 增强边框 */
+  button,
+  input,
+  select,
+  textarea {
+    border-width: 2px;
+  }
+
+  /* 增强焦点指示器 */
+  :focus-visible {
+    outline: 3px solid currentColor;
+    outline-offset: 2px;
+  }
+}
