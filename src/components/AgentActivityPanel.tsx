@@ -2,15 +2,17 @@ import { FormEvent, useEffect, useMemo, useState } from "react";
 import {
   Bot,
   CheckCircle2,
-  Clock3,
+  Clock,
   Loader2,
-  MessageSquareMore,
+  Pause,
   Play,
   RotateCcw,
-  Send,
   Square,
+  Timer,
   X,
   XCircle,
+  ChevronDown,
+  ChevronRight,
 } from "lucide-react";
 import {
   closeSubagent,
@@ -18,7 +20,6 @@ import {
   errorMessage,
   listSubagents,
   resumeSubagent,
-  sendSubagentMessage,
   subscribeToSubagentEvents,
 } from "../api/runtime";
 import { cn } from "../lib/cn";
@@ -38,8 +39,8 @@ export function AgentActivityPanel({ open, parentThreadId, onClose }: AgentActiv
   const [allowEdits, setAllowEdits] = useState(false);
   const [allowCommands, setAllowCommands] = useState(false);
   const [creating, setCreating] = useState(false);
-  const [selectedId, setSelectedId] = useState<string | null>(null);
-  const [followup, setFollowup] = useState("");
+  const [showCreateForm, setShowCreateForm] = useState(false);
+  const [expandedId, setExpandedId] = useState<string | null>(null);
   const [error, setError] = useState("");
 
   useEffect(() => {
@@ -59,9 +60,19 @@ export function AgentActivityPanel({ open, parentThreadId, onClose }: AgentActiv
       .catch((reason) => setError(errorMessage(reason)));
   }, [open, parentThreadId]);
 
-  const selected = useMemo(
-    () => agents.find((agent) => agent.id === selectedId) ?? agents[0] ?? null,
-    [agents, selectedId],
+  useEffect(() => {
+    function handleKeyDown(event: globalThis.KeyboardEvent) {
+      if (event.key === "Escape") onClose();
+    }
+    if (open) {
+      window.addEventListener("keydown", handleKeyDown);
+      return () => window.removeEventListener("keydown", handleKeyDown);
+    }
+  }, [open, onClose]);
+
+  const runningCount = useMemo(
+    () => agents.filter((agent) => activeStates.has(agent.state)).length,
+    [agents],
   );
 
   async function handleCreate(event: FormEvent) {
@@ -80,8 +91,10 @@ export function AgentActivityPanel({ open, parentThreadId, onClose }: AgentActiv
         timeoutMs: 600_000,
       });
       setAgents((current) => sortAgents(upsert(current, created)));
-      setSelectedId(created.id);
       setTask("");
+      setAllowEdits(false);
+      setAllowCommands(false);
+      setShowCreateForm(false);
       setError("");
     } catch (reason) {
       setError(errorMessage(reason));
@@ -105,69 +118,247 @@ export function AgentActivityPanel({ open, parentThreadId, onClose }: AgentActiv
     } catch (reason) { setError(errorMessage(reason)); }
   }
 
-  async function sendFollowup(event: FormEvent) {
-    event.preventDefault();
-    if (!selected || !followup.trim()) return;
-    try {
-      const updated = await sendSubagentMessage(selected.id, followup.trim());
-      setAgents((current) => sortAgents(upsert(current, updated)));
-      setFollowup("");
-      setError("");
-    } catch (reason) { setError(errorMessage(reason)); }
+  function toggleExpand(agentId: string) {
+    setExpandedId((current) => current === agentId ? null : agentId);
   }
 
   if (!open) return null;
+
   return (
-    <aside className="agent-panel" aria-label="多智能体活动">
-      <header className="agent-panel-header">
-        <div><Bot size={17} /><strong>子智能体</strong><span>{agents.filter((agent) => activeStates.has(agent.state)).length} 运行中</span></div>
-        <button className="icon-button" type="button" onClick={onClose} aria-label="关闭子智能体面板" title="关闭"><X size={16} /></button>
-      </header>
-
-      <form className="agent-create" onSubmit={handleCreate}>
-        <textarea aria-label="子任务" rows={3} value={task} onChange={(event) => setTask(event.target.value)} placeholder="输入独立子任务" disabled={!parentThreadId || creating} />
-        <div className="agent-capabilities">
-          <label><input type="checkbox" checked={allowEdits} onChange={(event) => setAllowEdits(event.target.checked)} />编辑</label>
-          <label><input type="checkbox" checked={allowCommands} onChange={(event) => setAllowCommands(event.target.checked)} />命令</label>
-          <button type="submit" disabled={!parentThreadId || !task.trim() || creating}>
-            {creating ? <Loader2 className="spin" size={14} /> : <Play size={14} fill="currentColor" />}启动
+    <div
+      className="modal-backdrop"
+      role="presentation"
+      onMouseDown={(event) => event.target === event.currentTarget && onClose()}
+    >
+      <section
+        className="agent-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="agent-dialog-title"
+      >
+        <header className="agent-dialog-header">
+          <div className="agent-dialog-title">
+            <Bot size={18} />
+            <h2 id="agent-dialog-title">子智能体</h2>
+            {runningCount > 0 && <span className="agent-count-badge">{runningCount} 运行中</span>}
+          </div>
+          <button
+            className="icon-button"
+            type="button"
+            onClick={onClose}
+            aria-label="关闭子智能体面板"
+            title="关闭"
+          >
+            <X size={16} />
           </button>
+        </header>
+
+        <div className="agent-dialog-body">
+          <div className="agent-quick-actions">
+            {!showCreateForm ? (
+              <button
+                className="agent-create-button"
+                type="button"
+                onClick={() => setShowCreateForm(true)}
+                disabled={!parentThreadId}
+              >
+                <Play size={14} fill="currentColor" />
+                创建新任务
+              </button>
+            ) : (
+              <form className="agent-create-form" onSubmit={handleCreate}>
+                <textarea
+                  aria-label="子任务描述"
+                  rows={3}
+                  value={task}
+                  onChange={(event) => setTask(event.target.value)}
+                  placeholder="描述需要并行执行的子任务..."
+                  disabled={creating}
+                  autoFocus
+                />
+                <div className="agent-create-options">
+                  <div className="agent-capabilities">
+                    <label>
+                      <input
+                        type="checkbox"
+                        checked={allowEdits}
+                        onChange={(event) => setAllowEdits(event.target.checked)}
+                      />
+                      <span>编辑权限</span>
+                    </label>
+                    <label>
+                      <input
+                        type="checkbox"
+                        checked={allowCommands}
+                        onChange={(event) => setAllowCommands(event.target.checked)}
+                      />
+                      <span>命令权限</span>
+                    </label>
+                  </div>
+                  <div className="agent-create-actions">
+                    <button
+                      type="button"
+                      className="agent-button agent-button--secondary"
+                      onClick={() => { setShowCreateForm(false); setTask(""); setAllowEdits(false); setAllowCommands(false); }}
+                      disabled={creating}
+                    >
+                      取消
+                    </button>
+                    <button
+                      type="submit"
+                      className="agent-button agent-button--primary"
+                      disabled={!task.trim() || creating}
+                    >
+                      {creating ? <Loader2 className="spin" size={14} /> : <Play size={14} fill="currentColor" />}
+                      启动
+                    </button>
+                  </div>
+                </div>
+              </form>
+            )}
+          </div>
+
+          {error && <div className="agent-error" role="alert">{String(error)}</div>}
+
+          <div className="agent-list">
+            {agents.length === 0 && (
+              <div className="agent-empty">
+                <Bot size={32} className="agent-empty-icon" />
+                <strong>暂无子任务</strong>
+                <p>创建子任务来并行处理工作<br />每个任务独立运行，互不干扰</p>
+                {!showCreateForm && (
+                  <button
+                    className="agent-button agent-button--primary"
+                    type="button"
+                    onClick={() => setShowCreateForm(true)}
+                    disabled={!parentThreadId}
+                  >
+                    <Play size={14} fill="currentColor" />
+                    创建第一个任务
+                  </button>
+                )}
+              </div>
+            )}
+
+            {agents.map((agent) => (
+              <AgentCard
+                key={agent.id}
+                agent={agent}
+                expanded={expandedId === agent.id}
+                onToggleExpand={() => toggleExpand(agent.id)}
+                onStop={() => void stop(agent)}
+                onResume={() => void resume(agent)}
+              />
+            ))}
+          </div>
         </div>
-      </form>
+      </section>
+    </div>
+  );
+}
 
-      {error && <div className="agent-error" role="alert">{error}</div>}
-      <div className="agent-list">
-        {agents.length === 0 && <div className="agent-empty"><Bot size={20} /><span>暂无子任务</span></div>}
-        {agents.map((agent) => (
-          <button key={agent.id} className={cn("agent-row", selected?.id === agent.id && "agent-row--selected")} type="button" onClick={() => setSelectedId(agent.id)}>
-            <StateIcon state={agent.state} />
-            <span><strong>{agent.label}</strong><small>{stateLabel(agent.state)} · {agent.tokensUsed}/{agent.tokenBudget} tokens</small></span>
-          </button>
-        ))}
-      </div>
+interface AgentCardProps {
+  agent: SubagentView;
+  expanded: boolean;
+  onToggleExpand: () => void;
+  onStop: () => void;
+  onResume: () => void;
+}
 
-      {selected && (
-        <section className="agent-detail">
-          <div className="agent-detail-heading"><strong>{selected.label}</strong><span>{selected.capabilities.join(" · ")}</span></div>
-          <p className="agent-task">{selected.task}</p>
-          {selected.summary && <div className="agent-summary">{selected.summary}</div>}
-          {selected.error && <div className="agent-error">{selected.error}</div>}
-          <div className="agent-detail-actions">
-            {activeStates.has(selected.state) ? (
-              <button type="button" onClick={() => void stop(selected)}><Square size={13} fill="currentColor" />停止</button>
-            ) : ["failed", "cancelled", "timed_out"].includes(selected.state) ? (
-              <button type="button" onClick={() => void resume(selected)}><RotateCcw size={14} />恢复</button>
+function AgentCard({ agent, expanded, onToggleExpand, onStop, onResume }: AgentCardProps) {
+  const statusInfo = getStatusInfo(agent.state);
+  const progress = agent.tokenBudget > 0 ? (agent.tokensUsed / agent.tokenBudget) * 100 : 0;
+
+  return (
+    <div className={cn("agent-card", `agent-card--${agent.state}`)}>
+      <button
+        className="agent-card-header"
+        type="button"
+        onClick={onToggleExpand}
+        aria-expanded={expanded}
+      >
+        <div className="agent-card-status">
+          <statusInfo.Icon
+            size={16}
+            className={cn("agent-status-icon", statusInfo.spinning && "spin")}
+            style={{ color: statusInfo.color }}
+          />
+          <div className="agent-card-info">
+            <strong className="agent-card-label">{String(agent.label)}</strong>
+            <span className="agent-card-meta">
+              {statusInfo.label} · {agent.tokensUsed.toLocaleString()}/{agent.tokenBudget.toLocaleString()} tokens
+            </span>
+          </div>
+        </div>
+        <div className="agent-card-expand">
+          {expanded ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
+        </div>
+      </button>
+
+      {agent.tokenBudget > 0 && (
+        <div className="agent-progress-container">
+          <div className="agent-progress-bar">
+            <div
+              className="agent-progress-fill"
+              style={{
+                width: `${Math.min(progress, 100)}%`,
+                backgroundColor: statusInfo.color
+              }}
+            />
+          </div>
+          <span className="agent-progress-text">{Math.round(progress)}%</span>
+        </div>
+      )}
+
+      {expanded && (
+        <div className="agent-card-details">
+          <div className="agent-detail-section">
+            <h4>📝 任务描述</h4>
+            <p className="agent-task-text">{agent.task}</p>
+          </div>
+
+          <div className="agent-detail-section">
+            <h4>📊 执行信息</h4>
+            <dl className="agent-info-list">
+              <dt>权限</dt>
+              <dd>{Array.isArray(agent.capabilities) ? agent.capabilities.join(" · ") : String(agent.capabilities)}</dd>
+              <dt>已用 Token</dt>
+              <dd>{agent.tokensUsed.toLocaleString()} / {agent.tokenBudget.toLocaleString()}</dd>
+              <dt>创建时间</dt>
+              <dd>{new Date(agent.createdAtMs).toLocaleTimeString()}</dd>
+            </dl>
+          </div>
+
+          {agent.summary && (
+            <div className="agent-detail-section">
+              <h4>💬 执行摘要</h4>
+              <p className="agent-summary-text">{agent.summary}</p>
+            </div>
+          )}
+
+          {agent.error && (
+            <div className="agent-detail-section agent-detail-section--error">
+              <h4>⚠️ 错误信息</h4>
+              <p className="agent-error-text">{agent.error}</p>
+            </div>
+          )}
+
+          <div className="agent-card-actions">
+            {activeStates.has(agent.state) ? (
+              <button className="agent-button agent-button--danger" type="button" onClick={onStop}>
+                <Square size={13} fill="currentColor" />
+                停止
+              </button>
+            ) : ["failed", "cancelled", "timed_out"].includes(agent.state) ? (
+              <button className="agent-button agent-button--secondary" type="button" onClick={onResume}>
+                <RotateCcw size={14} />
+                恢复
+              </button>
             ) : null}
           </div>
-          {!activeStates.has(selected.state) && (
-            <form className="agent-followup" onSubmit={sendFollowup}>
-              <input aria-label="发送子智能体消息" value={followup} onChange={(event) => setFollowup(event.target.value)} placeholder="继续这个子任务" />
-              <button type="submit" disabled={!followup.trim()} aria-label="发送" title="发送"><Send size={14} /></button>
-            </form>
-          )}
-        </section>
+        </div>
       )}
-    </aside>
+    </div>
   );
 }
 
@@ -175,13 +366,56 @@ function upsert(agents: SubagentView[], incoming: SubagentView) {
   const existing = agents.some((agent) => agent.id === incoming.id);
   return existing ? agents.map((agent) => agent.id === incoming.id ? incoming : agent) : [incoming, ...agents];
 }
-function sortAgents(agents: SubagentView[]) { return [...agents].sort((a, b) => b.updatedAtMs - a.updatedAtMs); }
-function stateLabel(state: SubagentState) {
-  return { queued: "排队", running: "运行中", blocked: "等待审批", completed: "已完成", failed: "失败", cancelled: "已取消", timed_out: "已超时" }[state];
+
+function sortAgents(agents: SubagentView[]) {
+  return [...agents].sort((a, b) => b.updatedAtMs - a.updatedAtMs);
 }
-function StateIcon({ state }: { state: SubagentState }) {
-  if (state === "completed") return <CheckCircle2 className="agent-state agent-state--success" size={16} />;
-  if (["failed", "cancelled", "timed_out"].includes(state)) return <XCircle className="agent-state agent-state--error" size={16} />;
-  if (state === "blocked") return <Clock3 className="agent-state agent-state--blocked" size={16} />;
-  return state === "running" ? <Loader2 className="agent-state spin" size={16} /> : <MessageSquareMore className="agent-state" size={16} />;
+
+function getStatusInfo(state: SubagentState) {
+  const statusMap = {
+    queued: {
+      label: "排队中",
+      Icon: Clock,
+      color: "#3B82F6",
+      spinning: false
+    },
+    running: {
+      label: "运行中",
+      Icon: Loader2,
+      color: "#22C55E",
+      spinning: true
+    },
+    blocked: {
+      label: "等待审批",
+      Icon: Pause,
+      color: "#F59E0B",
+      spinning: false
+    },
+    completed: {
+      label: "已完成",
+      Icon: CheckCircle2,
+      color: "#10B981",
+      spinning: false
+    },
+    failed: {
+      label: "失败",
+      Icon: XCircle,
+      color: "#EF4444",
+      spinning: false
+    },
+    cancelled: {
+      label: "已取消",
+      Icon: XCircle,
+      color: "#6B7280",
+      spinning: false
+    },
+    timed_out: {
+      label: "已超时",
+      Icon: Timer,
+      color: "#F97316",
+      spinning: false
+    },
+  };
+
+  return statusMap[state] || statusMap.queued;
 }

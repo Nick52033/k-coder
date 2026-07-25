@@ -22,9 +22,9 @@ use crate::protocol::{MessageRole, TokenUsage, ToolCall, ToolDefinition};
 
 pub use anthropic::AnthropicMessagesProvider;
 pub use config::{
-    DEFAULT_MODEL_CONTEXT_WINDOW, ProviderConfig, ProviderConfigError, ProviderConfigStore,
-    ProviderConfigView, ProviderEndpointConfig, ProviderKind, ProviderModelConfig,
-    ProviderTransport, SaveProviderConfigRequest,
+    DEFAULT_MODEL_CONTEXT_WINDOW, ProviderCatalogView, ProviderConfig, ProviderConfigError,
+    ProviderConfigStore, ProviderConfigView, ProviderEndpointConfig, ProviderKind,
+    ProviderModelConfig, ProviderTransport, SaveProviderConfigRequest,
 };
 pub use credentials::{CredentialError, CredentialStore, OsCredentialStore};
 pub use fallback::{FallbackProvider, FallbackTarget};

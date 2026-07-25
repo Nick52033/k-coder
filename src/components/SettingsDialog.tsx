@@ -39,7 +39,6 @@ import {
   Workflow,
   X,
   Plus,
-  Star,
   MoreVertical,
   Edit3,
   Trash2,
@@ -75,6 +74,22 @@ interface ProviderItem {
   transport: ProviderTransport;
   hasApiKey: boolean;
   isDefault: boolean;
+  isDraft: boolean;
+}
+
+function providerItemFromView(provider: ProviderConfigView, activeProviderId: string | null): ProviderItem {
+  return {
+    id: provider.id,
+    name: provider.name,
+    baseUrl: provider.baseUrl,
+    model: provider.model,
+    models: provider.models,
+    endpoints: provider.endpoints,
+    transport: provider.transport,
+    hasApiKey: provider.hasApiKey,
+    isDefault: provider.id === activeProviderId,
+    isDraft: false,
+  };
 }
 
 interface EditableProviderModel extends ProviderModelConfig {
@@ -89,7 +104,9 @@ function editableModel(model?: Partial<ProviderModelConfig>): EditableProviderMo
     key: `provider-model-${modelRowSequence}`,
     id: model?.id ?? "",
     displayName: model?.displayName ?? "",
-    contextWindow: model?.contextWindow ?? 128_000,
+    contextWindow: model?.contextWindow ?? 200_000,
+    maxOutputTokens: model?.maxOutputTokens,
+    supportsVision: model?.supportsVision ?? false,
     fallback: model?.fallback ?? false,
   };
 }
@@ -142,6 +159,8 @@ interface SettingsDefinition {
 
 interface SettingsDialogProps {
   provider: ProviderConfigView | null;
+  providers: ProviderConfigView[];
+  activeProviderId: string | null;
   error: string;
   skin: Skin;
   themeMode: ThemeMode;
@@ -149,6 +168,8 @@ interface SettingsDialogProps {
   onSetSkin: (skin: Skin) => void;
   onToggleTheme: () => void;
   onSaveProvider: (request: SaveProviderConfigRequest) => Promise<boolean>;
+  onActivateProvider: (providerId: string) => Promise<boolean>;
+  onDeleteProvider: (providerId: string) => Promise<boolean>;
 }
 
 const settingsDefinitions: SettingsDefinition[] = [
@@ -168,6 +189,8 @@ const settingsDefinitions: SettingsDefinition[] = [
 
 export function SettingsDialog({
   provider,
+  providers,
+  activeProviderId,
   error,
   skin,
   themeMode,
@@ -175,6 +198,8 @@ export function SettingsDialog({
   onSetSkin,
   onToggleTheme,
   onSaveProvider,
+  onActivateProvider,
+  onDeleteProvider,
 }: SettingsDialogProps) {
   const [section, setSection] = useState<SettingsSection>("providers");
 
@@ -248,8 +273,12 @@ export function SettingsDialog({
             {section === "providers" ? (
               <ProviderSettingsPage
                 provider={provider}
+                configuredProviders={providers}
+                activeProviderId={activeProviderId}
                 error={error}
                 onSave={onSaveProvider}
+                onActivate={onActivateProvider}
+                onDelete={onDeleteProvider}
               />
             ) : section === "appearance" ? (
               <AppearancePage
@@ -278,42 +307,34 @@ export function SettingsDialog({
 
 interface ProviderSettingsPageProps {
   provider: ProviderConfigView | null;
+  configuredProviders: ProviderConfigView[];
+  activeProviderId: string | null;
   error: string;
   onSave: (request: SaveProviderConfigRequest) => Promise<boolean>;
+  onActivate: (providerId: string) => Promise<boolean>;
+  onDelete: (providerId: string) => Promise<boolean>;
 }
 
-function ProviderSettingsPage({ provider, error, onSave }: ProviderSettingsPageProps) {
+function ProviderSettingsPage({
+  provider,
+  configuredProviders,
+  activeProviderId,
+  error,
+  onSave,
+  onActivate,
+  onDelete,
+}: ProviderSettingsPageProps) {
   const toast = useToast();
 
-  // 从 localStorage 加载供应商列表
   const [providers, setProviders] = useState<ProviderItem[]>(() => {
-    const stored = localStorage.getItem('k-coder-providers');
-    if (stored) {
-      try {
-        return JSON.parse(stored);
-      } catch {
-        // 解析失败
-      }
-    }
-    // 使用当前供应商初始化
-    if (provider) {
-      return [{
-        id: 'default',
-        name: provider.name,
-        baseUrl: provider.baseUrl,
-        model: provider.model,
-        models: provider.models,
-        endpoints: provider.endpoints,
-        transport: provider.transport,
-        hasApiKey: provider.hasApiKey,
-        isDefault: true,
-      }];
-    }
-    return [];
+    const runtimeProviders = configuredProviders.length > 0
+      ? configuredProviders
+      : provider ? [provider] : [];
+    return runtimeProviders.map((item) => providerItemFromView(item, activeProviderId));
   });
 
   const [selectedId, setSelectedId] = useState<string | null>(
-    providers.find(p => p.isDefault)?.id ?? providers[0]?.id ?? null
+    activeProviderId ?? providers[0]?.id ?? null
   );
   const [showMenu, setShowMenu] = useState<string | null>(null);
   const [showDeleteConfirm, setShowDeleteConfirm] = useState<string | null>(null);
@@ -322,14 +343,26 @@ function ProviderSettingsPage({ provider, error, onSave }: ProviderSettingsPageP
 
   const selectedProvider = providers.find(p => p.id === selectedId) ?? null;
 
-  // 保存到 localStorage
   useEffect(() => {
-    localStorage.setItem('k-coder-providers', JSON.stringify(providers));
-  }, [providers]);
+    const runtimeProviders = configuredProviders.length > 0
+      ? configuredProviders
+      : provider ? [provider] : [];
+    const runtimeIds = new Set(runtimeProviders.map((item) => item.id));
+    setProviders((current) => [
+      ...runtimeProviders.map((item) => providerItemFromView(item, activeProviderId)),
+      ...current.filter((item) => item.isDraft && !runtimeIds.has(item.id)),
+    ]);
+    setSelectedId((current) => {
+      if (current && (runtimeIds.has(current) || providers.some((item) => item.id === current))) {
+        return current;
+      }
+      return activeProviderId ?? runtimeProviders[0]?.id ?? null;
+    });
+  }, [activeProviderId, configuredProviders, provider]);
 
   function handleAddProvider() {
     const newProvider: ProviderItem = {
-      id: `provider-${Date.now()}`,
+      id: crypto.randomUUID(),
       name: "新供应商",
       baseUrl: DEFAULT_BASE_URL,
       model: "",
@@ -338,16 +371,22 @@ function ProviderSettingsPage({ provider, error, onSave }: ProviderSettingsPageP
       transport: "open_ai_chat_completions",
       hasApiKey: false,
       isDefault: providers.length === 0,
+      isDraft: true,
     };
     setProviders([...providers, newProvider]);
     setSelectedId(newProvider.id);
     toast.success("已添加新供应商");
   }
 
-  function handleSetDefault(id: string) {
+  async function handleSetDefault(id: string) {
+    const didActivate = await onActivate(id);
+    if (!didActivate) {
+      toast.error("切换失败，请先保存该供应商的 API Key");
+      return;
+    }
     setProviders(providers.map(p => ({ ...p, isDefault: p.id === id })));
     setShowMenu(null);
-    toast.success("已设为默认供应商");
+    toast.success("已切换当前供应商");
   }
 
   function handleStartRename(id: string, currentName: string) {
@@ -367,7 +406,12 @@ function ProviderSettingsPage({ provider, error, onSave }: ProviderSettingsPageP
     toast.success("已重命名");
   }
 
-  function handleDelete(id: string) {
+  async function handleDelete(id: string) {
+    const isPersisted = configuredProviders.some((item) => item.id === id);
+    if (isPersisted && !(await onDelete(id))) {
+      toast.error("删除供应商失败");
+      return;
+    }
     const filtered = providers.filter(p => p.id !== id);
     if (providers.find(p => p.id === id)?.isDefault && filtered.length > 0) {
       filtered[0].isDefault = true;
@@ -382,24 +426,25 @@ function ProviderSettingsPage({ provider, error, onSave }: ProviderSettingsPageP
   }
 
   async function handleSaveProvider(updatedProvider: ProviderItem, apiKey?: string) {
-    // 如果是默认供应商，同步到后端
-    if (updatedProvider.isDefault) {
-      const request: SaveProviderConfigRequest = {
-        kind: "open_ai_compatible",
-        transport: updatedProvider.transport,
-        name: updatedProvider.name,
-        baseUrl: updatedProvider.baseUrl,
-        model: updatedProvider.model,
-        models: updatedProvider.models,
-        endpoints: updatedProvider.endpoints,
-        ...(apiKey ? { apiKey } : {}),
-      };
-      const saved = await onSave(request);
-      if (saved) setProviders(providers.map(p => p.id === updatedProvider.id ? updatedProvider : p));
-      return saved;
+    const request: SaveProviderConfigRequest = {
+      id: updatedProvider.id,
+      kind: "open_ai_compatible",
+      transport: updatedProvider.transport,
+      name: updatedProvider.name,
+      baseUrl: updatedProvider.baseUrl,
+      model: updatedProvider.model,
+      models: updatedProvider.models,
+      endpoints: updatedProvider.endpoints,
+      activate: updatedProvider.isDefault,
+      ...(apiKey ? { apiKey } : {}),
+    };
+    const saved = await onSave(request);
+    if (saved) {
+      setProviders(providers.map(p => p.id === updatedProvider.id
+        ? { ...updatedProvider, hasApiKey: Boolean(apiKey) || updatedProvider.hasApiKey }
+        : p));
     }
-    setProviders(providers.map(p => p.id === updatedProvider.id ? updatedProvider : p));
-    return true;
+    return saved;
   }
 
   return (
@@ -456,7 +501,7 @@ function ProviderSettingsPage({ provider, error, onSave }: ProviderSettingsPageP
                       <strong>{p.name}</strong>
                       <small>{p.models.length > 0 ? `${p.models.length} 个模型` : "尚未配置"}</small>
                     </span>
-                    {p.isDefault && <Star size={14} fill="currentColor" className="provider-default-icon" />}
+                    {p.isDefault && <Check size={14} className="provider-default-icon" />}
                   </button>
                   <div className="provider-menu-wrapper">
                     <button
@@ -472,8 +517,8 @@ function ProviderSettingsPage({ provider, error, onSave }: ProviderSettingsPageP
                         <div className="provider-menu">
                           {!p.isDefault && (
                             <button type="button" onClick={() => handleSetDefault(p.id)}>
-                              <Star size={14} />
-                              <span>设为默认</span>
+                              <Check size={14} />
+                              <span>设为当前供应商</span>
                             </button>
                           )}
                           <button type="button" onClick={() => handleStartRename(p.id, p.name)}>
@@ -574,10 +619,12 @@ function ProviderEditor({ providerItem, error, onSave }: ProviderEditorProps) {
   const [testing, setTesting] = useState(false);
   const [testResult, setTestResult] = useState("");
 
-  const normalizedModels = models.map(({ id, displayName, contextWindow, fallback }) => ({
+  const normalizedModels = models.map(({ id, displayName, contextWindow, maxOutputTokens, supportsVision, fallback }) => ({
     id: id.trim(),
     displayName: displayName.trim(),
     contextWindow,
+    maxOutputTokens,
+    supportsVision,
     fallback,
   }));
   const modelIds = normalizedModels.map((model) => model.id).filter(Boolean);
@@ -651,7 +698,7 @@ function ProviderEditor({ providerItem, error, onSave }: ProviderEditorProps) {
           <div className="provider-name-row">
             <h4>{providerName || "未命名供应商"}</h4>
             <span className={`provider-health ${providerItem.hasApiKey ? "provider-health--ready" : ""}`}>
-              {providerItem.isDefault ? "默认" : "备用"}
+              {providerItem.isDefault ? "当前" : "可用"}
             </span>
           </div>
           <div className="provider-tags" aria-label="供应商能力">
@@ -706,72 +753,104 @@ function ProviderEditor({ providerItem, error, onSave }: ProviderEditorProps) {
             </button>
           </div>
           <div className="provider-model-list" role="list">
-            <div className="provider-model-columns" aria-hidden="true">
-              <span>默认</span>
-              <span>模型 ID</span>
-              <span>显示名称</span>
-              <span>上下文长度</span>
-              <span>故障切换</span>
-              <span>操作</span>
-            </div>
             {models.map((configuredModel, index) => (
-              <div className="provider-model-row" role="listitem" key={configuredModel.key}>
-                <label className="provider-model-default">
-                  <input
-                    type="radio"
-                    name="default-provider-model"
-                    checked={configuredModel.key === defaultModelKey}
-                    onChange={() => { setDefaultModelKey(configuredModel.key); markChanged(); }}
-                    aria-label={`设为默认模型：${configuredModel.displayName || configuredModel.id || index + 1}`}
-                  />
-                </label>
-                <input
-                  required
-                  maxLength={200}
-                  value={configuredModel.id}
-                  onChange={(event) => updateModel(configuredModel.key, { id: event.target.value })}
-                  placeholder="gpt-4o"
-                  aria-label={`模型 ID ${index + 1}`}
-                />
-                <input
-                  required
-                  maxLength={120}
-                  value={configuredModel.displayName}
-                  onChange={(event) => updateModel(configuredModel.key, { displayName: event.target.value })}
-                  placeholder="GPT-4o"
-                  aria-label={`显示名称 ${index + 1}`}
-                />
-                <div className="provider-context-input">
-                  <input
-                    type="number"
-                    required
-                    min={1_024}
-                    max={10_000_000}
-                    step={1}
-                    value={configuredModel.contextWindow || ""}
-                    onChange={(event) => updateModel(configuredModel.key, { contextWindow: Number(event.target.value) })}
-                    aria-label={`上下文长度 ${index + 1}`}
-                  />
-                  <span>tokens</span>
+              <div className="provider-model-card" key={configuredModel.key}>
+                <div className="provider-model-card-header">
+                  <label className="provider-model-default">
+                    <input
+                      type="radio"
+                      name="default-provider-model"
+                      checked={configuredModel.key === defaultModelKey}
+                      onChange={() => { setDefaultModelKey(configuredModel.key); markChanged(); }}
+                      aria-label={`设为默认模型：${configuredModel.displayName || configuredModel.id || index + 1}`}
+                    />
+                    <span className="default-badge">默认模型</span>
+                  </label>
+                  <div className="provider-model-actions">
+                    <label className="provider-model-option">
+                      <input
+                        type="checkbox"
+                        checked={configuredModel.supportsVision || false}
+                        onChange={(event) => updateModel(configuredModel.key, { supportsVision: event.target.checked })}
+                      />
+                      <span>支持图片</span>
+                    </label>
+                    <label className="provider-model-option">
+                      <input
+                        type="checkbox"
+                        checked={configuredModel.fallback}
+                        disabled={configuredModel.key === defaultModelKey}
+                        onChange={(event) => updateModel(configuredModel.key, { fallback: event.target.checked })}
+                      />
+                      <span>故障切换</span>
+                    </label>
+                    <button
+                      className="icon-button provider-model-delete"
+                      type="button"
+                      onClick={() => removeModel(configuredModel.key)}
+                      aria-label={`删除模型：${configuredModel.displayName || configuredModel.id || index + 1}`}
+                      title="删除模型"
+                    >
+                      <Trash2 size={16} />
+                    </button>
+                  </div>
                 </div>
-                <label className="provider-model-fallback">
-                  <input
-                    type="checkbox"
-                    checked={configuredModel.fallback}
-                    disabled={configuredModel.key === defaultModelKey}
-                    onChange={(event) => updateModel(configuredModel.key, { fallback: event.target.checked })}
-                  />
-                  <span>备用</span>
-                </label>
-                <button
-                  className="icon-button provider-model-delete"
-                  type="button"
-                  onClick={() => removeModel(configuredModel.key)}
-                  aria-label={`删除模型：${configuredModel.displayName || configuredModel.id || index + 1}`}
-                  title="删除模型"
-                >
-                  <Trash2 size={15} />
-                </button>
+                <div className="provider-model-card-body">
+                  <div className="provider-model-field">
+                    <label>模型 ID</label>
+                    <input
+                      required
+                      maxLength={200}
+                      value={configuredModel.id}
+                      onChange={(event) => updateModel(configuredModel.key, { id: event.target.value })}
+                      placeholder="claude-opus-4-8"
+                      aria-label={`模型 ID ${index + 1}`}
+                    />
+                  </div>
+                  <div className="provider-model-field">
+                    <label>显示名称</label>
+                    <input
+                      required
+                      maxLength={120}
+                      value={configuredModel.displayName}
+                      onChange={(event) => updateModel(configuredModel.key, { displayName: event.target.value })}
+                      placeholder="Claude Opus 4.8"
+                      aria-label={`显示名称 ${index + 1}`}
+                    />
+                  </div>
+                  <div className="provider-model-field">
+                    <label>上下文长度</label>
+                    <div className="provider-model-input-with-unit">
+                      <input
+                        type="number"
+                        required
+                        min={1_024}
+                        max={10_000_000}
+                        step={1}
+                        value={configuredModel.contextWindow || ""}
+                        onChange={(event) => updateModel(configuredModel.key, { contextWindow: Number(event.target.value) })}
+                        aria-label={`上下文长度 ${index + 1}`}
+                      />
+                      <span className="unit">tokens</span>
+                    </div>
+                  </div>
+                  <div className="provider-model-field">
+                    <label>最大输出</label>
+                    <div className="provider-model-input-with-unit">
+                      <input
+                        type="number"
+                        min={1_024}
+                        max={10_000_000}
+                        step={1}
+                        value={configuredModel.maxOutputTokens || ""}
+                        onChange={(event) => updateModel(configuredModel.key, { maxOutputTokens: event.target.value ? Number(event.target.value) : undefined })}
+                        placeholder="16384"
+                        aria-label={`最大输出 ${index + 1}`}
+                      />
+                      <span className="unit">tokens</span>
+                    </div>
+                  </div>
+                </div>
               </div>
             ))}
             {models.length === 0 && <div className="provider-model-empty">还没有模型</div>}
@@ -824,7 +903,7 @@ function ProviderEditor({ providerItem, error, onSave }: ProviderEditorProps) {
           onClick={() => {
             setTesting(true);
             setTestResult("");
-            void testProviderConnection().then((result) => {
+            void testProviderConnection(providerItem.id).then((result) => {
               setTestResult(`连接正常 · ${result.latencyMs} ms`);
               toast.success(`连接正常 · ${result.latencyMs} ms`);
             }).catch((reason) => {

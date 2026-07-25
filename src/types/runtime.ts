@@ -296,6 +296,8 @@ export interface ProviderModelConfig {
   id: string;
   displayName: string;
   contextWindow: number;
+  maxOutputTokens?: number;
+  supportsVision?: boolean;
   fallback: boolean;
 }
 
@@ -308,6 +310,7 @@ export interface ProviderEndpointConfig {
 
 export interface ProviderConfigView {
   schemaVersion: number;
+  id: string;
   kind: ProviderKind;
   transport: ProviderTransport;
   name: string;
@@ -318,7 +321,14 @@ export interface ProviderConfigView {
   hasApiKey: boolean;
 }
 
+export interface ProviderCatalogView {
+  schemaVersion: number;
+  activeProviderId: string | null;
+  providers: ProviderConfigView[];
+}
+
 export interface SaveProviderConfigRequest {
+  id: string;
   kind: ProviderKind;
   transport: ProviderTransport;
   name: string;
@@ -327,6 +337,7 @@ export interface SaveProviderConfigRequest {
   models: ProviderModelConfig[];
   endpoints: ProviderEndpointConfig[];
   apiKey?: string;
+  activate: boolean;
 }
 
 export type PlanStepState = "pending" | "in_progress" | "completed" | "failed" | "skipped";

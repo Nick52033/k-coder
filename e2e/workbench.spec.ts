@@ -5,10 +5,13 @@ test.beforeEach(async ({ page }) => {
     const callbacks = new Map<number, (...args: unknown[]) => void>();
     let callbackId = 1;
     const thread = { schemaVersion: 1, id: "thread-1", title: "Phase 6 workbench", createdAtMs: 1, updatedAtMs: 2, archived: false };
+    const openAiProvider = { schemaVersion: 1, id: "openai", kind: "open_ai_compatible", transport: "open_ai_chat_completions", name: "OpenAI", baseUrl: "https://api.openai.com/v1", model: "gpt-4.1", models: [{ id: "gpt-4.1", displayName: "GPT-4.1", contextWindow: 128000, fallback: false }, { id: "gpt-4o", displayName: "GPT-4 Omni", contextWindow: 64000, fallback: false }], endpoints: [], hasApiKey: true };
+    const ziccProvider = { schemaVersion: 1, id: "zicc", kind: "open_ai_compatible", transport: "open_ai_responses", name: "zicc", baseUrl: "https://zicc.example.com/v1", model: "gpt-5.6-terra", models: [{ id: "gpt-5.6-terra", displayName: "gpt-5.6-terra", contextWindow: 128000, fallback: false }, { id: "gpt-5.5", displayName: "gpt-5.5", contextWindow: 128000, fallback: false }], endpoints: [], hasApiKey: true };
+    const pendingProvider = { schemaVersion: 1, id: "pending", kind: "open_ai_compatible", transport: "anthropic_messages", name: "待配置供应商", baseUrl: "https://pending.example.com/v1", model: "claude-test", models: [{ id: "claude-test", displayName: "Claude Test", contextWindow: 128000, fallback: false }], endpoints: [], hasApiKey: false };
+    let providerCatalog: { schemaVersion: number; activeProviderId: string | null; providers: Array<typeof openAiProvider> } = { schemaVersion: 1, activeProviderId: "openai", providers: [openAiProvider, ziccProvider, pendingProvider] };
     const responses: Record<string, unknown> = {
       runtime_status: { ready: true, phase: "advanced-agent", version: "0.10.0", uptimeSeconds: 12, capabilities: ["skills", "mcp-stdio", "tool-hooks", "persistent-plans", "budgeted-goals"] },
-      get_provider_config: { schemaVersion: 1, kind: "open_ai_compatible", transport: "open_ai_chat_completions", name: "OpenAI", baseUrl: "https://api.openai.com/v1", model: "gpt-4.1", models: [{ id: "gpt-4.1", displayName: "GPT-4.1", contextWindow: 128000, fallback: false }, { id: "gpt-4o", displayName: "GPT-4o", contextWindow: 64000, fallback: false }], endpoints: [], hasApiKey: true },
-      save_provider_config: { schemaVersion: 1, kind: "open_ai_compatible", transport: "open_ai_chat_completions", name: "OpenAI", baseUrl: "https://api.openai.com/v1", model: "gpt-4.1", models: [{ id: "gpt-4.1", displayName: "GPT-4.1", contextWindow: 128000, fallback: false }, { id: "gpt-4o", displayName: "GPT-4o", contextWindow: 64000, fallback: false }], endpoints: [], hasApiKey: true },
+      test_provider_connection: { connected: true, latencyMs: 42, usage: null },
       get_plan: null,
       get_goal: { schemaVersion: 1, id: "goal-1", threadId: "thread-1", objective: "完成 Phase 9 高级智能体能力", state: "active", tokenBudget: 100000, tokensUsed: 24000, timeBudgetMs: 3600000, elapsedMs: 420000, reason: null, createdAtMs: 2, updatedAtMs: 3, revision: 2 },
       transition_goal: { schemaVersion: 1, id: "goal-1", threadId: "thread-1", objective: "完成 Phase 9 高级智能体能力", state: "paused", tokenBudget: 100000, tokensUsed: 24000, timeBudgetMs: 3600000, elapsedMs: 420000, reason: null, createdAtMs: 2, updatedAtMs: 4, revision: 3 },
@@ -65,9 +68,45 @@ test.beforeEach(async ({ page }) => {
         unregisterCallback: (id: number) => callbacks.delete(id),
         invoke: async (command: string, args?: Record<string, unknown>) => {
           (window as unknown as { __invoked: string[] }).__invoked.push(command);
+          if (command === "get_provider_catalog") return providerCatalog;
+          if (command === "get_provider_config") {
+            return providerCatalog.providers.find((provider) => provider.id === providerCatalog.activeProviderId) ?? null;
+          }
           if (command === "save_provider_config") {
             (window as unknown as { __lastProviderRequest: unknown }).__lastProviderRequest = args?.request;
-            return { ...responses[command] as Record<string, unknown>, ...args?.request as Record<string, unknown> };
+            const request = args?.request as Record<string, unknown>;
+            const providerId = request.id as string;
+            const existing = providerCatalog.providers.find((provider) => provider.id === providerId);
+            const { apiKey, activate, ...publicConfig } = request;
+            const saved = {
+              schemaVersion: 1,
+              ...publicConfig,
+              hasApiKey: Boolean(apiKey) || existing?.hasApiKey || false,
+            } as typeof openAiProvider;
+            providerCatalog = {
+              ...providerCatalog,
+              activeProviderId: activate ? providerId : providerCatalog.activeProviderId,
+              providers: existing
+                ? providerCatalog.providers.map((provider) => provider.id === providerId ? saved : provider)
+                : [...providerCatalog.providers, saved],
+            };
+            return saved;
+          }
+          if (command === "activate_provider") {
+            const providerId = args?.providerId as string;
+            (window as unknown as { __lastActivatedProvider: string | null }).__lastActivatedProvider = providerId;
+            providerCatalog = { ...providerCatalog, activeProviderId: providerId };
+            return providerCatalog;
+          }
+          if (command === "delete_provider") {
+            const providerId = args?.providerId as string;
+            const providers = providerCatalog.providers.filter((provider) => provider.id !== providerId);
+            providerCatalog = {
+              ...providerCatalog,
+              providers,
+              activeProviderId: providerCatalog.activeProviderId === providerId ? providers[0]?.id ?? null : providerCatalog.activeProviderId,
+            };
+            return providerCatalog;
           }
           return responses[command] ?? null;
         },
@@ -75,6 +114,7 @@ test.beforeEach(async ({ page }) => {
       __TAURI_EVENT_PLUGIN_INTERNALS__: { unregisterListener: () => undefined },
       __invoked: [],
       __lastProviderRequest: null,
+      __lastActivatedProvider: null,
     });
   });
 });
@@ -93,8 +133,9 @@ test("supports the primary workbench inspection flow", async ({ page }) => {
   await expect(page.locator(".plan-list").getByText("apply_patch", { exact: true })).toBeVisible();
   await expect(page.locator(".plan-list").getByText("run_command", { exact: true })).toBeVisible();
   await page.locator('button[aria-label="设置"]:visible').click();
+  await expect(page.locator(".provider-list-item")).toHaveCount(3);
   await expect(page.getByLabel("供应商名称")).toHaveValue("OpenAI");
-  await expect(page.locator(".provider-model-row")).toHaveCount(2);
+  await expect(page.locator(".provider-model-card")).toHaveCount(2);
   await expect(page.getByLabel("模型 ID 1")).toHaveValue("gpt-4.1");
   await expect(page.getByLabel("显示名称 1")).toHaveValue("GPT-4.1");
   await expect(page.getByLabel("上下文长度 1")).toHaveValue("128000");
@@ -110,9 +151,10 @@ test("supports the primary workbench inspection flow", async ({ page }) => {
 test("shows and starts bounded subagent activity", async ({ page }) => {
   await page.goto("/");
   await page.getByRole("button", { name: "切换子智能体面板" }).click();
-  await expect(page.getByRole("button", { name: /检查后端/ })).toBeVisible();
+  await page.getByRole("button", { name: /检查后端/ }).click();
   await expect(page.getByText("后端检查完成", { exact: true })).toBeVisible();
-  await page.getByLabel("子任务").fill("检查测试");
+  await page.getByRole("button", { name: "创建新任务" }).click();
+  await page.getByLabel("子任务描述").fill("检查测试");
   await page.getByRole("button", { name: "启动" }).click();
   await expect(page.getByRole("button", { name: /检查测试/ })).toBeVisible();
   await expect.poll(() => page.evaluate(() => (window as unknown as { __invoked: string[] }).__invoked.includes("create_subagent"))).toBe(true);
@@ -128,28 +170,43 @@ test("shows a bounded goal with visible budget and controls", async ({ page }, t
   await page.screenshot({ path: testInfo.outputPath(`goal-${testInfo.project.name}.png`), fullPage: true });
 });
 
-test("selects the model from the composer footer", async ({ page }) => {
+test("switches providers and models from the composer footer", async ({ page }, testInfo) => {
   await page.goto("/");
+  await page.getByRole("button", { name: "切换到深色模式" }).click();
   const composer = page.locator(".composer");
   const selector = composer.getByRole("button", { name: "选择模型" });
 
   await expect(selector).toBeVisible();
   await expect(selector).toContainText("OpenAI");
   await expect(selector).toContainText("GPT-4.1");
-  await expect(selector).toContainText("gpt-4.1");
+  await expect(selector.locator("em")).toHaveCount(0);
   await expect(page.locator(".sidebar").getByRole("button", { name: "选择模型" })).toHaveCount(0);
 
   await selector.click();
   await expect(page.getByRole("listbox", { name: "可用模型" })).toBeVisible();
-  await expect(page.locator(".model-selector-provider")).toContainText("OpenAI");
+  const providerOptions = page.locator(".model-selector-provider-options");
+  await expect(providerOptions.getByRole("button")).toHaveCount(3);
+  await expect(providerOptions.getByRole("button", { name: /待配置供应商/ })).toBeDisabled();
   await expect(page.getByRole("option")).toHaveCount(2);
   await expect(page.getByText("Deepseek-V4-Pro", { exact: true })).toHaveCount(0);
-  await page.getByRole("option", { name: /GPT-4o.*gpt-4o/ }).click();
-  await expect(selector).toContainText("GPT-4o");
+  await page.getByRole("option", { name: /GPT-4 Omni.*gpt-4o/ }).click();
+  await expect(selector).toContainText("GPT-4 Omni");
+  await expect(selector.locator("em")).toHaveText("gpt-4o");
   await expect.poll(() => page.evaluate(() => (window as unknown as { __invoked: string[] }).__invoked.includes("save_provider_config"))).toBe(true);
+
+  await selector.click();
+  await providerOptions.getByRole("button", { name: /zicc/ }).click();
+  await expect(selector).toContainText("zicc");
+  await expect(selector).toContainText("gpt-5.6-terra");
+  await expect(selector.locator("em")).toHaveCount(0);
+  await expect.poll(() => page.evaluate(() => (window as unknown as { __lastActivatedProvider: string | null }).__lastActivatedProvider)).toBe("zicc");
 
   await selector.press("ArrowDown");
   await expect(page.getByRole("listbox", { name: "可用模型" })).toBeVisible();
+  await expect(page.getByRole("option")).toHaveCount(2);
+  await expect(page.getByRole("option", { name: /gpt-5.5/ })).toBeVisible();
+  await page.waitForTimeout(250);
+  await page.screenshot({ path: testInfo.outputPath(`provider-selector-${testInfo.project.name}.png`), fullPage: true });
   await page.keyboard.press("Escape");
   await expect(page.getByRole("listbox", { name: "可用模型" })).toBeHidden();
   await expect(selector).toBeFocused();
@@ -160,21 +217,21 @@ test("adds, edits, deletes, and saves structured provider models", async ({ page
   await page.locator('button[aria-label="设置"]:visible').click();
 
   await page.getByRole("button", { name: "新增模型" }).click();
-  await expect(page.locator(".provider-model-row")).toHaveCount(3);
+  await expect(page.locator(".provider-model-card")).toHaveCount(3);
   await page.getByLabel("模型 ID 3").fill("o3-mini");
   await page.getByLabel("显示名称 3").fill("O3 Mini");
   await page.getByLabel("上下文长度 3").fill("200000");
   await page.getByLabel(/设为默认模型：O3 Mini/).check();
 
-  await page.getByRole("button", { name: "删除模型：GPT-4o" }).click();
-  await expect(page.locator(".provider-model-row")).toHaveCount(2);
+  await page.getByRole("button", { name: "删除模型：GPT-4 Omni" }).click();
+  await expect(page.locator(".provider-model-card")).toHaveCount(2);
   await page.getByRole("button", { name: "保存配置" }).click();
 
   await expect.poll(() => page.evaluate(() => (window as unknown as { __lastProviderRequest: { model: string } | null }).__lastProviderRequest?.model)).toBe("o3-mini");
   const request = await page.evaluate(() => (window as unknown as { __lastProviderRequest: { models: unknown[] } }).__lastProviderRequest);
   expect(request.models).toEqual([
-    { id: "gpt-4.1", displayName: "GPT-4.1", contextWindow: 128000, fallback: false },
-    { id: "o3-mini", displayName: "O3 Mini", contextWindow: 200000, fallback: false },
+    { id: "gpt-4.1", displayName: "GPT-4.1", contextWindow: 128000, maxOutputTokens: undefined, supportsVision: false, fallback: false },
+    { id: "o3-mini", displayName: "O3 Mini", contextWindow: 200000, maxOutputTokens: undefined, supportsVision: false, fallback: false },
   ]);
 });
 

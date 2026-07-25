@@ -18,6 +18,10 @@ pub struct ProviderModelConfig {
     pub display_name: String,
     pub context_window: u32,
     #[serde(default)]
+    pub max_output_tokens: Option<u32>,
+    #[serde(default)]
+    pub supports_vision: bool,
+    #[serde(default)]
     pub fallback: bool,
 }
 
@@ -27,6 +31,8 @@ impl ProviderModelConfig {
             display_name: id.clone(),
             id,
             context_window: DEFAULT_MODEL_CONTEXT_WINDOW,
+            max_output_tokens: None,
+            supports_vision: false,
             fallback: false,
         }
     }
@@ -42,6 +48,10 @@ enum ProviderModelConfigCompat {
         display_name: String,
         #[serde(rename = "contextWindow")]
         context_window: u32,
+        #[serde(default, rename = "maxOutputTokens")]
+        max_output_tokens: Option<u32>,
+        #[serde(default, rename = "supportsVision")]
+        supports_vision: bool,
         #[serde(default)]
         fallback: bool,
     },
@@ -60,11 +70,15 @@ where
                 id,
                 display_name,
                 context_window,
+                max_output_tokens,
+                supports_vision,
                 fallback,
             } => ProviderModelConfig {
                 id,
                 display_name,
                 context_window,
+                max_output_tokens,
+                supports_vision,
                 fallback,
             },
         })
@@ -102,6 +116,8 @@ pub enum ProviderTransport {
 #[serde(rename_all = "camelCase")]
 pub struct ProviderConfig {
     pub schema_version: u32,
+    #[serde(default = "default_provider_id")]
+    pub id: String,
     pub kind: ProviderKind,
     #[serde(default)]
     pub transport: ProviderTransport,
@@ -123,10 +139,22 @@ impl ProviderConfig {
                 self.schema_version
             )));
         }
+        self.id = self.id.trim().to_string();
         self.base_url = self.base_url.trim().trim_end_matches('/').to_string();
         self.name = self.name.trim().to_string();
         self.model = self.model.trim().to_string();
 
+        if self.id.is_empty()
+            || self.id.len() > 80
+            || !self.id.chars().all(|character| {
+                character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
+            })
+        {
+            return Err(ProviderConfigError::Invalid(
+                "provider ID must contain 1 to 80 ASCII letters, digits, dots, hyphens, or underscores"
+                    .to_string(),
+            ));
+        }
         if self.name.is_empty() || self.name.len() > 80 {
             return Err(ProviderConfigError::Invalid(
                 "provider name must contain between 1 and 80 characters".to_string(),
@@ -236,7 +264,15 @@ impl ProviderConfig {
     }
 
     pub fn anthropic_messages_url(&self) -> Result<Url, ProviderConfigError> {
-        self.endpoint_url("messages", "Anthropic messages")
+        // Anthropic Messages API 端点路径
+        // 如果 base_url 已经包含 /v1，则只添加 /messages
+        // 否则添加 /v1/messages
+        let path = if self.base_url.ends_with("/v1") || self.base_url.contains("/v1/") {
+            "messages"
+        } else {
+            "v1/messages"
+        };
+        self.endpoint_url(path, "Anthropic messages")
     }
 
     pub fn gemini_stream_url(&self) -> Result<Url, ProviderConfigError> {
@@ -286,6 +322,8 @@ fn validate_base_url(value: &str, label: &str) -> Result<(), ProviderConfigError
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct SaveProviderConfigRequest {
+    #[serde(default = "default_provider_id")]
+    pub id: String,
     pub kind: ProviderKind,
     #[serde(default)]
     pub transport: ProviderTransport,
@@ -298,12 +336,15 @@ pub struct SaveProviderConfigRequest {
     #[serde(default)]
     pub endpoints: Vec<ProviderEndpointConfig>,
     pub api_key: Option<String>,
+    #[serde(default = "default_true")]
+    pub activate: bool,
 }
 
 impl SaveProviderConfigRequest {
     pub fn public_config(&self) -> Result<ProviderConfig, ProviderConfigError> {
         ProviderConfig {
             schema_version: PROTOCOL_VERSION,
+            id: self.id.clone(),
             kind: self.kind,
             transport: self.transport,
             name: self.name.clone(),
@@ -320,6 +361,7 @@ impl SaveProviderConfigRequest {
 #[serde(rename_all = "camelCase")]
 pub struct ProviderConfigView {
     pub schema_version: u32,
+    pub id: String,
     pub kind: ProviderKind,
     pub transport: ProviderTransport,
     pub name: String,
@@ -328,6 +370,77 @@ pub struct ProviderConfigView {
     pub models: Vec<ProviderModelConfig>,
     pub endpoints: Vec<ProviderEndpointConfig>,
     pub has_api_key: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderCatalogView {
+    pub schema_version: u32,
+    pub active_provider_id: Option<String>,
+    pub providers: Vec<ProviderConfigView>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct ProviderCatalog {
+    schema_version: u32,
+    active_provider_id: Option<String>,
+    providers: Vec<ProviderConfig>,
+}
+
+impl ProviderCatalog {
+    fn empty() -> Self {
+        Self {
+            schema_version: PROTOCOL_VERSION,
+            active_provider_id: None,
+            providers: Vec::new(),
+        }
+    }
+
+    fn validate(mut self) -> Result<Self, ProviderConfigError> {
+        if self.schema_version != PROTOCOL_VERSION {
+            return Err(ProviderConfigError::Invalid(format!(
+                "unsupported provider catalog schema version {}",
+                self.schema_version
+            )));
+        }
+        if self.providers.len() > 32 {
+            return Err(ProviderConfigError::Invalid(
+                "a provider catalog may contain at most 32 providers".to_string(),
+            ));
+        }
+        let mut ids = std::collections::HashSet::new();
+        let mut providers = Vec::with_capacity(self.providers.len());
+        for provider in self.providers {
+            let provider = provider.validate()?;
+            if !ids.insert(provider.id.clone()) {
+                return Err(ProviderConfigError::Invalid(
+                    "provider IDs must be unique".to_string(),
+                ));
+            }
+            providers.push(provider);
+        }
+        self.providers = providers;
+        if !self
+            .active_provider_id
+            .as_ref()
+            .is_some_and(|id| self.providers.iter().any(|provider| &provider.id == id))
+        {
+            self.active_provider_id = None;
+        }
+        Ok(self)
+    }
+
+    fn active(&self) -> Option<&ProviderConfig> {
+        let active_id = self.active_provider_id.as_ref()?;
+        self.providers
+            .iter()
+            .find(|provider| &provider.id == active_id)
+    }
+}
+
+fn default_provider_id() -> String {
+    "default".to_string()
 }
 
 fn default_provider_name() -> String {
@@ -348,42 +461,131 @@ pub enum ProviderConfigError {
 
 #[derive(Debug, Clone)]
 pub struct ProviderConfigStore {
-    path: PathBuf,
+    catalog_path: PathBuf,
+    legacy_path: PathBuf,
 }
 
 impl ProviderConfigStore {
     pub fn new(data_root: impl AsRef<Path>) -> Self {
         Self {
-            path: data_root.as_ref().join("provider.json"),
+            catalog_path: data_root.as_ref().join("providers.json"),
+            legacy_path: data_root.as_ref().join("provider.json"),
         }
     }
 
     pub fn load(&self) -> Result<Option<ProviderConfig>, ProviderConfigError> {
-        let bytes = match fs::read(&self.path) {
+        Ok(self.load_catalog()?.active().cloned())
+    }
+
+    pub fn save(&self, config: &ProviderConfig) -> Result<(), ProviderConfigError> {
+        self.save_provider(config, true)
+    }
+
+    pub fn list(&self) -> Result<(Option<String>, Vec<ProviderConfig>), ProviderConfigError> {
+        let catalog = self.load_catalog()?;
+        Ok((catalog.active_provider_id, catalog.providers))
+    }
+
+    pub fn save_provider(
+        &self,
+        config: &ProviderConfig,
+        activate: bool,
+    ) -> Result<(), ProviderConfigError> {
+        let config = config.clone().validate()?;
+        let mut catalog = self.load_catalog()?;
+        if let Some(existing) = catalog
+            .providers
+            .iter_mut()
+            .find(|provider| provider.id == config.id)
+        {
+            *existing = config.clone();
+        } else {
+            catalog.providers.push(config.clone());
+        }
+        if activate {
+            catalog.active_provider_id = Some(config.id.clone());
+        }
+        self.save_catalog(&catalog.validate()?)
+    }
+
+    pub fn activate(&self, provider_id: &str) -> Result<ProviderConfig, ProviderConfigError> {
+        let mut catalog = self.load_catalog()?;
+        let config = catalog
+            .providers
+            .iter()
+            .find(|provider| provider.id == provider_id)
+            .cloned()
+            .ok_or_else(|| ProviderConfigError::Invalid("provider does not exist".to_string()))?;
+        catalog.active_provider_id = Some(config.id.clone());
+        self.save_catalog(&catalog)?;
+        Ok(config)
+    }
+
+    pub fn delete(&self, provider_id: &str) -> Result<(), ProviderConfigError> {
+        let mut catalog = self.load_catalog()?;
+        let previous_len = catalog.providers.len();
+        catalog
+            .providers
+            .retain(|provider| provider.id != provider_id);
+        if catalog.providers.len() == previous_len {
+            return Err(ProviderConfigError::Invalid(
+                "provider does not exist".to_string(),
+            ));
+        }
+        if catalog.active_provider_id.as_deref() == Some(provider_id) {
+            catalog.active_provider_id = None;
+        }
+        self.save_catalog(&catalog.validate()?)
+    }
+
+    fn load_catalog(&self) -> Result<ProviderCatalog, ProviderConfigError> {
+        match fs::read(&self.catalog_path) {
+            Ok(bytes) => {
+                let catalog: ProviderCatalog = serde_json::from_slice(&bytes)
+                    .map_err(|error| ProviderConfigError::Invalid(error.to_string()))?;
+                catalog.validate()
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                self.load_legacy_catalog()
+            }
+            Err(error) => Err(ProviderConfigError::Io(error.to_string())),
+        }
+    }
+
+    fn load_legacy_catalog(&self) -> Result<ProviderCatalog, ProviderConfigError> {
+        let bytes = match fs::read(&self.legacy_path) {
             Ok(bytes) => bytes,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(ProviderCatalog::empty());
+            }
             Err(error) => return Err(ProviderConfigError::Io(error.to_string())),
         };
         let config: ProviderConfig = serde_json::from_slice(&bytes)
             .map_err(|error| ProviderConfigError::Invalid(error.to_string()))?;
-        config.validate().map(Some)
+        let config = config.validate()?;
+        ProviderCatalog {
+            schema_version: PROTOCOL_VERSION,
+            active_provider_id: Some(config.id.clone()),
+            providers: vec![config],
+        }
+        .validate()
     }
 
-    pub fn save(&self, config: &ProviderConfig) -> Result<(), ProviderConfigError> {
-        let parent = self.path.parent().ok_or_else(|| {
+    fn save_catalog(&self, catalog: &ProviderCatalog) -> Result<(), ProviderConfigError> {
+        let parent = self.catalog_path.parent().ok_or_else(|| {
             ProviderConfigError::Io("configuration path has no parent".to_string())
         })?;
         fs::create_dir_all(parent).map_err(|error| ProviderConfigError::Io(error.to_string()))?;
 
-        let temp_path = self.path.with_extension("json.tmp");
-        let serialized = serde_json::to_vec_pretty(config)
+        let temp_path = self.catalog_path.with_extension("json.tmp");
+        let serialized = serde_json::to_vec_pretty(catalog)
             .map_err(|error| ProviderConfigError::Invalid(error.to_string()))?;
         let mut file = fs::File::create(&temp_path)
             .map_err(|error| ProviderConfigError::Io(error.to_string()))?;
         file.write_all(&serialized)
             .and_then(|_| file.sync_all())
             .map_err(|error| ProviderConfigError::Io(error.to_string()))?;
-        replace_file(&temp_path, &self.path)?;
+        replace_file(&temp_path, &self.catalog_path)?;
         Ok(())
     }
 }
@@ -404,6 +606,7 @@ mod tests {
     fn config(base_url: &str) -> ProviderConfig {
         ProviderConfig {
             schema_version: PROTOCOL_VERSION,
+            id: default_provider_id(),
             kind: ProviderKind::OpenAiCompatible,
             transport: ProviderTransport::OpenAiChatCompletions,
             name: default_provider_name(),
@@ -461,7 +664,7 @@ mod tests {
             .load()
             .expect("configuration should load")
             .expect("configuration should exist");
-        let raw = fs::read_to_string(directory.path().join("provider.json"))
+        let raw = fs::read_to_string(directory.path().join("providers.json"))
             .expect("configuration file should be readable");
 
         assert_eq!(loaded, config);
@@ -472,11 +675,46 @@ mod tests {
     }
 
     #[test]
+    fn migrates_a_legacy_single_provider_and_switches_catalog_entries() {
+        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        let store = ProviderConfigStore::new(directory.path());
+        let first = config("https://first.example.com/v1")
+            .validate()
+            .expect("first provider should validate");
+        fs::write(
+            directory.path().join("provider.json"),
+            serde_json::to_vec(&first).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(store.load().unwrap(), Some(first.clone()));
+        let mut second = config("https://second.example.com/v1");
+        second.id = "second".to_string();
+        second.name = "Second".to_string();
+        let second = second.validate().unwrap();
+        store.save_provider(&second, false).unwrap();
+        let (active_id, providers) = store.list().unwrap();
+        assert_eq!(active_id.as_deref(), Some("default"));
+        assert_eq!(providers.len(), 2);
+
+        store.activate("second").unwrap();
+        assert_eq!(store.load().unwrap(), Some(second));
+    }
+
+    #[test]
     fn rejects_an_unknown_configuration_schema() {
         let mut unknown = config("https://example.com/v1");
         unknown.schema_version = PROTOCOL_VERSION + 1;
 
         assert!(unknown.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_provider_ids_that_are_unsafe_for_credential_accounts() {
+        let mut invalid = config("https://example.com/v1");
+        invalid.id = "../shared credential".to_string();
+
+        assert!(invalid.validate().is_err());
     }
 
     #[test]
@@ -506,12 +744,16 @@ mod tests {
                 id: " gpt-4o ".to_string(),
                 display_name: " GPT-4o ".to_string(),
                 context_window: 128_000,
+                max_output_tokens: None,
+                supports_vision: false,
                 fallback: false,
             },
             ProviderModelConfig {
                 id: "gpt-4o".to_string(),
                 display_name: "duplicate".to_string(),
                 context_window: 64_000,
+                max_output_tokens: None,
+                supports_vision: false,
                 fallback: false,
             },
             ProviderModelConfig::legacy("".to_string()),
@@ -555,6 +797,8 @@ mod tests {
             id: "test-model".to_string(),
             display_name: "Test model".to_string(),
             context_window: 512,
+            max_output_tokens: None,
+            supports_vision: false,
             fallback: false,
         }];
 
@@ -571,6 +815,8 @@ mod tests {
                 id: "fallback".into(),
                 display_name: "Fallback".into(),
                 context_window: 64_000,
+                max_output_tokens: None,
+                supports_vision: false,
                 fallback: true,
             },
         ];
@@ -615,6 +861,27 @@ mod tests {
         assert_eq!(
             config.gemini_stream_url().unwrap().as_str(),
             "https://example.com/v1/models/test-model:streamGenerateContent?alt=sse"
+        );
+    }
+
+    #[test]
+    fn builds_anthropic_messages_url_with_and_without_v1() {
+        // baseUrl 包含 /v1 的情况
+        let config_with_v1 = config("https://api.zicc.cc/v1")
+            .validate()
+            .expect("configuration should validate");
+        assert_eq!(
+            config_with_v1.anthropic_messages_url().unwrap().as_str(),
+            "https://api.zicc.cc/v1/messages"
+        );
+
+        // baseUrl 不包含 /v1 的情况
+        let config_without_v1 = config("https://api.zicc.cc")
+            .validate()
+            .expect("configuration should validate");
+        assert_eq!(
+            config_without_v1.anthropic_messages_url().unwrap().as_str(),
+            "https://api.zicc.cc/v1/messages"
         );
     }
 }

@@ -366,12 +366,41 @@ pub fn get_provider_config(
 }
 
 #[tauri::command]
+pub fn get_provider_catalog(
+    state: State<'_, AppState>,
+) -> CommandResult<crate::providers::ProviderCatalogView> {
+    state
+        .provider_catalog()
+        .map_err(|error| CommandError::new("provider_config", error))
+}
+
+#[tauri::command]
 pub fn save_provider_config(
     state: State<'_, AppState>,
     request: SaveProviderConfigRequest,
 ) -> CommandResult<ProviderConfigView> {
     state
         .save_provider_config(request)
+        .map_err(|error| CommandError::new("provider_config", error))
+}
+
+#[tauri::command]
+pub fn activate_provider(
+    state: State<'_, AppState>,
+    provider_id: String,
+) -> CommandResult<crate::providers::ProviderCatalogView> {
+    state
+        .activate_provider(&provider_id)
+        .map_err(|error| CommandError::new("provider_config", error))
+}
+
+#[tauri::command]
+pub fn delete_provider(
+    state: State<'_, AppState>,
+    provider_id: String,
+) -> CommandResult<crate::providers::ProviderCatalogView> {
+    state
+        .delete_provider(&provider_id)
         .map_err(|error| CommandError::new("provider_config", error))
 }
 
@@ -386,9 +415,10 @@ pub struct ProviderConnectionTest {
 #[tauri::command]
 pub async fn test_provider_connection(
     state: State<'_, AppState>,
+    provider_id: Option<String>,
 ) -> CommandResult<ProviderConnectionTest> {
     let (provider, model, _) = state
-        .build_provider()
+        .build_provider_for(provider_id.as_deref())
         .map_err(|error| CommandError::new("provider_config", error))?;
     let started = std::time::Instant::now();
     let request = ProviderRequest {
@@ -426,9 +456,12 @@ pub async fn test_provider_connection(
 }
 
 #[tauri::command]
-pub fn delete_provider_api_key(state: State<'_, AppState>) -> CommandResult<()> {
+pub fn delete_provider_api_key(
+    state: State<'_, AppState>,
+    provider_id: String,
+) -> CommandResult<()> {
     state
-        .delete_provider_api_key()
+        .delete_provider_api_key(&provider_id)
         .map_err(|error| CommandError::new("credential_store", error))
 }
 

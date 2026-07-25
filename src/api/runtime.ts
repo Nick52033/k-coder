@@ -18,6 +18,7 @@ import type {
   PtyOutputPage,
   PtySessionView,
   PatchPreview,
+  ProviderCatalogView,
   ProviderConfigView,
   ProviderConnectionTest,
   RuntimeStatus,
@@ -56,12 +57,24 @@ export function getProviderConfig() {
   return invoke<ProviderConfigView | null>("get_provider_config");
 }
 
+export function getProviderCatalog() {
+  return invoke<ProviderCatalogView>("get_provider_catalog");
+}
+
 export function saveProviderConfig(request: SaveProviderConfigRequest) {
   return invoke<ProviderConfigView>("save_provider_config", { request });
 }
 
-export function deleteProviderApiKey() {
-  return invoke<void>("delete_provider_api_key");
+export function activateProvider(providerId: string) {
+  return invoke<ProviderCatalogView>("activate_provider", { providerId });
+}
+
+export function deleteProvider(providerId: string) {
+  return invoke<ProviderCatalogView>("delete_provider", { providerId });
+}
+
+export function deleteProviderApiKey(providerId: string) {
+  return invoke<void>("delete_provider_api_key", { providerId });
 }
 
 export function createThread() {
@@ -147,7 +160,7 @@ export function resolveApproval(requestId: string, resolution: ApprovalResolutio
 export function undoChange(threadId: string, changeId: string) {
   return invoke<ChangeSet>("undo_change", { threadId, changeId });
 }
-export function testProviderConnection() { return invoke<ProviderConnectionTest>("test_provider_connection"); }
+export function testProviderConnection(providerId?: string) { return invoke<ProviderConnectionTest>("test_provider_connection", { providerId }); }
 
 export function searchThreads(query: string) { return invoke<ThreadSummary[]>("search_threads", { query }); }
 export function renameThread(threadId: string, title: string) { return invoke<ThreadSummary>("rename_thread", { threadId, title }); }

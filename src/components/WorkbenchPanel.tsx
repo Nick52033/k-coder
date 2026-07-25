@@ -103,8 +103,50 @@ function FilesView({ onAttach }: { onAttach: (attachment: AttachmentContent) => 
   const [error, setError] = useState("");
   const [query, setQuery] = useState("");
   const [results, setResults] = useState<SearchResult[]>([]);
-  async function select(path: string) { try { setPreview(await previewWorkspaceFile(path)); setError(""); } catch (error) { setError(String(error)); } }
-  async function attach() { if (preview) onAttach(await extractAttachment(preview.path)); }
+  const [hasWorkspace, setHasWorkspace] = useState(true);
+
+  async function select(path: string) {
+    try {
+      setPreview(await previewWorkspaceFile(path));
+      setError("");
+    } catch (error) {
+      setError(String(error));
+    }
+  }
+
+  async function attach() {
+    if (preview) onAttach(await extractAttachment(preview.path));
+  }
+
+  useEffect(() => {
+    void getWorkspaceState()
+      .then((state) => setHasWorkspace(Boolean(state.current)))
+      .catch(() => setHasWorkspace(false));
+  }, []);
+
+  if (!hasWorkspace) {
+    return (
+      <div className="files-view">
+        <div className="panel-toolbar">
+          <strong>资源管理器</strong>
+        </div>
+        <div className="panel-empty">
+          <Folder size={48} />
+          <div>
+            <strong>浏览和附加项目文件</strong>
+            <p>打开工作区后可以：</p>
+            <ul>
+              <li>浏览文件和文件夹</li>
+              <li>搜索代码内容</li>
+              <li>预览文件</li>
+              <li>附加文件到对话</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="files-view">
       <div className="panel-toolbar"><strong>资源管理器</strong><button type="button" title="刷新" aria-label="刷新文件树" onClick={() => setRevision((value) => value + 1)}><RefreshCw size={14} /></button></div>

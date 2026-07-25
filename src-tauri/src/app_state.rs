@@ -20,8 +20,8 @@ use crate::protocol::{ApprovalAction, ApprovalResolution, ChangeSet, TurnState};
 use crate::providers::{
     AnthropicMessagesProvider, CredentialError, CredentialStore, FallbackProvider, FallbackTarget,
     GoogleGeminiProvider, OpenAiChatCompletionsProvider, OpenAiResponsesProvider,
-    OsCredentialStore, Provider, ProviderConfig, ProviderConfigError, ProviderConfigStore,
-    ProviderConfigView, ProviderTransport, SaveProviderConfigRequest,
+    OsCredentialStore, Provider, ProviderCatalogView, ProviderConfig, ProviderConfigError,
+    ProviderConfigStore, ProviderConfigView, ProviderTransport, SaveProviderConfigRequest,
 };
 use crate::storage::{
     JsonlThreadRepository, StorageError, StoredEvent, StoredEventKind, ThreadRepository,
@@ -309,8 +309,27 @@ impl AppState {
         let Some(config) = self.provider_config.load()? else {
             return Ok(None);
         };
-        Ok(Some(ProviderConfigView {
+        Ok(Some(self.provider_view(config)?))
+    }
+
+    pub fn provider_catalog(&self) -> Result<ProviderCatalogView, AppStateError> {
+        let (active_provider_id, configs) = self.provider_config.list()?;
+        let providers = configs
+            .into_iter()
+            .map(|config| self.provider_view(config))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(ProviderCatalogView {
+            schema_version: crate::protocol::PROTOCOL_VERSION,
+            active_provider_id,
+            providers,
+        })
+    }
+
+    fn provider_view(&self, config: ProviderConfig) -> Result<ProviderConfigView, AppStateError> {
+        let has_api_key = self.credentials.get_api_key(&config.id)?.is_some();
+        Ok(ProviderConfigView {
             schema_version: config.schema_version,
+            id: config.id,
             kind: config.kind,
             transport: config.transport,
             name: config.name,
@@ -318,8 +337,8 @@ impl AppState {
             model: config.model,
             models: config.models,
             endpoints: config.endpoints,
-            has_api_key: self.credentials.get_api_key()?.is_some(),
-        }))
+            has_api_key,
+        })
     }
 
     pub fn save_provider_config(
@@ -332,38 +351,73 @@ impl AppState {
             .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty());
+        let effective_activate = request.activate || self.provider_config.load()?.is_none();
         if let Some(api_key) = api_key {
-            self.credentials.set_api_key(api_key)?;
-        } else if self.credentials.get_api_key()?.is_none() {
+            self.credentials.set_api_key(&config.id, api_key)?;
+        } else if effective_activate && self.credentials.get_api_key(&config.id)?.is_none() {
             return Err(AppStateError::ProviderNotConfigured(
                 "an API key is required".to_string(),
             ));
         }
-        self.provider_config.save(&config)?;
+        self.provider_config
+            .save_provider(&config, effective_activate)?;
+        if effective_activate {
+            self.persist_active_provider(&config)?;
+        }
+        self.provider_view(config)
+    }
+
+    pub fn activate_provider(
+        &self,
+        provider_id: &str,
+    ) -> Result<ProviderCatalogView, AppStateError> {
+        if self.credentials.get_api_key(provider_id)?.is_none() {
+            return Err(AppStateError::ProviderNotConfigured(
+                "the provider API key is missing".to_string(),
+            ));
+        }
+        let config = self.provider_config.activate(provider_id)?;
+        self.persist_active_provider(&config)?;
+        self.provider_catalog()
+    }
+
+    pub fn delete_provider(&self, provider_id: &str) -> Result<ProviderCatalogView, AppStateError> {
+        let deleted_active_provider = self
+            .provider_config
+            .load()?
+            .is_some_and(|provider| provider.id == provider_id);
+        self.provider_config.delete(provider_id)?;
+        self.credentials.delete_api_key(provider_id)?;
+        if deleted_active_provider {
+            let mut replacement = None;
+            for provider in self.provider_config.list()?.1 {
+                if self.credentials.get_api_key(&provider.id)?.is_some() {
+                    replacement = Some(provider);
+                    break;
+                }
+            }
+            if let Some(replacement) = replacement {
+                self.provider_config.activate(&replacement.id)?;
+                self.persist_active_provider(&replacement)?;
+            }
+        }
+        self.provider_catalog()
+    }
+
+    pub fn delete_provider_api_key(&self, provider_id: &str) -> Result<(), AppStateError> {
+        self.credentials.delete_api_key(provider_id)?;
+        Ok(())
+    }
+
+    fn persist_active_provider(&self, config: &ProviderConfig) -> Result<(), AppStateError> {
         self.repository
             .projection()
             .set_setting(
                 "provider",
-                &serde_json::to_string(&config)
+                &serde_json::to_string(config)
                     .map_err(|error| AppStateError::ProviderNotConfigured(error.to_string()))?,
             )
-            .map_err(|error| AppStateError::Storage(StorageError::Io(error.to_string())))?;
-        Ok(ProviderConfigView {
-            schema_version: config.schema_version,
-            kind: config.kind,
-            transport: config.transport,
-            name: config.name,
-            base_url: config.base_url,
-            model: config.model,
-            models: config.models,
-            endpoints: config.endpoints,
-            has_api_key: true,
-        })
-    }
-
-    pub fn delete_provider_api_key(&self) -> Result<(), AppStateError> {
-        self.credentials.delete_api_key()?;
-        Ok(())
+            .map_err(|error| AppStateError::Storage(StorageError::Io(error.to_string())))
     }
 
     pub fn provider_context_limit(&self) -> Result<usize, AppStateError> {
@@ -375,12 +429,28 @@ impl AppState {
     }
 
     pub fn build_provider(&self) -> Result<(Arc<dyn Provider>, String, usize), AppStateError> {
-        let config = self.provider_config.load()?.ok_or_else(|| {
+        self.build_provider_for(None)
+    }
+
+    pub fn build_provider_for(
+        &self,
+        provider_id: Option<&str>,
+    ) -> Result<(Arc<dyn Provider>, String, usize), AppStateError> {
+        let config = if let Some(provider_id) = provider_id {
+            self.provider_config
+                .list()?
+                .1
+                .into_iter()
+                .find(|provider| provider.id == provider_id)
+        } else {
+            self.provider_config.load()?
+        }
+        .ok_or_else(|| {
             AppStateError::ProviderNotConfigured(
                 "configure a provider before starting a turn".to_string(),
             )
         })?;
-        let api_key = self.credentials.get_api_key()?.ok_or_else(|| {
+        let api_key = self.credentials.get_api_key(&config.id)?.ok_or_else(|| {
             AppStateError::ProviderNotConfigured("the provider API key is missing".to_string())
         })?;
         let model = config.model.clone();
@@ -645,21 +715,24 @@ mod tests {
 
     #[derive(Default)]
     struct FakeCredentials {
-        api_key: StdMutex<Option<String>>,
+        api_keys: StdMutex<HashMap<String, String>>,
     }
 
     impl CredentialStore for FakeCredentials {
-        fn get_api_key(&self) -> Result<Option<String>, CredentialError> {
-            Ok(self.api_key.lock().unwrap().clone())
+        fn get_api_key(&self, provider_id: &str) -> Result<Option<String>, CredentialError> {
+            Ok(self.api_keys.lock().unwrap().get(provider_id).cloned())
         }
 
-        fn set_api_key(&self, api_key: &str) -> Result<(), CredentialError> {
-            *self.api_key.lock().unwrap() = Some(api_key.to_string());
+        fn set_api_key(&self, provider_id: &str, api_key: &str) -> Result<(), CredentialError> {
+            self.api_keys
+                .lock()
+                .unwrap()
+                .insert(provider_id.to_string(), api_key.to_string());
             Ok(())
         }
 
-        fn delete_api_key(&self) -> Result<(), CredentialError> {
-            *self.api_key.lock().unwrap() = None;
+        fn delete_api_key(&self, provider_id: &str) -> Result<(), CredentialError> {
+            self.api_keys.lock().unwrap().remove(provider_id);
             Ok(())
         }
     }
@@ -673,6 +746,7 @@ mod tests {
 
         let view = state
             .save_provider_config(SaveProviderConfigRequest {
+                id: "primary".to_string(),
                 kind: ProviderKind::OpenAiCompatible,
                 transport: ProviderTransport::OpenAiChatCompletions,
                 name: "测试供应商".to_string(),
@@ -683,17 +757,22 @@ mod tests {
                         id: "test-model".to_string(),
                         display_name: "Test model".to_string(),
                         context_window: 128_000,
+                        max_output_tokens: None,
+                        supports_vision: false,
                         fallback: false,
                     },
                     crate::providers::ProviderModelConfig {
                         id: "test-model-fast".to_string(),
                         display_name: "Test model fast".to_string(),
                         context_window: 64_000,
+                        max_output_tokens: None,
+                        supports_vision: false,
                         fallback: true,
                     },
                 ],
                 endpoints: vec![],
                 api_key: Some("super-secret".to_string()),
+                activate: true,
             })
             .expect("configuration should save");
         let serialized = serde_json::to_string(&view).expect("view should serialize");
@@ -707,9 +786,76 @@ mod tests {
         assert_eq!(state.provider_context_limit().unwrap(), 128_000);
         assert!(!serialized.contains("super-secret"));
         assert_eq!(
-            credentials.get_api_key().unwrap().as_deref(),
+            credentials.get_api_key("primary").unwrap().as_deref(),
             Some("super-secret")
         );
+    }
+
+    #[test]
+    fn provider_catalog_switches_configs_without_sharing_credentials() {
+        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        let credentials = Arc::new(FakeCredentials::default());
+        let state = AppState::with_credentials(directory.path(), credentials)
+            .expect("state should initialize");
+
+        for (id, name, activate) in [("first", "First", true), ("second", "Second", false)] {
+            state
+                .save_provider_config(SaveProviderConfigRequest {
+                    id: id.to_string(),
+                    kind: ProviderKind::OpenAiCompatible,
+                    transport: ProviderTransport::OpenAiChatCompletions,
+                    name: name.to_string(),
+                    base_url: format!("https://{id}.example.com/v1"),
+                    model: "test-model".to_string(),
+                    models: vec![],
+                    endpoints: vec![],
+                    api_key: Some(format!("{id}-secret")),
+                    activate,
+                })
+                .expect("provider should save");
+        }
+
+        let catalog = state.provider_catalog().unwrap();
+        assert_eq!(catalog.active_provider_id.as_deref(), Some("first"));
+        assert_eq!(catalog.providers.len(), 2);
+        assert!(
+            catalog
+                .providers
+                .iter()
+                .all(|provider| provider.has_api_key)
+        );
+
+        state
+            .save_provider_config(SaveProviderConfigRequest {
+                id: "pending".to_string(),
+                kind: ProviderKind::OpenAiCompatible,
+                transport: ProviderTransport::OpenAiChatCompletions,
+                name: "Pending".to_string(),
+                base_url: "https://pending.example.com/v1".to_string(),
+                model: "test-model".to_string(),
+                models: vec![],
+                endpoints: vec![],
+                api_key: None,
+                activate: false,
+            })
+            .expect("an inactive provider may be saved before its key is configured");
+        assert!(matches!(
+            state.activate_provider("pending"),
+            Err(AppStateError::ProviderNotConfigured(_))
+        ));
+
+        let switched = state.activate_provider("second").unwrap();
+        assert_eq!(switched.active_provider_id.as_deref(), Some("second"));
+        assert_eq!(state.provider_config().unwrap().unwrap().name, "Second");
+
+        let after_first_delete = state.delete_provider("second").unwrap();
+        assert_eq!(
+            after_first_delete.active_provider_id.as_deref(),
+            Some("first")
+        );
+        let after_second_delete = state.delete_provider("first").unwrap();
+        assert_eq!(after_second_delete.active_provider_id, None);
+        assert_eq!(after_second_delete.providers.len(), 1);
     }
 
     #[tokio::test]

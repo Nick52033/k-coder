@@ -4,7 +4,9 @@ import {
   cancelTurn,
   createThread as createThreadCommand,
   errorMessage,
-  getProviderConfig,
+  getProviderCatalog,
+  activateProvider as activateProviderCommand,
+  deleteProvider as deleteProviderCommand,
   listThreads,
   readThread,
   searchThreads,
@@ -28,6 +30,7 @@ import type {
   ChangeSet,
   ConversationMessage,
   ImageAttachment,
+  ProviderCatalogView,
   ProviderConfigView,
   SaveProviderConfigRequest,
   ThreadSummary,
@@ -50,6 +53,8 @@ interface WorkbenchState {
   pendingApproval: ApprovalRequest | null;
   changes: ChangeSet[];
   providerConfig: ProviderConfigView | null;
+  providerConfigs: ProviderConfigView[];
+  activeProviderId: string | null;
   plan: PlanView | null;
   goal: GoalView | null;
   loading: boolean;
@@ -65,8 +70,10 @@ interface WorkbenchState {
   sendMessage: (input: string, attachments?: ImageAttachment[]) => Promise<void>;
   retryLastTurn: () => Promise<void>;
   stopTurn: () => Promise<void>;
-  loadProviderConfig: () => Promise<void>;
+  loadProviderCatalog: () => Promise<void>;
   saveProvider: (request: SaveProviderConfigRequest) => Promise<boolean>;
+  activateProvider: (providerId: string) => Promise<boolean>;
+  deleteProvider: (providerId: string) => Promise<boolean>;
   createActiveGoal: (objective: string, tokenBudget: number, timeBudgetMs: number) => Promise<boolean>;
   transitionActiveGoal: (state: GoalState, reason?: string) => Promise<boolean>;
   resolvePendingApproval: (resolution: ApprovalResolution) => Promise<boolean>;
@@ -89,6 +96,58 @@ function toConversationMessage(message: ChatMessage): ConversationMessage {
 
 let initializationPromise: Promise<void> | null = null;
 
+const LEGACY_PROVIDER_STORAGE_KEY = "k-coder-providers";
+
+function providerSignature(provider: Partial<ProviderConfigView>) {
+  return [provider.name, provider.baseUrl, provider.transport, provider.model].join("\u0000");
+}
+
+function providerCatalogState(catalog: ProviderCatalogView) {
+  return {
+    providerConfigs: catalog.providers,
+    activeProviderId: catalog.activeProviderId,
+    providerConfig: catalog.providers.find((provider) => provider.id === catalog.activeProviderId) ?? null,
+  };
+}
+
+async function migrateLegacyProviderCatalog(catalog: ProviderCatalogView) {
+  const raw = localStorage.getItem(LEGACY_PROVIDER_STORAGE_KEY);
+  if (!raw) return catalog;
+
+  try {
+    const legacyProviders = JSON.parse(raw) as Array<Partial<ProviderConfigView> & { isDefault?: boolean }>;
+    if (!Array.isArray(legacyProviders)) return catalog;
+    const knownIds = new Set(catalog.providers.map((provider) => provider.id));
+    const knownSignatures = new Set(catalog.providers.map(providerSignature));
+    let migrationComplete = true;
+    for (const legacy of legacyProviders) {
+      const signature = providerSignature(legacy);
+      if (!legacy.id || knownIds.has(legacy.id) || knownSignatures.has(signature) || !legacy.name || !legacy.baseUrl || !legacy.model) continue;
+      try {
+        await saveProviderConfig({
+          id: legacy.id,
+          kind: legacy.kind ?? "open_ai_compatible",
+          transport: legacy.transport ?? "open_ai_chat_completions",
+          name: legacy.name,
+          baseUrl: legacy.baseUrl,
+          model: legacy.model,
+          models: legacy.models ?? [],
+          endpoints: legacy.endpoints ?? [],
+          activate: false,
+        });
+        knownIds.add(legacy.id);
+        knownSignatures.add(signature);
+      } catch {
+        migrationComplete = false;
+      }
+    }
+    if (migrationComplete) localStorage.removeItem(LEGACY_PROVIDER_STORAGE_KEY);
+    return await getProviderCatalog();
+  } catch {
+    return catalog;
+  }
+}
+
 export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
   threads: [],
   activeThreadId: null,
@@ -100,6 +159,8 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
   pendingApproval: null,
   changes: [],
   providerConfig: null,
+  providerConfigs: [],
+  activeProviderId: null,
   plan: null,
   goal: null,
   loading: true,
@@ -110,7 +171,7 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
     initializationPromise = (async () => {
       set({ loading: true, error: "" });
       try {
-        await Promise.all([get().reloadThreads(), get().loadProviderConfig()]);
+        await Promise.all([get().reloadThreads(), get().loadProviderCatalog()]);
         let threadId = get().activeThreadId ?? get().threads[0]?.id ?? null;
         if (!threadId) {
           const thread = await createThreadCommand();
@@ -277,15 +338,17 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
     }
   },
 
-  loadProviderConfig: async () => {
-    const providerConfig = await getProviderConfig();
-    set({ providerConfig });
+  loadProviderCatalog: async () => {
+    let catalog = await getProviderCatalog();
+    catalog = await migrateLegacyProviderCatalog(catalog);
+    set(providerCatalogState(catalog));
   },
 
   saveProvider: async (request) => {
     try {
-      const providerConfig = await saveProviderConfig(request);
-      set({ providerConfig, error: "" });
+      await saveProviderConfig(request);
+      const catalog = await getProviderCatalog();
+      set({ ...providerCatalogState(catalog), error: "" });
       return true;
     } catch (error) {
       set({ error: errorMessage(error) });
@@ -299,6 +362,28 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
     try {
       const goal = await createGoal({ threadId, objective, tokenBudget, timeBudgetMs });
       set({ goal, error: "" });
+      return true;
+    } catch (error) {
+      set({ error: errorMessage(error) });
+      return false;
+    }
+  },
+
+  activateProvider: async (providerId) => {
+    try {
+      const catalog = await activateProviderCommand(providerId);
+      set({ ...providerCatalogState(catalog), error: "" });
+      return true;
+    } catch (error) {
+      set({ error: errorMessage(error) });
+      return false;
+    }
+  },
+
+  deleteProvider: async (providerId) => {
+    try {
+      const catalog = await deleteProviderCommand(providerId);
+      set({ ...providerCatalogState(catalog), error: "" });
       return true;
     } catch (error) {
       set({ error: errorMessage(error) });

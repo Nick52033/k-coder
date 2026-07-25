@@ -30,7 +30,7 @@ import {
   CircleCheck,
 } from "lucide-react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { getRuntimeStatus, subscribeToAgentEvents } from "./api/runtime";
+import { getRuntimeStatus, subscribeToAgentEvents, listSubagents } from "./api/runtime";
 import { useWorkbenchStore } from "./stores/workbenchStore";
 import { PatchReviewDialog } from "./components/PatchReviewDialog";
 import { SettingsDialog } from "./components/SettingsDialog";
@@ -73,6 +73,7 @@ function App() {
   const [themeMode, setThemeModeState] = useState<ThemeMode>(() =>
     readStored(STORAGE_THEME, "light"),
   );
+  const [subagentThreadIds, setSubagentThreadIds] = useState<Set<string>>(new Set());
   const messageAreaRef = useRef<HTMLDivElement>(null);
   const {
     threads,
@@ -85,6 +86,8 @@ function App() {
     pendingApproval,
     changes,
     providerConfig,
+    providerConfigs,
+    activeProviderId,
     plan,
     goal,
     loading,
@@ -99,6 +102,8 @@ function App() {
     resolvePendingApproval,
     undoAppliedChange,
     saveProvider,
+    activateProvider,
+    deleteProvider,
     handleAgentEvent,
     clearError,
     searchThreadHistory,
@@ -118,6 +123,13 @@ function App() {
         if (disposed) stopListening();
         else unlisten = stopListening;
         await initialize();
+
+        // Fetch all subagents to mark their threads
+        const subagents = await listSubagents();
+        if (!disposed) {
+          const threadIds = new Set(subagents.map(subagent => subagent.threadId));
+          setSubagentThreadIds(threadIds);
+        }
       } catch (error) {
         if (!disposed) setRuntimeError(String(error));
       }
@@ -299,18 +311,26 @@ function App() {
             )}
           </label>
           <nav className="thread-list" aria-label="会话列表">
-            {threads.map((thread) => (
-              <div className={cn("thread-item", thread.id === activeThreadId && "thread-item--active")} key={thread.id}>
-                <button className="thread-item-main" type="button" onClick={() => void selectThread(thread.id)}>
-                  <MessageSquare size={15} />
-                  <span>{thread.title}</span>
-                </button>
-                <span className="thread-actions">
-                  <button type="button" title="重命名" aria-label={`重命名会话 ${thread.title}`} onClick={() => { const title = window.prompt("会话名称", thread.title); if (title) void renameConversation(thread.id, title); }}><Pencil size={12} /></button>
-                  <button type="button" title="删除" aria-label={`删除会话 ${thread.title}`} onClick={async () => { if (window.confirm(`删除会话"${thread.title}"？`)) await deleteConversation(thread.id); }}><Trash2 size={12} /></button>
-                </span>
-              </div>
-            ))}
+            {threads.map((thread) => {
+              const isSubagentThread = subagentThreadIds.has(thread.id);
+              return (
+                <div className={cn("thread-item", thread.id === activeThreadId && "thread-item--active")} key={thread.id}>
+                  <button className="thread-item-main" type="button" onClick={() => void selectThread(thread.id)}>
+                    <MessageSquare size={15} />
+                    <span>{thread.title}</span>
+                    {isSubagentThread && (
+                      <span className="subagent-badge" title="子智能体线程">
+                        <Bot size={12} />
+                      </span>
+                    )}
+                  </button>
+                  <span className="thread-actions">
+                    <button type="button" title="重命名" aria-label={`重命名会话 ${thread.title}`} onClick={() => { const title = window.prompt("会话名称", thread.title); if (title) void renameConversation(thread.id, title); }}><Pencil size={12} /></button>
+                    <button type="button" title="删除" aria-label={`删除会话 ${thread.title}`} onClick={async () => { if (window.confirm(`删除会话"${thread.title}"？`)) await deleteConversation(thread.id); }}><Trash2 size={12} /></button>
+                  </span>
+                </div>
+              );
+            })}
             {!threads.length && (
               <div className="thread-empty">
                 <MessageSquare size={16} />
@@ -418,7 +438,13 @@ function App() {
             disabled={Boolean(activeTurnId)}
           />
           <div className="composer-footer">
-            <ModelSelector provider={providerConfig} onSaveProvider={saveProvider} />
+            <ModelSelector
+              provider={providerConfig}
+              providers={providerConfigs}
+              activeProviderId={activeProviderId}
+              onSaveProvider={saveProvider}
+              onActivateProvider={activateProvider}
+            />
             {activeTurnId ? (
               <button className="stop-button" type="button" aria-label="停止生成" title="停止生成" onClick={() => void stopTurn()}>
                 {lastTurn?.state === "streaming" ? (
@@ -520,6 +546,8 @@ function App() {
       {settingsOpen && (
         <SettingsDialog
           provider={providerConfig}
+          providers={providerConfigs}
+          activeProviderId={activeProviderId}
           error={error}
           skin={skin}
           themeMode={themeMode}
@@ -527,6 +555,8 @@ function App() {
           onSetSkin={setSkin}
           onToggleTheme={toggleTheme}
           onSaveProvider={saveProvider}
+          onActivateProvider={activateProvider}
+          onDeleteProvider={deleteProvider}
         />
       )}
       {pendingApproval && (
