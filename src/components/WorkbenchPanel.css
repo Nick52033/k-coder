@@ -1,0 +1,69 @@
+.file-type-icon {
+  width: 14px;
+  min-width: 14px;
+  height: 14px;
+  stroke-width: 2;
+}
+
+.file-type-icon--typescript { color: #287fbd; }
+.file-type-icon--javascript { color: #a98400; }
+.file-type-icon--json { color: #9b7b00; }
+.file-type-icon--markup { color: #c6533d; }
+.file-type-icon--style { color: #7957b8; }
+.file-type-icon--document { color: #1785a8; }
+.file-type-icon--rust { color: #b85432; }
+.file-type-icon--python { color: #3572a5; }
+.file-type-icon--yaml { color: #9854ad; }
+.file-type-icon--database { color: #b66d16; }
+.file-type-icon--shell { color: #278653; }
+.file-type-icon--image { color: #a64ca6; }
+.file-type-icon--config { color: #6d7780; }
+.file-type-icon--default { color: var(--color-ink-subtle); }
+
+[data-theme="dark"] .file-type-icon--typescript { color: #4fc1ff; }
+[data-theme="dark"] .file-type-icon--javascript { color: #dcdc70; }
+[data-theme="dark"] .file-type-icon--json { color: #d7ba7d; }
+[data-theme="dark"] .file-type-icon--markup { color: #e3795c; }
+[data-theme="dark"] .file-type-icon--style { color: #b68cdf; }
+[data-theme="dark"] .file-type-icon--document { color: #4ec9b0; }
+[data-theme="dark"] .file-type-icon--rust { color: #e38b62; }
+[data-theme="dark"] .file-type-icon--python { color: #75beff; }
+[data-theme="dark"] .file-type-icon--yaml { color: #c586c0; }
+[data-theme="dark"] .file-type-icon--database { color: #d7ba7d; }
+[data-theme="dark"] .file-type-icon--shell { color: #6a9955; }
+[data-theme="dark"] .file-type-icon--image { color: #c586c0; }
+[data-theme="dark"] .file-type-icon--config { color: #a7b0b8; }
+
+.git-actions {
+  flex-wrap: wrap;
+}
+
+.git-actions button {
+  min-width: 64px;
+  justify-content: center;
+}
+
+.git-actions button:disabled,
+.git-file button:disabled {
+  opacity: 0.48;
+  cursor: default;
+}
+
+.git-action-spinner {
+  animation: git-action-spin 800ms linear infinite;
+}
+
+.panel-notice {
+  padding: 7px 9px;
+  color: var(--color-success-text);
+  background: var(--color-surface-hover);
+  font-size: var(--font-size-sm);
+}
+
+@keyframes git-action-spin {
+  to { transform: rotate(360deg); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .git-action-spinner { animation: none; }
+}

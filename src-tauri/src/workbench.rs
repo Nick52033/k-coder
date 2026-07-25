@@ -290,7 +290,16 @@ pub fn open_external(root: &Path, relative: &str, reveal: bool) -> Result<(), Wo
 }
 
 pub fn git_status(root: &Path) -> Result<GitStatusView, WorkbenchError> {
-    let output = git(root, &["status", "--porcelain=v1", "--branch"]);
+    let output = git(
+        root,
+        &[
+            "-c",
+            "core.quotepath=false",
+            "status",
+            "--porcelain=v1",
+            "--branch",
+        ],
+    );
     let Ok(output) = output else {
         return Ok(GitStatusView {
             is_repository: false,
@@ -416,6 +425,9 @@ pub fn git_action(
     }
     match action {
         "stage" => {
+            if paths.is_empty() {
+                return git(root, &["add", "--all"]);
+            }
             let mut args = vec!["add", "--"];
             args.extend(paths.iter().map(String::as_str));
             git(root, &args)
@@ -431,8 +443,52 @@ pub fn git_action(
                 .ok_or_else(|| WorkbenchError::Invalid("commit message is required".into()))?;
             git(root, &["commit", "-m", message])
         }
-        "pull" => git(root, &["pull", "--ff-only"]),
-        "push" => git(root, &["push"]),
+        "pull" => {
+            git(
+                root,
+                &[
+                    "rev-parse",
+                    "--abbrev-ref",
+                    "--symbolic-full-name",
+                    "@{upstream}",
+                ],
+            )
+            .map_err(|_| {
+                WorkbenchError::Invalid(
+                    "current branch has no upstream; push it once before pulling".into(),
+                )
+            })?;
+            git(root, &["pull", "--ff-only"])
+        }
+        "push" => {
+            if git(
+                root,
+                &[
+                    "rev-parse",
+                    "--abbrev-ref",
+                    "--symbolic-full-name",
+                    "@{upstream}",
+                ],
+            )
+            .is_ok()
+            {
+                git(root, &["push"])
+            } else {
+                let branch = git(root, &["branch", "--show-current"])?;
+                let branch = branch.trim();
+                if branch.is_empty() {
+                    return Err(WorkbenchError::Invalid(
+                        "detached HEAD cannot be pushed from the workbench".into(),
+                    ));
+                }
+                git(root, &["remote", "get-url", "origin"]).map_err(|_| {
+                    WorkbenchError::Invalid(
+                        "current branch has no upstream and remote 'origin' is unavailable".into(),
+                    )
+                })?;
+                git(root, &["push", "--set-upstream", "origin", branch])
+            }
+        }
         _ => unreachable!(),
     }
 }
@@ -583,10 +639,64 @@ mod tests {
     }
 
     #[test]
+    fn git_actions_stage_all_commit_push_and_pull_with_a_temporary_remote() {
+        let local = tempfile::tempdir().unwrap();
+        let remote = tempfile::tempdir().unwrap();
+        let peer = tempfile::tempdir().unwrap();
+        init_repository(local.path());
+        git(remote.path(), &["init", "--bare"]).unwrap();
+
+        std::fs::write(local.path().join("tracked.txt"), "first\n").unwrap();
+        git_action(local.path(), "stage", &[], None, false).unwrap();
+        git_action(local.path(), "commit", &[], Some("initial"), true).unwrap();
+        git(local.path(), &["branch", "-M", "main"]).unwrap();
+        let remote_path = remote.path().to_string_lossy().into_owned();
+        git(local.path(), &["remote", "add", "origin", &remote_path]).unwrap();
+
+        git_action(local.path(), "push", &[], None, true).unwrap();
+        assert_eq!(
+            git(local.path(), &["rev-parse", "--abbrev-ref", "@{upstream}"])
+                .unwrap()
+                .trim(),
+            "origin/main"
+        );
+
+        init_repository(peer.path());
+        git(peer.path(), &["remote", "add", "origin", &remote_path]).unwrap();
+        git(peer.path(), &["fetch", "origin", "main"]).unwrap();
+        git(
+            peer.path(),
+            &["switch", "-c", "main", "--track", "origin/main"],
+        )
+        .unwrap();
+        std::fs::write(peer.path().join("remote.txt"), "from remote\n").unwrap();
+        git_action(peer.path(), "stage", &[], None, false).unwrap();
+        git_action(peer.path(), "commit", &[], Some("remote change"), true).unwrap();
+        git_action(peer.path(), "push", &[], None, true).unwrap();
+
+        git_action(local.path(), "pull", &[], None, true).unwrap();
+        let pulled = std::fs::read_to_string(local.path().join("remote.txt")).unwrap();
+        assert_eq!(pulled.replace("\r\n", "\n"), "from remote\n");
+    }
+
+    #[test]
     fn git_rejects_path_traversal_and_unknown_actions() {
         let root = tempfile::tempdir().unwrap();
         init_repository(root.path());
         assert!(git_diff(root.path(), Some("../outside"), false).is_err());
         assert!(git_action(root.path(), "reset", &[], None, true).is_err());
+    }
+
+    #[test]
+    fn git_status_preserves_unicode_paths() {
+        let root = tempfile::tempdir().unwrap();
+        init_repository(root.path());
+        std::fs::write(root.path().join("中文.rs"), "fn main() {}\n").unwrap();
+
+        let status = git_status(root.path()).unwrap();
+        assert_eq!(status.files.len(), 1);
+        assert_eq!(status.files[0].path, "中文.rs");
+        assert_eq!(status.files[0].index_status, "?");
+        assert_eq!(status.files[0].worktree_status, "?");
     }
 }

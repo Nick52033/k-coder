@@ -1,13 +1,12 @@
 import { useEffect, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
-  ArrowDownToLine, ChevronDown, ChevronRight, CircleCheck, File, FileCode2, FileDiff, Folder,
-  FolderOpen, GitBranch, Image, ListChecks, LocateFixed, Paperclip, RefreshCw,
-  Plus, Upload, X,
-  Search,
-  Circle,
-  CircleDot,
+  ArrowDownToLine, Braces, ChevronDown, ChevronRight, Circle, CircleCheck, CircleDot,
+  CodeXml, Database, File, FileCode2, FileCog, FileDiff, FileText, Folder, FolderOpen,
+  GitBranch, Hash, Image, ListChecks, LocateFixed, Paperclip, Plus, RefreshCw, Search,
+  Terminal, Upload, X,
 } from "lucide-react";
+import "./WorkbenchPanel.css";
 import {
   extractAttachment, getGitBranches, getGitDiff, getGitStatus, getWorkspaceState,
   listWorkspaceDirectory, openWorkspaceFile, previewWorkspaceFile, revealWorkspaceFile,
@@ -144,7 +143,7 @@ function DirectoryNode({ path, depth, onSelect }: { path: string; depth: number;
   }, [path]);
   return <>{error && <div className="tree-error" role="alert">{error}</div>}{entries.map((entry) => entry.isDirectory ? <FolderNode key={entry.path} entry={entry} depth={depth} onSelect={onSelect} /> : (
     <button className="tree-row" style={{ paddingLeft: 25 + depth * 14 }} type="button" key={entry.path} onClick={() => onSelect(entry.path)}>
-      {isImage(entry.name) ? <Image size={14} /> : <File size={14} />}<span>{entry.name}</span>
+      <FileTypeIcon name={entry.name} /><span>{entry.name}</span>
     </button>
   ))}</>;
 }
@@ -165,6 +164,8 @@ function GitView() {
   const [diff, setDiff] = useState("");
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
+  const [busyAction, setBusyAction] = useState<"stage" | "unstage" | "commit" | "pull" | "push" | null>(null);
   const refresh = () => Promise.all([getGitStatus(), getGitBranches()])
     .then(([nextStatus, nextBranches]) => { setStatus(nextStatus); setBranches(nextBranches); setError(""); })
     .catch((reason) => setError(String(reason)));
@@ -175,7 +176,19 @@ function GitView() {
       : name === "push" ? "将当前分支推送到远程？"
       : null;
     if (confirmation && !window.confirm(confirmation)) return;
-    try { await runGitAction(name, paths, name === "commit" ? message : undefined, Boolean(confirmation)); setMessage(""); setError(""); void refresh(); } catch (error) { setError(String(error)); }
+    setBusyAction(name);
+    setNotice("");
+    try {
+      await runGitAction(name, paths, name === "commit" ? message : undefined, Boolean(confirmation));
+      if (name === "commit") setMessage("");
+      setError("");
+      setNotice(gitActionSuccessLabel(name));
+      await refresh();
+    } catch (error) {
+      setError(String(error));
+    } finally {
+      setBusyAction(null);
+    }
   }
   async function changeBranch(branch: string, create = false) {
     if (!branch || (!create && branch === branches?.current)) return;
@@ -183,13 +196,24 @@ function GitView() {
     try { await switchGitBranch(branch, create, true); setDiff(""); await refresh(); } catch (reason) { setError(String(reason)); }
   }
   if (status && !status.isRepository) return <div className="panel-empty"><GitBranch size={22} /><span>当前工作区不是 Git 仓库</span></div>;
+  const hasUnstagedChanges = Boolean(status?.files.some(isGitFileStageable));
+  const hasStagedChanges = Boolean(status?.files.some(isGitFileStaged));
   return <div className="git-view">
-    <div className="panel-toolbar"><span><GitBranch size={14} /><strong>{status?.branch ?? "Git"}</strong>{status && (status.ahead || status.behind) ? <small>↑{status.ahead} ↓{status.behind}</small> : null}</span><button type="button" title="刷新" aria-label="刷新 Git 状态" onClick={() => void refresh()}><RefreshCw size={14} /></button></div>
+    <div className="panel-toolbar"><span title={status?.upstream ?? "尚未关联远程分支"}><GitBranch size={14} /><strong>{status?.branch ?? "Git"}</strong>{status && (status.ahead || status.behind) ? <small>↑{status.ahead} ↓{status.behind}</small> : null}</span><button type="button" title="刷新" aria-label="刷新 Git 状态" onClick={() => void refresh()}><RefreshCw size={14} /></button></div>
     <div className="branch-controls"><select aria-label="当前分支" value={branches?.current ?? ""} onChange={(event) => void changeBranch(event.target.value)}>{branches?.branches.map((branch) => <option key={branch} value={branch}>{branch}</option>)}</select><button type="button" title="新建分支" aria-label="新建分支" onClick={() => { const branch = window.prompt("新分支名称"); if (branch?.trim()) void changeBranch(branch.trim(), true); }}><Plus size={14} /></button></div>
-    <div className="git-actions"><button type="button" onClick={() => void action("pull")}><ArrowDownToLine size={14} />拉取</button><button type="button" onClick={() => void action("push")}><Upload size={14} />推送</button></div>
-    <div className="git-files">{status?.files.map((file) => <div className="git-file" key={file.path}><button type="button" title="查看 Diff" onClick={() => void getGitDiff(file.path, Boolean(file.indexStatus.trim() && !file.worktreeStatus.trim())).then(setDiff).catch((reason) => setError(String(reason)))}><span>{file.path}</span><code>{file.indexStatus}{file.worktreeStatus}</code></button><button type="button" title={file.indexStatus.trim() ? "取消暂存" : "暂存"} aria-label={`${file.indexStatus.trim() ? "取消暂存" : "暂存"} ${file.path}`} onClick={() => void action(file.indexStatus.trim() ? "unstage" : "stage", [file.path])}>{file.indexStatus.trim() ? "−" : "+"}</button></div>)}</div>
+    <div className="git-actions">
+      <button type="button" disabled={busyAction !== null || !status?.upstream} title={status?.upstream ? "从远程快进拉取" : "当前分支尚未关联远程分支"} onClick={() => void action("pull")}><GitActionIcon active={busyAction === "pull"} icon={<ArrowDownToLine size={14} />} />拉取</button>
+      <button type="button" disabled={busyAction !== null || !status?.branch} title={status?.upstream ? "推送当前分支" : "首次推送将关联 origin"} onClick={() => void action("push")}><GitActionIcon active={busyAction === "push"} icon={<Upload size={14} />} />推送</button>
+      <button type="button" disabled={busyAction !== null || !hasUnstagedChanges} title="暂存全部更改" onClick={() => void action("stage")}><GitActionIcon active={busyAction === "stage"} icon={<Plus size={14} />} />全部暂存</button>
+    </div>
+    <div className="git-files">{status?.files.map((file) => {
+      const nextAction = isGitFileStageable(file) ? "stage" : "unstage";
+      const actionLabel = nextAction === "stage" ? "暂存" : "取消暂存";
+      return <div className="git-file" key={file.path}><button type="button" title="查看 Diff" onClick={() => void getGitDiff(file.path, isGitFileStaged(file) && !isGitFileStageable(file)).then(setDiff).catch((reason) => setError(String(reason)))}><span>{file.path}</span><code>{file.indexStatus}{file.worktreeStatus}</code></button><button type="button" disabled={busyAction !== null} title={actionLabel} aria-label={`${actionLabel} ${file.path}`} onClick={() => void action(nextAction, [file.path])}>{nextAction === "stage" ? "+" : "−"}</button></div>;
+    })}</div>
     {diff && <pre className="git-diff">{diff}</pre>}
-    <div className="commit-box"><input value={message} onChange={(event) => setMessage(event.target.value)} placeholder="提交说明" aria-label="提交说明" /><button type="button" disabled={!message.trim()} onClick={() => void action("commit")}>提交</button></div>
+    <div className="commit-box"><input value={message} onChange={(event) => setMessage(event.target.value)} placeholder="提交说明" aria-label="提交说明" /><button type="button" disabled={busyAction !== null || !message.trim() || !hasStagedChanges} title={hasStagedChanges ? "提交已暂存的更改" : "请先暂存更改"} onClick={() => void action("commit")}>{busyAction === "commit" ? "提交中" : "提交"}</button></div>
+    {notice && <div className="panel-notice" role="status">{notice}</div>}
     {error && <div className="panel-error">{error}</div>}
   </div>;
 }
@@ -203,4 +227,43 @@ function PlanView({ plan, activities, changes, onSelectChange }: { plan: Persist
   </div>;
 }
 
-function isImage(name: string) { return /\.(png|jpe?g|gif|webp|bmp)$/i.test(name); }
+function FileTypeIcon({ name }: { name: string }) {
+  const visual = fileVisual(name);
+  const Icon = visual.icon;
+  return <Icon className={`file-type-icon file-type-icon--${visual.kind}`} size={14} aria-hidden="true" />;
+}
+
+function fileVisual(name: string) {
+  const lower = name.toLowerCase();
+  const extension = lower.includes(".") ? lower.slice(lower.lastIndexOf(".") + 1) : "";
+  if (/^(package|tsconfig|jsconfig).*\.json$/.test(lower) || extension === "json") return { kind: "json", icon: Braces };
+  if (["ts", "tsx"].includes(extension)) return { kind: "typescript", icon: FileCode2 };
+  if (["js", "jsx", "mjs", "cjs"].includes(extension)) return { kind: "javascript", icon: FileCode2 };
+  if (["html", "htm", "xml", "svg"].includes(extension)) return { kind: "markup", icon: CodeXml };
+  if (["css", "scss", "sass", "less"].includes(extension)) return { kind: "style", icon: Hash };
+  if (["md", "mdx", "txt", "rtf"].includes(extension)) return { kind: "document", icon: FileText };
+  if (["rs", "toml"].includes(extension) || lower === "cargo.lock") return { kind: "rust", icon: FileCog };
+  if (["py", "pyi", "ipynb"].includes(extension)) return { kind: "python", icon: FileCode2 };
+  if (["yaml", "yml"].includes(extension)) return { kind: "yaml", icon: FileCog };
+  if (["sql", "db", "sqlite", "sqlite3"].includes(extension)) return { kind: "database", icon: Database };
+  if (["sh", "bash", "zsh", "ps1", "bat", "cmd"].includes(extension)) return { kind: "shell", icon: Terminal };
+  if (["png", "jpg", "jpeg", "gif", "webp", "bmp", "ico"].includes(extension)) return { kind: "image", icon: Image };
+  if (lower.startsWith(".env") || ["gitignore", "gitattributes", "editorconfig"].includes(extension)) return { kind: "config", icon: FileCog };
+  return { kind: "default", icon: File };
+}
+
+function isGitFileStageable(file: GitStatusView["files"][number]) {
+  return file.indexStatus === "?" || Boolean(file.worktreeStatus.trim());
+}
+
+function isGitFileStaged(file: GitStatusView["files"][number]) {
+  return file.indexStatus !== " " && file.indexStatus !== "?";
+}
+
+function gitActionSuccessLabel(action: "stage" | "unstage" | "commit" | "pull" | "push") {
+  return action === "stage" ? "更改已暂存" : action === "unstage" ? "已取消暂存" : action === "commit" ? "提交完成" : action === "pull" ? "拉取完成" : "推送完成";
+}
+
+function GitActionIcon({ active, icon }: { active: boolean; icon: React.ReactNode }) {
+  return active ? <RefreshCw className="git-action-spinner" size={14} /> : icon;
+}

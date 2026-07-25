@@ -196,3 +196,68 @@ test("exposes opt-in memory, browser audit, and advanced metrics", async ({ page
   await expect(page.getByText(/回归评估 3\/3/)).toBeVisible();
   await page.screenshot({ path: testInfo.outputPath(`phase9-${testInfo.project.name}.png`), fullPage: true });
 });
+
+test("colors file formats and wires complete Git actions", async ({ page }, testInfo) => {
+  await page.goto("/");
+  await page.evaluate(() => {
+    const host = window as unknown as {
+      __TAURI_INTERNALS__: { invoke: (command: string, args?: Record<string, unknown>) => Promise<unknown> };
+      __gitActions: Array<Record<string, unknown>>;
+    };
+    const originalInvoke = host.__TAURI_INTERNALS__.invoke;
+    host.__gitActions = [];
+    host.__TAURI_INTERNALS__.invoke = async (command, args) => {
+      if (command === "list_workspace_directory") {
+        return [
+          { name: "app.ts", path: "app.ts", isDirectory: false, size: 10, modifiedAtMs: 2 },
+          { name: "package.json", path: "package.json", isDirectory: false, size: 10, modifiedAtMs: 2 },
+          { name: "README.md", path: "README.md", isDirectory: false, size: 10, modifiedAtMs: 2 },
+          { name: "styles.css", path: "styles.css", isDirectory: false, size: 10, modifiedAtMs: 2 },
+        ];
+      }
+      if (command === "git_status") {
+        return {
+          isRepository: true,
+          branch: "main",
+          upstream: "origin/main",
+          ahead: 0,
+          behind: 0,
+          files: [
+            { path: "new.ts", indexStatus: "?", worktreeStatus: "?" },
+            { path: "staged.ts", indexStatus: "M", worktreeStatus: " " },
+          ],
+        };
+      }
+      if (command === "git_action") {
+        host.__gitActions.push(args ?? {});
+        return "ok";
+      }
+      return originalInvoke(command, args);
+    };
+  });
+
+  await page.getByRole("button", { name: "切换工作台面板" }).click();
+  await page.getByRole("button", { name: "刷新文件树" }).click();
+  await expect(page.locator(".file-type-icon--typescript")).toBeVisible();
+  await expect(page.locator(".file-type-icon--json")).toBeVisible();
+  await expect(page.locator(".file-type-icon--document")).toBeVisible();
+  await expect(page.locator(".file-type-icon--style")).toBeVisible();
+  await page.screenshot({ path: testInfo.outputPath("colored-file-tree.png"), fullPage: true });
+
+  await page.getByRole("tab", { name: "Git" }).click();
+  await expect(page.getByRole("button", { name: "暂存 new.ts" })).toBeVisible();
+  await page.getByRole("button", { name: "暂存 new.ts" }).click();
+  page.on("dialog", (dialog) => dialog.accept());
+  await page.getByRole("button", { name: "拉取" }).click();
+  await page.getByRole("button", { name: "推送" }).click();
+  await page.getByLabel("提交说明").fill("test workbench Git actions");
+  await page.screenshot({ path: testInfo.outputPath("git-actions.png"), fullPage: true });
+  await page.getByRole("button", { name: "提交", exact: true }).click();
+
+  await expect.poll(() => page.evaluate(() => (window as unknown as { __gitActions: Array<{ action: string }> }).__gitActions.map(({ action }) => action))).toEqual([
+    "stage",
+    "pull",
+    "push",
+    "commit",
+  ]);
+});
