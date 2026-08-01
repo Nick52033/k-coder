@@ -44,6 +44,13 @@ import {
   Trash2,
   Globe2,
   PlayCircle,
+  Target,
+  Pause,
+  Play,
+  CircleCheck,
+  CircleDollarSign,
+  Clock3,
+  Flag,
 } from "lucide-react";
 import type {
   ProviderConfigView,
@@ -60,6 +67,8 @@ import type {
   MemorySettings,
   MemoryView,
   MetricsSnapshot,
+  GoalState,
+  GoalView,
 } from "../types/runtime";
 
 const DEFAULT_BASE_URL = "https://api.openai.com/v1";
@@ -130,9 +139,10 @@ type SettingsSection =
   | "knowledge"
   | "rules"
   | "general"
-  | "browser";
+  | "browser"
+  | "goal";
 
-type Skin = "paper" | "midnight" | "vscode" | "amber";
+type Skin = "paper" | "midnight" | "vscode" | "amber" | "codebuddy";
 type ThemeMode = "light" | "dark";
 
 interface SkinDefinition {
@@ -146,6 +156,7 @@ const skinDefinitions: SkinDefinition[] = [
   { id: "paper", label: "纸墨精工", desc: "绿色品牌 · 浅色为主 · 日常精工", preview: "#176b4d" },
   { id: "midnight", label: "午夜终端", desc: "OLED 深黑 · 翠绿高亮 · 纯暗色", preview: "#10b981" },
   { id: "vscode", label: "编辑器经典", desc: "中性深灰 · 蓝色高亮 · 专注编码", preview: "#007acc" },
+  { id: "codebuddy", label: "CodeBuddy", desc: "冷调深蓝灰 · 蓝紫高亮 · 沉浸编码", preview: "#4F8AFF" },
   { id: "amber", label: "琥珀暖光", desc: "暖白纸感 · 橙金点缀 · 极度护眼", preview: "#D97706" },
 ];
 
@@ -161,6 +172,8 @@ interface SettingsDialogProps {
   provider: ProviderConfigView | null;
   providers: ProviderConfigView[];
   activeProviderId: string | null;
+  activeThreadId: string | null;
+  goal: GoalView | null;
   error: string;
   skin: Skin;
   themeMode: ThemeMode;
@@ -170,6 +183,8 @@ interface SettingsDialogProps {
   onSaveProvider: (request: SaveProviderConfigRequest) => Promise<boolean>;
   onActivateProvider: (providerId: string) => Promise<boolean>;
   onDeleteProvider: (providerId: string) => Promise<boolean>;
+  onCreateGoal: (objective: string, tokenBudget: number, timeBudgetMs: number) => Promise<boolean>;
+  onTransitionGoal: (state: GoalState, reason?: string) => Promise<boolean>;
 }
 
 const settingsDefinitions: SettingsDefinition[] = [
@@ -182,6 +197,7 @@ const settingsDefinitions: SettingsDefinition[] = [
   { id: "workflows", label: "Workflows", group: "智能体", icon: Workflow, available: false },
   { id: "knowledge", label: "记忆", group: "知识与规则", icon: Library, available: true },
   { id: "browser", label: "浏览器自动化", group: "智能体", icon: Globe2, available: true },
+  { id: "goal", label: "目标与预算", group: "智能体", icon: Target, available: true },
   { id: "rules", label: "规则与审计", group: "知识与规则", icon: ShieldCheck, available: true },
   { id: "appearance", label: "外观", group: "应用", icon: Palette, available: true },
   { id: "general", label: "通用", group: "应用", icon: Settings, available: false },
@@ -191,6 +207,8 @@ export function SettingsDialog({
   provider,
   providers,
   activeProviderId,
+  activeThreadId,
+  goal,
   error,
   skin,
   themeMode,
@@ -200,6 +218,8 @@ export function SettingsDialog({
   onSaveProvider,
   onActivateProvider,
   onDeleteProvider,
+  onCreateGoal,
+  onTransitionGoal,
 }: SettingsDialogProps) {
   const [section, setSection] = useState<SettingsSection>("providers");
 
@@ -293,6 +313,13 @@ export function SettingsDialog({
               <MemoryPage />
             ) : section === "browser" ? (
               <BrowserPage />
+            ) : section === "goal" ? (
+              <GoalSettingsPage
+                threadId={activeThreadId}
+                goal={goal}
+                onCreate={onCreateGoal}
+                onTransition={onTransitionGoal}
+              />
             ) : section === "mcp" || section === "skills" || section === "rules" ? (
               <ExtensionsPage mode={section} />
             ) : (
@@ -302,6 +329,172 @@ export function SettingsDialog({
         </div>
       </section>
     </div>
+  );
+}
+
+interface GoalSettingsPageProps {
+  threadId: string | null;
+  goal: GoalView | null;
+  onCreate: (objective: string, tokenBudget: number, timeBudgetMs: number) => Promise<boolean>;
+  onTransition: (state: GoalState, reason?: string) => Promise<boolean>;
+}
+
+function GoalSettingsPage({
+  threadId,
+  goal,
+  onCreate,
+  onTransition,
+}: GoalSettingsPageProps) {
+  const toast = useToast();
+  const [objective, setObjective] = useState("");
+  const [tokenBudget, setTokenBudget] = useState(100_000);
+  const [timeBudgetMs, setTimeBudgetMs] = useState(60 * 60 * 1000);
+  const [busy, setBusy] = useState(false);
+  const [reason, setReason] = useState("");
+
+  const active = goal && goal.state !== "completed" && goal.state !== "budget_exhausted";
+
+  async function handleCreate(event: FormEvent) {
+    event.preventDefault();
+    if (!threadId) {
+      toast.error("请先选择对话");
+      return;
+    }
+    if (!objective.trim()) {
+      toast.error("请输入目标说明");
+      return;
+    }
+    setBusy(true);
+    const ok = await onCreate(objective.trim(), tokenBudget, timeBudgetMs);
+    setBusy(false);
+    if (ok) toast.success("Goal 已创建");
+    else toast.error("创建 Goal 失败，请检查预算范围");
+  }
+
+  async function handleTransition(state: GoalState) {
+    setBusy(true);
+    const ok = await onTransition(state, reason.trim() || undefined);
+    setBusy(false);
+    if (ok) {
+      toast.success("Goal 状态已更新");
+      setReason("");
+    } else {
+      toast.error("更新 Goal 状态失败");
+    }
+  }
+
+  const percent = goal ? Math.min(100, Math.round((goal.tokensUsed / goal.tokenBudget) * 100)) : 0;
+
+  return (
+    <section className="settings-page" aria-labelledby="goal-page-title">
+      <div className="settings-page-header">
+        <div>
+          <p className="settings-eyebrow">智能体</p>
+          <h3 id="goal-page-title">目标与预算</h3>
+        </div>
+        {active && goal && (
+          <span className={`goal-state-badge goal-state-badge--${goal.state}`}>
+            {goal.state === "active" ? "运行中" : goal.state === "paused" ? "已暂停" : "已阻塞"}
+          </span>
+        )}
+      </div>
+      <p className="settings-page-description">
+        为当前对话设定一个目标和资源预算。当 token 或时间预算耗尽时，K-Coder 会自动停止。
+      </p>
+
+      {goal ? (
+        <div className="goal-settings-current">
+          <div className="goal-settings-card">
+            <div className="goal-settings-card-head">
+              <Flag size={16} />
+              <strong title={goal.objective}>{goal.objective}</strong>
+            </div>
+            <div className="goal-settings-meta">
+              <span><CircleDollarSign size={13} />{goal.tokensUsed.toLocaleString()} / {goal.tokenBudget.toLocaleString()} tokens</span>
+              <span><Clock3 size={13} />{(goal.elapsedMs / 60000).toFixed(1)} / {(goal.timeBudgetMs / 60000).toFixed(1)} 分钟</span>
+            </div>
+            <div className="goal-progress" aria-label={`Goal 预算已使用 ${percent}%`}>
+              <span style={{ width: `${percent}%` }} />
+            </div>
+          </div>
+
+          {active ? (
+            <div className="goal-settings-actions">
+              {goal.state === "active" ? (
+                <button className="secondary-button" type="button" disabled={busy} onClick={() => void handleTransition("paused")}>
+                  <Pause size={15} /> 暂停
+                </button>
+              ) : (
+                <button className="secondary-button" type="button" disabled={busy} onClick={() => void handleTransition("active")}>
+                  <Play size={15} /> 继续
+                </button>
+              )}
+              <button className="primary-button" type="button" disabled={busy} onClick={() => void handleTransition("completed")}>
+                <CircleCheck size={15} /> 完成
+              </button>
+            </div>
+          ) : (
+            <p className="goal-settings-terminal">
+              {goal.state === "completed" ? "目标已完成" : "预算已耗尽，无法继续"}
+            </p>
+          )}
+        </div>
+      ) : (
+        <form className="goal-settings-form" onSubmit={(event) => void handleCreate(event)}>
+          <label>
+            目标说明
+            <textarea
+              value={objective}
+              maxLength={2000}
+              placeholder="例如：重构 mod.rs 的权限校验，并跑通相关测试"
+              onChange={(event) => setObjective(event.target.value)}
+            />
+          </label>
+          <div className="goal-settings-row">
+            <label>
+              Token 预算
+              <input
+                type="number"
+                min={1}
+                max={2_000_000}
+                step={10_000}
+                value={tokenBudget}
+                onChange={(event) => setTokenBudget(Number(event.target.value))}
+              />
+            </label>
+            <label>
+              时间预算（分钟）
+              <input
+                type="number"
+                min={1}
+                max={24 * 60}
+                step={5}
+                value={Math.round(timeBudgetMs / 60000)}
+                onChange={(event) => setTimeBudgetMs(Number(event.target.value) * 60000)}
+              />
+            </label>
+          </div>
+          <button className="primary-button" type="submit" disabled={busy}>
+            <Target size={15} /> 创建 Goal
+          </button>
+        </form>
+      )}
+
+      {goal && active && (
+        <div className="goal-settings-reason">
+          <label>
+            操作说明（可选）
+            <input
+              type="text"
+              value={reason}
+              maxLength={2000}
+              placeholder="例如：暂停，等待用户确认后再继续"
+              onChange={(event) => setReason(event.target.value)}
+            />
+          </label>
+        </div>
+      )}
+    </section>
   );
 }
 

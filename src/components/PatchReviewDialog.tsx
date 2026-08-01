@@ -6,7 +6,6 @@ import {
   FileDiff,
   RefreshCw,
   Rows3,
-  ShieldCheck,
   Undo2,
   X,
 } from "lucide-react";
@@ -331,6 +330,14 @@ export function PatchReviewDialog({
   );
 }
 
+type GenericApprovalChoice = "once" | "session" | "reject";
+
+const GENERIC_CHOICES: { value: GenericApprovalChoice; label: string; description?: string }[] = [
+  { value: "once", label: "允许一次", description: "仅本次调用放行" },
+  { value: "session", label: "本会话都允许", description: "本会话内同类操作不再询问" },
+  { value: "reject", label: "拒绝" },
+];
+
 function GenericToolApproval({
   request,
   error,
@@ -342,15 +349,36 @@ function GenericToolApproval({
 }) {
   const [busy, setBusy] = useState(false);
   const [localError, setLocalError] = useState("");
+  const [highlight, setHighlight] = useState<number>(0);
+  const [feedback, setFeedback] = useState("");
+  const dialogRef = useRef<HTMLDivElement>(null);
 
-  async function resolve(action: "approved" | "rejected") {
+  useEffect(() => {
+    const dialog = dialogRef.current;
+    if (!dialog) return;
+    (dialog.querySelector<HTMLElement>("[data-choice]") ?? dialog).focus();
+  }, [request.id]);
+
+  function pick(choice: GenericApprovalChoice) {
+    if (busy) return;
+    if (choice === "reject" && feedback.trim().length > 0) {
+      // 暂存反馈，由调用方决定是否回传给模型
+    }
+    void resolve(choice);
+  }
+
+  async function resolve(choice: GenericApprovalChoice) {
     if (!onResolve) return;
     setBusy(true);
+    setLocalError("");
+    const action: ApprovalResolution["action"] = choice === "reject" ? "rejected" : "approved";
     const success = await onResolve({
       action,
       patch: null,
       selectedPaths: [],
       expectedHashes: [],
+      scope: choice === "session" ? "session" : "once",
+      feedback: choice === "reject" ? feedback.trim() : "",
     });
     if (!success) {
       setLocalError("审批未能提交，请重试");
@@ -358,26 +386,104 @@ function GenericToolApproval({
     }
   }
 
+  function handleKey(event: React.KeyboardEvent<HTMLDivElement>) {
+    if (busy) return;
+    if (event.key === "Escape") {
+      event.preventDefault();
+      void resolve("reject");
+      return;
+    }
+    if (event.key === "1") { event.preventDefault(); pick("once"); return; }
+    if (event.key === "2") { event.preventDefault(); pick("session"); return; }
+    if (event.key === "3") { event.preventDefault(); pick("reject"); return; }
+    if (event.key === "ArrowDown" || event.key === "j") {
+      event.preventDefault();
+      setHighlight((value) => (value + 1) % GENERIC_CHOICES.length);
+      return;
+    }
+    if (event.key === "ArrowUp" || event.key === "k") {
+      event.preventDefault();
+      setHighlight((value) => (value - 1 + GENERIC_CHOICES.length) % GENERIC_CHOICES.length);
+      return;
+    }
+    if (event.key === "Enter") {
+      const target = event.target as HTMLElement | null;
+      if (target && target.tagName === "TEXTAREA") return;
+      event.preventDefault();
+      pick(GENERIC_CHOICES[highlight]?.value ?? "once");
+    }
+  }
+
+  const targetLine = summarizeTarget(request);
+
   return (
-    <div className="review-overlay generic-approval" role="dialog" aria-modal="true" aria-label="外部工具审批" aria-busy={busy}>
-      <section className="generic-approval-panel">
-        <header>
-          <ShieldCheck size={20} />
-          <div><h2>外部工具请求</h2><span>{request.toolName}</span></div>
-        </header>
-        <dl>
-          <div><dt>风险</dt><dd>{riskLabel(request.risk)}</dd></div>
-          <div><dt>原因</dt><dd>{request.reason}</dd></div>
-        </dl>
-        <pre><code>{JSON.stringify(request.arguments, null, 2)}</code></pre>
-        {(error || localError) && <div className="review-error" role="alert">{localError || error}</div>}
-        <footer>
-          <button className="secondary-button" type="button" disabled={busy} onClick={() => void resolve("rejected")}>拒绝</button>
-          <button className="primary-button" type="button" disabled={busy} onClick={() => void resolve("approved")}>允许一次</button>
-        </footer>
+    <div
+      className="claude-approval"
+      role="dialog"
+      aria-modal="false"
+      aria-label="外部工具审批"
+      aria-busy={busy}
+      tabIndex={-1}
+      ref={dialogRef}
+      onKeyDown={handleKey}
+    >
+      <section className="claude-approval-panel" aria-busy={busy}>
+        <h2 className="claude-approval-title">
+          确认执行 {request.toolName}{targetLine ? `: ${targetLine}` : ""}?
+        </h2>
+        <p className="claude-approval-reason">{request.reason || riskLabel(request.risk)}</p>
+        <details className="claude-approval-details">
+          <summary>查看参数</summary>
+          <pre><code>{JSON.stringify(request.arguments, null, 2)}</code></pre>
+        </details>
+        <div className="claude-approval-actions" role="group" aria-label="审批选项">
+          {GENERIC_CHOICES.map((choice, index) => (
+            <button
+              key={choice.value}
+              type="button"
+              data-choice={choice.value}
+              className={`claude-approval-action ${choice.value === "once" ? "claude-approval-action--primary" : ""} ${
+                choice.value === "reject" ? "claude-approval-action--danger" : ""
+              } ${highlight === index ? "is-highlight" : ""}`}
+              onMouseEnter={() => setHighlight(index)}
+              onClick={() => pick(choice.value)}
+              disabled={busy}
+            >
+              {choice.label}
+            </button>
+          ))}
+        </div>
+        <input
+          type="text"
+          className="claude-approval-input"
+          placeholder="告诉 k-Coder 应该怎么做（可选）"
+          value={feedback}
+          onChange={(event) => setFeedback(event.target.value)}
+          disabled={busy}
+        />
+        {(error || localError) && (
+          <div className="claude-approval-error" role="alert">{localError || error}</div>
+        )}
+        <div className="claude-approval-hint">按 Esc 取消 · 按数字键快速选择</div>
       </section>
     </div>
   );
+}
+
+function summarizeTarget(request: ApprovalRequest): string {
+  const args = request.arguments ?? {};
+  if (typeof args.path === "string") return args.path;
+  if (typeof args.file_path === "string") return args.file_path;
+  if (typeof args.filePath === "string") return args.filePath;
+  if (typeof args.destination === "string") return args.destination;
+  if (typeof args.command === "string") return truncate(args.command, 80);
+  if (typeof args.cmd === "string") return truncate(args.cmd, 80);
+  if (typeof args.url === "string") return args.url;
+  return "";
+}
+
+function truncate(value: string, max: number) {
+  return value.length > max ? `${value.slice(0, max - 1)}…` : value;
 }
 
 function riskLabel(risk: ApprovalRequest["risk"]) {

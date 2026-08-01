@@ -814,6 +814,15 @@ pub async fn run_turn(
         .map_err(|error| CommandError::new("memory", error))?;
     let runtime_instructions =
         append_runtime_instructions(runtime_instructions, memory_instructions);
+
+    // 根据模式添加额外指令
+    let mode_instructions = match request.agent_mode.as_deref() {
+        Some("ask") => "\n\n<agent_mode>ASK模式：只回答问题和提供建议，不要使用任何修改文件的工具（Write、Edit等），不要执行会改变项目状态的命令。专注于分析、解释和建议。</agent_mode>",
+        Some("plan") => "\n\n<agent_mode>PLAN模式：在执行任何修改操作前，先制定详细计划并等待用户确认。说明你将要做什么、为什么这样做、以及可能的影响。获得明确同意后再执行。</agent_mode>",
+        _ => "", // craft模式或未指定 - 默认行为
+    };
+    let runtime_instructions = format!("{}{}", runtime_instructions, mode_instructions);
+
     let goal_budget = advanced
         .goals
         .turn_budget(&thread_id)

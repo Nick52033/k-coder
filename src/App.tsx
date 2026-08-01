@@ -25,9 +25,6 @@ import {
   Undo2,
   X,
   Target,
-  Pause,
-  Play,
-  CircleCheck,
 } from "lucide-react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { getRuntimeStatus, subscribeToAgentEvents, listSubagents } from "./api/runtime";
@@ -38,11 +35,12 @@ import { WorkbenchPanel, WorkspacePicker } from "./components/WorkbenchPanel";
 import { AgentActivityPanel } from "./components/AgentActivityPanel";
 import { ModelSelector } from "./components/ModelSelector";
 import { cn } from "./lib/cn";
-import type { AttachmentContent, GoalState, GoalView, RuntimeStatus } from "./types/runtime";
+import type { AttachmentContent, GoalView, RuntimeStatus } from "./types/runtime";
 import "./App.css";
 import "./enhanced-animations.css"; // UI 增强动画
+import "./components/ModeSelector.css";
 
-type Skin = "paper" | "midnight" | "vscode" | "amber";
+type Skin = "paper" | "midnight" | "vscode" | "amber" | "codebuddy";
 type ThemeMode = "light" | "dark";
 
 const STORAGE_SKIN = "kcoder_skin";
@@ -74,6 +72,10 @@ function App() {
     readStored(STORAGE_THEME, "light"),
   );
   const [subagentThreadIds, setSubagentThreadIds] = useState<Set<string>>(new Set());
+  const [agentMode, setAgentMode] = useState<"craft" | "ask" | "plan">("craft");
+  const [modeMenuOpen, setModeMenuOpen] = useState(false);
+  const [expandedChangeSets, setExpandedChangeSets] = useState<Set<string>>(new Set());
+  const [queueExpanded, setQueueExpanded] = useState(false);
   const messageAreaRef = useRef<HTMLDivElement>(null);
   const {
     threads,
@@ -92,6 +94,7 @@ function App() {
     goal,
     loading,
     error,
+    messageQueue,
     initialize,
     createThread,
     selectThread,
@@ -111,6 +114,8 @@ function App() {
     deleteConversation,
     createActiveGoal,
     transitionActiveGoal,
+    clearQueue,
+    forceResetState,
   } = useWorkbenchStore();
 
   useEffect(() => {
@@ -144,11 +149,23 @@ function App() {
         if (!disposed) setRuntimeError(String(reason));
       });
 
+    // 添加紧急状态重置快捷键 Ctrl+Shift+R
+    function handleEmergencyReset(event: globalThis.KeyboardEvent) {
+      if ((event.ctrlKey || event.metaKey) && event.shiftKey && event.key.toLowerCase() === "r") {
+        event.preventDefault();
+        // 使用新的 forceResetState 函数
+        void forceResetState();
+        console.log("紧急状态已重置");
+      }
+    }
+    window.addEventListener("keydown", handleEmergencyReset);
+
     return () => {
       disposed = true;
       unlisten?.();
+      window.removeEventListener("keydown", handleEmergencyReset);
     };
-  }, [handleAgentEvent, initialize]);
+  }, [handleAgentEvent, initialize, forceResetState]);
 
   useEffect(() => {
     const area = messageAreaRef.current;
@@ -173,6 +190,7 @@ function App() {
       if (event.key === "Escape") {
         setWorkbenchOpen(false);
         setAgentPanelOpen(false);
+        setModeMenuOpen(false);
       }
     }
     window.addEventListener("keydown", handleShortcut);
@@ -206,7 +224,7 @@ function App() {
       .map((attachment) => ({ name: attachment.name, dataUrl: attachment.content }));
     setDraft("");
     setAttachments([]);
-    void sendMessage(message + attachmentContext, imageAttachments);
+    void sendMessage(message + attachmentContext, imageAttachments, agentMode);
   }
 
   function handleComposerKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
@@ -220,6 +238,45 @@ function App() {
     }
   }
 
+  function handlePaste(event: React.ClipboardEvent<HTMLTextAreaElement>) {
+    const items = event.clipboardData.items;
+    const imageFiles: File[] = [];
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i];
+      if (item.type.startsWith("image/")) {
+        const file = item.getAsFile();
+        if (file) imageFiles.push(file);
+      }
+    }
+    if (imageFiles.length === 0) return; // 没有图片，使用默认粘贴行为（粘贴文本）
+
+    event.preventDefault();
+    for (const file of imageFiles) {
+      const reader = new FileReader();
+      reader.onload = () => {
+        const dataUrl = reader.result as string;
+        const name = file.name || `paste-${Date.now()}.png`;
+        setAttachments((items) => {
+          // 避免重复添加同名图片
+          const path = `clipboard://${name}`;
+          if (items.some((a) => a.path === path)) return items;
+          return [
+            ...items,
+            {
+              path,
+              name,
+              kind: "image",
+              content: dataUrl,
+              size: file.size,
+              truncated: false,
+            },
+          ];
+        });
+      };
+      reader.readAsDataURL(file);
+    }
+  }
+
   function openSettings() {
     clearError();
     setWorkbenchOpen(false);
@@ -228,7 +285,7 @@ function App() {
   }
 
   return (
-    <main className="workbench">
+    <main className={cn("workbench", workbenchOpen && "workbench--panel-open")}>
       <header className="titlebar" data-tauri-drag-region>
         <div className="brand" data-tauri-drag-region>
           <span className="brand-mark" aria-hidden="true">K</span>
@@ -387,16 +444,116 @@ function App() {
             <div className="empty-thread"><Activity className="spin" size={24} /><p>正在读取会话</p></div>
           ) : messages.length ? (
             <div className="message-list">
-              {messages.map((message) => (
-                <article className={cn("message", `message--${message.role}`)} key={message.id}>
-                  <div className="message-role">{message.role === "user" ? "你" : "k-Coder"}</div>
-                  <div className="message-content">
-                    {message.text || (message.status === "streaming" ? <span className="typing-indicator">•••</span> : null)}
+              {messages.map((message) => {
+                // 查找该消息对应回合的文件变更
+                const messageChanges = message.role === "assistant" && message.turnId
+                  ? changes.filter(change => change.turnId === message.turnId && !change.undone)
+                  : [];
+
+                return (
+                  <article className={cn("message", `message--${message.role}`, message.status === "streaming" && "message--streaming")} key={message.id}>
+                    {message.role === "assistant" && (
+                      <div className="message-avatar" aria-hidden="true">
+                        <span className="message-avatar-mark">K</span>
+                        <span className="message-avatar-pulse" />
+                      </div>
+                    )}
+                    <div className="message-body">
+                      <div className="message-role">{message.role === "user" ? "你" : "k-Coder"}</div>
+                      <div className="message-content">
+                        {message.text || (message.status === "streaming" ? (
+                          <span className="typing-indicator" aria-label="AI 正在响应">
+                            <span className="typing-dot" />
+                            <span className="typing-dot" />
+                            <span className="typing-dot" />
+                          </span>
+                        ) : null)}
+                      </div>
+                    </div>
+
+                    {/* 文件变更列表 */}
+                    {message.role === "assistant" && messageChanges.length > 0 && (
+                      <div className="message-changes">
+                        <button
+                          type="button"
+                          className="changes-toggle"
+                          onClick={() => {
+                            setExpandedChangeSets(prev => {
+                              const next = new Set(prev);
+                              if (next.has(message.id)) {
+                                next.delete(message.id);
+                              } else {
+                                next.add(message.id);
+                              }
+                              return next;
+                            });
+                          }}
+                        >
+                          <span className={cn("changes-arrow", expandedChangeSets.has(message.id) && "changes-arrow--expanded")}>▶</span>
+                          <span>{messageChanges.reduce((sum, change) => sum + change.files.length, 0)} 个文件</span>
+                        </button>
+
+                        {expandedChangeSets.has(message.id) && (
+                          <div className="changes-list">
+                            {messageChanges.flatMap(change => change.files).map((file, idx) => (
+                              <div key={idx} className="change-file-item">
+                                <span className="change-file-name">{file.path}</span>
+                                {file.linesAdded > 0 && <span className="change-stat change-stat--added">+{file.linesAdded}</span>}
+                                {file.linesRemoved > 0 && <span className="change-stat change-stat--removed">-{file.linesRemoved}</span>}
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    )}
+
+                    {message.status === "failed" && <div className="message-status message-status--error">生成失败</div>}
+                    {message.status === "cancelled" && <div className="message-status">已停止</div>}
+                  </article>
+                );
+              })}
+
+              {/* 内嵌授权请求 */}
+              {pendingApproval && (
+                <article className="message message--approval">
+                  <div className="message-avatar" aria-hidden="true">
+                    <span className="message-avatar-mark">K</span>
                   </div>
-                  {message.status === "failed" && <div className="message-status message-status--error">生成失败</div>}
-                  {message.status === "cancelled" && <div className="message-status">已停止</div>}
+                  <div className="message-body">
+                    <div className="message-role">k-Coder</div>
+                    <div className="approval-inline">
+                      <div className="approval-prompt">
+                        确认执行命令？
+                      </div>
+
+                      <div className="approval-options">
+                        <button
+                          type="button"
+                          className="approval-option"
+                          onClick={() => void resolvePendingApproval({ kind: "once" })}
+                        >
+                          运行
+                        </button>
+                        <button
+                          type="button"
+                          className="approval-option"
+                          onClick={() => void resolvePendingApproval({ kind: "session" })}
+                        >
+                          跳过
+                        </button>
+                        <button
+                          type="button"
+                          className="approval-option approval-option--danger"
+                          onClick={() => void resolvePendingApproval({ kind: "reject" })}
+                        >
+                          拒绝
+                        </button>
+                      </div>
+                    </div>
+                  </div>
                 </article>
-              ))}
+              )}
+
               {retryable && (
                 <button className="retry-button" type="button" onClick={() => void retryLastTurn()}>
                   <RefreshCw size={15} />
@@ -416,28 +573,161 @@ function App() {
           <div className="error-banner" role="alert">
             <CircleAlert size={16} />
             <span>{error}</span>
-            <button type="button" aria-label="关闭错误" title="关闭" onClick={clearError}><X size={15} /></button>
+            <div style={{ display: 'flex', gap: '4px', alignItems: 'center' }}>
+              {activeTurnId && (
+                <button
+                  type="button"
+                  aria-label="强制重置"
+                  title="强制重置卡住的状态"
+                  onClick={() => void forceResetState()}
+                  style={{
+                    padding: '2px 6px',
+                    fontSize: '0.65rem',
+                    borderRadius: '3px',
+                    border: '1px solid currentColor',
+                    background: 'transparent',
+                    cursor: 'pointer',
+                    whiteSpace: 'nowrap'
+                  }}
+                >
+                  重置
+                </button>
+              )}
+              <button type="button" aria-label="关闭错误" title="关闭" onClick={clearError}><X size={15} /></button>
+            </div>
           </div>
         )}
 
-        <GoalControl
-          goal={goal}
-          disabled={Boolean(activeTurnId)}
-          onCreate={createActiveGoal}
-          onTransition={transitionActiveGoal}
-        />
+        {/* 消息队列显示 */}
+        {messageQueue.length > 0 && (
+          <div className="message-queue">
+            <button
+              type="button"
+              className="queue-toggle"
+              onClick={() => setQueueExpanded(!queueExpanded)}
+            >
+              <span className={cn("queue-arrow", queueExpanded && "queue-arrow--expanded")}>▶</span>
+              <span className="queue-title">队列 ({messageQueue.filter(m => m.status === "pending").length})</span>
+            </button>
+
+            {queueExpanded && (
+              <div className="queue-list">
+                {messageQueue.map((queueItem, idx) => (
+                  <div key={queueItem.id} className={cn("queue-item", `queue-item--${queueItem.status}`)}>
+                    <span className="queue-item-index">{idx + 1}</span>
+                    <div className="queue-item-content">
+                      <span className="queue-item-text">{queueItem.input.slice(0, 50)}{queueItem.input.length > 50 ? "..." : ""}</span>
+                      <span className="queue-item-status">
+                        {queueItem.status === "pending" && "等待中"}
+                        {queueItem.status === "processing" && "处理中..."}
+                        {queueItem.status === "completed" && "已完成"}
+                        {queueItem.status === "failed" && "失败"}
+                      </span>
+                    </div>
+                  </div>
+                ))}
+                {messageQueue.filter(m => m.status === "pending").length > 0 && (
+                  <button
+                    type="button"
+                    className="queue-clear-btn"
+                    onClick={clearQueue}
+                  >
+                    清空队列
+                  </button>
+                )}
+              </div>
+            )}
+          </div>
+        )}
+
+        <GoalControl goal={goal} onManage={() => setSettingsOpen(true)} />
         <form className="composer" onSubmit={submitMessage}>
-          {attachments.length > 0 && <div className="attachment-strip">{attachments.map((attachment) => <span key={attachment.path}><Paperclip size={12} />{attachment.name}<button type="button" aria-label={`移除 ${attachment.name}`} onClick={() => setAttachments((items) => items.filter((item) => item.path !== attachment.path))}><X size={12} /></button></span>)}</div>}
+          {attachments.length > 0 && <div className="attachment-strip">{attachments.map((attachment) => <span key={attachment.path} className={attachment.kind === "image" ? "attachment-tag attachment-tag--image" : "attachment-tag"}>{attachment.kind === "image" ? <img src={attachment.content} alt={attachment.name} className="attachment-thumb" /> : <Paperclip size={12} />}{attachment.name}<button type="button" aria-label={`移除 ${attachment.name}`} onClick={() => setAttachments((items) => items.filter((item) => item.path !== attachment.path))}><X size={12} /></button></span>)}</div>}
           <textarea
             aria-label="消息"
             value={draft}
             onChange={(event) => setDraft(event.target.value)}
             onKeyDown={handleComposerKeyDown}
-            placeholder="输入消息"
+            onPaste={handlePaste}
+            placeholder={activeTurnId ? "" : "输入消息，可直接粘贴图片"}
             rows={3}
             disabled={Boolean(activeTurnId)}
           />
           <div className="composer-footer">
+            <div className="composer-mode-selector">
+              <button
+                type="button"
+                className="mode-toggle"
+                onClick={() => setModeMenuOpen(!modeMenuOpen)}
+                aria-label="选择模式"
+                title="选择交互模式"
+              >
+                {agentMode === "craft" && (
+                  <>
+                    <Code2 size={16} />
+                    <span>Craft</span>
+                  </>
+                )}
+                {agentMode === "ask" && (
+                  <>
+                    <MessageSquare size={16} />
+                    <span>Ask</span>
+                  </>
+                )}
+                {agentMode === "plan" && (
+                  <>
+                    <FileDiff size={16} />
+                    <span>Plan</span>
+                  </>
+                )}
+              </button>
+              {modeMenuOpen && (
+                <div className="mode-menu">
+                  <button
+                    type="button"
+                    className={`mode-option ${agentMode === "craft" ? "mode-option--active" : ""}`}
+                    onClick={() => {
+                      setAgentMode("craft");
+                      setModeMenuOpen(false);
+                    }}
+                  >
+                    <Code2 size={16} />
+                    <div>
+                      <strong>Craft</strong>
+                      <span>直接执行，修改代码</span>
+                    </div>
+                  </button>
+                  <button
+                    type="button"
+                    className={`mode-option ${agentMode === "ask" ? "mode-option--active" : ""}`}
+                    onClick={() => {
+                      setAgentMode("ask");
+                      setModeMenuOpen(false);
+                    }}
+                  >
+                    <MessageSquare size={16} />
+                    <div>
+                      <strong>Ask</strong>
+                      <span>只回答问题，不修改代码</span>
+                    </div>
+                  </button>
+                  <button
+                    type="button"
+                    className={`mode-option ${agentMode === "plan" ? "mode-option--active" : ""}`}
+                    onClick={() => {
+                      setAgentMode("plan");
+                      setModeMenuOpen(false);
+                    }}
+                  >
+                    <FileDiff size={16} />
+                    <div>
+                      <strong>Plan</strong>
+                      <span>先制定计划，等待确认</span>
+                    </div>
+                  </button>
+                </div>
+              )}
+            </div>
             <ModelSelector
               provider={providerConfig}
               providers={providerConfigs}
@@ -547,6 +837,8 @@ function App() {
         <SettingsDialog
           provider={providerConfig}
           providers={providerConfigs}
+          activeThreadId={activeThreadId}
+          goal={goal}
           activeProviderId={activeProviderId}
           error={error}
           skin={skin}
@@ -557,13 +849,8 @@ function App() {
           onSaveProvider={saveProvider}
           onActivateProvider={activateProvider}
           onDeleteProvider={deleteProvider}
-        />
-      )}
-      {pendingApproval && (
-        <PatchReviewDialog
-          request={pendingApproval}
-          error={error}
-          onResolve={resolvePendingApproval}
+          onCreateGoal={createActiveGoal}
+          onTransitionGoal={transitionActiveGoal}
         />
       )}
       {!pendingApproval && selectedChange && (
@@ -580,47 +867,43 @@ function App() {
 
 function GoalControl({
   goal,
-  disabled,
-  onCreate,
-  onTransition,
+  onManage,
 }: {
   goal: GoalView | null;
-  disabled: boolean;
-  onCreate: (objective: string, tokenBudget: number, timeBudgetMs: number) => Promise<boolean>;
-  onTransition: (state: GoalState, reason?: string) => Promise<boolean>;
+  onManage: () => void;
 }) {
+  // 无 Goal 或已结束：不占用聊天区空间，全部收敛到设置里管理
   if (!goal || goal.state === "completed" || goal.state === "budget_exhausted") {
-    return (
-      <div className="goal-bar goal-bar--idle">
-        <button
-          type="button"
-          disabled={disabled}
-          onClick={() => {
-            const objective = window.prompt("目标说明");
-            if (objective?.trim()) void onCreate(objective.trim(), 100_000, 60 * 60 * 1000);
-          }}
-        >
-          <Target size={14} /> 创建 Goal
-        </button>
-        {goal?.state === "budget_exhausted" && <span>预算已耗尽</span>}
-      </div>
-    );
+    return null;
   }
   const percent = Math.min(100, Math.round((goal.tokensUsed / goal.tokenBudget) * 100));
+  const paused = goal.state === "paused";
+  const blocked = goal.state === "blocked";
   return (
-    <div className="goal-bar">
-      <Target size={14} />
-      <div className="goal-copy">
-        <strong title={goal.objective}>{goal.objective}</strong>
-        <span>{goal.state === "active" ? "运行中" : goal.state === "paused" ? "已暂停" : "已阻塞"} · {goal.tokensUsed.toLocaleString()} / {goal.tokenBudget.toLocaleString()} tokens</span>
-      </div>
-      <div className="goal-progress" aria-label={`Goal 预算已使用 ${percent}%`}><span style={{ width: `${percent}%` }} /></div>
-      {goal.state === "active" ? (
-        <button type="button" title="暂停 Goal" aria-label="暂停 Goal" disabled={disabled} onClick={() => void onTransition("paused")}><Pause size={14} /></button>
-      ) : (
-        <button type="button" title="继续 Goal" aria-label="继续 Goal" disabled={disabled} onClick={() => void onTransition("active")}><Play size={14} /></button>
-      )}
-      <button type="button" title="完成 Goal" aria-label="完成 Goal" disabled={disabled} onClick={() => void onTransition("completed")}><CircleCheck size={14} /></button>
+    <div
+      className="goal-slim"
+      role="button"
+      tabIndex={0}
+      aria-label="Goal 状态，点击管理"
+      title={paused ? "Goal 已暂停，点击管理" : blocked ? "Goal 已阻塞，点击管理" : "Goal 运行中，点击管理"}
+      onClick={onManage}
+      onKeyDown={(event) => {
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          onManage();
+        }
+      }}
+    >
+      <span className={`goal-slim-icon ${paused ? "goal-slim-icon--paused" : blocked ? "goal-slim-icon--blocked" : ""}`}>
+        <Target size={13} />
+      </span>
+      <span className="goal-slim-track" aria-hidden="true">
+        <span style={{ width: `${percent}%` }} />
+      </span>
+      <span className="goal-slim-copy">
+        {paused ? "已暂停" : blocked ? "已阻塞" : "运行中"} · {goal.tokensUsed.toLocaleString()} / {goal.tokenBudget.toLocaleString()} tokens
+      </span>
+      <span className="goal-slim-manage" aria-hidden="true">管理</span>
     </div>
   );
 }

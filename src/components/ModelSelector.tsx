@@ -167,7 +167,9 @@ export function ModelSelector({
     setSwitching(true);
     const success = await onActivateProvider(providerId);
     setSwitching(false);
-    if (success) closeMenu({ restoreFocus: true });
+    // 切完供应商保持弹窗打开，让用户继续选具体模型；
+    // 只在切换失败时关闭弹窗。
+    if (!success) closeMenu({ restoreFocus: true });
   }
 
   return (

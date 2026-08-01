@@ -246,6 +246,10 @@ export interface ApprovalResolution {
   patch: string | null;
   selectedPaths: string[];
   expectedHashes: ExpectedFileHash[];
+  /** 授权作用域：`once`=仅本次调用；`session`=本会话内同类操作放行。 */
+  scope?: "once" | "session";
+  /** 拒绝时附带给模型的反馈文本（可选）。 */
+  feedback?: string;
 }
 
 export interface ApprovalSnapshot {

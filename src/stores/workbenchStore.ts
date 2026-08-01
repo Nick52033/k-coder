@@ -42,12 +42,23 @@ import type {
   PlanView,
 } from "../types/runtime";
 
+interface QueuedMessage {
+  id: string;
+  input: string;
+  attachments: ImageAttachment[];
+  agentMode?: string;
+  status: "pending" | "processing" | "completed" | "failed";
+  turnId?: string;
+  error?: string;
+}
+
 interface WorkbenchState {
   threads: ThreadSummary[];
   activeThreadId: string | null;
   messages: ConversationMessage[];
   lastTurn: TurnSnapshot | null;
   activeTurnId: string | null;
+  messageQueue: QueuedMessage[];
   usage: TokenUsage | null;
   toolActivities: ToolActivity[];
   pendingApproval: ApprovalRequest | null;
@@ -67,7 +78,9 @@ interface WorkbenchState {
   createThread: () => Promise<void>;
   selectThread: (threadId: string) => Promise<void>;
   archiveActiveThread: () => Promise<void>;
-  sendMessage: (input: string, attachments?: ImageAttachment[]) => Promise<void>;
+  sendMessage: (input: string, attachments?: ImageAttachment[], agentMode?: string) => Promise<void>;
+  processQueue: () => Promise<void>;
+  clearQueue: () => void;
   retryLastTurn: () => Promise<void>;
   stopTurn: () => Promise<void>;
   loadProviderCatalog: () => Promise<void>;
@@ -80,6 +93,7 @@ interface WorkbenchState {
   undoAppliedChange: (changeId: string) => Promise<boolean>;
   handleAgentEvent: (event: AgentEvent) => void;
   clearError: () => void;
+  forceResetState: () => Promise<void>;
 }
 
 function toConversationMessage(message: ChatMessage): ConversationMessage {
@@ -154,6 +168,7 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
   messages: [],
   lastTurn: null,
   activeTurnId: null,
+  messageQueue: [],
   usage: null,
   toolActivities: [],
   pendingApproval: null,
@@ -287,10 +302,26 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
     }
   },
 
-  sendMessage: async (input, attachments = []) => {
+  sendMessage: async (input, attachments = [], agentMode) => {
     const threadId = get().activeThreadId;
     const text = input.trim();
-    if (!threadId || !text || get().activeTurnId) return;
+    if (!threadId || !text) return;
+
+    // 创建队列项
+    const queuedMessage: QueuedMessage = {
+      id: `queue-${crypto.randomUUID()}`,
+      input: text,
+      attachments,
+      agentMode,
+      status: "pending",
+    };
+
+    // 添加到队列
+    set((state) => ({
+      messageQueue: [...state.messageQueue, queuedMessage],
+    }));
+
+    // 添加乐观更新的用户消息
     const optimisticId = `pending-${crypto.randomUUID()}`;
     set((state) => ({
       messages: [
@@ -303,16 +334,92 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
         },
       ],
       error: "",
-      usage: null,
     }));
+
+    // 处理队列
+    get().processQueue();
+  },
+
+  processQueue: async () => {
+    const { messageQueue, activeTurnId, activeThreadId } = get();
+
+    // 如果已有活动的 turn，等待它完成
+    if (activeTurnId) return;
+
+    // 找到第一个待处理的消息
+    const nextMessage = messageQueue.find(msg => msg.status === "pending");
+    if (!nextMessage || !activeThreadId) return;
+
+    // 标记为处理中
+    set((state) => ({
+      messageQueue: state.messageQueue.map(msg =>
+        msg.id === nextMessage.id ? { ...msg, status: "processing" as const } : msg
+      ),
+    }));
+
     try {
-      const outcome = await runTurn(threadId, text, attachments);
-      await Promise.all([get().reloadThreads(), get().selectThread(threadId)]);
-      if (outcome.error) set({ error: outcome.error });
+      const outcome = await runTurn(
+        activeThreadId,
+        nextMessage.input,
+        nextMessage.attachments,
+        nextMessage.agentMode
+      );
+
+      // 标记为完成
+      set((state) => ({
+        messageQueue: state.messageQueue.map(msg =>
+          msg.id === nextMessage.id
+            ? { ...msg, status: "completed" as const, turnId: outcome.turn_id }
+            : msg
+        ),
+      }));
+
+      await Promise.all([get().reloadThreads(), get().selectThread(activeThreadId)]);
+
+      if (outcome.error) {
+        set({ error: outcome.error });
+        // 标记为失败
+        set((state) => ({
+          messageQueue: state.messageQueue.map(msg =>
+            msg.id === nextMessage.id
+              ? { ...msg, status: "failed" as const, error: outcome.error }
+              : msg
+          ),
+        }));
+      }
+
+      // 清理已完成的消息（保留最近5条用于显示）
+      set((state) => ({
+        messageQueue: state.messageQueue.filter(
+          msg => msg.status !== "completed" ||
+          state.messageQueue.indexOf(msg) >= state.messageQueue.length - 5
+        ),
+      }));
+
+      // 继续处理队列中的下一条消息
+      setTimeout(() => get().processQueue(), 500);
+
     } catch (error) {
-      set({ error: errorMessage(error), activeTurnId: null });
-      await get().selectThread(threadId);
+      // 标记为失败
+      set((state) => ({
+        messageQueue: state.messageQueue.map(msg =>
+          msg.id === nextMessage.id
+            ? { ...msg, status: "failed" as const, error: errorMessage(error) }
+            : msg
+        ),
+        error: errorMessage(error),
+        activeTurnId: null,
+      }));
+
+      await get().selectThread(activeThreadId);
+
+      // 继续处理队列中的下一条消息
+      setTimeout(() => get().processQueue(), 500);
     }
+  },
+
+  clearQueue: () => {
+    set({ messageQueue: [] });
   },
 
   retryLastTurn: async () => {
@@ -324,6 +431,7 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
       await Promise.all([get().reloadThreads(), get().selectThread(threadId)]);
       if (outcome.error) set({ error: outcome.error });
     } catch (error) {
+      // 确保错误发生时清除 activeTurnId，防止界面卡住
       set({ error: errorMessage(error), activeTurnId: null });
     }
   },
@@ -333,8 +441,10 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
     if (!threadId || !get().activeTurnId) return;
     try {
       await cancelTurn(threadId);
+      // 确保在取消后清除 activeTurnId，防止界面卡住
+      set({ activeTurnId: null });
     } catch (error) {
-      set({ error: errorMessage(error) });
+      set({ error: errorMessage(error), activeTurnId: null });
     }
   },
 
@@ -560,6 +670,12 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
               : message,
           ),
         }));
+        // 5秒后自动清除错误提示，避免错误一直显示
+        setTimeout(() => {
+          if (get().error === event.message) {
+            set({ error: "" });
+          }
+        }, 5000);
         break;
       case "turn_cancelled":
         set((state) => ({
@@ -577,4 +693,33 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
   },
 
   clearError: () => set({ error: "" }),
+
+  forceResetState: async () => {
+    const threadId = get().activeThreadId;
+    console.log("强制重置状态...");
+
+    // 尝试取消任何正在运行的 turn
+    if (threadId && get().activeTurnId) {
+      try {
+        await cancelTurn(threadId);
+      } catch (e) {
+        console.warn("取消 turn 失败（可能已完成）", e);
+      }
+    }
+
+    // 清除所有可能导致卡住的状态
+    set({
+      activeTurnId: null,
+      pendingApproval: null,
+      error: "",
+      loading: false,
+    });
+
+    // 重新加载当前线程的状态
+    if (threadId) {
+      await get().selectThread(threadId);
+    }
+
+    console.log("状态已重置");
+  },
 }));

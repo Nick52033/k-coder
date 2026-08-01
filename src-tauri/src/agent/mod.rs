@@ -28,7 +28,7 @@ const MAX_IMAGE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_TOTAL_IMAGE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_RESPONSE_BYTES: usize = 10 * 1024 * 1024;
 const MAX_TOOL_OUTPUT_BYTES: usize = 256 * 1024;
-const MAX_TOOL_ITERATIONS: usize = 8;
+const MAX_TOOL_ITERATIONS: usize = 16;
 const MAX_TOOL_CALLS: usize = 24;
 const MAX_IDENTICAL_TOOL_CALLS: usize = 2;
 
@@ -37,6 +37,7 @@ const MAX_IDENTICAL_TOOL_CALLS: usize = 2;
 pub struct RunTurnRequest {
     pub thread_id: String,
     pub input: String,
+    pub agent_mode: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

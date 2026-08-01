@@ -463,6 +463,7 @@ impl MultiAgentCoordinator {
                             RunTurnRequest {
                                 thread_id: record.thread_id.clone(),
                                 input: input.unwrap_or_default(),
+                                agent_mode: None,
                             },
                             cancellation.clone(),
                             publisher,

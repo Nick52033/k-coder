@@ -93,8 +93,8 @@ export function archiveThread(threadId: string) {
   return invoke<void>("archive_thread", { threadId });
 }
 
-export function runTurn(threadId: string, input: string, attachments: ImageAttachment[] = []) {
-  return invoke<TurnOutcome>("run_turn", { request: { threadId, input }, attachments });
+export function runTurn(threadId: string, input: string, attachments: ImageAttachment[] = [], agentMode?: string) {
+  return invoke<TurnOutcome>("run_turn", { request: { threadId, input, agentMode }, attachments });
 }
 
 export function retryTurn(threadId: string) {
