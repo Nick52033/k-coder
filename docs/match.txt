@@ -1,0 +1,32 @@
+﻿
+src-tauri\src\commands\mod.rs:28:    AgentEve
+nt, AgentEventEnvelope, ApprovalResolution, C
+hangeSet, ImageAttachment, MessageRole,
+src-tauri\src\commands\mod.rs:36:    self, At
+tachmentContent, FileEntry, FilePreview, GitB
+ranchView, GitStatusView, WorkspaceState,
+src-tauri\src\commands\mod.rs:639:pub fn extr
+act_attachment(
+src-tauri\src\commands\mod.rs:642:) -> Comman
+dResult<AttachmentContent> {
+src-tauri\src\commands\mod.rs:653:           
+ .map_err(|error| CommandError::new("attachme
+nt", error))?;
+src-tauri\src\commands\mod.rs:654:        ret
+urn Ok(AttachmentContent {
+src-tauri\src\commands\mod.rs:663:    workben
+ch::extract_attachment(&state.workspace_root(
+), &path)
+src-tauri\src\commands\mod.rs:664:        .ma
+p_err(|error| CommandError::new("attachment",
+ error))
+src-tauri\src\commands\mod.rs:791:pub async f
+n run_turn(
+src-tauri\src\commands\mod.rs:795:    attachm
+ents: Vec<ImageAttachment>,
+src-tauri\src\commands\mod.rs:879:        .ru
+n_turn_with_attachments(
+src-tauri\src\commands\mod.rs:883:           
+ attachments,
+
+

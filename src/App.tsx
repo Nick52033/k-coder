@@ -498,8 +498,7 @@ function App() {
                             {messageChanges.flatMap(change => change.files).map((file, idx) => (
                               <div key={idx} className="change-file-item">
                                 <span className="change-file-name">{file.path}</span>
-                                {file.linesAdded > 0 && <span className="change-stat change-stat--added">+{file.linesAdded}</span>}
-                                {file.linesRemoved > 0 && <span className="change-stat change-stat--removed">-{file.linesRemoved}</span>}
+                                <span className="change-operation">{file.operation}</span>
                               </div>
                             ))}
                           </div>
@@ -530,21 +529,39 @@ function App() {
                         <button
                           type="button"
                           className="approval-option"
-                          onClick={() => void resolvePendingApproval({ kind: "once" })}
+                          onClick={() => void resolvePendingApproval({
+                            action: "approved",
+                            patch: null,
+                            selectedPaths: [],
+                            expectedHashes: [],
+                            scope: "once",
+                          })}
                         >
                           运行
                         </button>
                         <button
                           type="button"
                           className="approval-option"
-                          onClick={() => void resolvePendingApproval({ kind: "session" })}
+                          onClick={() => void resolvePendingApproval({
+                            action: "approved",
+                            patch: null,
+                            selectedPaths: [],
+                            expectedHashes: [],
+                            scope: "session",
+                          })}
                         >
                           跳过
                         </button>
                         <button
                           type="button"
                           className="approval-option approval-option--danger"
-                          onClick={() => void resolvePendingApproval({ kind: "reject" })}
+                          onClick={() => void resolvePendingApproval({
+                            action: "rejected",
+                            patch: null,
+                            selectedPaths: [],
+                            expectedHashes: [],
+                            scope: "once",
+                          })}
                         >
                           拒绝
                         </button>

@@ -1,0 +1,146 @@
+﻿  781| 
+  782| #[tauri::command]
+  783| pub fn rebuild_session_projection(state: State<'_, AppState>) -> CommandResult<()> {
+  784|     state
+  785|         .repository()
+  786|         .rebuild_projection()
+  787|         .map_err(|error| CommandError::new("projection_rebuild", error))
+  788| }
+  789| 
+  790| #[tauri::command]
+  791| pub async fn run_turn(
+  792|     app: AppHandle,
+  793|     state: State<'_, AppState>,
+  794|     request: RunTurnRequest,
+  795|     attachments: Vec<ImageAttachment>,
+  796| ) -> CommandResult<TurnOutcome> {
+  797|     let thread_id = request.thread_id.clone();
+  798|     state
+  799|         .prepare_extensions(false)
+  800|         .await
+  801|         .map_err(|error| CommandError::new("extensions", error))?;
+  802|     let advanced = state.advanced();
+  803|     let runtime_instructions = state
+  804|         .extension_instructions(&request.input)
+  805|         .map_err(|error| CommandError::new("extensions", error))?;
+  806|     let advanced_instructions = advanced
+  807|         .runtime_instructions(&thread_id)
+  808|         .map_err(|error| CommandError::new("advanced_runtime", error))?;
+  809|     let runtime_instructions =
+  810|         append_runtime_instructions(runtime_instructions, advanced_instructions);
+  811|     let memory_instructions = advanced
+  812|         .memory
+  813|         .context()
+  814|         .map_err(|error| CommandError::new("memory", error))?;
+  815|     let runtime_instructions =
+  816|         append_runtime_instructions(runtime_instructions, memory_instructions);
+  817|     let goal_budget = advanced
+  818|         .goals
+  819|         .turn_budget(&thread_id)
+  820|         .map_err(|error| CommandError::new("goal", error))?;
+  821|     let goal_timeout_ms = advanced
+  822|         .goals
+  823|         .current(&thread_id)
+  824|         .map_err(|error| CommandError::new("goal", error))?
+  825|         .filter(|goal| goal.state == crate::advanced::GoalState::Active)
+  826|         .map(|goal| goal.time_budget_ms.saturating_sub(goal.elapsed_ms));
+  827|     let _ = state.logger().log(
+  828|         "info",
+  829|         "turn_requested",
+  830|         serde_json::json!({"threadId": thread_id}),
+  831|     );
+  832|     let (provider, model, context_limit) = state
+  833|         .build_provider()
+  834|         .map_err(|error| CommandError::new("provider_config", error))?;
+  835|     let cancellation = state
+  836|         .begin_turn(&thread_id)
+  837|         .await
+  838|         .map_err(|error| CommandError::new("turn_active", error))?;
+  839|     let goal_timeout = goal_timeout_ms.map(|timeout_ms| {
+  840|         let cancellation = cancellation.clone();
+  841|         tokio::spawn(async move {
+  842|             tokio::time::sleep(std::time::Duration::from_millis(timeout_ms)).await;
+  843|             cancellation.cancel();
+  844|         })
+  845|     });
+  846|     let base_tools = state.tool_registry();
+  847|     let child_context = subagent_context(
+  848|         &app,
+  849|         &state,
+  850|         provider.clone(),
+  851|         model.clone(),
+  852|         context_limit,
+  853|         base_tools.clone(),
+  854|     );
+  855|     let (agent_handlers, agent_risks) = delegation_tools(
+  856|         state.subagents(),
+  857|         child_context,
+  858|         thread_id.clone(),
+  859|         cancellation.child_token(),
+  860|     );
+  861|     let tools = base_tools
+  862|         .with_additional_handlers(agent_handlers, agent_risks)
+  863|         .map_err(|error| CommandError::new("multi_agent", error))?;
+  864|     let mut runtime = AgentRuntime::with_tools_and_approvals(
+  865|         state.runtime_repository(),
+  866|         tools,
+  867|         state.workspace_root(),
+  868|         state.approvals(),
+  869|     )
+  870|     .with_runtime_instructions(runtime_instructions)
+  871|     .with_context_limit(context_limit)
+  872|     .with_metrics(advanced.metrics.clone());
+  873|     if let Some((_, remaining_tokens)) = &goal_budget {
+  874|         runtime = runtime.with_token_budget(*remaining_tokens);
+  875|     }
+  876|     let publisher: Arc<dyn EventPublisher> = Arc::new(TauriEventPublisher { app });
+  877|     let started = std::time::Instant::now();
+  878|     let result = runtime
+  879|         .run_turn_with_attachments(
+  880|             provider,
+  881|             model,
+  882|             request,
+  883|             attachments,
+  884|             cancellation,
+  885|             publisher,
+  886|         )
+  887|         .await;
+  888|     if let Some(timeout) = goal_timeout {
+  889|         timeout.abort();
+  890|     }
+  891|     if let Some((goal_id, _)) = goal_budget {
+  892|         let tokens = match &result {
+  893|             Ok(outcome) => turn_tokens(&state, &thread_id, &outcome.turn_id).await,
+  894|             Err(_) => 0,
+  895|         };
+  896|         let _ = advanced
+  897|             .goals
+  898|             .record_turn(&goal_id, tokens, started.elapsed().as_millis() as u64);
+  899|     }
+  900|     state.finish_turn(&thread_id).await;
+  901|     let _ = state.logger().log(
+  902|         if result.is_ok() { "info" } else { "error" },
+  903|         "turn_finished",
+  904|         serde_json::json!({"threadId": thread_id, "success": result.is_ok()}),
+  905|     );
+  906|     result.map_err(|error| CommandError::new("agent_runtime", error))
+  907| }
+  908| 
+  909| #[tauri::command(rename_all = "camelCase")]
+  910| pub async fn retry_turn(
+  911|     app: AppHandle,
+  912|     state: State<'_, AppState>,
+  913|     thread_id: String,
+  914| ) -> CommandResult<TurnOutcome> {
+  915|     state
+  916|         .prepare_extensions(false)
+  917|         .await
+  918|         .map_err(|error| CommandError::new("extensions", error))?;
+  919|     let retry_input = state
+  920|         .repository()
+  921|         .read_thread(&thread_id)
+  922|         .await
+  923|         .map_err(|error| CommandError::new("storage", error))?
+  924|         .messages
+  925|         .into_iter()
+  926|         .rev()

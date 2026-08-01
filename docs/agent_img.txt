@@ -1,0 +1,76 @@
+﻿
+src-tauri\src\agent\mod.rs:16:    ChatMessage, ContentBlock, Expect
+edFileHash, ImageAttachment, MessageRole, PROTOCOL_VERSION,
+src-tauri\src\agent\mod.rs:20:    Provider, ProviderError, Provider
+Event, ProviderImage, ProviderMessage, ProviderRequest,
+src-tauri\src\agent\mod.rs:26:const MAX_IMAGE_COUNT: usize = 4;
+src-tauri\src\agent\mod.rs:27:const MAX_IMAGE_BYTES: usize = 4 * 10
+24 * 1024;
+src-tauri\src\agent\mod.rs:28:const MAX_TOTAL_IMAGE_BYTES: usize = 
+8 * 1024 * 1024;
+src-tauri\src\agent\mod.rs:150:        self.run_turn_with_attachmen
+ts(
+src-tauri\src\agent\mod.rs:161:    pub async fn run_turn_with_attac
+hments(
+src-tauri\src\agent\mod.rs:166:        attachments: Vec<ImageAttach
+ment>,
+src-tauri\src\agent\mod.rs:171:        let message = user_message(i
+nput, attachments)?;
+src-tauri\src\agent\mod.rs:1197:    attachments: Vec<ImageAttachmen
+t>,
+src-tauri\src\agent\mod.rs:1199:    if attachments.len() > MAX_IMAG
+E_COUNT {
+src-tauri\src\agent\mod.rs:1201:            "at most {MAX_IMAGE_COU
+NT} images may be attached"
+src-tauri\src\agent\mod.rs:1206:    for attachment in attachments {
+src-tauri\src\agent\mod.rs:1207:        let (_, encoded) = parse_im
+age_data_url(&attachment.data_url)?;
+src-tauri\src\agent\mod.rs:1210:            AgentRuntimeError::Inva
+lidInput("image data is not valid base64".into())
+src-tauri\src\agent\mod.rs:1212:        if decoded.len() > MAX_IMAG
+E_BYTES {
+src-tauri\src\agent\mod.rs:1214:                "an attached image 
+exceeds the 4 MiB limit".into(),
+src-tauri\src\agent\mod.rs:1218:        if total > MAX_TOTAL_IMAGE_
+BYTES {
+src-tauri\src\agent\mod.rs:1220:                "attached images ex
+ceed the 8 MiB total limit".into(),
+src-tauri\src\agent\mod.rs:1223:        content.push(ContentBlock::
+Image {
+src-tauri\src\agent\mod.rs:1224:            name: attachment.name.c
+hars().take(255).collect(),
+src-tauri\src\agent\mod.rs:1225:            data_url: attachment.da
+ta_url,
+src-tauri\src\agent\mod.rs:1237:fn parse_image_data_url(value: &str
+) -> Result<(&str, &str), AgentRuntimeError> {
+src-tauri\src\agent\mod.rs:1239:        AgentRuntimeError::InvalidI
+nput("image attachment must be a data URL".into())
+src-tauri\src\agent\mod.rs:1244:        .ok_or_else(|| AgentRuntime
+Error::InvalidInput("image data URL must use base64".into()))?;
+src-tauri\src\agent\mod.rs:1247:        "image/png" | "image/jpeg" 
+| "image/gif" | "image/webp"
+src-tauri\src\agent\mod.rs:1250:            "image type must be PNG
+, JPEG, GIF, or WebP".into(),
+src-tauri\src\agent\mod.rs:1258:    let images = message
+src-tauri\src\agent\mod.rs:1262:            ContentBlock::Image { n
+ame, data_url } => Some(ProviderImage { name, data_url }),
+src-tauri\src\agent\mod.rs:1266:    if message.role == MessageRole:
+:User && !images.is_empty() {
+src-tauri\src\agent\mod.rs:1267:        Some(ProviderMessage::UserC
+ontent { text, images })
+src-tauri\src\agent\mod.rs:1316:    fn validates_and_maps_bounded_i
+mage_attachments() {
+src-tauri\src\agent\mod.rs:1319:            vec![ImageAttachment {
+src-tauri\src\agent\mod.rs:1321:                data_url: "data:ima
+ge/png;base64,iVBORw0KGgo=".into(),
+src-tauri\src\agent\mod.rs:1327:            Some(ProviderMessage::U
+serContent { text, images })
+src-tauri\src\agent\mod.rs:1328:                if text == "inspect
+ this screenshot" && images.len() == 1
+src-tauri\src\agent\mod.rs:1332:                "bad image".into(),
+src-tauri\src\agent\mod.rs:1333:                vec![ImageAttachmen
+t {
+src-tauri\src\agent\mod.rs:1335:                    data_url: "data
+:image/svg+xml;base64,PHN2Zy8+".into(),
+
+

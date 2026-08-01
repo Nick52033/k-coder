@@ -1,0 +1,146 @@
+﻿ 1196|     text: String,
+ 1197|     attachments: Vec<ImageAttachment>,
+ 1198| ) -> Result<ChatMessage, AgentRuntimeError> {
+ 1199|     if attachments.len() > MAX_IMAGE_COUNT {
+ 1200|         return Err(AgentRuntimeError::InvalidInput(format!(
+ 1201|             "at most {MAX_IMAGE_COUNT} images may be attached"
+ 1202|         )));
+ 1203|     }
+ 1204|     let mut total = 0usize;
+ 1205|     let mut content = vec![ContentBlock::Text { text }];
+ 1206|     for attachment in attachments {
+ 1207|         let (_, encoded) = parse_image_data_url(&attachment.data_url)?;
+ 1208|         let decoded = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, encoded)
+ 1209|             .map_err(|_| {
+ 1210|             AgentRuntimeError::InvalidInput("image data is not valid base64".into())
+ 1211|         })?;
+ 1212|         if decoded.len() > MAX_IMAGE_BYTES {
+ 1213|             return Err(AgentRuntimeError::InvalidInput(
+ 1214|                 "an attached image exceeds the 4 MiB limit".into(),
+ 1215|             ));
+ 1216|         }
+ 1217|         total = total.saturating_add(decoded.len());
+ 1218|         if total > MAX_TOTAL_IMAGE_BYTES {
+ 1219|             return Err(AgentRuntimeError::InvalidInput(
+ 1220|                 "attached images exceed the 8 MiB total limit".into(),
+ 1221|             ));
+ 1222|         }
+ 1223|         content.push(ContentBlock::Image {
+ 1224|             name: attachment.name.chars().take(255).collect(),
+ 1225|             data_url: attachment.data_url,
+ 1226|         });
+ 1227|     }
+ 1228|     Ok(ChatMessage {
+ 1229|         schema_version: PROTOCOL_VERSION,
+ 1230|         id: Uuid::new_v4().to_string(),
+ 1231|         role: MessageRole::User,
+ 1232|         content,
+ 1233|         created_at_ms: now_ms(),
+ 1234|     })
+ 1235| }
+ 1236| 
+ 1237| fn parse_image_data_url(value: &str) -> Result<(&str, &str), AgentRuntimeError> {
+ 1238|     let (metadata, encoded) = value.split_once(',').ok_or_else(|| {
+ 1239|         AgentRuntimeError::InvalidInput("image attachment must be a data URL".into())
+ 1240|     })?;
+ 1241|     let media_type = metadata
+ 1242|         .strip_prefix("data:")
+ 1243|         .and_then(|value| value.strip_suffix(";base64"))
+ 1244|         .ok_or_else(|| AgentRuntimeError::InvalidInput("image data URL must use base64".into()))?;
+ 1245|     if !matches!(
+ 1246|         media_type,
+ 1247|         "image/png" | "image/jpeg" | "image/gif" | "image/webp"
+ 1248|     ) {
+ 1249|         return Err(AgentRuntimeError::InvalidInput(
+ 1250|             "image type must be PNG, JPEG, GIF, or WebP".into(),
+ 1251|         ));
+ 1252|     }
+ 1253|     Ok((media_type, encoded))
+ 1254| }
+ 1255| 
+ 1256| fn chat_to_provider(message: ChatMessage) -> Option<ProviderMessage> {
+ 1257|     let text = message.text();
+ 1258|     let images = message
+ 1259|         .content
+ 1260|         .into_iter()
+ 1261|         .filter_map(|block| match block {
+ 1262|             ContentBlock::Image { name, data_url } => Some(ProviderImage { name, data_url }),
+ 1263|             ContentBlock::Text { .. } => None,
+ 1264|         })
+ 1265|         .collect::<Vec<_>>();
+ 1266|     if message.role == MessageRole::User && !images.is_empty() {
+ 1267|         Some(ProviderMessage::UserContent { text, images })
+ 1268|     } else {
+ 1269|         Some(ProviderMessage::Text {
+ 1270|             role: message.role,
+ 1271|             text,
+ 1272|         })
+ 1273|     }
+ 1274| }
+ 1275| 
+ 1276| fn validate_input(input: &str) -> Result<String, AgentRuntimeError> {
+ 1277|     let input = input.trim();
+ 1278|     if input.is_empty() {
+ 1279|         return Err(AgentRuntimeError::InvalidInput(
+ 1280|             "input must not be empty".to_string(),
+ 1281|         ));
+ 1282|     }
+ 1283|     if input.len() > MAX_INPUT_BYTES {
+ 1284|         return Err(AgentRuntimeError::InvalidInput(format!(
+ 1285|             "input exceeds the {MAX_INPUT_BYTES} byte limit"
+ 1286|         )));
+ 1287|     }
+ 1288|     Ok(input.to_string())
+ 1289| }
+ 1290| 
+ 1291| fn outcome(thread_id: &str, turn_id: &str, state: TurnState, error: Option<String>) -> TurnOutcome {
+ 1292|     TurnOutcome {
+ 1293|         schema_version: PROTOCOL_VERSION,
+ 1294|         thread_id: thread_id.to_string(),
+ 1295|         turn_id: turn_id.to_string(),
+ 1296|         state,
+ 1297|         error,
+ 1298|     }
+ 1299| }
+ 1300| 
+ 1301| #[cfg(test)]
+ 1302| mod tests {
+ 1303|     use std::path::Path;
+ 1304|     use std::sync::Mutex;
+ 1305|     use std::time::Duration;
+ 1306| 
+ 1307|     use async_trait::async_trait;
+ 1308| 
+ 1309|     use super::*;
+ 1310|     use crate::protocol::{ToolDefinition, ToolRisk};
+ 1311|     use crate::providers::testing::FakeProvider;
+ 1312|     use crate::storage::JsonlThreadRepository;
+ 1313|     use crate::tools::ToolHandler;
+ 1314| 
+ 1315|     #[test]
+ 1316|     fn validates_and_maps_bounded_image_attachments() {
+ 1317|         let message = user_message(
+ 1318|             "inspect this screenshot".into(),
+ 1319|             vec![ImageAttachment {
+ 1320|                 name: "screen.png".into(),
+ 1321|                 data_url: "data:image/png;base64,iVBORw0KGgo=".into(),
+ 1322|             }],
+ 1323|         )
+ 1324|         .unwrap();
+ 1325|         assert!(matches!(
+ 1326|             chat_to_provider(message),
+ 1327|             Some(ProviderMessage::UserContent { text, images })
+ 1328|                 if text == "inspect this screenshot" && images.len() == 1
+ 1329|         ));
+ 1330|         assert!(
+ 1331|             user_message(
+ 1332|                 "bad image".into(),
+ 1333|                 vec![ImageAttachment {
+ 1334|                     name: "bad.svg".into(),
+ 1335|                     data_url: "data:image/svg+xml;base64,PHN2Zy8+".into(),
+ 1336|                 }],
+ 1337|             )
+ 1338|             .is_err()
+ 1339|         );
+ 1340|     }
+ 1341| 
