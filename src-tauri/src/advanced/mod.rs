@@ -5,8 +5,10 @@ mod goal;
 mod memory;
 mod metrics;
 mod plan;
+mod request_user_input;
 mod search;
 mod store;
+mod todo;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -21,7 +23,12 @@ pub use goal::{CreateGoalRequest, GoalState, GoalStore, GoalTransitionRequest, G
 pub use memory::{MemorySettings, MemoryStore, MemoryUpsertRequest, MemoryView};
 pub use metrics::{MetricsSnapshot, RuntimeMetrics};
 pub use plan::{PlanStep, PlanStepState, PlanStore, PlanUpdateRequest, PlanView};
+pub use request_user_input::{
+    REQUEST_USER_INPUT_TOOL_NAME, RequestUserInputArgs, RequestUserInputQuestion,
+    RequestUserInputTool,
+};
 pub use search::{RepositorySearchIndex, SearchResult};
+pub use todo::{TODO_WRITE_TOOL_NAME, TodoWriteArgs, TodoWriteToolHandler};
 
 #[derive(Clone)]
 pub struct AdvancedServices {
@@ -54,12 +61,14 @@ impl AdvancedServices {
             Arc::new(search::SearchTool::new(search)),
             Arc::new(memory::RecallMemoryTool::new(self.memory.clone())),
             Arc::new(memory::RememberTool::new(self.memory.clone())),
+            Arc::new(request_user_input::RequestUserInputTool),
             Arc::new(browser::BrowserTool::navigate(self.browser.clone())),
             Arc::new(browser::BrowserTool::click(self.browser.clone())),
             Arc::new(browser::BrowserTool::type_text(self.browser.clone())),
             Arc::new(browser::BrowserTool::snapshot(self.browser.clone())),
             Arc::new(browser::BrowserTool::screenshot(self.browser.clone())),
             Arc::new(browser::BrowserTool::close(self.browser.clone())),
+            Arc::new(todo::TodoWriteToolHandler),
         ];
         let mut risks = HashMap::new();
         for handler in &handlers {

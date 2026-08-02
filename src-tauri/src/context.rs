@@ -164,10 +164,13 @@ fn message_chars(message: &ProviderMessage) -> usize {
     match message {
         ProviderMessage::Text { text, .. } => text.len(),
         ProviderMessage::UserContent { text, images } => text.len() + images.len() * 4096,
-        ProviderMessage::AssistantToolCalls { calls } => calls
-            .iter()
-            .map(|call| call.name.len() + call.arguments.to_string().len())
-            .sum(),
+        ProviderMessage::AssistantToolCalls { text, calls } => {
+            text.len()
+                + calls
+                    .iter()
+                    .map(|call| call.name.len() + call.arguments.to_string().len())
+                    .sum::<usize>()
+        }
         ProviderMessage::ToolResult { name, output, .. } => name.len() + output.len(),
         ProviderMessage::ProviderContext { item, .. } => item.to_string().len(),
     }

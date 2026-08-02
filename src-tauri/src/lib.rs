@@ -24,6 +24,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_fs::init())
         .setup(|app| {
             let data_root = app.path().app_data_dir()?.join("runtime-data");
             let state = AppState::new(data_root)
@@ -33,6 +34,10 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::runtime_status,
+            commands::get_approval_mode,
+            commands::set_approval_mode,
+            commands::get_reasoning_effort,
+            commands::set_reasoning_effort,
             commands::get_plan,
             commands::update_plan,
             commands::get_goal,
@@ -96,6 +101,7 @@ pub fn run() {
             commands::close_subagent,
             commands::preview_patch,
             commands::resolve_approval,
+            commands::resolve_user_input,
             commands::undo_change,
             commands::start_command,
             commands::command_status,
@@ -111,6 +117,7 @@ pub fn run() {
             commands::resize_pty,
             commands::wait_pty,
             commands::close_pty,
+            commands::capture_screen,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

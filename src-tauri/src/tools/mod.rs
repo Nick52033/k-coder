@@ -5,17 +5,33 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::execution::{CommandMode, CommandRuntime, CommandState, StartCommandRequest};
+use crate::execution::{
+    CommandMode, CommandRuntime, CommandState, OutputStream, StartCommandRequest,
+};
 use crate::patch::{PatchError, PatchService};
 use crate::policy::{
     AllowRegisteredTools, ExecutionWorkspacePolicy, PolicyDecision, PolicyEngine,
     ReadOnlyWorkspacePolicy, WorkspacePolicy,
 };
 use crate::protocol::{
-    ChangeSet, ExpectedFileHash, PatchPreview, ToolDefinition, ToolResult, ToolRisk,
+    ChangeSet, ExpectedFileHash, PatchPreview, ToolDefinition, ToolOutputStream, ToolResult,
+    ToolRisk,
 };
+
+const TOOL_PROGRESS_CHANNEL_CAPACITY: usize = 64;
+const TOOL_PROGRESS_BATCH_BYTES: usize = 16 * 1024;
+const TOOL_PROGRESS_READ_LIMIT: usize = 200;
+const MAX_PERSISTED_TOOL_PROGRESS_BYTES: usize = 64 * 1024;
+
+#[derive(Debug, Clone)]
+pub struct ToolProgress {
+    pub stream: ToolOutputStream,
+    pub cursor: u64,
+    pub delta: String,
+}
 
 #[derive(Debug, Clone)]
 pub struct ToolContext {
@@ -24,6 +40,19 @@ pub struct ToolContext {
     pub call_id: String,
     pub workspace_root: PathBuf,
     pub approval: Option<ApprovedToolExecution>,
+    pub progress: Option<mpsc::Sender<ToolProgress>>,
+}
+
+impl ToolContext {
+    pub fn publish_progress(&self, progress: ToolProgress) {
+        if let Some(sender) = &self.progress {
+            let _ = sender.try_send(progress);
+        }
+    }
+}
+
+pub fn tool_progress_channel() -> (mpsc::Sender<ToolProgress>, mpsc::Receiver<ToolProgress>) {
+    mpsc::channel(TOOL_PROGRESS_CHANNEL_CAPACITY)
 }
 
 #[derive(Debug, Clone)]
@@ -312,6 +341,17 @@ impl ToolRegistry {
             .collect::<Vec<_>>();
         definitions.sort_by(|left, right| left.name.cmp(&right.name));
         definitions
+    }
+
+    /// 返回所有已注册工具的名称（排序后），用于 system prompt 中的工具列表。
+    pub fn definition_names(&self) -> Vec<String> {
+        let mut names = self
+            .handlers
+            .keys()
+            .map(|name| name.to_string())
+            .collect::<Vec<_>>();
+        names.sort();
+        names
     }
 
     pub async fn dispatch(
@@ -766,7 +806,7 @@ impl ToolHandler for RunCommandTool {
 
     async fn execute(
         &self,
-        _context: &ToolContext,
+        context: &ToolContext,
         arguments: Value,
         cancellation: CancellationToken,
     ) -> Result<ToolResult, ToolError> {
@@ -786,14 +826,30 @@ impl ToolHandler for RunCommandTool {
             .await
             .map_err(|error| ToolError::Execution(error.to_string()))?;
         let id = session.id;
-        let status = tokio::select! {
-            status = self.runtime.wait(&id) => status.map_err(|error| ToolError::Execution(error.to_string()))?,
-            _ = cancellation.cancelled() => {
-                let _ = self.runtime.cancel(&id).await;
-                let _ = self.runtime.wait(&id).await;
-                let _ = self.runtime.close(&id).await;
-                return Err(ToolError::Cancelled);
-            }
+        let status = {
+            let wait = self.runtime.wait(&id);
+            tokio::pin!(wait);
+            let mut cursor = 0;
+            let mut poll = tokio::time::interval(std::time::Duration::from_millis(75));
+            poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let status = loop {
+                tokio::select! {
+                    status = &mut wait => {
+                        break status.map_err(|error| ToolError::Execution(error.to_string()))?;
+                    }
+                    _ = poll.tick() => {
+                        cursor = self.forward_command_output(context, &id, cursor).await?;
+                    }
+                    _ = cancellation.cancelled() => {
+                        let _ = self.runtime.cancel(&id).await;
+                        let _ = (&mut wait).await;
+                        let _ = self.runtime.close(&id).await;
+                        return Err(ToolError::Cancelled);
+                    }
+                }
+            };
+            self.forward_command_output(context, &id, cursor).await?;
+            status
         };
         let output = self
             .runtime
@@ -805,12 +861,20 @@ impl ToolHandler for RunCommandTool {
             .iter()
             .map(|chunk| chunk.text.as_str())
             .collect::<String>();
+        let output_chunks = bounded_command_output_chunks(&output.chunks);
         let success = matches!(status.state, CommandState::Exited { code: 0 });
+        let duration_ms = status
+            .finished_at_ms
+            .map(|finished| finished.saturating_sub(status.started_at_ms));
         let metadata = json!({
             "sessionId": id,
             "state": status.state,
+            "startedAtMs": status.started_at_ms,
+            "finishedAtMs": status.finished_at_ms,
+            "durationMs": duration_ms,
             "outputTruncated": status.output_truncated,
-            "nextCursor": output.next_cursor
+            "nextCursor": output.next_cursor,
+            "outputChunks": output_chunks
         });
         self.runtime
             .close(&id)
@@ -821,6 +885,92 @@ impl ToolHandler for RunCommandTool {
             output: text,
             metadata,
         })
+    }
+}
+
+fn bounded_command_output_chunks(chunks: &[crate::execution::OutputChunk]) -> Vec<Value> {
+    let mut remaining = MAX_PERSISTED_TOOL_PROGRESS_BYTES;
+    let mut result = Vec::new();
+    for chunk in chunks.iter().rev() {
+        if remaining == 0 {
+            break;
+        }
+        let text = if chunk.text.len() <= remaining {
+            chunk.text.clone()
+        } else {
+            let mut start = chunk.text.len().saturating_sub(remaining);
+            while start < chunk.text.len() && !chunk.text.is_char_boundary(start) {
+                start += 1;
+            }
+            chunk.text[start..].to_string()
+        };
+        remaining = remaining.saturating_sub(text.len());
+        result.push(json!({
+            "cursor": chunk.cursor,
+            "stream": match chunk.stream {
+                OutputStream::Stdout => "stdout",
+                OutputStream::Stderr => "stderr",
+            },
+            "text": text,
+        }));
+    }
+    result.reverse();
+    result
+}
+
+impl RunCommandTool {
+    async fn forward_command_output(
+        &self,
+        context: &ToolContext,
+        id: &str,
+        mut cursor: u64,
+    ) -> Result<u64, ToolError> {
+        loop {
+            let page = self
+                .runtime
+                .read(id, cursor, TOOL_PROGRESS_READ_LIMIT)
+                .await
+                .map_err(|error| ToolError::Execution(error.to_string()))?;
+            let chunk_count = page.chunks.len();
+            let mut batch: Option<(ToolOutputStream, u64, String)> = None;
+
+            for chunk in page.chunks {
+                let stream = match chunk.stream {
+                    OutputStream::Stdout => ToolOutputStream::Stdout,
+                    OutputStream::Stderr => ToolOutputStream::Stderr,
+                };
+                let can_append = batch.as_ref().is_some_and(|(batch_stream, _, text)| {
+                    *batch_stream == stream
+                        && text.len().saturating_add(chunk.text.len()) <= TOOL_PROGRESS_BATCH_BYTES
+                });
+                if can_append {
+                    if let Some((_, _, text)) = &mut batch {
+                        text.push_str(&chunk.text);
+                    }
+                } else {
+                    if let Some((stream, cursor, delta)) = batch.take() {
+                        context.publish_progress(ToolProgress {
+                            stream,
+                            cursor,
+                            delta,
+                        });
+                    }
+                    batch = Some((stream, chunk.cursor, chunk.text));
+                }
+            }
+            if let Some((stream, cursor, delta)) = batch {
+                context.publish_progress(ToolProgress {
+                    stream,
+                    cursor,
+                    delta,
+                });
+            }
+
+            cursor = page.next_cursor;
+            if chunk_count < TOOL_PROGRESS_READ_LIMIT {
+                return Ok(cursor);
+            }
+        }
     }
 }
 
@@ -1001,6 +1151,7 @@ mod tests {
             call_id: "call".to_string(),
             workspace_root: root.to_path_buf(),
             approval: None,
+            progress: None,
         }
     }
 
@@ -1034,6 +1185,70 @@ mod tests {
             )
             .await;
         assert_eq!(result, Err(ToolError::UnknownTool("shell".to_string())));
+    }
+
+    #[tokio::test]
+    async fn run_command_streams_redacted_stdout_and_stderr_progress() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = CommandRuntime::new(directory.path()).unwrap();
+        let tool = RunCommandTool { runtime };
+        let (progress, mut output) = tool_progress_channel();
+        let mut tool_context = context(directory.path());
+        tool_context.progress = Some(progress);
+
+        #[cfg(windows)]
+        let arguments = json!({
+            "program": "powershell",
+            "args": [
+                "-NoProfile",
+                "-Command",
+                "[Console]::Out.WriteLine('ready'); [Console]::Error.WriteLine('API_KEY=secret')"
+            ]
+        });
+        #[cfg(not(windows))]
+        let arguments = json!({
+            "program": "sh",
+            "args": ["-c", "printf 'ready\\n'; printf 'API_KEY=secret\\n' >&2"]
+        });
+
+        let result = tool
+            .execute(&tool_context, arguments, CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert!(result.metadata["startedAtMs"].as_u64().is_some());
+        assert!(result.metadata["finishedAtMs"].as_u64().is_some());
+        assert!(result.metadata["durationMs"].as_u64().is_some());
+        let persisted = result.metadata["outputChunks"].as_array().unwrap();
+        assert!(persisted.iter().any(|chunk| {
+            chunk["stream"] == "stdout"
+                && chunk["text"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("ready"))
+        }));
+        assert!(persisted.iter().any(|chunk| {
+            chunk["stream"] == "stderr"
+                && chunk["text"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("[REDACTED]"))
+        }));
+
+        drop(tool_context);
+        let mut progress_events = Vec::new();
+        while let Ok(event) = output.try_recv() {
+            progress_events.push(event);
+        }
+        assert!(progress_events.iter().any(|event| {
+            event.stream == ToolOutputStream::Stdout && event.delta.contains("ready")
+        }));
+        assert!(progress_events.iter().any(|event| {
+            event.stream == ToolOutputStream::Stderr && event.delta.contains("[REDACTED]")
+        }));
+        assert!(
+            !progress_events
+                .iter()
+                .any(|event| event.delta.contains("secret"))
+        );
     }
 
     #[tokio::test]

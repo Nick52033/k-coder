@@ -360,17 +360,26 @@ pub fn git_diff(root: &Path, path: Option<&str>, staged: bool) -> Result<String,
 }
 
 pub fn git_branches(root: &Path) -> Result<GitBranchView, WorkbenchError> {
-    let output = git(root, &["branch", "--format=%(HEAD)%00%(refname:short)"])?;
+    // 容错：非 git 仓库时返回空列表，避免把错误抛给前端
+    let output = match git(root, &["branch", "--no-color", "--list"]) {
+        Ok(output) => output,
+        Err(_) => {
+            return Ok(GitBranchView {
+                current: None,
+                branches: Vec::new(),
+            });
+        }
+    };
     let mut current = None;
     let mut branches = Vec::new();
     for line in output.lines() {
-        let Some((head, name)) = line.split_once('\0') else {
-            continue;
-        };
+        let (is_current, name) = line
+            .strip_prefix("* ")
+            .map_or((false, line.trim()), |name| (true, name.trim()));
         if name.is_empty() {
             continue;
         }
-        if head == "*" {
+        if is_current {
             current = Some(name.to_string());
         }
         branches.push(name.to_string());
@@ -396,9 +405,9 @@ pub fn git_switch_branch(
     }
     git(root, &["check-ref-format", "--branch", branch])?;
     if create {
-        git(root, &["switch", "-c", branch])
+        git(root, &["checkout", "-b", branch])
     } else {
-        git(root, &["switch", branch])
+        git(root, &["checkout", branch])
     }
 }
 
@@ -433,9 +442,16 @@ pub fn git_action(
             git(root, &args)
         }
         "unstage" => {
-            let mut args = vec!["restore", "--staged", "--"];
+            let mut args = vec!["reset", "--quiet", "HEAD", "--"];
             args.extend(paths.iter().map(String::as_str));
-            git(root, &args)
+            match git(root, &args) {
+                Ok(output) => Ok(output),
+                Err(_) => {
+                    let mut fallback = vec!["rm", "--cached", "--"];
+                    fallback.extend(paths.iter().map(String::as_str));
+                    git(root, &fallback)
+                }
+            }
         }
         "commit" => {
             let message = message
@@ -474,7 +490,7 @@ pub fn git_action(
             {
                 git(root, &["push"])
             } else {
-                let branch = git(root, &["branch", "--show-current"])?;
+                let branch = git(root, &["symbolic-ref", "--quiet", "--short", "HEAD"])?;
                 let branch = branch.trim();
                 if branch.is_empty() {
                     return Err(WorkbenchError::Invalid(
@@ -666,7 +682,7 @@ mod tests {
         git(peer.path(), &["fetch", "origin", "main"]).unwrap();
         git(
             peer.path(),
-            &["switch", "-c", "main", "--track", "origin/main"],
+            &["checkout", "-b", "main", "--track", "origin/main"],
         )
         .unwrap();
         std::fs::write(peer.path().join("remote.txt"), "from remote\n").unwrap();

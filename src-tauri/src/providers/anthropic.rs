@@ -116,12 +116,35 @@ impl Provider for AnthropicMessagesProvider {
             .config
             .anthropic_messages_url()
             .map_err(|error| ProviderError::Request(error.to_string()))?;
+        let reasoning_budget = request.reasoning_effort.anthropic_budget_tokens();
+        let max_tokens = reasoning_budget
+            .map(|budget| {
+                (budget as u64)
+                    .saturating_add(4_096)
+                    .max(DEFAULT_MAX_TOKENS)
+            })
+            .unwrap_or(DEFAULT_MAX_TOKENS);
         let mut payload = json!({
             "model": request.model,
             "messages": anthropic_messages(&request.messages),
-            "max_tokens": DEFAULT_MAX_TOKENS,
+            "max_tokens": max_tokens,
             "stream": true
         });
+        // Anthropic 的 system 消息需要放在顶层 system 字段
+        let system_text: Vec<&str> = request
+            .messages
+            .iter()
+            .filter_map(|m| match m {
+                ProviderMessage::Text {
+                    role: MessageRole::System,
+                    text,
+                } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        if !system_text.is_empty() {
+            payload["system"] = Value::String(system_text.join("\n\n"));
+        }
         if !request.tools.is_empty() {
             payload["tools"] = Value::Array(
                 request
@@ -136,6 +159,9 @@ impl Provider for AnthropicMessagesProvider {
                     })
                     .collect(),
             );
+        }
+        if let Some(budget_tokens) = reasoning_budget {
+            payload["thinking"] = json!({ "type": "enabled", "budget_tokens": budget_tokens });
         }
 
         let response = tokio::select! {
@@ -229,10 +255,13 @@ fn anthropic_messages(messages: &[ProviderMessage]) -> Vec<Value> {
     let mut result = Vec::<Value>::new();
     for message in messages {
         match message {
-            ProviderMessage::Text { role, text } => result.push(json!({
-                "role": match role { MessageRole::User => "user", MessageRole::Assistant => "assistant" },
-                "content": text
-            })),
+            ProviderMessage::Text { role, text } => match role {
+                MessageRole::System => {} // System 消息通过顶层 system 字段注入
+                _ => result.push(json!({
+                    "role": match role { MessageRole::User => "user", MessageRole::Assistant => "assistant", _ => "user" },
+                    "content": text
+                })),
+            },
             ProviderMessage::UserContent { text, images } => result.push(json!({
                 "role": "user",
                 "content": std::iter::once(json!({ "type": "text", "text": text }))
@@ -245,11 +274,13 @@ fn anthropic_messages(messages: &[ProviderMessage]) -> Vec<Value> {
                     }))
                     .collect::<Vec<_>>()
             })),
-            ProviderMessage::AssistantToolCalls { calls } => result.push(json!({
+            ProviderMessage::AssistantToolCalls { text, calls } => result.push(json!({
                 "role": "assistant",
-                "content": calls.iter().map(|call| json!({
+                "content": std::iter::once(text).filter(|text| !text.is_empty()).map(|text| {
+                    json!({ "type": "text", "text": text })
+                }).chain(calls.iter().map(|call| json!({
                     "type": "tool_use", "id": call.id, "name": call.name, "input": call.arguments
-                })).collect::<Vec<_>>()
+                }))).collect::<Vec<_>>()
             })),
             ProviderMessage::ToolResult { call_id, success, output, .. } => {
                 let block = json!({
@@ -362,6 +393,21 @@ mod tests {
         }]);
         assert_eq!(messages[0]["content"][0]["type"], "tool_result");
         assert_eq!(messages[0]["content"][0]["is_error"], true);
+    }
+
+    #[test]
+    fn preserves_progress_text_before_anthropic_tool_use() {
+        let messages = anthropic_messages(&[ProviderMessage::AssistantToolCalls {
+            text: "I will inspect it.".into(),
+            calls: vec![ToolCall {
+                id: "call".into(),
+                name: "read_file".into(),
+                arguments: json!({ "path": "README.md" }),
+                metadata: json!({}),
+            }],
+        }]);
+        assert_eq!(messages[0]["content"][0]["type"], "text");
+        assert_eq!(messages[0]["content"][1]["type"], "tool_use");
     }
 
     #[test]

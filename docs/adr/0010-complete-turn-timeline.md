@@ -1,0 +1,33 @@
+# ADR 0010：补全对话时间线缺失事件
+
+- 状态：已接受
+- 日期：2026-08-02
+
+## 背景
+
+JSONL 是会话事件的事实来源，但旧的 `TurnTimelineItem` 只投影文本、推理摘要和工具活动。Provider 上下文、逐次用量、压缩、审批、文件变更、用户提问、任务清单和 Turn 终态虽然已经部分落盘，却在刷新后被分散到其他字段或直接丢失。失败/取消的 Turn 也没有稳定的时间线项，重试时无法把多个尝试放在同一条用户消息下。
+
+实时事件还有两个一致性风险：加载线程快照期间到达的事件可能被旧快照覆盖；命令的 stdout/stderr 游标输出只存在于瞬时 UI 状态，刷新后语义丢失。
+
+## 决策
+
+1. `TurnTimelineItem` 保留 `text`、`reasoning` 和 `tool`，新增统一的有界 `event` 变体。`TimelineEventKind` 独立表示 provider context、usage、compacted、approval requested/resolved、user input requested/resolved、todo updated、change applied/undone 和 turn completed/failed/cancelled。
+2. `project_thread` 按 JSONL 事件顺序生成时间线，同时保留审批、用户输入、变更、任务清单和最后用量的领域快照。生命周期事件使用稳定的领域 ID，实时重放不会重复同一事件。
+3. `request_user_input`、`todo_write`、Provider 用量和终态事件先追加 JSONL，再发布给前端。用户输入恢复为 FIFO 队列；线程恢复会把未解决的审批和用户输入转为取消，避免展示已失效的操作卡片。
+4. `run_command` 的最终结果元数据保留有界的脱敏 stdout/stderr chunks（含 stream、cursor、text），前端优先读取该结构，旧结果继续回退到 stdout 文本。
+5. 线程加载建立临时 hydration buffer。当前线程的实时事件在快照完成前暂存，应用快照后按接收顺序同步重放；非当前线程事件不能污染当前视图。消息的 `turnUserMessageIds` 将失败/取消/重试尝试锚定到原用户消息，无法锚定的孤儿 Turn 单独显示。
+6. 设置边界：Provider 上下文最多 512 KiB，单次模型响应最多 512 KiB，单 Turn 最多 24 次迭代、24 次工具调用和 1,000,000 tokens，时间线文本单项最多 2,000 字符，持久化命令输出最多 64 KiB。瞬时进展队列可以丢弃展示增量，但最终结果与审计事件不得丢失。
+
+## 影响
+
+- 刷新、崩溃恢复和实时展示都使用同一份事件顺序，审批、用户输入、变更、终态和用量不再静默消失。
+- 时间线只保存受控摘要和 ID，不复制完整 Provider payload、密钥或无限命令输出。
+- 前端需要兼容旧的 `toolActivities` 和缺少新增字段的历史 `ThreadDetail`；事件 schema 从 2 迁移到 3。
+
+## 验收门槛
+
+- `cargo fmt --manifest-path src-tauri/Cargo.toml -- --check` 通过。
+- `cargo check --manifest-path src-tauri/Cargo.toml` 通过。
+- `cargo test --manifest-path src-tauri/Cargo.toml` 通过，并覆盖用户输入落盘顺序、终态投影、输出 chunks 和旧事件迁移。
+- `pnpm build` 和双视口 Playwright 时间线、恢复、取消重试及 hydration 竞态测试通过。
+- 启动 `pnpm tauri dev`，在真实桌面窗口打开含审批/用户输入/变更的会话，确认事件可操作且刷新后仍可恢复。

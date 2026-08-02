@@ -162,6 +162,7 @@ mod tests {
         let request = ProviderRequest {
             schema_version: 1,
             model: "primary".into(),
+            reasoning_effort: crate::protocol::ReasoningEffort::default(),
             messages: vec![],
             tools: vec![],
         };

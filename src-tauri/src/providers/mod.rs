@@ -18,7 +18,7 @@ use futures_util::Stream;
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
-use crate::protocol::{MessageRole, TokenUsage, ToolCall, ToolDefinition};
+use crate::protocol::{MessageRole, ReasoningEffort, TokenUsage, ToolCall, ToolDefinition};
 
 pub use anthropic::AnthropicMessagesProvider;
 pub use config::{
@@ -37,6 +37,8 @@ pub use responses::OpenAiResponsesProvider;
 pub struct ProviderRequest {
     pub schema_version: u32,
     pub model: String,
+    #[serde(default)]
+    pub reasoning_effort: ReasoningEffort,
     pub messages: Vec<ProviderMessage>,
     pub tools: Vec<ToolDefinition>,
 }
@@ -57,6 +59,7 @@ pub enum ProviderMessage {
         images: Vec<ProviderImage>,
     },
     AssistantToolCalls {
+        text: String,
         calls: Vec<ToolCall>,
     },
     ToolResult {
@@ -89,6 +92,14 @@ pub(crate) fn split_image_data_url(data_url: &str) -> Option<(&str, &str)> {
 pub enum ProviderEvent {
     TextDelta {
         delta: String,
+    },
+    ReasoningSummaryDelta {
+        item_id: String,
+        delta: String,
+    },
+    ReasoningSummaryCompleted {
+        item_id: String,
+        summary: String,
     },
     ToolCall {
         call: ToolCall,

@@ -15,7 +15,8 @@ use uuid::Uuid;
 use crate::agent::{AgentRuntime, EventPublisher, RunTurnRequest};
 use crate::policy::ApprovalManager;
 use crate::protocol::{
-    AgentEvent, AgentEventEnvelope, TokenUsage, ToolDefinition, ToolResult, ToolRisk, TurnState,
+    AgentEvent, AgentEventEnvelope, ApprovalMode, ReasoningEffort, TokenUsage, ToolDefinition,
+    ToolResult, ToolRisk, TurnState,
 };
 use crate::providers::Provider;
 use crate::storage::{JsonlThreadRepository, StoredEventKind, ThreadRepository, now_ms};
@@ -122,6 +123,8 @@ pub struct SubagentExecutionContext {
     pub tools: ToolRegistry,
     pub workspace_root: PathBuf,
     pub approvals: Arc<ApprovalManager>,
+    pub approval_mode: ApprovalMode,
+    pub reasoning_effort: ReasoningEffort,
     pub agent_events: Arc<dyn EventPublisher>,
     pub lifecycle_events: Arc<dyn SubagentEventPublisher>,
 }
@@ -433,10 +436,11 @@ impl MultiAgentCoordinator {
             let remaining_tokens = record.token_budget.saturating_sub(record.tokens_used);
             let runtime = AgentRuntime::with_tools_and_approvals(
                 context.repository.clone(), allowed_tools, context.workspace_root.clone(), context.approvals.clone(),
-            ).with_runtime_instructions(
+            ).with_approval_mode(context.approval_mode).with_runtime_instructions(
                 "You are a bounded subagent. Complete only the delegated task. Return a concise result for the parent agent; do not claim access outside your provided tools or workspace.".into(),
             )
             .with_context_limit(context.context_limit)
+            .with_reasoning_effort(context.reasoning_effort)
             .with_token_budget(remaining_tokens);
             let publisher: Arc<dyn EventPublisher> = Arc::new(ChildEventPublisher {
                 agent_id: id.clone(),
@@ -1091,6 +1095,8 @@ mod tests {
             tools: ToolRegistry::read_only(),
             workspace_root: workspace.to_path_buf(),
             approvals: Arc::new(ApprovalManager::new(Duration::from_secs(1))),
+            approval_mode: ApprovalMode::Ask,
+            reasoning_effort: ReasoningEffort::default(),
             agent_events: Arc::new(NoopAgentPublisher),
             lifecycle_events: lifecycle,
         }

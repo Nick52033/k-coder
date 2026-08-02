@@ -25,8 +25,9 @@ use crate::multi_agent::{
 };
 use crate::persistence::{ProjectRecord, UsageSummary};
 use crate::protocol::{
-    AgentEvent, AgentEventEnvelope, ApprovalResolution, ChangeSet, ImageAttachment, MessageRole,
-    PROTOCOL_VERSION, PatchPreview, RuntimeStatus, TokenUsage,
+    AgentEvent, AgentEventEnvelope, AgentMode, ApprovalMode, ApprovalResolution, ChangeSet,
+    ImageAttachment, MessageRole, PROTOCOL_VERSION, PatchPreview, ReasoningEffort, RuntimeStatus,
+    TokenUsage, UserInputResolution,
 };
 use crate::providers::{
     ProviderConfigView, ProviderEvent, ProviderMessage, ProviderRequest, SaveProviderConfigRequest,
@@ -35,6 +36,15 @@ use crate::storage::{StoredEventKind, ThreadDetail, ThreadSummary};
 use crate::workbench::{
     self, AttachmentContent, FileEntry, FilePreview, GitBranchView, GitStatusView, WorkspaceState,
 };
+
+/// Plan 协作模式指令模板（借鉴 Codex 的 plan.md）。
+const PLAN_MODE_INSTRUCTIONS: &str = include_str!("../../templates/plan_mode.md");
+
+/// Ask 模式指令模板。
+const ASK_MODE_INSTRUCTIONS: &str = include_str!("../../templates/ask_mode.md");
+
+/// Craft（默认执行）模式指令模板（借鉴 Codex 的 default.md）。
+const CRAFT_MODE_INSTRUCTIONS: &str = include_str!("../../templates/craft_mode.md");
 
 const AGENT_EVENT_NAME: &str = "agent-event";
 const SUBAGENT_EVENT_NAME: &str = "subagent-event";
@@ -93,6 +103,8 @@ fn subagent_context(
         tools,
         workspace_root: state.workspace_root(),
         approvals: state.approvals(),
+        approval_mode: state.approval_mode(),
+        reasoning_effort: state.reasoning_effort(),
         agent_events: Arc::new(TauriEventPublisher { app: app.clone() }),
         lifecycle_events: Arc::new(TauriSubagentEventPublisher { app: app.clone() }),
     }
@@ -105,6 +117,81 @@ fn append_runtime_instructions(base: String, memory: String) -> String {
         (true, false) => memory,
         (false, false) => format!("{base}\n\n{memory}"),
     }
+}
+
+/// 分层 system prompt 构建器（借鉴 Codex 的分层 system message 架构）。
+/// 把 prompt 按 `<identity>`/`<workspace>`/`<collaboration_mode>`/`<tools>`/`<memory>`/`<extension_prompts>` 分块，
+/// 让模型能清晰区分不同层级的指令。
+fn build_system_prompt(
+    workspace_root: &std::path::Path,
+    extension_instructions: &str,
+    advanced_instructions: &str,
+    memory_context: &str,
+    mode_instructions: &str,
+    tool_names: &[String],
+) -> String {
+    let mut sections = Vec::<String>::new();
+
+    // 1. identity — 固定的身份指令
+    sections.push("<identity>\n你是 k-Coder，一个专业的 AI 编码助手。你运行在用户的桌面环境中，可以读写文件、执行命令、搜索代码库。\n\n**重要**：请始终用中文回复用户。执行多步骤任务时，在第一次工具调用前和工作阶段切换时输出简短、具体的进度说明，让用户知道你正在做什么以及已确认什么。进度说明不是隐藏推理过程，不要输出私有思维链或逐步内心推演。\n</identity>".to_string());
+
+    // 2. workspace — 工作区信息
+    // 移除 Windows 扩展路径前缀 \\?\ 避免 JSON 转义问题
+    let workspace_path = workspace_root
+        .display()
+        .to_string()
+        .trim_start_matches(r"\\?\")
+        .replace('\\', "/");
+    let project_name = workspace_root
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("unknown");
+    sections.push(format!(
+        "<workspace>\n工作区路径：{workspace_path}\n项目名称：{project_name}\n</workspace>"
+    ));
+
+    // 3. collaboration mode — 当前协作模式指令
+    if !mode_instructions.trim().is_empty() {
+        sections.push(format!(
+            "<collaboration_mode>\n{}\n</collaboration_mode>",
+            mode_instructions.trim()
+        ));
+    }
+
+    // 4. tools — 可用工具列表
+    if !tool_names.is_empty() {
+        let tools_list = tool_names
+            .iter()
+            .map(|name| format!("- {name}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        sections.push(format!(
+            "<available_tools>\n{tools_list}\n</available_tools>"
+        ));
+    }
+
+    // 5. memory — 相关记忆
+    if !memory_context.trim().is_empty() {
+        sections.push(format!("<memory>\n{}\n</memory>", memory_context.trim()));
+    }
+
+    // 6. advanced — advanced 模块的运行时指令（goals/plans/metrics 等）
+    if !advanced_instructions.trim().is_empty() {
+        sections.push(format!(
+            "<runtime_context>\n{}\n</runtime_context>",
+            advanced_instructions.trim()
+        ));
+    }
+
+    // 7. extension — 扩展注入的指令
+    if !extension_instructions.trim().is_empty() {
+        sections.push(format!(
+            "<extension_prompts>\n{}\n</extension_prompts>",
+            extension_instructions.trim()
+        ));
+    }
+
+    sections.join("\n\n")
 }
 
 async fn turn_tokens(state: &AppState, thread_id: &str, turn_id: &str) -> u64 {
@@ -161,6 +248,8 @@ pub fn runtime_status(state: State<'_, AppState>) -> RuntimeStatus {
             "subagent-cancellation".to_string(),
             "subagent-persistence".to_string(),
             "persistent-plans".to_string(),
+            "plan-mode".to_string(),
+            "user-input-tool".to_string(),
             "budgeted-goals".to_string(),
             "browser-automation".to_string(),
             "repository-search".to_string(),
@@ -169,6 +258,38 @@ pub fn runtime_status(state: State<'_, AppState>) -> RuntimeStatus {
             "runtime-metrics".to_string(),
         ],
     }
+}
+
+#[tauri::command]
+pub fn get_approval_mode(state: State<'_, AppState>) -> ApprovalMode {
+    state.approval_mode()
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn set_approval_mode(
+    state: State<'_, AppState>,
+    mode: ApprovalMode,
+) -> CommandResult<ApprovalMode> {
+    state
+        .set_approval_mode(mode)
+        .await
+        .map_err(|error| CommandError::new("approval_mode", error))
+}
+
+#[tauri::command]
+pub fn get_reasoning_effort(state: State<'_, AppState>) -> ReasoningEffort {
+    state.reasoning_effort()
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn set_reasoning_effort(
+    state: State<'_, AppState>,
+    effort: ReasoningEffort,
+) -> CommandResult<ReasoningEffort> {
+    state
+        .set_reasoning_effort(effort)
+        .await
+        .map_err(|error| CommandError::new("reasoning_effort", error))
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -424,6 +545,7 @@ pub async fn test_provider_connection(
     let request = ProviderRequest {
         schema_version: PROTOCOL_VERSION,
         model,
+        reasoning_effort: ReasoningEffort::Off,
         messages: vec![ProviderMessage::Text {
             role: MessageRole::User,
             text: "Reply with OK.".into(),
@@ -800,28 +922,55 @@ pub async fn run_turn(
         .await
         .map_err(|error| CommandError::new("extensions", error))?;
     let advanced = state.advanced();
-    let runtime_instructions = state
+    let extension_instructions = state
         .extension_instructions(&request.input)
         .map_err(|error| CommandError::new("extensions", error))?;
     let advanced_instructions = advanced
         .runtime_instructions(&thread_id)
         .map_err(|error| CommandError::new("advanced_runtime", error))?;
-    let runtime_instructions =
-        append_runtime_instructions(runtime_instructions, advanced_instructions);
     let memory_instructions = advanced
         .memory
         .context()
         .map_err(|error| CommandError::new("memory", error))?;
-    let runtime_instructions =
-        append_runtime_instructions(runtime_instructions, memory_instructions);
 
-    // 根据模式添加额外指令
-    let mode_instructions = match request.agent_mode.as_deref() {
-        Some("ask") => "\n\n<agent_mode>ASK模式：只回答问题和提供建议，不要使用任何修改文件的工具（Write、Edit等），不要执行会改变项目状态的命令。专注于分析、解释和建议。</agent_mode>",
-        Some("plan") => "\n\n<agent_mode>PLAN模式：在执行任何修改操作前，先制定详细计划并等待用户确认。说明你将要做什么、为什么这样做、以及可能的影响。获得明确同意后再执行。</agent_mode>",
-        _ => "", // craft模式或未指定 - 默认行为
+    // 根据协作模式注入指令并限制可用工具
+    let agent_mode = request
+        .agent_mode
+        .as_deref()
+        .map(AgentMode::from_str)
+        .unwrap_or_default();
+    let mode_instructions = match agent_mode {
+        AgentMode::Plan => PLAN_MODE_INSTRUCTIONS.to_string(),
+        AgentMode::Ask => ASK_MODE_INSTRUCTIONS.to_string(),
+        AgentMode::Craft => CRAFT_MODE_INSTRUCTIONS.to_string(),
     };
-    let runtime_instructions = format!("{}{}", runtime_instructions, mode_instructions);
+
+    // Plan/Ask 模式下把工具限制为只读子集（借鉴 Codex 的 plan_mask）
+    let base_tools = if agent_mode.is_read_only() {
+        let allowed: Vec<String> = agent_mode
+            .allowed_tools()
+            .iter()
+            .map(|name| name.to_string())
+            .collect();
+        // 子代理委派工具在只读模式下也要过滤掉
+        state
+            .tool_registry()
+            .restricted_to(&allowed)
+            .map_err(|error| CommandError::new("agent_mode", error.to_string()))?
+    } else {
+        state.tool_registry()
+    };
+
+    // 分层拼接 system prompt（identity/workspace/mode/tools/memory/context/extension）
+    let tool_names = base_tools.definition_names();
+    let runtime_instructions = build_system_prompt(
+        &state.workspace_root(),
+        &extension_instructions,
+        &advanced_instructions,
+        &memory_instructions,
+        &mode_instructions,
+        &tool_names,
+    );
 
     let goal_budget = advanced
         .goals
@@ -852,7 +1001,6 @@ pub async fn run_turn(
             cancellation.cancel();
         })
     });
-    let base_tools = state.tool_registry();
     let child_context = subagent_context(
         &app,
         &state,
@@ -876,9 +1024,12 @@ pub async fn run_turn(
         state.workspace_root(),
         state.approvals(),
     )
+    .with_approval_mode(state.approval_mode())
     .with_runtime_instructions(runtime_instructions)
     .with_context_limit(context_limit)
-    .with_metrics(advanced.metrics.clone());
+    .with_metrics(advanced.metrics.clone())
+    .with_reasoning_effort(state.reasoning_effort())
+    .with_user_inputs(state.user_inputs());
     if let Some((_, remaining_tokens)) = &goal_budget {
         runtime = runtime.with_token_budget(*remaining_tokens);
     }
@@ -937,20 +1088,27 @@ pub async fn retry_turn(
         .map(|message| message.text())
         .unwrap_or_default();
     let advanced = state.advanced();
-    let runtime_instructions = state
+    let extension_instructions = state
         .extension_instructions(&retry_input)
         .map_err(|error| CommandError::new("extensions", error))?;
     let advanced_instructions = advanced
         .runtime_instructions(&thread_id)
         .map_err(|error| CommandError::new("advanced_runtime", error))?;
-    let runtime_instructions =
-        append_runtime_instructions(runtime_instructions, advanced_instructions);
     let memory_instructions = advanced
         .memory
         .context()
         .map_err(|error| CommandError::new("memory", error))?;
-    let runtime_instructions =
-        append_runtime_instructions(runtime_instructions, memory_instructions);
+    // retry 时使用 Craft 模式（retry 不支持 plan/ask 只读模式）
+    let mode_instructions = CRAFT_MODE_INSTRUCTIONS.to_string();
+    let tool_names = state.tool_registry().definition_names();
+    let runtime_instructions = build_system_prompt(
+        &state.workspace_root(),
+        &extension_instructions,
+        &advanced_instructions,
+        &memory_instructions,
+        &mode_instructions,
+        &tool_names,
+    );
     let goal_budget = advanced
         .goals
         .turn_budget(&thread_id)
@@ -981,9 +1139,11 @@ pub async fn retry_turn(
         state.workspace_root(),
         state.approvals(),
     )
+    .with_approval_mode(state.approval_mode())
     .with_runtime_instructions(runtime_instructions)
     .with_context_limit(context_limit)
-    .with_metrics(advanced.metrics.clone());
+    .with_metrics(advanced.metrics.clone())
+    .with_reasoning_effort(state.reasoning_effort());
     if let Some((_, remaining_tokens)) = &goal_budget {
         runtime = runtime.with_token_budget(*remaining_tokens);
     }
@@ -1148,6 +1308,19 @@ pub async fn resolve_approval(
         .resolve(&request_id, resolution)
         .await
         .map_err(|error| CommandError::new("approval", error))
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn resolve_user_input(
+    state: State<'_, AppState>,
+    request_id: String,
+    resolution: UserInputResolution,
+) -> CommandResult<()> {
+    state
+        .user_inputs()
+        .resolve(&request_id, resolution)
+        .await
+        .map_err(|error| CommandError::new("user_input", error))
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -1350,4 +1523,43 @@ pub async fn close_pty(state: State<'_, AppState>, session_id: String) -> Comman
         .close(&session_id)
         .await
         .map_err(|error| CommandError::new("pty_runtime", error))
+}
+
+/// 捕获当前显示器（主显示器）的完整画面，返回 PNG 的 base64 dataUrl。
+/// 前端拿到 dataUrl 后让用户框选裁剪区域。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn capture_screen() -> CommandResult<CaptureScreenResult> {
+    let png = tauri::async_runtime::spawn_blocking(capture_screen_blocking)
+        .await
+        .map_err(|error| CommandError::new("capture_screen", error.to_string()))??;
+    Ok(CaptureScreenResult {
+        data_url: format!("data:image/png;base64,{}", png),
+    })
+}
+
+/// 在阻塞线程中执行截图。
+fn capture_screen_blocking() -> Result<String, CommandError> {
+    use base64::Engine as _;
+    use std::io::Cursor;
+
+    let monitors = xcap::Monitor::all()
+        .map_err(|error| CommandError::new("capture_screen", error.to_string()))?;
+    let monitor = monitors
+        .first()
+        .ok_or_else(|| CommandError::new("capture_screen", "no monitor available"))?;
+    let image = monitor
+        .capture_image()
+        .map_err(|error| CommandError::new("capture_screen", error.to_string()))?;
+    let mut cursor = Cursor::new(Vec::new());
+    image
+        .write_to(&mut cursor, xcap::image::ImageFormat::Png)
+        .map_err(|error| CommandError::new("capture_screen", error.to_string()))?;
+    Ok(base64::engine::general_purpose::STANDARD.encode(cursor.into_inner()))
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CaptureScreenResult {
+    /// PNG 图片的 data URL，可直接用于 <img src> 或 canvas。
+    data_url: String,
 }

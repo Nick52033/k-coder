@@ -114,6 +114,23 @@ impl Provider for GoogleGeminiProvider {
             .gemini_stream_url()
             .map_err(|error| ProviderError::Request(error.to_string()))?;
         let mut payload = json!({ "contents": gemini_contents(&request.messages) });
+        // Gemini 的 system 消息需要放在顶层 systemInstruction 字段
+        let system_text: Vec<&str> = request
+            .messages
+            .iter()
+            .filter_map(|m| match m {
+                ProviderMessage::Text {
+                    role: MessageRole::System,
+                    text,
+                } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        if !system_text.is_empty() {
+            payload["systemInstruction"] = json!({
+                "parts": [{ "text": system_text.join("\n\n") }]
+            });
+        }
         if !request.tools.is_empty() {
             payload["tools"] = json!([{
                 "functionDeclarations": request.tools.iter().map(|tool| json!({
@@ -122,6 +139,10 @@ impl Provider for GoogleGeminiProvider {
                     "parameters": gemini_schema(tool.input_schema.clone())
                 })).collect::<Vec<_>>()
             }]);
+        }
+        if let Some(thinking_budget) = request.reasoning_effort.gemini_budget_tokens() {
+            payload["generationConfig"] =
+                json!({ "thinkingConfig": { "thinkingBudget": thinking_budget } });
         }
 
         let response = tokio::select! {
@@ -173,10 +194,13 @@ fn gemini_contents(messages: &[ProviderMessage]) -> Vec<Value> {
     messages
         .iter()
         .filter_map(|message| match message {
-            ProviderMessage::Text { role, text } => Some(json!({
-                "role": match role { MessageRole::User => "user", MessageRole::Assistant => "model" },
-                "parts": [{ "text": text }]
-            })),
+            ProviderMessage::Text { role, text } => match role {
+                MessageRole::System => None, // System 消息通过 systemInstruction 注入
+                _ => Some(json!({
+                    "role": match role { MessageRole::User => "user", MessageRole::Assistant => "model", _ => "user" },
+                    "parts": [{ "text": text }]
+                })),
+            },
             ProviderMessage::UserContent { text, images } => Some(json!({
                 "role": "user",
                 "parts": std::iter::once(json!({ "text": text }))
@@ -186,8 +210,10 @@ fn gemini_contents(messages: &[ProviderMessage]) -> Vec<Value> {
                     }))
                     .collect::<Vec<_>>()
             })),
-            ProviderMessage::AssistantToolCalls { calls } => {
-                let parts = calls.iter().map(|call| {
+            ProviderMessage::AssistantToolCalls { text, calls } => {
+                let parts = std::iter::once(text).filter(|text| !text.is_empty()).map(|text| {
+                    json!({ "text": text })
+                }).chain(calls.iter().map(|call| {
                     let mut part = json!({
                         "functionCall": { "id": call.id, "name": call.name, "args": call.arguments }
                     });
@@ -195,7 +221,7 @@ fn gemini_contents(messages: &[ProviderMessage]) -> Vec<Value> {
                         part["thoughtSignature"] = Value::String(signature.to_string());
                     }
                     part
-                }).collect::<Vec<_>>();
+                })).collect::<Vec<_>>();
                 Some(json!({ "role": "model", "parts": parts }))
             },
             ProviderMessage::ToolResult { call_id, name, success, output } => Some(json!({
@@ -327,6 +353,7 @@ mod tests {
     fn serializes_gemini_function_results() {
         let contents = gemini_contents(&[
             ProviderMessage::AssistantToolCalls {
+                text: "I will inspect it.".into(),
                 calls: vec![ToolCall {
                     id: "call".to_string(),
                     name: "read_file".to_string(),
@@ -341,7 +368,8 @@ mod tests {
                 output: "docs".to_string(),
             },
         ]);
-        assert_eq!(contents[0]["parts"][0]["thoughtSignature"], "opaque");
+        assert_eq!(contents[0]["parts"][0]["text"], "I will inspect it.");
+        assert_eq!(contents[0]["parts"][1]["thoughtSignature"], "opaque");
         assert_eq!(
             contents[1]["parts"][0]["functionResponse"]["name"],
             "read_file"

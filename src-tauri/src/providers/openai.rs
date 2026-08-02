@@ -33,6 +33,8 @@ impl OpenAiChatCompletionsProvider {
             .map_err(|error| ProviderError::Request(error.to_string()))?;
         let client = Client::builder()
             .redirect(reqwest::redirect::Policy::none())
+            .timeout(std::time::Duration::from_secs(120)) // 2分钟总超时
+            .connect_timeout(std::time::Duration::from_secs(30)) // 30秒连接超时
             .build()
             .map_err(|error| ProviderError::Request(error.to_string()))?;
         Ok(Self {
@@ -138,13 +140,16 @@ impl ToolCallAccumulator {
             .map(|pending| {
                 if pending.id.is_empty() || pending.name.is_empty() {
                     return Err(ProviderError::InvalidResponse(
-                        "Chat Completions returned an incomplete tool call".to_string(),
+                        format!(
+                            "Chat Completions returned an incomplete tool call (id: '{}', name: '{}', arguments: '{}')",
+                            pending.id, pending.name, pending.arguments
+                        ),
                     ));
                 }
                 let arguments = serde_json::from_str(&pending.arguments).map_err(|error| {
                     ProviderError::InvalidResponse(format!(
-                        "tool call {} returned invalid JSON arguments: {error}",
-                        pending.name
+                        "tool call {} returned invalid JSON arguments: {error}\nRaw arguments: {}",
+                        pending.name, pending.arguments
                     ))
                 })?;
                 Ok(ToolCall {
@@ -175,6 +180,9 @@ impl Provider for OpenAiChatCompletionsProvider {
             "stream": true,
             "stream_options": { "include_usage": true }
         });
+        if let Some(effort) = request.reasoning_effort.openai_value() {
+            payload["reasoning_effort"] = json!(effort);
+        }
         if !request.tools.is_empty() {
             payload["tools"] = Value::Array(
                 request
@@ -281,7 +289,7 @@ fn chat_messages(messages: &[ProviderMessage]) -> Vec<Value> {
         .iter()
         .filter_map(|message| match message {
             ProviderMessage::Text { role, text } => Some(json!({
-                "role": match role { MessageRole::User => "user", MessageRole::Assistant => "assistant" },
+                "role": match role { MessageRole::User => "user", MessageRole::Assistant => "assistant", MessageRole::System => "system" },
                 "content": text
             })),
             ProviderMessage::UserContent { text, images } => Some(json!({
@@ -293,9 +301,9 @@ fn chat_messages(messages: &[ProviderMessage]) -> Vec<Value> {
                     })))
                     .collect::<Vec<_>>()
             })),
-            ProviderMessage::AssistantToolCalls { calls } => Some(json!({
+            ProviderMessage::AssistantToolCalls { text, calls } => Some(json!({
                 "role": "assistant",
-                "content": null,
+                "content": if text.is_empty() { Value::Null } else { Value::String(text.clone()) },
                 "tool_calls": calls.iter().map(|call| json!({
                     "id": call.id,
                     "type": "function",
@@ -402,6 +410,7 @@ mod tests {
     fn serializes_structured_tool_history() {
         let messages = chat_messages(&[
             ProviderMessage::AssistantToolCalls {
+                text: "I will inspect the file.".into(),
                 calls: vec![ToolCall {
                     id: "c".to_string(),
                     name: "read_file".to_string(),
@@ -420,6 +429,7 @@ mod tests {
             messages[0]["tool_calls"][0]["function"]["name"],
             "read_file"
         );
+        assert_eq!(messages[0]["content"], "I will inspect the file.");
         assert_eq!(messages[1]["role"], "tool");
     }
 

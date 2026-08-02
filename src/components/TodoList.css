@@ -1,0 +1,88 @@
+.todo-list {
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px;
+  margin: 12px 0;
+  font-size: 13px;
+}
+
+.todo-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-weight: 600;
+  color: var(--text-primary);
+  margin-bottom: 12px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--border);
+}
+
+.todo-icon {
+  color: var(--text-secondary);
+}
+
+.todo-title {
+  flex: 1;
+}
+
+.todo-items {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.todo-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: 4px;
+  transition: background 0.2s;
+}
+
+.todo-item:hover {
+  background: var(--surface-3);
+}
+
+.todo-status-icon {
+  flex-shrink: 0;
+  margin-top: 2px;
+}
+
+.todo-icon-completed {
+  color: #22c55e;
+}
+
+.todo-icon-progress {
+  color: #3b82f6;
+  animation: pulse 2s ease-in-out infinite;
+}
+
+.todo-icon-pending {
+  color: var(--text-tertiary);
+}
+
+.todo-content {
+  flex: 1;
+  color: var(--text-primary);
+  line-height: 1.5;
+}
+
+.todo-item.todo-completed .todo-content {
+  color: var(--text-secondary);
+}
+
+.todo-active {
+  color: #3b82f6;
+  font-weight: 500;
+}
+
+@keyframes pulse {
+  0%, 100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.5;
+  }
+}

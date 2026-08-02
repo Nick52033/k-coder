@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -12,11 +13,13 @@ use uuid::Uuid;
 use crate::context::CompactionSummary;
 use crate::persistence::ProjectionDb;
 use crate::protocol::{
-    ApprovalRequest, ApprovalResolution, ApprovalSnapshot, ChangeSet, ChatMessage, MessageRole,
-    PROTOCOL_VERSION, TokenUsage, ToolCall, ToolResult, TurnState,
+    ApprovalAction, ApprovalRequest, ApprovalResolution, ApprovalSnapshot, ChangeSet, ChatMessage,
+    MessageRole, PROTOCOL_VERSION, TodoItem, TokenUsage, ToolCall, ToolResult, TurnState,
+    UserInputAction, UserInputRequest, UserInputResolution,
 };
 
-pub const EVENT_SCHEMA_VERSION: u32 = 2;
+pub const EVENT_SCHEMA_VERSION: u32 = 3;
+const MAX_TIMELINE_DETAIL_CHARS: usize = 2_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -61,7 +64,13 @@ pub enum StoredEventKind {
         message: ChatMessage,
     },
     AssistantToolCalls {
+        #[serde(default)]
+        text: String,
         calls: Vec<ToolCall>,
+    },
+    ReasoningSummary {
+        item_id: String,
+        summary: String,
     },
     ToolResult {
         call_id: String,
@@ -86,6 +95,16 @@ pub enum StoredEventKind {
     ApprovalResolved {
         request_id: String,
         resolution: ApprovalResolution,
+    },
+    UserInputRequested {
+        request: UserInputRequest,
+    },
+    UserInputResolved {
+        request_id: String,
+        resolution: UserInputResolution,
+    },
+    TodoUpdated {
+        todos: Vec<TodoItem>,
     },
     ChangeApplied {
         change_set: ChangeSet,
@@ -132,10 +151,16 @@ pub struct ThreadDetail {
     pub schema_version: u32,
     pub summary: ThreadSummary,
     pub messages: Vec<ChatMessage>,
+    pub message_turn_ids: HashMap<String, String>,
+    pub turn_user_message_ids: HashMap<String, String>,
     pub last_turn: Option<TurnSnapshot>,
     pub tool_activities: Vec<ToolActivitySnapshot>,
+    pub turn_timeline: Vec<TurnTimelineItem>,
     pub approvals: Vec<ApprovalSnapshot>,
+    pub user_inputs: Vec<UserInputSnapshot>,
     pub changes: Vec<ChangeSet>,
+    pub todos: Vec<TodoItem>,
+    pub last_usage: Option<TokenUsage>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -153,6 +178,66 @@ pub struct ToolActivitySnapshot {
     pub call: ToolCall,
     pub state: ToolActivityState,
     pub result: Option<ToolResult>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct UserInputSnapshot {
+    pub request: UserInputRequest,
+    pub resolution: Option<UserInputResolution>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TimelineEventKind {
+    ProviderContext,
+    Usage,
+    Compacted,
+    ApprovalRequested,
+    ApprovalResolved,
+    ChangeApplied,
+    ChangeUndone,
+    UserInputRequested,
+    UserInputResolved,
+    TodoUpdated,
+    TurnCompleted,
+    TurnFailed,
+    TurnCancelled,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(
+    tag = "type",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
+pub enum TurnTimelineItem {
+    Text {
+        id: String,
+        turn_id: String,
+        text: String,
+    },
+    Reasoning {
+        item_id: String,
+        turn_id: String,
+        summary: String,
+    },
+    Tool {
+        activity: ToolActivitySnapshot,
+    },
+    Event {
+        item_id: String,
+        turn_id: String,
+        kind: TimelineEventKind,
+        title: String,
+        detail: Option<String>,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -395,7 +480,7 @@ fn load_path(path: &Path) -> Result<Vec<StoredEvent>, StorageError> {
         let line = line.strip_suffix(b"\r").unwrap_or(line);
         match serde_json::from_slice::<StoredEvent>(line) {
             Ok(mut event) => {
-                if event.schema_version == 1 {
+                if event.schema_version < EVENT_SCHEMA_VERSION {
                     event.schema_version = EVENT_SCHEMA_VERSION;
                 }
                 if event.schema_version != EVENT_SCHEMA_VERSION {
@@ -424,11 +509,18 @@ fn project_thread(thread_id: &str, events: &[StoredEvent]) -> Result<ThreadDetai
 
     let mut title = created.0;
     let mut messages = Vec::new();
+    let mut message_turn_ids = HashMap::new();
+    let mut turn_user_message_ids = HashMap::new();
+    let mut latest_user_message_id: Option<String> = None;
     let mut archived = false;
     let mut last_turn = None;
     let mut tool_activities: Vec<ToolActivitySnapshot> = Vec::new();
+    let mut turn_timeline: Vec<TurnTimelineItem> = Vec::new();
     let mut approvals: Vec<ApprovalSnapshot> = Vec::new();
+    let mut user_inputs: Vec<UserInputSnapshot> = Vec::new();
     let mut changes: Vec<ChangeSet> = Vec::new();
+    let mut todos: Vec<TodoItem> = Vec::new();
+    let mut last_usage: Option<TokenUsage> = None;
     let mut updated_at_ms = created.1;
 
     for event in events {
@@ -443,19 +535,61 @@ fn project_thread(thread_id: &str, events: &[StoredEvent]) -> Result<ThreadDetai
                 if title == "新会话" && message.role == MessageRole::User {
                     title = title_from_message(&message.text());
                 }
+                if let Some(turn_id) = &event.turn_id {
+                    message_turn_ids.insert(message.id.clone(), turn_id.clone());
+                }
+                if message.role == MessageRole::User {
+                    latest_user_message_id = Some(message.id.clone());
+                }
                 messages.push(message.clone());
             }
-            StoredEventKind::AssistantMessage { message } => messages.push(message.clone()),
-            StoredEventKind::AssistantToolCalls { calls } => {
+            StoredEventKind::AssistantMessage { message } => {
                 if let Some(turn_id) = &event.turn_id {
-                    tool_activities.extend(calls.iter().cloned().map(|call| {
-                        ToolActivitySnapshot {
+                    message_turn_ids.insert(message.id.clone(), turn_id.clone());
+                    if !message.text().is_empty() {
+                        turn_timeline.push(TurnTimelineItem::Text {
+                            id: message.id.clone(),
+                            turn_id: turn_id.clone(),
+                            text: message.text(),
+                        });
+                    }
+                }
+                if message.role == MessageRole::User {
+                    latest_user_message_id = Some(message.id.clone());
+                }
+                messages.push(message.clone());
+            }
+            StoredEventKind::AssistantToolCalls { text, calls } => {
+                if let Some(turn_id) = &event.turn_id {
+                    if !text.is_empty() {
+                        turn_timeline.push(TurnTimelineItem::Text {
+                            id: event.event_id.clone(),
+                            turn_id: turn_id.clone(),
+                            text: text.clone(),
+                        });
+                    }
+                    for call in calls.iter().cloned() {
+                        let activity = ToolActivitySnapshot {
                             turn_id: turn_id.clone(),
                             call,
                             state: ToolActivityState::Running,
                             result: None,
-                        }
-                    }));
+                            started_at_ms: Some(event.created_at_ms),
+                            completed_at_ms: None,
+                            duration_ms: None,
+                        };
+                        tool_activities.push(activity.clone());
+                        turn_timeline.push(TurnTimelineItem::Tool { activity });
+                    }
+                }
+            }
+            StoredEventKind::ReasoningSummary { item_id, summary } => {
+                if let Some(turn_id) = &event.turn_id {
+                    turn_timeline.push(TurnTimelineItem::Reasoning {
+                        item_id: item_id.clone(),
+                        turn_id: turn_id.clone(),
+                        summary: summary.clone(),
+                    });
                 }
             }
             StoredEventKind::ToolResult {
@@ -472,17 +606,96 @@ fn project_thread(thread_id: &str, events: &[StoredEvent]) -> Result<ThreadDetai
                         ToolActivityState::Failed
                     };
                     activity.result = Some(result.clone());
+                    activity.completed_at_ms = Some(event.created_at_ms);
+                    activity.duration_ms = activity
+                        .started_at_ms
+                        .map(|started| event.created_at_ms.saturating_sub(started));
+                }
+                if let Some(TurnTimelineItem::Tool { activity }) = turn_timeline
+                    .iter_mut()
+                    .rev()
+                    .find(|item| matches!(item, TurnTimelineItem::Tool { activity } if activity.call.id == *call_id))
+                {
+                    activity.state = if result.success {
+                        ToolActivityState::Completed
+                    } else {
+                        ToolActivityState::Failed
+                    };
+                    activity.result = Some(result.clone());
+                    activity.completed_at_ms = Some(event.created_at_ms);
+                    activity.duration_ms = activity
+                        .started_at_ms
+                        .map(|started| event.created_at_ms.saturating_sub(started));
                 }
             }
-            StoredEventKind::ProviderContext { .. } => {}
-            StoredEventKind::ProviderCallUsage { .. } => {}
-            StoredEventKind::ContextCompacted { .. } => {}
+            StoredEventKind::ProviderContext { provider, item } => {
+                let context_type = item
+                    .get("type")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("provider_item");
+                let provider_item_id = item
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(|id| format!("，项目 {id}"))
+                    .unwrap_or_default();
+                push_timeline_event(
+                    &mut turn_timeline,
+                    event,
+                    TimelineEventKind::ProviderContext,
+                    "已保留模型上下文",
+                    Some(format!("{provider} · {context_type}{provider_item_id}")),
+                );
+            }
+            StoredEventKind::ProviderCallUsage { call_index, usage } => {
+                last_usage = Some(add_token_usage(last_usage.unwrap_or_default(), *usage));
+                push_timeline_event(
+                    &mut turn_timeline,
+                    event,
+                    TimelineEventKind::Usage,
+                    format!("模型调用 {} 用量", call_index + 1),
+                    Some(format!(
+                        "输入 {} · 输出 {} · 总计 {} tokens",
+                        usage.input_tokens, usage.output_tokens, usage.total_tokens
+                    )),
+                );
+            }
+            StoredEventKind::ContextCompacted { summary, automatic } => {
+                push_timeline_event(
+                    &mut turn_timeline,
+                    event,
+                    TimelineEventKind::Compacted,
+                    if *automatic {
+                        "已自动压缩上下文"
+                    } else {
+                        "已手动压缩上下文"
+                    },
+                    Some(format!(
+                        "压缩了 {} 条历史消息，保留 {} 项用户约束和 {} 项近期工具结果",
+                        summary.compacted_message_count,
+                        summary.user_constraints.len(),
+                        summary.recent_tool_results.len()
+                    )),
+                );
+            }
             StoredEventKind::ApprovalRequested { request } => {
                 approvals.push(ApprovalSnapshot {
                     request: request.clone(),
                     resolution: None,
                 });
-                update_turn(&mut last_turn, event, TurnState::AwaitingApproval, None);
+                push_timeline_event(
+                    &mut turn_timeline,
+                    event,
+                    TimelineEventKind::ApprovalRequested,
+                    if request.auto_approved {
+                        "已自动批准操作"
+                    } else {
+                        "已请求操作确认"
+                    },
+                    Some(format!("{} · {}", request.tool_name, request.reason)),
+                );
+                if !request.auto_approved {
+                    update_turn(&mut last_turn, event, TurnState::AwaitingApproval, None);
+                }
             }
             StoredEventKind::ApprovalResolved {
                 request_id,
@@ -495,9 +708,91 @@ fn project_thread(thread_id: &str, events: &[StoredEvent]) -> Result<ThreadDetai
                 {
                     approval.resolution = Some(resolution.clone());
                 }
+                push_timeline_event(
+                    &mut turn_timeline,
+                    event,
+                    TimelineEventKind::ApprovalResolved,
+                    "操作确认已处理",
+                    Some(format!(
+                        "请求 {request_id} · {}",
+                        approval_action_label(resolution.action)
+                    )),
+                );
                 update_turn(&mut last_turn, event, TurnState::Streaming, None);
             }
-            StoredEventKind::ChangeApplied { change_set } => changes.push(change_set.clone()),
+            StoredEventKind::UserInputRequested { request } => {
+                user_inputs.push(UserInputSnapshot {
+                    request: request.clone(),
+                    resolution: None,
+                });
+                let questions = request
+                    .questions
+                    .iter()
+                    .map(|question| question.question.as_str())
+                    .collect::<Vec<_>>()
+                    .join("；");
+                push_timeline_event(
+                    &mut turn_timeline,
+                    event,
+                    TimelineEventKind::UserInputRequested,
+                    "已请求用户输入",
+                    Some(questions),
+                );
+                update_turn(&mut last_turn, event, TurnState::AwaitingApproval, None);
+            }
+            StoredEventKind::UserInputResolved {
+                request_id,
+                resolution,
+            } => {
+                if let Some(input) = user_inputs
+                    .iter_mut()
+                    .rev()
+                    .find(|input| input.request.id == *request_id)
+                {
+                    input.resolution = Some(resolution.clone());
+                }
+                push_timeline_event(
+                    &mut turn_timeline,
+                    event,
+                    TimelineEventKind::UserInputResolved,
+                    "用户输入已处理",
+                    Some(format!(
+                        "请求 {request_id} · {}",
+                        user_input_action_label(resolution.action)
+                    )),
+                );
+                update_turn(&mut last_turn, event, TurnState::Streaming, None);
+            }
+            StoredEventKind::TodoUpdated { todos: updated } => {
+                todos = updated.clone();
+                let completed = updated
+                    .iter()
+                    .filter(|todo| matches!(todo.status, crate::protocol::TodoStatus::Completed))
+                    .count();
+                push_timeline_event(
+                    &mut turn_timeline,
+                    event,
+                    TimelineEventKind::TodoUpdated,
+                    "任务清单已更新",
+                    Some(format!("已完成 {completed}/{} 项", updated.len())),
+                );
+            }
+            StoredEventKind::ChangeApplied { change_set } => {
+                changes.push(change_set.clone());
+                let paths = change_set
+                    .files
+                    .iter()
+                    .map(|file| file.path.as_str())
+                    .collect::<Vec<_>>()
+                    .join("、");
+                push_timeline_event(
+                    &mut turn_timeline,
+                    event,
+                    TimelineEventKind::ChangeApplied,
+                    format!("已应用 {} 个文件变更", change_set.files.len()),
+                    Some(paths),
+                );
+            }
             StoredEventKind::ChangeUndone { change_id } => {
                 if let Some(change) = changes
                     .iter_mut()
@@ -506,9 +801,20 @@ fn project_thread(thread_id: &str, events: &[StoredEvent]) -> Result<ThreadDetai
                 {
                     change.undone = true;
                 }
+                push_timeline_event(
+                    &mut turn_timeline,
+                    event,
+                    TimelineEventKind::ChangeUndone,
+                    "已撤销文件变更",
+                    Some(format!("变更 {change_id}")),
+                );
             }
             StoredEventKind::TurnStarted => {
                 if let Some(turn_id) = &event.turn_id {
+                    last_usage = None;
+                    if let Some(message_id) = &latest_user_message_id {
+                        turn_user_message_ids.insert(turn_id.clone(), message_id.clone());
+                    }
                     last_turn = Some(TurnSnapshot {
                         turn_id: turn_id.clone(),
                         state: TurnState::Streaming,
@@ -516,16 +822,42 @@ fn project_thread(thread_id: &str, events: &[StoredEvent]) -> Result<ThreadDetai
                     });
                 }
             }
-            StoredEventKind::TurnCompleted { .. } => {
+            StoredEventKind::TurnCompleted { usage } => {
+                if usage.is_some() {
+                    last_usage = *usage;
+                }
+                push_timeline_event(
+                    &mut turn_timeline,
+                    event,
+                    TimelineEventKind::TurnCompleted,
+                    "Turn 已完成",
+                    None,
+                );
                 update_turn(&mut last_turn, event, TurnState::Completed, None)
             }
-            StoredEventKind::TurnFailed { message } => update_turn(
-                &mut last_turn,
-                event,
-                TurnState::Failed,
-                Some(message.clone()),
-            ),
+            StoredEventKind::TurnFailed { message } => {
+                push_timeline_event(
+                    &mut turn_timeline,
+                    event,
+                    TimelineEventKind::TurnFailed,
+                    "Turn 执行失败",
+                    Some(message.clone()),
+                );
+                update_turn(
+                    &mut last_turn,
+                    event,
+                    TurnState::Failed,
+                    Some(message.clone()),
+                )
+            }
             StoredEventKind::TurnCancelled => {
+                push_timeline_event(
+                    &mut turn_timeline,
+                    event,
+                    TimelineEventKind::TurnCancelled,
+                    "Turn 已取消",
+                    None,
+                );
                 update_turn(&mut last_turn, event, TurnState::Cancelled, None)
             }
             StoredEventKind::ThreadArchived => archived = true,
@@ -546,11 +878,94 @@ fn project_thread(thread_id: &str, events: &[StoredEvent]) -> Result<ThreadDetai
             archived,
         },
         messages,
+        message_turn_ids,
+        turn_user_message_ids,
         last_turn,
         tool_activities,
+        turn_timeline,
         approvals,
+        user_inputs,
         changes,
+        todos,
+        last_usage,
     })
+}
+
+fn push_timeline_event(
+    timeline: &mut Vec<TurnTimelineItem>,
+    event: &StoredEvent,
+    kind: TimelineEventKind,
+    title: impl Into<String>,
+    detail: Option<String>,
+) {
+    let Some(turn_id) = &event.turn_id else {
+        return;
+    };
+    let item_id = match &event.kind {
+        StoredEventKind::ApprovalRequested { request } => {
+            format!("approval-requested-{}", request.id)
+        }
+        StoredEventKind::ApprovalResolved { request_id, .. } => {
+            format!("approval-resolved-{request_id}")
+        }
+        StoredEventKind::UserInputRequested { request } => {
+            format!("user-input-requested-{}", request.id)
+        }
+        StoredEventKind::UserInputResolved { request_id, .. } => {
+            format!("user-input-resolved-{request_id}")
+        }
+        StoredEventKind::ChangeApplied { change_set } => {
+            format!("change-applied-{}", change_set.id)
+        }
+        StoredEventKind::ChangeUndone { change_id } => format!("change-undone-{change_id}"),
+        StoredEventKind::TurnCompleted { .. } => format!("turn-completed-{turn_id}"),
+        StoredEventKind::TurnFailed { .. } => format!("turn-failed-{turn_id}"),
+        StoredEventKind::TurnCancelled => format!("turn-cancelled-{turn_id}"),
+        _ => event.event_id.clone(),
+    };
+    timeline.push(TurnTimelineItem::Event {
+        item_id,
+        turn_id: turn_id.clone(),
+        kind,
+        title: bound_timeline_text(title.into()),
+        detail: detail.map(bound_timeline_text),
+    });
+}
+
+fn bound_timeline_text(value: String) -> String {
+    if value.chars().count() <= MAX_TIMELINE_DETAIL_CHARS {
+        return value;
+    }
+    value
+        .chars()
+        .take(MAX_TIMELINE_DETAIL_CHARS.saturating_sub(1))
+        .collect::<String>()
+        + "…"
+}
+
+fn add_token_usage(left: TokenUsage, right: TokenUsage) -> TokenUsage {
+    TokenUsage {
+        input_tokens: left.input_tokens.saturating_add(right.input_tokens),
+        output_tokens: left.output_tokens.saturating_add(right.output_tokens),
+        total_tokens: left.total_tokens.saturating_add(right.total_tokens),
+    }
+}
+
+fn approval_action_label(action: ApprovalAction) -> &'static str {
+    match action {
+        ApprovalAction::Approved => "已批准",
+        ApprovalAction::Rejected => "已拒绝",
+        ApprovalAction::TimedOut => "已超时",
+        ApprovalAction::Cancelled => "已取消",
+    }
+}
+
+fn user_input_action_label(action: UserInputAction) -> &'static str {
+    match action {
+        UserInputAction::Answered => "已回答",
+        UserInputAction::Skipped => "已跳过",
+        UserInputAction::Cancelled => "已取消",
+    }
 }
 
 fn update_turn(
@@ -593,7 +1008,7 @@ mod tests {
     use super::*;
     use crate::protocol::{
         ApprovalAction, ChangeFileSnapshot, ContentBlock, ExpectedFileHash, FileOperation,
-        MessageRole, PatchFilePreview, PatchPreview, ToolRisk,
+        MessageRole, PatchFilePreview, PatchPreview, ToolRisk, UserInputQuestion,
     };
 
     fn message(role: MessageRole, text: &str) -> ChatMessage {
@@ -641,6 +1056,142 @@ mod tests {
             .await
             .expect("thread should archive");
         assert!(repository.list_threads().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn projects_assistant_message_turn_ids_for_inline_activity() {
+        let directory = tempfile::tempdir().unwrap();
+        let repository = JsonlThreadRepository::new(directory.path()).unwrap();
+        let thread = repository.create_thread().await.unwrap();
+        let assistant = message(MessageRole::Assistant, "done");
+
+        repository
+            .append(StoredEvent::new(
+                &thread.id,
+                Some("turn-inline".to_string()),
+                StoredEventKind::AssistantMessage {
+                    message: assistant.clone(),
+                },
+            ))
+            .await
+            .unwrap();
+
+        let detail = repository.read_thread(&thread.id).await.unwrap();
+        assert_eq!(
+            detail
+                .message_turn_ids
+                .get(&assistant.id)
+                .map(String::as_str),
+            Some("turn-inline")
+        );
+    }
+
+    #[tokio::test]
+    async fn projects_interleaved_turn_timeline_in_event_order() {
+        let directory = tempfile::tempdir().unwrap();
+        let repository = JsonlThreadRepository::new(directory.path()).unwrap();
+        let thread = repository.create_thread().await.unwrap();
+        let call = ToolCall {
+            id: "call-read".into(),
+            name: "read_file".into(),
+            arguments: serde_json::json!({ "path": "README.md" }),
+            metadata: serde_json::json!({}),
+        };
+
+        repository
+            .append(StoredEvent::new(
+                &thread.id,
+                Some("turn-timeline".into()),
+                StoredEventKind::AssistantToolCalls {
+                    text: "我先读取说明文件。".into(),
+                    calls: vec![call.clone()],
+                },
+            ))
+            .await
+            .unwrap();
+        repository
+            .append(StoredEvent::new(
+                &thread.id,
+                Some("turn-timeline".into()),
+                StoredEventKind::ToolResult {
+                    call_id: call.id.clone(),
+                    name: call.name.clone(),
+                    result: ToolResult {
+                        success: true,
+                        output: "docs".into(),
+                        metadata: serde_json::json!({}),
+                    },
+                },
+            ))
+            .await
+            .unwrap();
+        repository
+            .append(StoredEvent::new(
+                &thread.id,
+                Some("turn-timeline".into()),
+                StoredEventKind::AssistantMessage {
+                    message: message(MessageRole::Assistant, "读取完成。"),
+                },
+            ))
+            .await
+            .unwrap();
+
+        let detail = repository.read_thread(&thread.id).await.unwrap();
+        assert_eq!(detail.turn_timeline.len(), 3);
+        assert!(matches!(
+            &detail.turn_timeline[0],
+            TurnTimelineItem::Text { text, .. } if text == "我先读取说明文件。"
+        ));
+        assert!(matches!(
+            &detail.turn_timeline[1],
+            TurnTimelineItem::Tool { activity }
+                if activity.call.id == "call-read"
+                    && activity.state == ToolActivityState::Completed
+        ));
+        assert!(matches!(
+            &detail.turn_timeline[2],
+            TurnTimelineItem::Text { text, .. } if text == "读取完成。"
+        ));
+    }
+
+    #[tokio::test]
+    async fn projects_completed_reasoning_summaries_without_provider_context() {
+        let directory = tempfile::tempdir().unwrap();
+        let repository = JsonlThreadRepository::new(directory.path()).unwrap();
+        let thread = repository.create_thread().await.unwrap();
+        repository
+            .append(StoredEvent::new(
+                &thread.id,
+                Some("turn-reasoning".into()),
+                StoredEventKind::ReasoningSummary {
+                    item_id: "rs_1".into(),
+                    summary: "Checked the public API contract.".into(),
+                },
+            ))
+            .await
+            .unwrap();
+
+        let detail = repository.read_thread(&thread.id).await.unwrap();
+        assert!(matches!(
+            &detail.turn_timeline[0],
+            TurnTimelineItem::Reasoning { item_id, summary, .. }
+                if item_id == "rs_1" && summary == "Checked the public API contract."
+        ));
+        assert!(detail.messages.is_empty());
+    }
+
+    #[test]
+    fn legacy_tool_call_events_default_to_empty_progress_text() {
+        let event: StoredEventKind = serde_json::from_value(serde_json::json!({
+            "type": "assistant_tool_calls",
+            "data": { "calls": [] }
+        }))
+        .unwrap();
+        assert!(matches!(
+            event,
+            StoredEventKind::AssistantToolCalls { text, calls }
+                if text.is_empty() && calls.is_empty()
+        ));
     }
 
     #[tokio::test]
@@ -715,6 +1266,7 @@ mod tests {
             tool_call_id: "call-1".to_string(),
             tool_name: "apply_patch".to_string(),
             reason: "review change".to_string(),
+            auto_approved: false,
             risk: ToolRisk::Write,
             arguments: serde_json::json!({ "patch": "strict patch" }),
             preview: Some(PatchPreview {
@@ -780,6 +1332,84 @@ mod tests {
         assert_eq!(detail.approvals[0].resolution, Some(resolution));
         assert_eq!(detail.changes.len(), 1);
         assert!(detail.changes[0].undone);
+        assert!(matches!(
+            &detail.turn_timeline[..],
+            [
+                TurnTimelineItem::Event {
+                    kind: TimelineEventKind::ApprovalRequested,
+                    ..
+                },
+                TurnTimelineItem::Event {
+                    kind: TimelineEventKind::ApprovalResolved,
+                    ..
+                },
+                TurnTimelineItem::Event {
+                    kind: TimelineEventKind::ChangeApplied,
+                    ..
+                },
+                TurnTimelineItem::Event {
+                    kind: TimelineEventKind::ChangeUndone,
+                    ..
+                },
+            ]
+        ));
+    }
+
+    #[tokio::test]
+    async fn rebuilds_pending_user_input_and_terminal_timeline_events() {
+        let directory = tempfile::tempdir().unwrap();
+        let repository = JsonlThreadRepository::new(directory.path()).unwrap();
+        let thread = repository.create_thread().await.unwrap();
+        let turn_id = "turn-input".to_string();
+        let request = UserInputRequest {
+            id: "input-1".into(),
+            thread_id: thread.id.clone(),
+            turn_id: turn_id.clone(),
+            tool_call_id: "call-input".into(),
+            questions: vec![UserInputQuestion {
+                question: "选择实现方式".into(),
+                options: vec!["稳妥".into(), "快速".into()],
+            }],
+            created_at_ms: now_ms(),
+            expires_at_ms: now_ms() + 60_000,
+        };
+        for kind in [
+            StoredEventKind::UserMessage {
+                message: message(MessageRole::User, "先规划"),
+            },
+            StoredEventKind::TurnStarted,
+            StoredEventKind::UserInputRequested {
+                request: request.clone(),
+            },
+            StoredEventKind::TurnCancelled,
+        ] {
+            repository
+                .append(StoredEvent::new(&thread.id, Some(turn_id.clone()), kind))
+                .await
+                .unwrap();
+        }
+
+        let detail = repository.read_thread(&thread.id).await.unwrap();
+        assert_eq!(detail.user_inputs.len(), 1);
+        assert_eq!(detail.user_inputs[0].request, request);
+        assert!(detail.user_inputs[0].resolution.is_none());
+        assert_eq!(
+            detail.turn_user_message_ids.get(&turn_id),
+            detail.messages.first().map(|message| &message.id)
+        );
+        assert!(matches!(
+            &detail.turn_timeline[..],
+            [
+                TurnTimelineItem::Event {
+                    kind: TimelineEventKind::UserInputRequested,
+                    ..
+                },
+                TurnTimelineItem::Event {
+                    kind: TimelineEventKind::TurnCancelled,
+                    ..
+                },
+            ]
+        ));
     }
 
     #[tokio::test]

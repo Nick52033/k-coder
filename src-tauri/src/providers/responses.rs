@@ -42,6 +42,8 @@ struct ResponsesStreamEvent {
     #[serde(rename = "type")]
     event_type: String,
     delta: Option<String>,
+    item_id: Option<String>,
+    text: Option<String>,
     response: Option<ResponsesObject>,
     item: Option<Value>,
     error: Option<ResponsesError>,
@@ -85,8 +87,11 @@ impl Provider for OpenAiResponsesProvider {
         let mut payload = json!({
             "model": request.model,
             "input": responses_input(&request.messages),
-            "stream": true
+            "stream": true,
         });
+        if let Some(effort) = request.reasoning_effort.openai_value() {
+            payload["reasoning"] = json!({ "effort": effort, "summary": "auto" });
+        }
         if !request.tools.is_empty() {
             payload["tools"] = Value::Array(
                 request
@@ -104,10 +109,10 @@ impl Provider for OpenAiResponsesProvider {
             );
         }
 
-        let response = tokio::select! {
+        let mut response = tokio::select! {
             _ = cancellation.cancelled() => return Err(ProviderError::Cancelled),
             response = self.client
-                .post(endpoint)
+                .post(endpoint.clone())
                 .bearer_auth(&self.api_key)
                 .header("accept", "text/event-stream")
                 .json(&payload)
@@ -116,7 +121,28 @@ impl Provider for OpenAiResponsesProvider {
         if !response.status().is_success() {
             let status = response.status().as_u16();
             let message = read_error_message(response, &cancellation, &self.api_key).await?;
-            return Err(ProviderError::Http { status, message });
+            if should_retry_without_reasoning_summary(status, &message) {
+                if let Some(payload) = payload.as_object_mut() {
+                    payload.remove("reasoning");
+                }
+                response = tokio::select! {
+                    _ = cancellation.cancelled() => return Err(ProviderError::Cancelled),
+                    response = self.client
+                        .post(endpoint)
+                        .bearer_auth(&self.api_key)
+                        .header("accept", "text/event-stream")
+                        .json(&payload)
+                        .send() => response.map_err(|error| ProviderError::Request(error.to_string()))?,
+                };
+                if !response.status().is_success() {
+                    let status = response.status().as_u16();
+                    let message =
+                        read_error_message(response, &cancellation, &self.api_key).await?;
+                    return Err(ProviderError::Http { status, message });
+                }
+            } else {
+                return Err(ProviderError::Http { status, message });
+            }
         }
 
         let secret = self.api_key.clone();
@@ -161,12 +187,19 @@ impl Provider for OpenAiResponsesProvider {
     }
 }
 
+fn should_retry_without_reasoning_summary(status: u16, message: &str) -> bool {
+    matches!(status, 400 | 422) && {
+        let message = message.to_ascii_lowercase();
+        message.contains("reasoning") || message.contains("summary")
+    }
+}
+
 fn responses_input(messages: &[ProviderMessage]) -> Vec<Value> {
     messages
         .iter()
         .flat_map(|message| match message {
             ProviderMessage::Text { role, text } => vec![json!({
-                "role": match role { MessageRole::User => "user", MessageRole::Assistant => "assistant" },
+                "role": match role { MessageRole::User => "user", MessageRole::Assistant => "assistant", MessageRole::System => "developer" },
                 "content": text
             })],
             ProviderMessage::UserContent { text, images } => vec![json!({
@@ -178,9 +211,10 @@ fn responses_input(messages: &[ProviderMessage]) -> Vec<Value> {
                     })))
                     .collect::<Vec<_>>()
             })],
-            ProviderMessage::AssistantToolCalls { calls } => calls
-                .iter()
-                .map(|call| {
+            ProviderMessage::AssistantToolCalls { text, calls } => std::iter::once(text)
+                .filter(|text| !text.is_empty())
+                .map(|text| json!({ "role": "assistant", "content": text }))
+                .chain(calls.iter().map(|call| {
                     let mut item = json!({
                         "type": "function_call",
                         "call_id": call.id,
@@ -191,7 +225,7 @@ fn responses_input(messages: &[ProviderMessage]) -> Vec<Value> {
                         item["id"] = Value::String(id.to_string());
                     }
                     item
-                })
+                }))
                 .collect(),
             ProviderMessage::ToolResult { call_id, output, .. } => vec![json!({
                 "type": "function_call_output",
@@ -221,9 +255,30 @@ fn parse_sse_data(data: &str) -> Result<ParsedResponsesEvent, ProviderError> {
 
     let mut events = Vec::new();
     if event.event_type == "response.output_text.delta" {
-        if let Some(delta) = event.delta.filter(|delta| !delta.is_empty()) {
+        if let Some(delta) = event.delta.as_ref().filter(|delta| !delta.is_empty()) {
+            let delta = delta.clone();
             events.push(ProviderEvent::TextDelta { delta });
         }
+    }
+    if event.event_type == "response.reasoning_summary_text.delta" {
+        let item_id = event.item_id.clone().ok_or_else(|| {
+            ProviderError::InvalidResponse(
+                "Responses API reasoning summary delta omitted item_id".to_string(),
+            )
+        })?;
+        if let Some(delta) = event.delta.as_ref().filter(|delta| !delta.is_empty()) {
+            let delta = delta.clone();
+            events.push(ProviderEvent::ReasoningSummaryDelta { item_id, delta });
+        }
+    }
+    if event.event_type == "response.reasoning_summary_text.done" {
+        let item_id = event.item_id.clone().ok_or_else(|| {
+            ProviderError::InvalidResponse(
+                "Responses API reasoning summary completion omitted item_id".to_string(),
+            )
+        })?;
+        let summary = event.text.unwrap_or_default();
+        events.push(ProviderEvent::ReasoningSummaryCompleted { item_id, summary });
     }
     if event.event_type == "response.output_item.done" {
         let item = event.item.ok_or_else(|| {
@@ -321,14 +376,76 @@ mod tests {
     }
 
     #[test]
+    fn parses_only_safe_reasoning_summary_events() {
+        let delta = parse_sse_data(
+            r#"{"type":"response.reasoning_summary_text.delta","item_id":"rs_1","delta":"Checking files"}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            &delta.events[0],
+            ProviderEvent::ReasoningSummaryDelta { item_id, delta }
+                if item_id == "rs_1" && delta == "Checking files"
+        ));
+
+        let done = parse_sse_data(
+            r#"{"type":"response.reasoning_summary_text.done","item_id":"rs_1","text":"Checked the relevant files."}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            &done.events[0],
+            ProviderEvent::ReasoningSummaryCompleted { item_id, summary }
+                if item_id == "rs_1" && summary == "Checked the relevant files."
+        ));
+
+        let raw_reasoning = parse_sse_data(
+            r#"{"type":"response.reasoning_text.delta","item_id":"rs_1","delta":"private chain of thought"}"#,
+        )
+        .unwrap();
+        assert!(raw_reasoning.events.is_empty());
+    }
+
+    #[test]
+    fn only_retries_parameter_errors_that_name_reasoning() {
+        assert!(should_retry_without_reasoning_summary(
+            400,
+            "Unsupported parameter: reasoning.summary"
+        ));
+        assert!(should_retry_without_reasoning_summary(
+            422,
+            "reasoning is not supported"
+        ));
+        assert!(!should_retry_without_reasoning_summary(
+            401,
+            "reasoning is not supported"
+        ));
+        assert!(!should_retry_without_reasoning_summary(
+            400,
+            "model is invalid"
+        ));
+    }
+
+    #[test]
     fn serializes_responses_tool_history() {
-        let input = responses_input(&[ProviderMessage::ToolResult {
-            call_id: "call".to_string(),
-            name: "read_file".to_string(),
-            success: true,
-            output: "docs".to_string(),
-        }]);
-        assert_eq!(input[0]["type"], "function_call_output");
+        let input = responses_input(&[
+            ProviderMessage::AssistantToolCalls {
+                text: "I will inspect it.".into(),
+                calls: vec![ToolCall {
+                    id: "call".into(),
+                    name: "read_file".into(),
+                    arguments: json!({ "path": "README.md" }),
+                    metadata: json!({}),
+                }],
+            },
+            ProviderMessage::ToolResult {
+                call_id: "call".to_string(),
+                name: "read_file".to_string(),
+                success: true,
+                output: "docs".to_string(),
+            },
+        ]);
+        assert_eq!(input[0]["role"], "assistant");
+        assert_eq!(input[1]["type"], "function_call");
+        assert_eq!(input[2]["type"], "function_call_output");
     }
 
     #[test]

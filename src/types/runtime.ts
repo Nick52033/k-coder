@@ -131,13 +131,24 @@ export interface PtyOutputPage {
   truncatedBeforeCursor: boolean;
 }
 
-export type MessageRole = "user" | "assistant";
+export type MessageRole = "user" | "assistant" | "system";
 export type TurnState =
   | "queued"
   | "streaming"
   | "awaiting_approval"
   | "running_tool"
   | "completed"
+  | "failed"
+  | "cancelled";
+
+/// Turn 的语义阶段（对应后端 TurnPhase 枚举）
+export type TurnPhase =
+  | "idle"
+  | "exploring"
+  | "planning"
+  | "executing"
+  | "awaiting_input"
+  | "complete"
   | "failed"
   | "cancelled";
 
@@ -195,14 +206,21 @@ export interface ThreadDetail {
   schemaVersion: number;
   summary: ThreadSummary;
   messages: ChatMessage[];
+  messageTurnIds: Record<string, string>;
+  turnUserMessageIds: Record<string, string>;
   lastTurn: TurnSnapshot | null;
   toolActivities: ToolActivity[];
+  turnTimeline: TurnTimelineItem[];
   approvals: ApprovalSnapshot[];
+  userInputs: UserInputSnapshot[];
   changes: ChangeSet[];
+  todos: TodoItem[];
+  lastUsage: TokenUsage | null;
 }
 
 export type FileOperation = "add" | "modify" | "delete" | "move";
 export type ToolRisk = "read" | "write" | "delete" | "external";
+export type ApprovalMode = "ask" | "full_access";
 export type ApprovalAction = "approved" | "rejected" | "timed_out" | "cancelled";
 
 export interface PatchFilePreview {
@@ -234,6 +252,7 @@ export interface ApprovalRequest {
   toolCallId: string;
   toolName: string;
   reason: string;
+  autoApproved: boolean;
   risk: ToolRisk;
   arguments: Record<string, unknown>;
   preview: PatchPreview | null;
@@ -287,7 +306,36 @@ export interface ToolActivity {
   call: ToolCall;
   state: "running" | "completed" | "failed";
   result: ToolResult | null;
+  outputChunks?: ToolOutputDelta[];
+  startedAtMs?: number;
+  completedAtMs?: number;
+  durationMs?: number;
 }
+
+export type AgentActivityStatus = "thinking" | "responding" | "running_tool" | "awaiting_approval" | "finalizing";
+export type ToolOutputStream = "stdout" | "stderr";
+export interface ToolOutputDelta { stream: ToolOutputStream; cursor: number; text: string; }
+
+export type TimelineEventKind =
+  | "provider_context"
+  | "usage"
+  | "compacted"
+  | "approval_requested"
+  | "approval_resolved"
+  | "change_applied"
+  | "change_undone"
+  | "user_input_requested"
+  | "user_input_resolved"
+  | "todo_updated"
+  | "turn_completed"
+  | "turn_failed"
+  | "turn_cancelled";
+
+export type TurnTimelineItem =
+  | { type: "text"; id: string; turnId: string; text: string }
+  | { type: "reasoning"; itemId: string; turnId: string; summary: string; complete?: boolean }
+  | { type: "tool"; activity: ToolActivity }
+  | { type: "event"; itemId: string; turnId: string; kind: TimelineEventKind; title: string; detail: string | null };
 
 export type ProviderKind = "open_ai_compatible";
 export type ProviderTransport =
@@ -380,13 +428,32 @@ interface EventBase {
   schemaVersion: number;
   threadId: string;
   turnId: string;
+  phase: TurnPhase;
+}
+
+export type TodoStatus = "pending" | "in_progress" | "completed";
+
+export interface TodoItem {
+  content: string;
+  status: TodoStatus;
+  activeForm: string;
 }
 
 export type AgentEvent =
   | (EventBase & { type: "turn_started" })
+  | (EventBase & { type: "activity_status_changed"; status: AgentActivityStatus })
   | (EventBase & { type: "text_delta"; delta: string })
+  | (EventBase & { type: "reasoning_summary_delta"; itemId: string; delta: string })
+  | (EventBase & { type: "reasoning_summary_completed"; itemId: string; summary: string })
   | (EventBase & { type: "usage_updated"; usage: TokenUsage })
   | (EventBase & { type: "tool_started"; call: ToolCall })
+  | (EventBase & {
+      type: "tool_output_delta";
+      callId: string;
+      stream: ToolOutputStream;
+      cursor: number;
+      delta: string;
+    })
   | (EventBase & {
       type: "tool_completed";
       callId: string;
@@ -407,7 +474,14 @@ export type AgentEvent =
       usage: TokenUsage | null;
     })
   | (EventBase & { type: "turn_failed"; message: string })
-  | (EventBase & { type: "turn_cancelled" });
+  | (EventBase & { type: "turn_cancelled" })
+  | (EventBase & { type: "user_input_requested"; request: UserInputRequest })
+  | (EventBase & {
+      type: "user_input_resolved";
+      requestId: string;
+      resolution: UserInputResolution;
+    })
+  | (EventBase & { type: "todo_updated"; todos: TodoItem[] });
 
 export interface ConversationMessage {
   id: string;
@@ -416,4 +490,39 @@ export interface ConversationMessage {
   createdAtMs: number;
   turnId?: string;
   status?: "streaming" | "failed" | "cancelled";
+}
+
+export type AgentMode = "craft" | "ask" | "plan";
+export type ReasoningEffort = "off" | "minimal" | "low" | "medium" | "high" | "x_high";
+
+export interface UserInputQuestion {
+  question: string;
+  options: string[];
+}
+
+export interface UserInputRequest {
+  id: string;
+  threadId: string;
+  turnId: string;
+  toolCallId: string;
+  questions: UserInputQuestion[];
+  createdAtMs: number;
+  expiresAtMs: number;
+}
+
+export type UserInputAction = "answered" | "skipped" | "cancelled";
+
+export interface UserInputAnswer {
+  question: string;
+  answer: string;
+}
+
+export interface UserInputResolution {
+  action: UserInputAction;
+  answers: UserInputAnswer[];
+}
+
+export interface UserInputSnapshot {
+  request: UserInputRequest;
+  resolution: UserInputResolution | null;
 }

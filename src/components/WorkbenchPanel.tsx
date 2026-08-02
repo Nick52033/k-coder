@@ -1,9 +1,9 @@
 import { useEffect, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
-  ArrowDownToLine, Braces, ChevronDown, ChevronRight, Circle, CircleCheck, CircleDot,
-  CodeXml, Database, File, FileCode2, FileCog, FileDiff, FileText, Folder, FolderOpen,
-  GitBranch, Hash, Image, ListChecks, LocateFixed, Paperclip, Plus, RefreshCw, Search,
+  ArrowDownToLine, Braces, ChevronDown, ChevronRight, CircleCheck,
+  CodeXml, Database, File, FileCode2, FileCog, FileText, Folder, FolderOpen,
+  GitBranch, Hash, Image, LocateFixed, Paperclip, Plus, RefreshCw, Search,
   Terminal, Upload, X,
 } from "lucide-react";
 import "./WorkbenchPanel.css";
@@ -14,13 +14,12 @@ import {
   searchRepository,
 } from "../api/runtime";
 import type {
-  AttachmentContent, ChangeSet, FileEntry, FilePreview, GitBranchView, GitStatusView,
-  ProjectRecord, ToolActivity, WorkspaceState,
-  PlanView as PersistentPlan,
+  AttachmentContent, FileEntry, FilePreview, GitBranchView, GitStatusView,
+  ProjectRecord, WorkspaceState,
   SearchResult,
 } from "../types/runtime";
 
-type Tab = "files" | "git" | "plan";
+type Tab = "files" | "git";
 
 export function WorkspacePicker({ onChanged }: { onChanged: () => void }) {
   const [state, setState] = useState<WorkspaceState | null>(null);
@@ -46,7 +45,7 @@ export function WorkspacePicker({ onChanged }: { onChanged: () => void }) {
       await load();
       onChanged();
     } catch (reason) {
-      setError(String(reason));
+      setError(toReadableError(reason));
     }
   }
 
@@ -77,18 +76,16 @@ export function WorkspacePicker({ onChanged }: { onChanged: () => void }) {
   );
 }
 
-export function WorkbenchPanel({ plan, toolActivities, changes, onAttach, onSelectChange, open = false }: { plan: PersistentPlan | null; toolActivities: ToolActivity[]; changes: ChangeSet[]; onAttach: (attachment: AttachmentContent) => void; onSelectChange: (changeId: string) => void; open?: boolean }) {
+export function WorkbenchPanel({ onAttach, open = false }: { onAttach: (attachment: AttachmentContent) => void; open?: boolean }) {
   const [tab, setTab] = useState<Tab>("files");
   return (
     <aside className={`workbench-panel ${open ? "workbench-panel--open" : ""}`}>
       <div className="workbench-tabs" role="tablist" aria-label="工作台面板">
         <TabButton active={tab === "files"} icon={<FileCode2 size={15} />} label="文件" onClick={() => setTab("files")} />
         <TabButton active={tab === "git"} icon={<GitBranch size={15} />} label="Git" onClick={() => setTab("git")} />
-        <TabButton active={tab === "plan"} icon={<ListChecks size={15} />} label="计划" onClick={() => setTab("plan")} />
       </div>
       {tab === "files" && <FilesView onAttach={onAttach} />}
       {tab === "git" && <GitView />}
-      {tab === "plan" && <PlanView plan={plan} activities={toolActivities} changes={changes} onSelectChange={onSelectChange} />}
     </aside>
   );
 }
@@ -110,7 +107,7 @@ function FilesView({ onAttach }: { onAttach: (attachment: AttachmentContent) => 
       setPreview(await previewWorkspaceFile(path));
       setError("");
     } catch (error) {
-      setError(String(error));
+      setError(toReadableError(error));
     }
   }
 
@@ -180,7 +177,7 @@ function DirectoryNode({ path, depth, onSelect }: { path: string; depth: number;
     let disposed = false;
     void listWorkspaceDirectory(path)
       .then((value) => { if (!disposed) { setEntries(value); setError(""); } })
-      .catch((reason) => { if (!disposed) setError(String(reason)); });
+      .catch((reason) => { if (!disposed) setError(toReadableError(reason)); });
     return () => { disposed = true; };
   }, [path]);
   return <>{error && <div className="tree-error" role="alert">{error}</div>}{entries.map((entry) => entry.isDirectory ? <FolderNode key={entry.path} entry={entry} depth={depth} onSelect={onSelect} /> : (
@@ -200,6 +197,17 @@ function FolderNode({ entry, depth, onSelect }: { entry: FileEntry; depth: numbe
   </div>;
 }
 
+function toReadableError(reason: unknown): string {
+  if (typeof reason === "string") return reason;
+  if (reason instanceof Error) return reason.message;
+  try {
+    const parsed = JSON.stringify(reason);
+    return parsed === undefined || parsed === '"undefined"' ? "未知错误" : parsed;
+  } catch {
+    return "未知错误";
+  }
+}
+
 function GitView() {
   const [status, setStatus] = useState<GitStatusView | null>(null);
   const [branches, setBranches] = useState<GitBranchView | null>(null);
@@ -208,9 +216,12 @@ function GitView() {
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [busyAction, setBusyAction] = useState<"stage" | "unstage" | "commit" | "pull" | "push" | null>(null);
-  const refresh = () => Promise.all([getGitStatus(), getGitBranches()])
-    .then(([nextStatus, nextBranches]) => { setStatus(nextStatus); setBranches(nextBranches); setError(""); })
-    .catch((reason) => setError(String(reason)));
+  const refresh = async () => {
+    const [statusResult, branchesResult] = await Promise.allSettled([getGitStatus(), getGitBranches()]);
+    if (statusResult.status === "fulfilled") { setStatus(statusResult.value); setError(""); }
+    else setError(toReadableError(statusResult.reason));
+    if (branchesResult.status === "fulfilled") setBranches(branchesResult.value);
+  };
   useEffect(() => { void refresh(); }, []);
   async function action(name: "stage" | "unstage" | "commit" | "pull" | "push", paths: string[] = []) {
     const confirmation = name === "commit" ? `提交当前已暂存的更改？\n\n${message}`
@@ -227,7 +238,7 @@ function GitView() {
       setNotice(gitActionSuccessLabel(name));
       await refresh();
     } catch (error) {
-      setError(String(error));
+      setError(toReadableError(error));
     } finally {
       setBusyAction(null);
     }
@@ -235,7 +246,7 @@ function GitView() {
   async function changeBranch(branch: string, create = false) {
     if (!branch || (!create && branch === branches?.current)) return;
     if (!window.confirm(`${create ? "创建并切换到" : "切换到"}分支“${branch}”？\n\n未提交的更改会保留；如有冲突，Git 将拒绝切换。`)) return;
-    try { await switchGitBranch(branch, create, true); setDiff(""); await refresh(); } catch (reason) { setError(String(reason)); }
+    try { await switchGitBranch(branch, create, true); setDiff(""); await refresh(); } catch (reason) { setError(toReadableError(reason)); }
   }
   if (status && !status.isRepository) return <div className="panel-empty"><GitBranch size={22} /><span>当前工作区不是 Git 仓库</span></div>;
   const hasUnstagedChanges = Boolean(status?.files.some(isGitFileStageable));
@@ -257,15 +268,6 @@ function GitView() {
     <div className="commit-box"><input value={message} onChange={(event) => setMessage(event.target.value)} placeholder="提交说明" aria-label="提交说明" /><button type="button" disabled={busyAction !== null || !message.trim() || !hasStagedChanges} title={hasStagedChanges ? "提交已暂存的更改" : "请先暂存更改"} onClick={() => void action("commit")}>{busyAction === "commit" ? "提交中" : "提交"}</button></div>
     {notice && <div className="panel-notice" role="status">{notice}</div>}
     {error && <div className="panel-error">{error}</div>}
-  </div>;
-}
-
-function PlanView({ plan, activities, changes, onSelectChange }: { plan: PersistentPlan | null; activities: ToolActivity[]; changes: ChangeSet[]; onSelectChange: (changeId: string) => void }) {
-  if (!plan?.steps.length && !activities.length && !changes.length) return <div className="panel-empty"><ListChecks size={22} /><span>智能体创建计划后会显示在这里</span></div>;
-  return <div className="plan-list">
-    {plan?.steps.map((step, index) => <div className={`plan-step plan-step--${step.status}`} key={step.id}><span>{step.status === "completed" ? <CircleCheck size={14} /> : step.status === "in_progress" ? <CircleDot size={14} /> : step.status === "failed" ? <X size={14} /> : <Circle size={14} />}</span><div><strong>{index + 1}. {step.step}</strong><small>{step.detail ?? (step.status === "in_progress" ? "执行中" : step.status === "completed" ? "已完成" : step.status === "failed" ? "失败" : step.status === "skipped" ? "已跳过" : "待处理")}</small></div></div>)}
-    {!plan?.steps.length && activities.map((activity, index) => <div className="plan-step" key={`${activity.turnId}-${activity.call.id}`}><span>{activity.state === "completed" ? <CircleCheck size={14} /> : <span className="plan-index">{index + 1}</span>}</span><div><strong>{activity.call.name}</strong><small>{activity.state}</small></div></div>)}
-    {changes.length > 0 && <div className="plan-changes"><div className="plan-section-label">代码变更</div>{changes.slice().reverse().map((change) => <button type="button" key={change.id} onClick={() => onSelectChange(change.id)}><FileDiff size={14} /><span><strong>{change.files.length} 个文件</strong><small>{change.undone ? "已撤销" : "查看 Diff"}</small></span></button>)}</div>}
   </div>;
 }
 

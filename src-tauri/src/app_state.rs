@@ -15,8 +15,11 @@ use crate::logging::StructuredLogger;
 use crate::multi_agent::MultiAgentCoordinator;
 use crate::patch::{PatchError, PatchService};
 use crate::persistence::ProjectionDb;
-use crate::policy::ApprovalManager;
-use crate::protocol::{ApprovalAction, ApprovalResolution, ChangeSet, TurnState};
+use crate::policy::{ApprovalManager, UserInputManager};
+use crate::protocol::{
+    ApprovalAction, ApprovalMode, ApprovalResolution, ChangeSet, ReasoningEffort, TurnState,
+    UserInputAction, UserInputResolution,
+};
 use crate::providers::{
     AnthropicMessagesProvider, CredentialError, CredentialStore, FallbackProvider, FallbackTarget,
     GoogleGeminiProvider, OpenAiChatCompletionsProvider, OpenAiResponsesProvider,
@@ -38,6 +41,9 @@ pub struct AppState {
     tool_registry: RwLock<ToolRegistry>,
     patch_service: PatchService,
     approvals: Arc<ApprovalManager>,
+    approval_mode: RwLock<ApprovalMode>,
+    reasoning_effort: RwLock<ReasoningEffort>,
+    user_inputs: Arc<UserInputManager>,
     command_runtime: RwLock<CommandRuntime>,
     pty_runtime: RwLock<NativePtyRuntime>,
     logger: StructuredLogger,
@@ -91,6 +97,12 @@ impl AppState {
         let command_runtime = CommandRuntime::with_recovery(&workspace_root, &data_root)?;
         let pty_runtime = NativePtyRuntime::new(&workspace_root)?;
         let repository = Arc::new(JsonlThreadRepository::new(&data_root)?);
+        let reasoning_effort = repository
+            .projection()
+            .setting("reasoning_effort")
+            .map_err(|error| AppStateError::Workspace(error.to_string()))?
+            .and_then(|raw| serde_json::from_str::<ReasoningEffort>(&raw).ok())
+            .unwrap_or_default();
         let logger = StructuredLogger::new(&data_root)
             .map_err(|error| AppStateError::Logging(error.to_string()))?;
         let extensions = ExtensionService::new(
@@ -118,6 +130,9 @@ impl AppState {
             tool_registry: RwLock::new(tool_registry),
             patch_service,
             approvals: Arc::new(ApprovalManager::new(Duration::from_secs(5 * 60))),
+            approval_mode: RwLock::new(ApprovalMode::Ask),
+            reasoning_effort: RwLock::new(reasoning_effort),
+            user_inputs: Arc::new(UserInputManager::new(Duration::from_secs(10 * 60))),
             command_runtime: RwLock::new(command_runtime),
             pty_runtime: RwLock::new(pty_runtime),
             logger,
@@ -166,6 +181,59 @@ impl AppState {
 
     pub fn approvals(&self) -> Arc<ApprovalManager> {
         self.approvals.clone()
+    }
+
+    pub fn approval_mode(&self) -> ApprovalMode {
+        *self
+            .approval_mode
+            .read()
+            .expect("approval mode lock poisoned")
+    }
+
+    pub async fn set_approval_mode(
+        &self,
+        mode: ApprovalMode,
+    ) -> Result<ApprovalMode, AppStateError> {
+        let active_turns = self.active_turns.lock().await;
+        if !active_turns.is_empty() || self.subagents.has_active() {
+            return Err(AppStateError::ApprovalModeBusy);
+        }
+        *self
+            .approval_mode
+            .write()
+            .map_err(|_| AppStateError::ApprovalModeLock)? = mode;
+        drop(active_turns);
+        Ok(mode)
+    }
+
+    pub fn reasoning_effort(&self) -> ReasoningEffort {
+        *self
+            .reasoning_effort
+            .read()
+            .expect("reasoning effort lock poisoned")
+    }
+
+    pub async fn set_reasoning_effort(
+        &self,
+        effort: ReasoningEffort,
+    ) -> Result<ReasoningEffort, AppStateError> {
+        self.repository
+            .projection()
+            .set_setting(
+                "reasoning_effort",
+                &serde_json::to_string(&effort)
+                    .map_err(|error| AppStateError::Workspace(error.to_string()))?,
+            )
+            .map_err(|error| AppStateError::Workspace(error.to_string()))?;
+        *self
+            .reasoning_effort
+            .write()
+            .map_err(|_| AppStateError::ReasoningEffortLock)? = effort;
+        Ok(effort)
+    }
+
+    pub fn user_inputs(&self) -> Arc<UserInputManager> {
+        self.user_inputs.clone()
     }
 
     pub fn command_runtime(&self) -> CommandRuntime {
@@ -572,11 +640,10 @@ impl AppState {
             return Ok(detail);
         }
 
-        if let Some(approval) = detail
+        for approval in detail
             .approvals
             .iter()
-            .rev()
-            .find(|approval| approval.resolution.is_none())
+            .filter(|approval| approval.resolution.is_none())
         {
             self.repository
                 .append(StoredEvent::new(
@@ -589,6 +656,25 @@ impl AppState {
                             patch: None,
                             selected_paths: Vec::new(),
                             expected_hashes: Vec::new(),
+                        },
+                    },
+                ))
+                .await?;
+        }
+        for input in detail
+            .user_inputs
+            .iter()
+            .filter(|input| input.resolution.is_none())
+        {
+            self.repository
+                .append(StoredEvent::new(
+                    thread_id,
+                    Some(last_turn.turn_id.clone()),
+                    StoredEventKind::UserInputResolved {
+                        request_id: input.request.id.clone(),
+                        resolution: UserInputResolution {
+                            action: UserInputAction::Cancelled,
+                            answers: Vec::new(),
                         },
                     },
                 ))
@@ -688,6 +774,12 @@ pub enum AppStateError {
     ProviderNotConfigured(String),
     #[error("a turn is already active for thread {0}")]
     TurnAlreadyActive(String),
+    #[error("stop active turns and subagents before changing the approval mode")]
+    ApprovalModeBusy,
+    #[error("approval mode lock poisoned")]
+    ApprovalModeLock,
+    #[error("reasoning effort lock poisoned")]
+    ReasoningEffortLock,
     #[error("workspace is invalid: {0}")]
     Workspace(String),
     #[error("structured logging failed: {0}")]
@@ -710,7 +802,9 @@ mod tests {
     use std::sync::Mutex as StdMutex;
 
     use super::*;
-    use crate::protocol::{ApprovalRequest, ExpectedFileHash, ToolRisk};
+    use crate::protocol::{
+        ApprovalRequest, ExpectedFileHash, ToolRisk, UserInputQuestion, UserInputRequest,
+    };
     use crate::providers::{ProviderKind, ProviderTransport, SaveProviderConfigRequest};
 
     #[derive(Default)]
@@ -875,6 +969,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn approval_mode_defaults_to_ask_and_cannot_change_during_a_turn() {
+        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        let state =
+            AppState::with_credentials(directory.path(), Arc::new(FakeCredentials::default()))
+                .expect("state should initialize");
+
+        assert_eq!(state.approval_mode(), ApprovalMode::Ask);
+        state.begin_turn("thread").await.expect("turn starts");
+        assert!(matches!(
+            state.set_approval_mode(ApprovalMode::FullAccess).await,
+            Err(AppStateError::ApprovalModeBusy)
+        ));
+        state.finish_turn("thread").await;
+        assert_eq!(
+            state
+                .set_approval_mode(ApprovalMode::FullAccess)
+                .await
+                .unwrap(),
+            ApprovalMode::FullAccess
+        );
+    }
+
+    #[tokio::test]
+    async fn reasoning_effort_persists_and_applies_to_future_turns() {
+        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        let credentials = Arc::new(FakeCredentials::default());
+        let state = AppState::with_credentials(directory.path(), credentials.clone())
+            .expect("state should initialize");
+
+        assert_eq!(state.reasoning_effort(), ReasoningEffort::Medium);
+        assert_eq!(
+            state
+                .set_reasoning_effort(ReasoningEffort::High)
+                .await
+                .unwrap(),
+            ReasoningEffort::High
+        );
+        let restored = AppState::with_credentials(directory.path(), credentials)
+            .expect("state should restore");
+        assert_eq!(restored.reasoning_effort(), ReasoningEffort::High);
+
+        state.begin_turn("thread").await.unwrap();
+        assert_eq!(
+            state
+                .set_reasoning_effort(ReasoningEffort::Low)
+                .await
+                .unwrap(),
+            ReasoningEffort::Low
+        );
+        state.cancel_turn("thread").await;
+        state.finish_turn("thread").await;
+    }
+
+    #[tokio::test]
     async fn switching_workspace_updates_every_runtime_and_persists_the_selection() {
         let data = tempfile::tempdir().unwrap();
         let first = tempfile::tempdir().unwrap();
@@ -991,7 +1139,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recovers_an_orphaned_approval_as_cancelled_once() {
+    async fn recovers_all_orphaned_approvals_as_cancelled_once() {
         let data = tempfile::tempdir().unwrap();
         let workspace = tempfile::tempdir().unwrap();
         let state = AppState::with_workspace_and_credentials(
@@ -1009,6 +1157,7 @@ mod tests {
             tool_call_id: "call".to_string(),
             tool_name: "apply_patch".to_string(),
             reason: "review".to_string(),
+            auto_approved: false,
             risk: ToolRisk::Write,
             arguments: serde_json::json!({ "patch": "strict patch" }),
             preview: None,
@@ -1020,6 +1169,27 @@ mod tests {
             StoredEventKind::ApprovalRequested {
                 request: request.clone(),
             },
+            StoredEventKind::ApprovalRequested {
+                request: ApprovalRequest {
+                    id: "interrupted-approval-2".to_string(),
+                    tool_call_id: "call-2".to_string(),
+                    ..request.clone()
+                },
+            },
+            StoredEventKind::UserInputRequested {
+                request: UserInputRequest {
+                    id: "interrupted-input".to_string(),
+                    thread_id: thread.id.clone(),
+                    turn_id: turn_id.clone(),
+                    tool_call_id: "call-input".to_string(),
+                    questions: vec![UserInputQuestion {
+                        question: "继续吗".to_string(),
+                        options: vec!["继续".to_string(), "停止".to_string()],
+                    }],
+                    created_at_ms: 1,
+                    expires_at_ms: 2,
+                },
+            },
         ] {
             state
                 .repository()
@@ -1030,12 +1200,19 @@ mod tests {
 
         let detail = state.read_thread(&thread.id).await.unwrap();
         assert_eq!(detail.last_turn.unwrap().state, TurnState::Cancelled);
-        assert_eq!(
-            detail.approvals[0]
+        assert_eq!(detail.approvals.len(), 2);
+        assert!(detail.approvals.iter().all(|approval| {
+            approval
                 .resolution
                 .as_ref()
-                .map(|resolution| resolution.action),
-            Some(ApprovalAction::Cancelled)
+                .is_some_and(|resolution| resolution.action == ApprovalAction::Cancelled)
+        }));
+        assert_eq!(detail.user_inputs.len(), 1);
+        assert!(
+            detail.user_inputs[0]
+                .resolution
+                .as_ref()
+                .is_some_and(|resolution| resolution.action == UserInputAction::Cancelled)
         );
         let event_count = state.repository().load(&thread.id).await.unwrap().len();
         let detail = state.read_thread(&thread.id).await.unwrap();

@@ -117,6 +117,7 @@ mod tests {
         ProviderRequest {
             schema_version: PROTOCOL_VERSION,
             model: "test".to_string(),
+            reasoning_effort: crate::protocol::ReasoningEffort::default(),
             messages: Vec::new(),
             tools: Vec::new(),
         }

@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
   AgentEvent,
+  ApprovalMode,
   ApprovalResolution,
   ChangeSet,
   FileEntry,
@@ -21,6 +22,7 @@ import type {
   ProviderCatalogView,
   ProviderConfigView,
   ProviderConnectionTest,
+  ReasoningEffort,
   RuntimeStatus,
   SaveProviderConfigRequest,
   StartCommandRequest,
@@ -28,6 +30,7 @@ import type {
   ThreadDetail,
   ThreadSummary,
   TurnOutcome,
+  UserInputResolution,
   UsageSummary,
   WorkspaceState,
   CreateSubagentRequest,
@@ -51,6 +54,22 @@ import type {
 
 export function getRuntimeStatus() {
   return invoke<RuntimeStatus>("runtime_status");
+}
+
+export function getApprovalMode() {
+  return invoke<ApprovalMode>("get_approval_mode");
+}
+
+export function setApprovalMode(mode: ApprovalMode) {
+  return invoke<ApprovalMode>("set_approval_mode", { mode });
+}
+
+export function getReasoningEffort() {
+  return invoke<ReasoningEffort>("get_reasoning_effort");
+}
+
+export function setReasoningEffort(effort: ReasoningEffort) {
+  return invoke<ReasoningEffort>("set_reasoning_effort", { effort });
 }
 
 export function getProviderConfig() {
@@ -157,6 +176,10 @@ export function resolveApproval(requestId: string, resolution: ApprovalResolutio
   return invoke<void>("resolve_approval", { requestId, resolution });
 }
 
+export function resolveUserInput(requestId: string, resolution: UserInputResolution) {
+  return invoke<void>("resolve_user_input", { requestId, resolution });
+}
+
 export function undoChange(threadId: string, changeId: string) {
   return invoke<ChangeSet>("undo_change", { threadId, changeId });
 }
@@ -249,6 +272,15 @@ export function waitPty(sessionId: string) {
 
 export function closePty(sessionId: string) {
   return invoke<void>("close_pty", { sessionId });
+}
+
+export interface CaptureScreenResult {
+  /** PNG 图片的 data URL（data:image/png;base64,...） */
+  dataUrl: string;
+}
+
+export function captureScreen(): Promise<CaptureScreenResult> {
+  return invoke<CaptureScreenResult>("capture_screen");
 }
 
 export function subscribeToAgentEvents(

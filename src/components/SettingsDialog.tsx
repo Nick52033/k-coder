@@ -127,7 +127,7 @@ const transportOptions: Array<{ value: ProviderTransport; label: string }> = [
   { value: "google_gemini", label: "Google Gemini API" },
 ];
 
-type SettingsSection =
+export type SettingsSection =
   | "providers"
   | "appearance"
   | "usage"
@@ -169,6 +169,7 @@ interface SettingsDefinition {
 }
 
 interface SettingsDialogProps {
+  initialSection?: SettingsSection;
   provider: ProviderConfigView | null;
   providers: ProviderConfigView[];
   activeProviderId: string | null;
@@ -204,6 +205,7 @@ const settingsDefinitions: SettingsDefinition[] = [
 ];
 
 export function SettingsDialog({
+  initialSection = "providers",
   provider,
   providers,
   activeProviderId,
@@ -221,7 +223,7 @@ export function SettingsDialog({
   onCreateGoal,
   onTransitionGoal,
 }: SettingsDialogProps) {
-  const [section, setSection] = useState<SettingsSection>("providers");
+  const [section, setSection] = useState<SettingsSection>(initialSection);
 
   useEffect(() => {
     function handleKeyDown(event: globalThis.KeyboardEvent) {

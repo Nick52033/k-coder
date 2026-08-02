@@ -7,7 +7,7 @@ use tokio::sync::{Mutex, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use crate::execution::{CommandMode, CommandRuntime, StartCommandRequest};
-use crate::protocol::{ApprovalAction, ApprovalResolution, ToolRisk};
+use crate::protocol::{ApprovalAction, ApprovalResolution, ToolRisk, UserInputResolution};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "decision", rename_all = "snake_case")]
@@ -223,6 +223,95 @@ impl ApprovalManager {
     pub fn timeout_ms(&self) -> u64 {
         self.timeout.as_millis().min(u64::MAX as u128) as u64
     }
+}
+
+/// `request_user_input` 工具的等待管理器，语义与 `ApprovalManager` 类似，
+/// 区别是返回的是用户对问题的回答而非批准/拒绝。
+#[derive(Clone)]
+pub struct UserInputManager {
+    pending: Arc<Mutex<HashMap<String, oneshot::Sender<UserInputResolution>>>>,
+    timeout: Duration,
+}
+
+impl UserInputManager {
+    pub fn new(timeout: Duration) -> Self {
+        Self {
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            timeout,
+        }
+    }
+
+    pub async fn register(
+        &self,
+        request_id: &str,
+    ) -> Result<oneshot::Receiver<UserInputResolution>, UserInputError> {
+        let (sender, receiver) = oneshot::channel();
+        match self.pending.lock().await.entry(request_id.to_string()) {
+            Entry::Vacant(entry) => {
+                entry.insert(sender);
+            }
+            Entry::Occupied(_) => {
+                return Err(UserInputError::Duplicate(request_id.to_string()));
+            }
+        }
+        Ok(receiver)
+    }
+
+    pub async fn wait(
+        &self,
+        request_id: &str,
+        receiver: oneshot::Receiver<UserInputResolution>,
+        cancellation: CancellationToken,
+    ) -> Result<UserInputResolution, UserInputError> {
+        let result = tokio::select! {
+            _ = cancellation.cancelled() => Err(UserInputError::Cancelled),
+            _ = tokio::time::sleep(self.timeout) => Ok(UserInputResolution {
+                action: crate::protocol::UserInputAction::Cancelled,
+                answers: Vec::new(),
+            }),
+            resolution = receiver => resolution.map_err(|_| UserInputError::Closed),
+        };
+        self.pending.lock().await.remove(request_id);
+        result
+    }
+
+    pub async fn resolve(
+        &self,
+        request_id: &str,
+        resolution: UserInputResolution,
+    ) -> Result<(), UserInputError> {
+        let sender = self
+            .pending
+            .lock()
+            .await
+            .remove(request_id)
+            .ok_or_else(|| UserInputError::NotFound(request_id.to_string()))?;
+        sender.send(resolution).map_err(|_| UserInputError::Closed)
+    }
+
+    pub async fn discard(&self, request_id: &str) {
+        self.pending.lock().await.remove(request_id);
+    }
+
+    pub async fn pending_count(&self) -> usize {
+        self.pending.lock().await.len()
+    }
+
+    pub fn timeout_ms(&self) -> u64 {
+        self.timeout.as_millis().min(u64::MAX as u128) as u64
+    }
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum UserInputError {
+    #[error("user input request already exists: {0}")]
+    Duplicate(String),
+    #[error("user input request was not found: {0}")]
+    NotFound(String),
+    #[error("user input request channel closed")]
+    Closed,
+    #[error("user input wait was cancelled")]
+    Cancelled,
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]

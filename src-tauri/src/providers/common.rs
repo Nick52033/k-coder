@@ -69,6 +69,18 @@ pub(super) fn redact_event(event: ProviderEvent, secret: &str) -> ProviderEvent 
         ProviderEvent::TextDelta { delta } => ProviderEvent::TextDelta {
             delta: redact(&delta, secret),
         },
+        ProviderEvent::ReasoningSummaryDelta { item_id, delta } => {
+            ProviderEvent::ReasoningSummaryDelta {
+                item_id,
+                delta: redact(&delta, secret),
+            }
+        }
+        ProviderEvent::ReasoningSummaryCompleted { item_id, summary } => {
+            ProviderEvent::ReasoningSummaryCompleted {
+                item_id,
+                summary: redact(&summary, secret),
+            }
+        }
         ProviderEvent::ToolCall { mut call } => {
             redact_json(&mut call.arguments, secret);
             ProviderEvent::ToolCall { call }
