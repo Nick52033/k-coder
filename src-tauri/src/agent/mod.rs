@@ -7,7 +7,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use futures_util::StreamExt;
-use futures_util::stream::FuturesOrdered;
+use futures_util::stream::FuturesUnordered;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
@@ -15,6 +15,7 @@ use uuid::Uuid;
 
 use crate::advanced::{REQUEST_USER_INPUT_TOOL_NAME, RequestUserInputTool, RuntimeMetrics};
 use crate::context::{self, CompactionSummary, DEFAULT_CONTEXT_LIMIT};
+use crate::logging::StructuredLogger;
 use crate::policy::{
     ApprovalError, ApprovalManager, PolicyDecision, UserInputError, UserInputManager,
 };
@@ -24,7 +25,6 @@ use crate::protocol::{
     ImageAttachment, MessageRole, PROTOCOL_VERSION, PatchPreview, ReasoningEffort, TokenUsage,
     ToolCall, ToolResult, TurnState, UserInputAction, UserInputRequest, UserInputResolution,
 };
-use crate::logging::StructuredLogger;
 use crate::providers::{
     Provider, ProviderError, ProviderEvent, ProviderImage, ProviderMessage, ProviderRequest,
 };
@@ -502,7 +502,7 @@ impl AgentRuntime {
 
             // 声明需要在重试循环外部的变量
             let response: String;
-            let mut in_flight: FuturesOrdered<ToolExecutionFuture>;
+            let mut in_flight: FuturesUnordered<ToolExecutionFuture>;
             let pending_tool_calls: Vec<ToolCall>;
             let iteration_usage: Option<crate::protocol::TokenUsage>;
             let completed: bool;
@@ -562,7 +562,8 @@ impl AgentRuntime {
                 let mut response_inner = String::new();
                 let mut reasoning_summary_bytes = HashMap::<String, usize>::new();
                 let mut responding_published = false;
-                let in_flight_inner: FuturesOrdered<ToolExecutionFuture> = FuturesOrdered::new();
+                let in_flight_inner: FuturesUnordered<ToolExecutionFuture> =
+                    FuturesUnordered::new();
                 let mut pending_tool_calls_inner = Vec::new(); // 暂存 ToolCall，等 Completed 后再启动
                 let mut iteration_usage_inner = None;
                 let completed_inner = loop {
@@ -931,7 +932,7 @@ impl AgentRuntime {
                     turn_id.clone(),
                 );
 
-                in_flight.push_back(future);
+                in_flight.push(future);
             }
 
             // 🔥 等待所有工具执行完成
@@ -2211,9 +2212,54 @@ mod tests {
 
     struct SlowTool;
 
+    struct DelayTool;
+
     struct ExternalTool;
 
     struct AssertFileTool;
+
+    #[async_trait]
+    impl ToolHandler for DelayTool {
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition {
+                name: "delay".to_string(),
+                description: "Complete after a bounded test delay".to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "delayMs": { "type": "integer", "minimum": 0, "maximum": 1000 },
+                        "label": { "type": "string" }
+                    },
+                    "required": ["delayMs", "label"],
+                    "additionalProperties": false
+                }),
+            }
+        }
+
+        async fn execute(
+            &self,
+            _context: &ToolContext,
+            arguments: Value,
+            _cancellation: CancellationToken,
+        ) -> Result<ToolResult, ToolError> {
+            let delay_ms = arguments
+                .get("delayMs")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| {
+                    ToolError::InvalidArguments("delayMs must be an integer".to_string())
+                })?;
+            let label = arguments
+                .get("label")
+                .and_then(Value::as_str)
+                .ok_or_else(|| ToolError::InvalidArguments("label must be a string".to_string()))?;
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            Ok(ToolResult {
+                success: true,
+                output: label.to_string(),
+                metadata: json!({}),
+            })
+        }
+    }
 
     #[async_trait]
     impl ToolHandler for AssertFileTool {
@@ -2466,6 +2512,70 @@ mod tests {
                 TurnTimelineItem::Event { kind: crate::storage::TimelineEventKind::TurnCompleted, .. }
             ] if progress == "I will read the workspace docs" && answer == "I read it"
         ));
+    }
+
+    #[tokio::test]
+    async fn publishes_parallel_tool_results_as_each_tool_finishes() {
+        let directory = tempfile::tempdir().unwrap();
+        let repository = Arc::new(JsonlThreadRepository::new(directory.path()).unwrap());
+        let thread = repository.create_thread().await.unwrap();
+        let tools = ToolRegistry::new(vec![Arc::new(DelayTool)]).unwrap();
+        let runtime = AgentRuntime::with_tools(repository, tools, directory.path().to_path_buf());
+        let provider = Arc::new(FakeProvider::script(vec![
+            vec![
+                Ok(ProviderEvent::ToolCall {
+                    call: ToolCall {
+                        id: "slow".to_string(),
+                        name: "delay".to_string(),
+                        arguments: json!({ "delayMs": 200, "label": "slow" }),
+                        metadata: json!({}),
+                    },
+                }),
+                Ok(ProviderEvent::ToolCall {
+                    call: ToolCall {
+                        id: "fast".to_string(),
+                        name: "delay".to_string(),
+                        arguments: json!({ "delayMs": 5, "label": "fast" }),
+                        metadata: json!({}),
+                    },
+                }),
+                Ok(ProviderEvent::Completed),
+            ],
+            vec![
+                Ok(ProviderEvent::TextDelta {
+                    delta: "done".to_string(),
+                }),
+                Ok(ProviderEvent::Completed),
+            ],
+        ]));
+        let publisher = Arc::new(RecordingPublisher::default());
+
+        runtime
+            .run_turn(
+                provider,
+                "fake".to_string(),
+                RunTurnRequest {
+                    thread_id: thread.id,
+                    input: "run both".to_string(),
+                    agent_mode: None,
+                },
+                CancellationToken::new(),
+                publisher.clone(),
+            )
+            .await
+            .unwrap();
+
+        let completed = publisher
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|event| match &event.event {
+                AgentEvent::ToolCompleted { call_id, .. } => Some(call_id.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(completed, ["fast".to_string(), "slow".to_string()]);
     }
 
     #[tokio::test]

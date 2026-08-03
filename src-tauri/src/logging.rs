@@ -98,10 +98,7 @@ impl StructuredLogger {
         }
         paths.push(self.path.clone());
 
-        let level_filter = query
-            .level
-            .as_ref()
-            .map(|value| value.to_lowercase());
+        let level_filter = query.level.as_ref().map(|value| value.to_lowercase());
         let event_filter = query.event.as_ref().map(|value| value.to_lowercase());
         let limit = query.limit.unwrap_or(200).min(2000);
 

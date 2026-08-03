@@ -863,6 +863,12 @@ test("keeps a cancelled turn busy until the terminal event and then retries", as
     const base = { schemaVersion: 1, threadId: "thread-1", turnId: "turn-cancel" };
     emit({ ...base, type: "turn_started", phase: "exploring" });
     emit({ ...base, type: "text_delta", phase: "responding", delta: "正在执行长任务。" });
+    emit({
+      ...base,
+      type: "tool_started",
+      phase: "executing",
+      call: { id: "call-cancel", name: "run_command", arguments: { program: "pnpm", args: ["build"] }, metadata: {} },
+    });
   });
 
   await page.getByRole("button", { name: "停止生成" }).click();
@@ -878,6 +884,9 @@ test("keeps a cancelled turn busy until the terminal event and then retries", as
       phase: "cancelled",
     });
   });
+  const cancelledMessage = page.locator(".message--assistant").last();
+  await expect(cancelledMessage.locator(".turn-timeline-tool--running")).toHaveCount(0);
+  await expect(cancelledMessage.locator(".turn-timeline-tool--cancelled")).toContainText("已取消");
   await expect(page.getByRole("button", { name: "重试" })).toBeVisible();
   await page.getByRole("button", { name: "重试" }).click();
   await expect.poll(() => page.evaluate(() => (window as unknown as { __invoked: string[] }).__invoked.filter((command) => command === "retry_turn").length)).toBe(1);

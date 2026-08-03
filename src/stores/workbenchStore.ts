@@ -272,6 +272,29 @@ function normalizeApprovalTimeline(timeline: TurnTimelineItem[], approvals: Appr
   return normalized;
 }
 
+function finishRunningTools(
+  timeline: TurnTimelineItem[],
+  turnId: string,
+  terminalState: "failed" | "cancelled",
+  completedAtMs: number,
+) {
+  return timeline.map((item) => item.type === "tool"
+    && item.activity.turnId === turnId
+    && item.activity.state === "running"
+    ? {
+        ...item,
+        activity: {
+          ...item.activity,
+          state: terminalState,
+          completedAtMs,
+          durationMs: item.activity.startedAtMs
+            ? Math.max(0, completedAtMs - item.activity.startedAtMs)
+            : undefined,
+        },
+      }
+    : item);
+}
+
 function moveTimelineItemBeforeTool(timeline: TurnTimelineItem[], itemId: string, turnId: string, toolCallId: string) {
   const itemIndex = timeline.findIndex((item) => item.type === "event" && item.itemId === itemId);
   if (itemIndex < 0) return timeline;
@@ -506,14 +529,20 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
       const todos = new Map(get().todos);
       todos.set(threadId, detail.todos ?? []);
       hydrationBuffers.delete(threadId);
+      const restoredTimeline = detail.turnTimeline?.length
+        ? normalizeApprovalTimeline(detail.turnTimeline, detail.approvals)
+        : detail.toolActivities.map((activity) => ({ type: "tool" as const, activity }));
+      const terminalTimeline = detail.lastTurn?.state === "cancelled"
+        ? finishRunningTools(restoredTimeline, detail.lastTurn.turnId, "cancelled", detail.summary.updatedAtMs)
+        : detail.lastTurn?.state === "failed" || detail.lastTurn?.state === "completed"
+          ? finishRunningTools(restoredTimeline, detail.lastTurn.turnId, "failed", detail.summary.updatedAtMs)
+          : restoredTimeline;
       set({
         messages: detail.messages.map((message) =>
           toConversationMessage(message, detail.messageTurnIds?.[message.id]),
         ),
         lastTurn: detail.lastTurn,
-        turnTimeline: detail.turnTimeline?.length
-          ? normalizeApprovalTimeline(detail.turnTimeline, detail.approvals)
-          : detail.toolActivities.map((activity) => ({ type: "tool" as const, activity })),
+        turnTimeline: terminalTimeline,
         turnUserMessageIds: detail.turnUserMessageIds ?? {},
         activityStatus: shouldSetActiveTurn
           ? { turnId: detail.lastTurn!.turnId, status: statusForTurnState(detail.lastTurn!.state) ?? "thinking" }
@@ -1257,6 +1286,7 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
         break;
       case "turn_completed":
         set((state) => {
+          const completedAtMs = event.completedAtMs ?? Date.now();
           const finalText = toConversationMessage(event.message, event.turnId).text;
           let lastTextItemIndex = -1;
           let lastToolItemIndex = -1;
@@ -1275,6 +1305,7 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
             : finalText
               ? [...state.turnTimeline, { type: "text" as const, id: event.message.id, turnId: event.turnId, text: finalText }]
               : state.turnTimeline;
+          turnTimeline = finishRunningTools(turnTimeline, event.turnId, "failed", completedAtMs);
           turnTimeline = appendTimelineEvent(
             turnTimeline,
             `turn-completed-${event.turnId}`,
@@ -1306,7 +1337,9 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
         setTimeout(() => get().processQueue(), 500);
         break;
       case "turn_failed":
-        set((state) => ({
+        set((state) => {
+          const failedAtMs = event.completedAtMs ?? Date.now();
+          return {
           activeTurnId: null,
           activeTurnThreadId: null,
           activityStatus: null,
@@ -1326,7 +1359,7 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
               : message,
           ),
           turnTimeline: appendTimelineEvent(
-            state.turnTimeline,
+            finishRunningTools(state.turnTimeline, event.turnId, "failed", failedAtMs),
             `turn-failed-${event.turnId}`,
             event.turnId,
             "turn_failed",
@@ -1334,7 +1367,8 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
             event.message,
             event.durationMs,
           ),
-        }));
+          };
+        });
         setTimeout(() => get().processQueue(), 500);
         break;
       case "turn_cancelled":
@@ -1355,23 +1389,7 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
                 : message,
             ),
             turnTimeline: appendTimelineEvent(
-              state.turnTimeline.map((item) =>
-                item.type === "tool"
-                  && item.activity.turnId === event.turnId
-                  && item.activity.state === "running"
-                  ? {
-                    ...item,
-                    activity: {
-                      ...item.activity,
-                      state: "cancelled",
-                      completedAtMs: cancelledAtMs,
-                      durationMs: item.activity.startedAtMs
-                        ? Math.max(0, cancelledAtMs - item.activity.startedAtMs)
-                        : undefined,
-                    },
-                  }
-                  : item,
-              ),
+              finishRunningTools(state.turnTimeline, event.turnId, "cancelled", cancelledAtMs),
               `turn-cancelled-${event.turnId}`,
               event.turnId,
               "turn_cancelled",

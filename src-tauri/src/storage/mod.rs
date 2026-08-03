@@ -169,6 +169,7 @@ pub enum ToolActivityState {
     Running,
     Completed,
     Failed,
+    Cancelled,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -830,6 +831,12 @@ fn project_thread(thread_id: &str, events: &[StoredEvent]) -> Result<ThreadDetai
                 if usage.is_some() {
                     last_usage = *usage;
                 }
+                finish_running_tool_activities(
+                    &mut tool_activities,
+                    &mut turn_timeline,
+                    event,
+                    ToolActivityState::Failed,
+                );
                 push_timeline_event_with_duration(
                     &mut turn_timeline,
                     event,
@@ -841,6 +848,12 @@ fn project_thread(thread_id: &str, events: &[StoredEvent]) -> Result<ThreadDetai
                 update_turn(&mut last_turn, event, TurnState::Completed, None)
             }
             StoredEventKind::TurnFailed { message } => {
+                finish_running_tool_activities(
+                    &mut tool_activities,
+                    &mut turn_timeline,
+                    event,
+                    ToolActivityState::Failed,
+                );
                 push_timeline_event_with_duration(
                     &mut turn_timeline,
                     event,
@@ -857,6 +870,12 @@ fn project_thread(thread_id: &str, events: &[StoredEvent]) -> Result<ThreadDetai
                 )
             }
             StoredEventKind::TurnCancelled => {
+                finish_running_tool_activities(
+                    &mut tool_activities,
+                    &mut turn_timeline,
+                    event,
+                    ToolActivityState::Cancelled,
+                );
                 push_timeline_event_with_duration(
                     &mut turn_timeline,
                     event,
@@ -957,6 +976,32 @@ fn turn_duration_ms(started_at: &HashMap<String, u64>, event: &StoredEvent) -> O
         .as_ref()
         .and_then(|turn_id| started_at.get(turn_id))
         .map(|started_at_ms| event.created_at_ms.saturating_sub(*started_at_ms))
+}
+
+fn finish_running_tool_activities(
+    tool_activities: &mut [ToolActivitySnapshot],
+    turn_timeline: &mut [TurnTimelineItem],
+    event: &StoredEvent,
+    terminal_state: ToolActivityState,
+) {
+    let Some(turn_id) = event.turn_id.as_deref() else {
+        return;
+    };
+    let finish = |activity: &mut ToolActivitySnapshot| {
+        if activity.turn_id == turn_id && activity.state == ToolActivityState::Running {
+            activity.state = terminal_state.clone();
+            activity.completed_at_ms = Some(event.created_at_ms);
+            activity.duration_ms = activity
+                .started_at_ms
+                .map(|started| event.created_at_ms.saturating_sub(started));
+        }
+    };
+    tool_activities.iter_mut().for_each(finish);
+    turn_timeline.iter_mut().for_each(|item| {
+        if let TurnTimelineItem::Tool { activity } = item {
+            finish(activity);
+        }
+    });
 }
 
 fn bound_timeline_text(value: String) -> String {
@@ -1447,6 +1492,61 @@ mod tests {
                     ..
                 },
             ]
+        ));
+    }
+
+    #[tokio::test]
+    async fn cancelled_turn_finishes_running_tools_during_timeline_recovery() {
+        let directory = tempfile::tempdir().unwrap();
+        let repository = JsonlThreadRepository::new(directory.path()).unwrap();
+        let thread = repository.create_thread().await.unwrap();
+        let turn_id = "turn-cancelled-tools".to_string();
+        let calls = ["build", "version"]
+            .into_iter()
+            .map(|id| ToolCall {
+                id: id.to_string(),
+                name: "run_command".to_string(),
+                arguments: serde_json::json!({ "program": id }),
+                metadata: serde_json::json!({}),
+            })
+            .collect::<Vec<_>>();
+        for (index, kind) in [
+            StoredEventKind::TurnStarted,
+            StoredEventKind::AssistantToolCalls {
+                text: String::new(),
+                calls,
+            },
+            StoredEventKind::TurnCancelled,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut event = StoredEvent::new(&thread.id, Some(turn_id.clone()), kind);
+            event.created_at_ms = 20_000 + index as u64 * 25;
+            repository.append(event).await.unwrap();
+        }
+
+        let detail = repository.read_thread(&thread.id).await.unwrap();
+        assert_eq!(detail.tool_activities.len(), 2);
+        assert!(detail.tool_activities.iter().all(|activity| {
+            activity.state == ToolActivityState::Cancelled
+                && activity.completed_at_ms == Some(20_050)
+                && activity.duration_ms == Some(25)
+        }));
+        assert!(detail.turn_timeline.iter().take(2).all(|item| matches!(
+            item,
+            TurnTimelineItem::Tool { activity }
+                if activity.state == ToolActivityState::Cancelled
+                    && activity.completed_at_ms == Some(20_050)
+                    && activity.duration_ms == Some(25)
+        )));
+        assert!(matches!(
+            detail.turn_timeline.last(),
+            Some(TurnTimelineItem::Event {
+                kind: TimelineEventKind::TurnCancelled,
+                duration_ms: Some(50),
+                ..
+            })
         ));
     }
 

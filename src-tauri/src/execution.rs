@@ -16,6 +16,7 @@ use uuid::Uuid;
 const DEFAULT_BUFFER_BYTES: usize = 1024 * 1024;
 const MAX_BUFFER_BYTES: usize = 8 * 1024 * 1024;
 const MAX_TIMEOUT_MS: u64 = 60 * 60 * 1000;
+const OUTPUT_DRAIN_GRACE_MS: u64 = 500;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -473,8 +474,7 @@ impl CommandRuntime {
                     _ = watcher_session.cancel.cancelled() => { terminate_tree(pid).await; let _ = child.wait().await; CommandState::Cancelled },
                 },
             };
-            let _ = stdout_task.await;
-            let _ = stderr_task.await;
+            drain_output_tasks(stdout_task, stderr_task).await;
             *watcher_session.stdin.lock().await = None;
             *watcher_session.state.lock().await = outcome;
             *watcher_session.finished_at_ms.lock().await = Some(now_ms());
@@ -642,6 +642,33 @@ async fn read_stream<R: tokio::io::AsyncRead + Unpin>(
         }
         drop(output);
         session.changed.notify_waiters();
+    }
+}
+
+async fn drain_output_tasks(
+    mut stdout_task: tokio::task::JoinHandle<()>,
+    mut stderr_task: tokio::task::JoinHandle<()>,
+) {
+    let drained = tokio::time::timeout(Duration::from_millis(OUTPUT_DRAIN_GRACE_MS), async {
+        let _ = tokio::join!(&mut stdout_task, &mut stderr_task);
+    })
+    .await
+    .is_ok();
+    if !drained {
+        let abort_stdout = !stdout_task.is_finished();
+        let abort_stderr = !stderr_task.is_finished();
+        if abort_stdout {
+            stdout_task.abort();
+        }
+        if abort_stderr {
+            stderr_task.abort();
+        }
+        if abort_stdout {
+            let _ = stdout_task.await;
+        }
+        if abort_stderr {
+            let _ = stderr_task.await;
+        }
     }
 }
 
@@ -1201,6 +1228,20 @@ mod tests {
         assert_eq!(
             runtime.wait(&failed.id).await.unwrap().state,
             CommandState::Exited { code: 7 }
+        );
+    }
+
+    #[tokio::test]
+    async fn output_drain_is_bounded_when_pipe_readers_do_not_finish() {
+        let stdout_task = tokio::spawn(std::future::pending::<()>());
+        let stderr_task = tokio::spawn(std::future::pending::<()>());
+        let started = tokio::time::Instant::now();
+
+        drain_output_tasks(stdout_task, stderr_task).await;
+
+        assert!(
+            started.elapsed() < Duration::from_millis(1_500),
+            "output drain must not hold a finished command session open indefinitely"
         );
     }
 
