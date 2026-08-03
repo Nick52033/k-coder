@@ -22,6 +22,7 @@ tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2"
 tauri-plugin-dialog = "2"
 tauri-plugin-fs = "2"
+tauri-plugin-global-shortcut = "2"
 async-trait = "0.1"
 async-stream = "0.3"
 base64 = "0.22"
@@ -43,8 +44,12 @@ tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "process"
 tokio-util = "0.7"
 url = "2"
 uuid = { version = "1", features = ["serde", "v4"] }
-xcap = "0.4"
 zip = { version = "8.4.0", default-features = false, features = ["deflate"] }
+
+[target.'cfg(windows)'.dependencies]
+image = { version = "0.25", default-features = false, features = ["bmp", "gif", "ico", "jpeg", "png", "webp"] }
+ndarray = "0.17"
+ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "ndarray", "load-dynamic"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

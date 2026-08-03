@@ -24,6 +24,7 @@ import type {
   ProviderConnectionTest,
   ReasoningEffort,
   RuntimeStatus,
+  SaveWorkspaceFileRequest,
   SaveProviderConfigRequest,
   StartCommandRequest,
   StartPtyRequest,
@@ -197,6 +198,7 @@ export function getWorkspaceState() { return invoke<WorkspaceState>("workspace_s
 export function switchWorkspace(path: string, trusted: boolean) { return invoke<ProjectRecord>("switch_workspace", { path, trusted }); }
 export function listWorkspaceDirectory(path = "") { return invoke<FileEntry[]>("list_workspace_directory", { path }); }
 export function previewWorkspaceFile(path: string) { return invoke<FilePreview>("preview_workspace_file", { path }); }
+export function saveWorkspaceFile(request: SaveWorkspaceFileRequest) { return invoke<FilePreview>("save_workspace_file", { request }); }
 export function extractAttachment(path: string) { return invoke<AttachmentContent>("extract_attachment", { path }); }
 export function openWorkspaceFile(path: string) { return invoke<void>("open_workspace_file", { path }); }
 export function revealWorkspaceFile(path: string) { return invoke<void>("reveal_workspace_file", { path }); }
@@ -274,13 +276,14 @@ export function closePty(sessionId: string) {
   return invoke<void>("close_pty", { sessionId });
 }
 
-export interface CaptureScreenResult {
-  /** PNG 图片的 data URL（data:image/png;base64,...） */
-  dataUrl: string;
+export interface OcrResult {
+  text: string;
+  lineCount: number;
+  durationMs: number;
 }
 
-export function captureScreen(): Promise<CaptureScreenResult> {
-  return invoke<CaptureScreenResult>("capture_screen");
+export function recognizeImage(dataUrl: string): Promise<OcrResult> {
+  return invoke<OcrResult>("recognize_image", { dataUrl });
 }
 
 export function subscribeToAgentEvents(

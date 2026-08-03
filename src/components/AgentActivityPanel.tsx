@@ -36,6 +36,7 @@ const activeStates = new Set<SubagentState>(["queued", "running", "blocked"]);
 export function AgentActivityPanel({ open, parentThreadId, onClose }: AgentActivityPanelProps) {
   const [agents, setAgents] = useState<SubagentView[]>([]);
   const [task, setTask] = useState("");
+  const [tokenBudget, setTokenBudget] = useState("");
   const [allowEdits, setAllowEdits] = useState(false);
   const [allowCommands, setAllowCommands] = useState(false);
   const [creating, setCreating] = useState(false);
@@ -81,17 +82,23 @@ export function AgentActivityPanel({ open, parentThreadId, onClose }: AgentActiv
     const capabilities = ["list_directory", "read_file"];
     if (allowEdits) capabilities.push("apply_patch", "write_file");
     if (allowCommands) capabilities.push("run_command");
+    const parsedTokenBudget = tokenBudget.trim() ? Number(tokenBudget) : undefined;
+    if (parsedTokenBudget !== undefined && (!Number.isSafeInteger(parsedTokenBudget) || parsedTokenBudget <= 0)) {
+      setError("Token 预算必须是正整数");
+      return;
+    }
     setCreating(true);
     try {
       const created = await createSubagent({
         parentThreadId,
         task: task.trim(),
         capabilities,
-        tokenBudget: 64_000,
+        ...(parsedTokenBudget === undefined ? {} : { tokenBudget: parsedTokenBudget }),
         timeoutMs: 600_000,
       });
       setAgents((current) => sortAgents(upsert(current, created)));
       setTask("");
+      setTokenBudget("");
       setAllowEdits(false);
       setAllowCommands(false);
       setShowCreateForm(false);
@@ -177,6 +184,18 @@ export function AgentActivityPanel({ open, parentThreadId, onClose }: AgentActiv
                   autoFocus
                 />
                 <div className="agent-create-options">
+                  <label className="agent-token-budget">
+                    <span>Token 预算（可选）</span>
+                    <input
+                      type="number"
+                      min={1}
+                      step={10_000}
+                      value={tokenBudget}
+                      placeholder="默认不限制"
+                      disabled={creating}
+                      onChange={(event) => setTokenBudget(event.target.value)}
+                    />
+                  </label>
                   <div className="agent-capabilities">
                     <label>
                       <input
@@ -199,7 +218,7 @@ export function AgentActivityPanel({ open, parentThreadId, onClose }: AgentActiv
                     <button
                       type="button"
                       className="agent-button agent-button--secondary"
-                      onClick={() => { setShowCreateForm(false); setTask(""); setAllowEdits(false); setAllowCommands(false); }}
+                      onClick={() => { setShowCreateForm(false); setTask(""); setTokenBudget(""); setAllowEdits(false); setAllowCommands(false); }}
                       disabled={creating}
                     >
                       取消
@@ -267,7 +286,7 @@ interface AgentCardProps {
 
 function AgentCard({ agent, expanded, onToggleExpand, onStop, onResume }: AgentCardProps) {
   const statusInfo = getStatusInfo(agent.state);
-  const progress = agent.tokenBudget > 0 ? (agent.tokensUsed / agent.tokenBudget) * 100 : 0;
+  const progress = agent.tokenBudget ? (agent.tokensUsed / agent.tokenBudget) * 100 : null;
 
   return (
     <div className={cn("agent-card", `agent-card--${agent.state}`)}>
@@ -286,7 +305,7 @@ function AgentCard({ agent, expanded, onToggleExpand, onStop, onResume }: AgentC
           <div className="agent-card-info">
             <strong className="agent-card-label">{String(agent.label)}</strong>
             <span className="agent-card-meta">
-              {statusInfo.label} · {agent.tokensUsed.toLocaleString()}/{agent.tokenBudget.toLocaleString()} tokens
+              {statusInfo.label} · {formatTokenUsage(agent.tokensUsed, agent.tokenBudget)}
             </span>
           </div>
         </div>
@@ -295,7 +314,7 @@ function AgentCard({ agent, expanded, onToggleExpand, onStop, onResume }: AgentC
         </div>
       </button>
 
-      {agent.tokenBudget > 0 && (
+      {progress !== null && (
         <div className="agent-progress-container">
           <div className="agent-progress-bar">
             <div
@@ -323,7 +342,7 @@ function AgentCard({ agent, expanded, onToggleExpand, onStop, onResume }: AgentC
               <dt>权限</dt>
               <dd>{Array.isArray(agent.capabilities) ? agent.capabilities.join(" · ") : String(agent.capabilities)}</dd>
               <dt>已用 Token</dt>
-              <dd>{agent.tokensUsed.toLocaleString()} / {agent.tokenBudget.toLocaleString()}</dd>
+              <dd>{formatTokenUsage(agent.tokensUsed, agent.tokenBudget)}</dd>
               <dt>创建时间</dt>
               <dd>{new Date(agent.createdAtMs).toLocaleTimeString()}</dd>
             </dl>
@@ -360,6 +379,12 @@ function AgentCard({ agent, expanded, onToggleExpand, onStop, onResume }: AgentC
       )}
     </div>
   );
+}
+
+function formatTokenUsage(tokensUsed: number, tokenBudget: number | null) {
+  return tokenBudget === null
+    ? `${tokensUsed.toLocaleString()} / 无上限 tokens`
+    : `${tokensUsed.toLocaleString()} / ${tokenBudget.toLocaleString()} tokens`;
 }
 
 function upsert(agents: SubagentView[], incoming: SubagentView) {

@@ -28,6 +28,13 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "resources": {
+      "../src/resources/ocr/onnxruntime.dll": "ocr/onnxruntime.dll",
+      "../src/resources/ocr/onnxruntime_providers_shared.dll": "ocr/onnxruntime_providers_shared.dll",
+      "../src/resources/ocr/ppocrv5_mobile_det.onnx": "ocr/ppocrv5_mobile_det.onnx",
+      "../src/resources/ocr/ppocrv5_mobile_rec.onnx": "ocr/ppocrv5_mobile_rec.onnx",
+      "../src/resources/ocr/ppocrv5_mobile_vocab.txt": "ocr/ppocrv5_mobile_vocab.txt"
+    },
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

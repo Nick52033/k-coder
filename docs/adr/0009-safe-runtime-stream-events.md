@@ -12,6 +12,7 @@
 
 - 公共协议区分活动状态、安全推理摘要、助手正文和工具输出。
 - 只接收 Provider 明确标记的 reasoning summary；不接收、不持久化、不展示原始 reasoning text。
+- OpenAI Responses 请求 `reasoning.summary=auto`；Gemini `generateContent` 在推理启用时请求 `includeThoughts=true`，并且只把标记为 `thought` 的摘要文本转换为公共事件。Chat Completions 的非标准 `reasoning_content` 和 Anthropic 原始 thinking 块不视为安全摘要。
 - 完成的安全摘要持久化为 Turn 时间线事件，但不进入 Provider 对话历史。
 - Thinking 等活动状态和命令输出增量是瞬时事件。命令输出必须先经过运行时脱敏，再通过固定容量队列和有界批次转发；最终工具结果继续作为持久化事实。
 - 前端对摘要和实时输出分别设置独立上限，并把 stdout/stderr 保留为不同展示流。
@@ -20,6 +21,7 @@
 - 同一 Turn 的并发工具审批按请求 ID 持久化并在界面 FIFO 排队。线程恢复取消全部未决审批；解析已过期请求时只丢弃对应界面项，不把整个 Turn 误判为运行失败。
 - 普通工具失败作为结构化结果回送 Provider，允许模型在同一 Turn 中修复并复验。审计或存储失败保持类型化致命错误；并行批次在取消和回滚后终止，不能伪装成模型可继续处理的工具文本。
 - 助手正文、流式说明和安全摘要使用同一个 GFM Markdown 渲染器。禁用原始 HTML 和远程图片自动加载；代码块、表格及长内容必须保持有界并适配窄屏。
+- 活动 Turn 中已经收到的安全摘要持续展开；摘要完成只表示该摘要项停止追加，不能在 Turn 仍运行时立即把内容收起。进入 Turn 终态后再随执行过程默认折叠。
 
 ## 结果
 

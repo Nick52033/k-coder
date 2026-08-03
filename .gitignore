@@ -24,3 +24,7 @@ test-results
 *.njsproj
 *.sln
 *.sw?
+
+# ONNX Runtime debug symbols are not needed at runtime and exceed GitHub's file limit.
+src/resources/ocr/onnxruntime-win-x64-1.24.3/lib/onnxruntime.pdb
+src/resources/ocr/onnxruntime-win-x64-1.24.3/lib/onnxruntime_providers_shared.pdb

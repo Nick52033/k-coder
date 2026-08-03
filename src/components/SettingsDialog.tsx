@@ -184,7 +184,7 @@ interface SettingsDialogProps {
   onSaveProvider: (request: SaveProviderConfigRequest) => Promise<boolean>;
   onActivateProvider: (providerId: string) => Promise<boolean>;
   onDeleteProvider: (providerId: string) => Promise<boolean>;
-  onCreateGoal: (objective: string, tokenBudget: number, timeBudgetMs: number) => Promise<boolean>;
+  onCreateGoal: (objective: string, tokenBudget: number | null, timeBudgetMs: number) => Promise<boolean>;
   onTransitionGoal: (state: GoalState, reason?: string) => Promise<boolean>;
 }
 
@@ -337,8 +337,14 @@ export function SettingsDialog({
 interface GoalSettingsPageProps {
   threadId: string | null;
   goal: GoalView | null;
-  onCreate: (objective: string, tokenBudget: number, timeBudgetMs: number) => Promise<boolean>;
+  onCreate: (objective: string, tokenBudget: number | null, timeBudgetMs: number) => Promise<boolean>;
   onTransition: (state: GoalState, reason?: string) => Promise<boolean>;
+}
+
+function formatTokenUsage(tokensUsed: number, tokenBudget: number | null) {
+  return tokenBudget === null
+    ? `${tokensUsed.toLocaleString()} / 无上限 tokens`
+    : `${tokensUsed.toLocaleString()} / ${tokenBudget.toLocaleString()} tokens`;
 }
 
 function GoalSettingsPage({
@@ -349,7 +355,7 @@ function GoalSettingsPage({
 }: GoalSettingsPageProps) {
   const toast = useToast();
   const [objective, setObjective] = useState("");
-  const [tokenBudget, setTokenBudget] = useState(100_000);
+  const [tokenBudget, setTokenBudget] = useState("");
   const [timeBudgetMs, setTimeBudgetMs] = useState(60 * 60 * 1000);
   const [busy, setBusy] = useState(false);
   const [reason, setReason] = useState("");
@@ -366,11 +372,16 @@ function GoalSettingsPage({
       toast.error("请输入目标说明");
       return;
     }
+    const parsedTokenBudget = tokenBudget.trim() ? Number(tokenBudget) : null;
+    if (parsedTokenBudget !== null && (!Number.isSafeInteger(parsedTokenBudget) || parsedTokenBudget <= 0)) {
+      toast.error("Token 预算必须是正整数");
+      return;
+    }
     setBusy(true);
-    const ok = await onCreate(objective.trim(), tokenBudget, timeBudgetMs);
+    const ok = await onCreate(objective.trim(), parsedTokenBudget, timeBudgetMs);
     setBusy(false);
     if (ok) toast.success("Goal 已创建");
-    else toast.error("创建 Goal 失败，请检查预算范围");
+    else toast.error("创建 Goal 失败，请检查预算设置");
   }
 
   async function handleTransition(state: GoalState) {
@@ -385,7 +396,9 @@ function GoalSettingsPage({
     }
   }
 
-  const percent = goal ? Math.min(100, Math.round((goal.tokensUsed / goal.tokenBudget) * 100)) : 0;
+  const percent = goal?.tokenBudget
+    ? Math.min(100, Math.round((goal.tokensUsed / goal.tokenBudget) * 100))
+    : null;
 
   return (
     <section className="settings-page" aria-labelledby="goal-page-title">
@@ -401,7 +414,7 @@ function GoalSettingsPage({
         )}
       </div>
       <p className="settings-page-description">
-        为当前对话设定一个目标和资源预算。当 token 或时间预算耗尽时，K-Coder 会自动停止。
+        为当前对话设定目标与时间边界。Token 预算默认不限制，也可以显式设置累计上限。
       </p>
 
       {goal ? (
@@ -412,12 +425,14 @@ function GoalSettingsPage({
               <strong title={goal.objective}>{goal.objective}</strong>
             </div>
             <div className="goal-settings-meta">
-              <span><CircleDollarSign size={13} />{goal.tokensUsed.toLocaleString()} / {goal.tokenBudget.toLocaleString()} tokens</span>
+              <span><CircleDollarSign size={13} />{formatTokenUsage(goal.tokensUsed, goal.tokenBudget)}</span>
               <span><Clock3 size={13} />{(goal.elapsedMs / 60000).toFixed(1)} / {(goal.timeBudgetMs / 60000).toFixed(1)} 分钟</span>
             </div>
-            <div className="goal-progress" aria-label={`Goal 预算已使用 ${percent}%`}>
-              <span style={{ width: `${percent}%` }} />
-            </div>
+            {percent !== null && (
+              <div className="goal-progress" aria-label={`Goal 预算已使用 ${percent}%`}>
+                <span style={{ width: `${percent}%` }} />
+              </div>
+            )}
           </div>
 
           {active ? (
@@ -454,14 +469,14 @@ function GoalSettingsPage({
           </label>
           <div className="goal-settings-row">
             <label>
-              Token 预算
+              Token 预算（可选）
               <input
                 type="number"
                 min={1}
-                max={2_000_000}
                 step={10_000}
                 value={tokenBudget}
-                onChange={(event) => setTokenBudget(Number(event.target.value))}
+                placeholder="默认不限制"
+                onChange={(event) => setTokenBudget(event.target.value)}
               />
             </label>
             <label>

@@ -7,6 +7,7 @@ pub mod execution;
 pub mod extensions;
 pub mod logging;
 pub mod multi_agent;
+pub mod ocr;
 pub mod patch;
 pub mod persistence;
 pub mod policy;
@@ -25,11 +26,13 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
+        .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .setup(|app| {
             let data_root = app.path().app_data_dir()?.join("runtime-data");
             let state = AppState::new(data_root)
                 .map_err(|error| std::io::Error::other(error.to_string()))?;
             app.manage(state);
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -74,6 +77,7 @@ pub fn run() {
             commands::switch_workspace,
             commands::list_workspace_directory,
             commands::preview_workspace_file,
+            commands::save_workspace_file,
             commands::extract_attachment,
             commands::open_workspace_file,
             commands::reveal_workspace_file,
@@ -117,7 +121,7 @@ pub fn run() {
             commands::resize_pty,
             commands::wait_pty,
             commands::close_pty,
-            commands::capture_screen,
+            commands::recognize_image,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

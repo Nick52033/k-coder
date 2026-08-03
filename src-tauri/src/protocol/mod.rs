@@ -233,6 +233,7 @@ pub enum MessageRole {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentBlock {
     Text { text: String },
+    Context { text: String },
     Image { name: String, data_url: String },
 }
 
@@ -241,6 +242,8 @@ pub enum ContentBlock {
 pub struct ImageAttachment {
     pub name: String,
     pub data_url: String,
+    #[serde(default)]
+    pub ocr_text: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -259,7 +262,18 @@ impl ChatMessage {
             .iter()
             .map(|block| match block {
                 ContentBlock::Text { text } => text.as_str(),
+                ContentBlock::Context { text } => text.as_str(),
                 ContentBlock::Image { .. } => "",
+            })
+            .collect()
+    }
+
+    pub fn visible_text(&self) -> String {
+        self.content
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                ContentBlock::Context { .. } | ContentBlock::Image { .. } => None,
             })
             .collect()
     }
@@ -476,15 +490,24 @@ pub enum AgentEvent {
         turn_id: String,
         message: ChatMessage,
         usage: Option<TokenUsage>,
+        started_at_ms: u64,
+        completed_at_ms: u64,
+        duration_ms: u64,
     },
     TurnFailed {
         thread_id: String,
         turn_id: String,
         message: String,
+        started_at_ms: u64,
+        completed_at_ms: u64,
+        duration_ms: u64,
     },
     TurnCancelled {
         thread_id: String,
         turn_id: String,
+        started_at_ms: u64,
+        completed_at_ms: u64,
+        duration_ms: u64,
     },
     /// Plan 模式：模型通过 `request_user_input` 工具向用户提问
     UserInputRequested {
@@ -658,6 +681,9 @@ mod tests {
         let event = AgentEventEnvelope::new(AgentEvent::TurnCancelled {
             thread_id: "thread-1".to_string(),
             turn_id: "turn-1".to_string(),
+            started_at_ms: 10,
+            completed_at_ms: 25,
+            duration_ms: 15,
         });
 
         let value = serde_json::to_value(event).expect("agent event should serialize");
@@ -665,6 +691,9 @@ mod tests {
         assert_eq!(value["schemaVersion"], PROTOCOL_VERSION);
         assert_eq!(value["type"], "turn_cancelled");
         assert_eq!(value["threadId"], "thread-1");
+        assert_eq!(value["startedAtMs"], 10);
+        assert_eq!(value["completedAtMs"], 25);
+        assert_eq!(value["durationMs"], 15);
     }
 
     #[test]

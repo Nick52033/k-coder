@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use futures_util::StreamExt;
 use serde::Serialize;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 use tokio_util::sync::CancellationToken;
 
 use crate::advanced::{
@@ -23,6 +23,7 @@ use crate::multi_agent::{
     CreateSubagentRequest, MultiAgentError, SubagentEventPublisher, SubagentExecutionContext,
     SubagentView, delegation_tools,
 };
+use crate::ocr::{self, OcrResult};
 use crate::persistence::{ProjectRecord, UsageSummary};
 use crate::protocol::{
     AgentEvent, AgentEventEnvelope, AgentMode, ApprovalMode, ApprovalResolution, ChangeSet,
@@ -34,7 +35,8 @@ use crate::providers::{
 };
 use crate::storage::{StoredEventKind, ThreadDetail, ThreadSummary};
 use crate::workbench::{
-    self, AttachmentContent, FileEntry, FilePreview, GitBranchView, GitStatusView, WorkspaceState,
+    self, AttachmentContent, FileEntry, FilePreview, GitBranchView, GitStatusView,
+    SaveWorkspaceFileRequest, WorkspaceState,
 };
 
 /// Plan 协作模式指令模板（借鉴 Codex 的 plan.md）。
@@ -758,6 +760,23 @@ pub fn preview_workspace_file(
 }
 
 #[tauri::command(rename_all = "camelCase")]
+pub async fn save_workspace_file(
+    state: State<'_, AppState>,
+    request: SaveWorkspaceFileRequest,
+) -> CommandResult<FilePreview> {
+    let patch_service = state.patch_service();
+    let _edit_guard = patch_service.acquire_edit_lock().await;
+    workbench::save_file(&state.workspace_root(), request).map_err(|error| {
+        let code = if matches!(error, workbench::WorkbenchError::Conflict(_)) {
+            "file_conflict"
+        } else {
+            "file_save"
+        };
+        CommandError::new(code, error)
+    })
+}
+
+#[tauri::command(rename_all = "camelCase")]
 pub fn extract_attachment(
     state: State<'_, AppState>,
     path: String,
@@ -916,6 +935,8 @@ pub async fn run_turn(
     request: RunTurnRequest,
     attachments: Vec<ImageAttachment>,
 ) -> CommandResult<TurnOutcome> {
+    let mut attachments = attachments;
+    enrich_image_attachments(&app, &mut attachments).await;
     let thread_id = request.thread_id.clone();
     state
         .prepare_extensions(false)
@@ -1030,7 +1051,7 @@ pub async fn run_turn(
     .with_metrics(advanced.metrics.clone())
     .with_reasoning_effort(state.reasoning_effort())
     .with_user_inputs(state.user_inputs());
-    if let Some((_, remaining_tokens)) = &goal_budget {
+    if let Some((_, Some(remaining_tokens))) = &goal_budget {
         runtime = runtime.with_token_budget(*remaining_tokens);
     }
     let publisher: Arc<dyn EventPublisher> = Arc::new(TauriEventPublisher { app });
@@ -1144,7 +1165,7 @@ pub async fn retry_turn(
     .with_context_limit(context_limit)
     .with_metrics(advanced.metrics.clone())
     .with_reasoning_effort(state.reasoning_effort());
-    if let Some((_, remaining_tokens)) = &goal_budget {
+    if let Some((_, Some(remaining_tokens))) = &goal_budget {
         runtime = runtime.with_token_budget(*remaining_tokens);
     }
     let publisher: Arc<dyn EventPublisher> = Arc::new(TauriEventPublisher { app });
@@ -1525,41 +1546,65 @@ pub async fn close_pty(state: State<'_, AppState>, session_id: String) -> Comman
         .map_err(|error| CommandError::new("pty_runtime", error))
 }
 
-/// 捕获当前显示器（主显示器）的完整画面，返回 PNG 的 base64 dataUrl。
-/// 前端拿到 dataUrl 后让用户框选裁剪区域。
+/// 在本地使用随应用打包的 PP-OCRv5 模型识别图片文字。
 #[tauri::command(rename_all = "camelCase")]
-pub async fn capture_screen() -> CommandResult<CaptureScreenResult> {
-    let png = tauri::async_runtime::spawn_blocking(capture_screen_blocking)
+pub async fn recognize_image(app: AppHandle, data_url: String) -> CommandResult<OcrResult> {
+    let resource_dir = ocr_resource_dir(&app)?;
+    tauri::async_runtime::spawn_blocking(move || ocr::recognize_data_url(&data_url, &resource_dir))
         .await
-        .map_err(|error| CommandError::new("capture_screen", error.to_string()))??;
-    Ok(CaptureScreenResult {
-        data_url: format!("data:image/png;base64,{}", png),
+        .map_err(|error| CommandError::new("ocr", error.to_string()))?
+        .map_err(|error| CommandError::new("ocr", error))
+}
+
+fn ocr_resource_dir(app: &AppHandle) -> CommandResult<std::path::PathBuf> {
+    let bundled_dir = app
+        .path()
+        .resource_dir()
+        .map_err(|error| CommandError::new("ocr_resources", error))?
+        .join("ocr");
+    let development_dir =
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../src/resources/ocr");
+    Ok(if bundled_dir.join("onnxruntime.dll").is_file() {
+        bundled_dir
+    } else {
+        development_dir
     })
 }
 
-/// 在阻塞线程中执行截图。
-fn capture_screen_blocking() -> Result<String, CommandError> {
-    use base64::Engine as _;
-    use std::io::Cursor;
-
-    let monitors = xcap::Monitor::all()
-        .map_err(|error| CommandError::new("capture_screen", error.to_string()))?;
-    let monitor = monitors
-        .first()
-        .ok_or_else(|| CommandError::new("capture_screen", "no monitor available"))?;
-    let image = monitor
-        .capture_image()
-        .map_err(|error| CommandError::new("capture_screen", error.to_string()))?;
-    let mut cursor = Cursor::new(Vec::new());
-    image
-        .write_to(&mut cursor, xcap::image::ImageFormat::Png)
-        .map_err(|error| CommandError::new("capture_screen", error.to_string()))?;
-    Ok(base64::engine::general_purpose::STANDARD.encode(cursor.into_inner()))
+async fn enrich_image_attachments(app: &AppHandle, attachments: &mut [ImageAttachment]) {
+    let Ok(resource_dir) = ocr_resource_dir(app) else {
+        return;
+    };
+    for attachment in attachments.iter_mut() {
+        if attachment
+            .ocr_text
+            .as_deref()
+            .is_some_and(|text| !text.trim().is_empty())
+        {
+            continue;
+        }
+        let data_url = attachment.data_url.clone();
+        let resource_dir = resource_dir.clone();
+        let result = tauri::async_runtime::spawn_blocking(move || {
+            ocr::recognize_data_url(&data_url, &resource_dir)
+        })
+        .await;
+        if let Ok(Ok(result)) = result {
+            if !result.text.trim().is_empty() {
+                attachment.ocr_text = Some(result.text);
+            }
+        }
+    }
 }
 
-#[derive(Debug, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CaptureScreenResult {
-    /// PNG 图片的 data URL，可直接用于 <img src> 或 canvas。
-    data_url: String,
+#[cfg(test)]
+mod tests {
+    use super::CRAFT_MODE_INSTRUCTIONS;
+
+    #[test]
+    fn craft_mode_can_proactively_clarify_ambiguous_behavior() {
+        assert!(CRAFT_MODE_INSTRUCTIONS.contains("request_user_input"));
+        assert!(CRAFT_MODE_INSTRUCTIONS.contains("暂停当前 Turn"));
+        assert!(CRAFT_MODE_INSTRUCTIONS.contains("破坏性操作"));
+    }
 }

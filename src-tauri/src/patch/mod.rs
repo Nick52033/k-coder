@@ -84,6 +84,10 @@ impl PatchService {
         Self::default()
     }
 
+    pub async fn acquire_edit_lock(&self) -> tokio::sync::OwnedMutexGuard<()> {
+        self.edit_lock.clone().lock_owned().await
+    }
+
     pub fn preview_patch(
         &self,
         workspace_root: &Path,

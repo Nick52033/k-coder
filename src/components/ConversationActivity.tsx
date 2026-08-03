@@ -1,4 +1,5 @@
 import {
+  Activity,
   Brain,
   ChevronDown,
   Circle,
@@ -7,11 +8,12 @@ import {
   CircleX,
   Clock3,
   FileDiff,
+  FileText,
   ListChecks,
   LoaderCircle,
   SquareTerminal,
 } from "lucide-react";
-import { useEffect, useState, type ReactNode } from "react";
+import { lazy, Suspense, useEffect, useState, type ReactNode } from "react";
 import type {
   AgentActivityStatus,
   ChangeSet,
@@ -19,8 +21,11 @@ import type {
   PlanView,
   ToolActivity,
   ToolOutputDelta,
+  TimelineEventKind,
   TurnTimelineItem,
 } from "../types/runtime";
+
+const CodeEditor = lazy(() => import("./CodeEditor").then((module) => ({ default: module.CodeEditor })));
 
 export function ConversationTurnActivity({
   activities,
@@ -29,6 +34,7 @@ export function ConversationTurnActivity({
   plan,
   streaming = false,
   activityStatus = null,
+  finalMessageId,
   renderText,
 }: {
   activities: ToolActivity[];
@@ -37,28 +43,91 @@ export function ConversationTurnActivity({
   plan: PlanView | null;
   streaming?: boolean;
   activityStatus?: AgentActivityStatus | null;
+  finalMessageId?: string;
   renderText?: (text: string) => ReactNode;
 }) {
   if (!activities.length && !timeline.length && !plan?.steps.length && !activityStatus) return null;
 
-  return (
-    <div className="turn-context">
+  const finalResponse = finalMessageId
+    ? timeline.find((item): item is Extract<TurnTimelineItem, { type: "text" }> => item.type === "text" && item.id === finalMessageId)
+    : null;
+  const processTimeline = finalResponse ? timeline.filter((item) => item !== finalResponse) : timeline;
+  const terminalEvent = [...processTimeline].reverse().find(
+    (item): item is Extract<TurnTimelineItem, { type: "event" }> => item.type === "event" && isTerminalEvent(item.kind),
+  );
+  const processItems = processTimeline.filter((item) => item !== terminalEvent);
+  const hasProcess = Boolean(plan?.steps.length || activities.length || processItems.length || activityStatus);
+  const toolCount = processTimeline.filter((item) => item.type === "tool").length || activities.length;
+  const summaryTitle = terminalEvent?.durationMs !== undefined
+    ? `执行了 ${formatDuration(terminalEvent.durationMs)}`
+    : "执行过程";
+  const processContent = (
+    <div className={streaming ? "turn-execution-live" : "turn-execution-content"}>
       {plan?.steps.length ? <ConversationPlan plan={plan} /> : null}
-      {timeline.length ? (
+      {processTimeline.length ? (
         <div className="turn-timeline">
-          {timeline.map((item) => <TimelineItem item={item} changes={changes} renderText={renderText} key={timelineItemKey(item)} />)}
+          {processTimeline.map((item) => (
+            <TimelineItem
+              item={item}
+              changes={changes}
+              active={streaming}
+              renderText={renderText}
+              key={timelineItemKey(item)}
+            />
+          ))}
         </div>
       ) : activities.length ? (
         <div className="turn-timeline">
           {activities.map((activity) => <ToolActivityRow activity={activity} key={activity.call.id} />)}
         </div>
       ) : null}
-      {streaming && activityStatus ? <ActivityStatusRow status={activityStatus} /> : null}
+      {streaming && activityStatus ? (
+        <ActivityStatusRow
+          status={activityStatus}
+          hasRunningTool={activities.some((activity) => activity.state === "running")}
+        />
+      ) : null}
+    </div>
+  );
+
+  return (
+    <div className="turn-context">
+      {hasProcess && streaming ? processContent : null}
+      {hasProcess && !streaming ? (
+        <details className="turn-disclosure turn-execution" open={streaming || undefined}>
+          <summary>
+            <Activity size={15} aria-hidden="true" />
+            <span className="turn-disclosure-title">{summaryTitle}</span>
+            <span className="turn-disclosure-status">{toolCount ? `${toolCount} 个操作` : "已完成"}</span>
+            <ChevronDown className="turn-disclosure-chevron" size={15} aria-hidden="true" />
+          </summary>
+          {processContent}
+        </details>
+      ) : null}
+      {finalResponse ? (
+        <div className="turn-final-response">
+          <TimelineItem item={finalResponse} changes={changes} renderText={renderText} />
+        </div>
+      ) : null}
     </div>
   );
 }
 
-function TimelineItem({ item, changes, renderText }: { item: TurnTimelineItem; changes: ChangeSet[]; renderText?: (text: string) => ReactNode }) {
+function isTerminalEvent(kind: TimelineEventKind) {
+  return kind === "turn_completed" || kind === "turn_failed" || kind === "turn_cancelled";
+}
+
+function TimelineItem({
+  item,
+  changes,
+  active = false,
+  renderText,
+}: {
+  item: TurnTimelineItem;
+  changes: ChangeSet[];
+  active?: boolean;
+  renderText?: (text: string) => ReactNode;
+}) {
   if (item.type === "text") {
     return (
       <div className="turn-progress-text">
@@ -68,10 +137,10 @@ function TimelineItem({ item, changes, renderText }: { item: TurnTimelineItem; c
   }
   if (item.type === "reasoning") {
     return (
-      <details className="turn-disclosure turn-reasoning" open={!item.complete || undefined}>
+      <details className="turn-disclosure turn-reasoning" open={active || !item.complete || undefined}>
         <summary>
           <Brain size={15} aria-hidden="true" />
-          <span className="turn-disclosure-title">推理摘要</span>
+          <span className="turn-disclosure-title">思考内容</span>
           <span className="turn-disclosure-status">{item.complete ? "已完成" : "生成中"}</span>
           <ChevronDown className="turn-disclosure-chevron" size={15} aria-hidden="true" />
         </summary>
@@ -110,18 +179,27 @@ function timelineItemKey(item: TurnTimelineItem) {
   return item.activity.call.id;
 }
 
-function ActivityStatusRow({ status }: { status: AgentActivityStatus }) {
+function ActivityStatusRow({
+  status,
+  hasRunningTool,
+}: {
+  status: AgentActivityStatus;
+  hasRunningTool: boolean;
+}) {
   const labels: Record<AgentActivityStatus, string> = {
-    thinking: "Thinking",
-    responding: "正在组织回复",
-    running_tool: "正在执行操作",
-    awaiting_approval: "等待你的确认",
-    finalizing: "正在整理结果",
+    thinking: "思考中",
+    responding: "生成回复中",
+    running_tool: "处理工具结果中",
+    awaiting_approval: "等待确认",
+    finalizing: "整理结果中",
   };
+  if (status === "running_tool" && hasRunningTool) return null;
+
   return (
-    <div className={`turn-activity-status turn-activity-status--${status}`} role="status">
+    <div className={`turn-live-status turn-live-status--${status}`} role="status" aria-live="polite">
       <LoaderCircle size={15} aria-hidden="true" />
       <span>{labels[status]}</span>
+      <span className="turn-live-status-dots" aria-hidden="true"><i /><i /><i /></span>
     </div>
   );
 }
@@ -130,25 +208,30 @@ function ToolActivityRow({ activity }: { activity: ToolActivity }) {
   const outputChunks = visibleOutput(activity);
   const elapsedMs = useActivityDuration(activity);
   const command = activity.call.name === "run_command" ? commandDetails(activity.call.arguments) : null;
+  const fileDetails = command ? null : fileActivityDetails(activity);
+  const isRunning = activity.state === "running";
   return (
     <div className={`turn-timeline-tool turn-timeline-tool--${activity.state}`}>
       {activity.state === "completed" ? (
         <CircleCheck size={15} aria-hidden="true" />
       ) : activity.state === "failed" ? (
         <CircleX size={15} aria-hidden="true" />
+      ) : activity.state === "cancelled" ? (
+        <Circle size={15} aria-hidden="true" />
       ) : (
-        <CircleDot className="turn-tool-running" size={15} aria-hidden="true" />
+        <LoaderCircle className="turn-tool-running" size={15} aria-hidden="true" />
       )}
       <span>
-        <strong>{toolLabel(activity.call.name)}</strong>
+        <strong>{isRunning ? runningToolLabel(activity.call.name) : toolLabel(activity.call.name)}</strong>
         <small className="turn-tool-meta">
           <span>{toolTarget(activity) || activityStateLabel(activity)}</span>
           {elapsedMs !== null ? <span className="turn-tool-duration"><Clock3 size={12} aria-hidden="true" />耗时 {formatDuration(elapsedMs)}</span> : null}
         </small>
       </span>
       {command ? <CommandDetails command={command} /> : null}
+      {fileDetails ? <FileActivityDetails details={fileDetails} /> : null}
       {outputChunks.length ? (
-        <details className="turn-tool-output" open={activity.state === "running" || undefined}>
+        <details className="turn-tool-output" open={isRunning || undefined}>
           <summary>
             <SquareTerminal size={14} aria-hidden="true" />
             <span>命令输出</span>
@@ -162,6 +245,56 @@ function ToolActivityRow({ activity }: { activity: ToolActivity }) {
         </details>
       ) : null}
     </div>
+  );
+}
+
+interface FileActivityDetailsValue {
+  kind: "read" | "patch" | "write";
+  label: string;
+  path: string;
+  modelId: string;
+  language: string;
+  content: string;
+  meta: string;
+  truncated: boolean;
+  lineNumberOffset: number;
+}
+
+function FileActivityDetails({ details }: { details: FileActivityDetailsValue }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <details className="turn-tool-details" onToggle={(event) => setOpen(event.currentTarget.open)}>
+      <summary>
+        <FileText size={14} aria-hidden="true" />
+        <span>{details.label}</span>
+        <ChevronDown size={14} aria-hidden="true" />
+      </summary>
+      <div className="turn-command-details">
+        {details.kind === "read" ? (
+          open ? (
+            <div className="turn-file-editor" style={{ height: readEditorHeight(details.content) }}>
+              <Suspense fallback={<div className="code-editor-loading">正在载入读取内容...</div>}>
+                <CodeEditor
+                  path={details.path}
+                  modelPath={`kcoder-read://${details.modelId}/${details.path}`}
+                  language={details.language}
+                  value={details.content}
+                  readOnly
+                  lineNumberOffset={details.lineNumberOffset}
+                />
+              </Suspense>
+            </div>
+          ) : null
+        ) : <pre>{details.content}</pre>}
+        {details.meta || details.truncated ? (
+          <small>
+            {details.meta}
+            {details.meta && details.truncated ? " · " : ""}
+            {details.truncated ? "内容过长，仅显示前 64 KiB" : ""}
+          </small>
+        ) : null}
+      </div>
+    </details>
   );
 }
 
@@ -240,6 +373,103 @@ function commandDetails(argumentsValue: Record<string, unknown>): CommandDetails
   };
 }
 
+function fileActivityDetails(activity: ToolActivity): FileActivityDetailsValue | null {
+  const args = activity.call.arguments ?? {};
+  const path = typeof args.path === "string" ? args.path : "";
+  let label = "";
+  let content = "";
+  let meta = path;
+  let kind: FileActivityDetailsValue["kind"] = "read";
+  let truncated = false;
+  let lineNumberOffset = 1;
+
+  if (activity.call.name === "read_file" && typeof activity.result?.output === "string") {
+    label = "查看读取内容";
+    content = activity.result.output;
+    const metadata = activity.result.metadata ?? {};
+    const offset = typeof metadata.offset === "number" ? metadata.offset : null;
+    const bytesReturned = typeof metadata.bytesReturned === "number" ? metadata.bytesReturned : null;
+    const totalBytes = typeof metadata.totalBytes === "number" ? metadata.totalBytes : null;
+    const startLine = typeof metadata.startLine === "number" ? metadata.startLine : null;
+    const endLine = typeof metadata.endLine === "number" ? metadata.endLine : null;
+    const totalLines = typeof metadata.totalLines === "number" ? metadata.totalLines : null;
+    lineNumberOffset = startLine ?? 1;
+    const lineRange = startLine !== null && endLine !== null
+      ? startLine === endLine ? `第 ${startLine} 行` : `第 ${startLine}-${endLine} 行`
+      : "";
+    meta = [
+      path,
+      lineRange,
+      offset !== null && bytesReturned !== null
+        ? bytesReturned > 0 ? `字节 ${offset}-${offset + bytesReturned - 1}` : `字节 ${offset}（空）`
+        : "",
+      totalLines !== null ? `共 ${totalLines} 行` : totalBytes !== null ? `共 ${totalBytes} 字节` : "",
+      metadata.truncated === true ? "文件仍有未读取内容" : "",
+    ].filter(Boolean).join(" · ");
+  } else if (activity.call.name === "apply_patch" && typeof args.patch === "string") {
+    kind = "patch";
+    label = "查看补丁";
+    content = args.patch;
+    meta = patchFilePaths(args.patch).join("、");
+  } else if (activity.call.name === "write_file" && typeof args.content === "string") {
+    kind = "write";
+    label = "查看写入内容";
+    content = args.content;
+  } else {
+    return null;
+  }
+
+  if (kind !== "read") {
+    const bounded = boundDetail(content);
+    content = bounded.content;
+    truncated = bounded.truncated;
+  }
+  return {
+    kind,
+    label,
+    path,
+    modelId: `${activity.turnId}-${activity.call.id}`,
+    language: languageForPath(path),
+    content,
+    meta,
+    truncated,
+    lineNumberOffset,
+  };
+}
+
+function languageForPath(path: string) {
+  const extension = path.toLowerCase().split(".").pop() ?? "";
+  const languages: Record<string, string> = {
+    c: "c", cpp: "cpp", cs: "csharp", css: "css", go: "go", h: "cpp", hpp: "cpp",
+    html: "html", java: "java", js: "javascript", json: "json", jsx: "javascript",
+    md: "markdown", py: "python", rs: "rust", scss: "scss", sh: "shell", sql: "sql",
+    toml: "ini", ts: "typescript", tsx: "typescript", xml: "xml", yaml: "yaml", yml: "yaml",
+  };
+  return languages[extension] ?? "plaintext";
+}
+
+function readEditorHeight(content: string) {
+  const lineCount = content.split(/\r\n|\r|\n/).length;
+  return Math.min(380, Math.max(96, lineCount * 19 + 16));
+}
+
+function patchFilePaths(patch: string) {
+  const paths: string[] = [];
+  for (const line of patch.split(/\r?\n/)) {
+    const match = line.match(/^\*\*\* (?:Add|Update|Delete) File:\s*(.+)$/)
+      ?? line.match(/^\*\*\* Move to:\s*(.+)$/);
+    const path = match?.[1]?.trim();
+    if (path && !paths.includes(path)) paths.push(path);
+  }
+  return paths;
+}
+
+function boundDetail(value: string) {
+  const limit = 64 * 1024;
+  if (value.length <= limit) return { content: value, truncated: false };
+  return { content: value.slice(0, limit), truncated: true };
+}
+
 function shellQuote(value: string) {
   if (/^[\w./:=+-]+$/.test(value)) return value;
   return `"${value.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
@@ -253,7 +483,7 @@ function useActivityDuration(activity: ToolActivity): number | null {
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
     if (activity.state !== "running" || !activity.startedAtMs) return undefined;
-    const timer = window.setInterval(() => setNow(Date.now()), 1_000);
+    const timer = window.setInterval(() => setNow(Date.now()), 250);
     return () => window.clearInterval(timer);
   }, [activity.state, activity.startedAtMs]);
   if (typeof activity.durationMs === "number") return activity.durationMs;
@@ -341,22 +571,64 @@ function toolLabel(name: string) {
   return labels[name] ?? name;
 }
 
+function runningToolLabel(name: string) {
+  const labels: Record<string, string> = {
+    apply_patch: "正在应用补丁",
+    browser_click: "正在操作页面",
+    browser_navigate: "正在打开网页",
+    list_directory: "正在查看目录",
+    read_file: "正在读取文件",
+    request_user_input: "正在准备问题",
+    run_command: "正在执行命令",
+    search_repository: "正在搜索代码",
+    update_plan: "正在更新计划",
+    write_file: "正在写入文件",
+  };
+  return labels[name] ?? `正在运行 ${name}`;
+}
+
 function toolTarget(activity: ToolActivity) {
   const args = activity.call.arguments ?? {};
+  if (activity.state === "failed" && activity.result?.output) {
+    return truncate(activity.result.output, 120);
+  }
+  if (activity.call.name === "read_file" && typeof args.path === "string") {
+    const metadata = activity.result?.metadata ?? {};
+    const startLine = positiveInteger(metadata.startLine) ?? positiveInteger(args.startLine);
+    const requestedLineCount = positiveInteger(args.lineCount);
+    const endLine = positiveInteger(metadata.endLine)
+      ?? (startLine !== null && requestedLineCount !== null
+        ? startLine + requestedLineCount - 1
+        : null);
+    if (startLine !== null) {
+      const range = endLine !== null && endLine !== startLine
+        ? `第 ${startLine}-${endLine} 行`
+        : `第 ${startLine} 行`;
+      return truncate(`${args.path} · ${range}`, 120);
+    }
+  }
   if (activity.call.name === "run_command") {
     const command = commandDetails(args);
     if (command) return truncate(command.text, 120);
   }
+  if (activity.call.name === "apply_patch" && typeof args.patch === "string") {
+    const paths = patchFilePaths(args.patch);
+    if (paths.length) return truncate(paths.join("、"), 120);
+  }
   for (const key of ["path", "filePath", "file_path", "command", "query", "url"]) {
     if (typeof args[key] === "string" && args[key]) return truncate(args[key], 88);
   }
-  if (activity.state === "failed" && activity.result?.output) return truncate(activity.result.output, 88);
   return "";
+}
+
+function positiveInteger(value: unknown) {
+  return typeof value === "number" && Number.isInteger(value) && value > 0 ? value : null;
 }
 
 function activityStateLabel(activity: ToolActivity) {
   if (activity.state === "running") return "执行中";
   if (activity.state === "failed") return "执行失败";
+  if (activity.state === "cancelled") return "已取消";
   return "已完成";
 }
 

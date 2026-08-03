@@ -3,6 +3,7 @@
   position: relative;
   display: flex;
   align-items: center;
+  flex-shrink: 0;
 }
 
 .mode-toggle {
@@ -16,6 +17,7 @@
   color: var(--color-ink);
   font-size: var(--font-size-base);
   cursor: pointer;
+  white-space: nowrap;
   transition: all 120ms ease;
 }
 
@@ -129,11 +131,13 @@
   position: relative;
   display: inline-flex;
   min-width: 0;
+  flex-shrink: 0;
 }
 
 .approval-mode-trigger {
   display: inline-flex;
   min-width: 0;
+  max-width: 100%;
   min-height: 32px;
   padding: 5px 8px;
   align-items: center;
@@ -145,6 +149,10 @@
   cursor: pointer;
   font-size: var(--font-size-sm);
   transition: color var(--transition-fast), background-color var(--transition-fast);
+}
+
+.approval-mode-trigger > span {
+  white-space: nowrap;
 }
 
 .approval-mode-trigger:hover {
@@ -248,11 +256,13 @@
   position: relative;
   display: inline-flex;
   min-width: 0;
+  flex-shrink: 0;
 }
 
 .reasoning-trigger {
   display: inline-flex;
   min-width: 0;
+  max-width: 100%;
   min-height: 32px;
   align-items: center;
   gap: 6px;
@@ -264,6 +274,10 @@
   cursor: pointer;
   font-size: var(--font-size-sm);
   transition: color var(--transition-fast), background-color var(--transition-fast);
+}
+
+.reasoning-trigger > span {
+  white-space: nowrap;
 }
 
 .reasoning-trigger:hover {

@@ -1,16 +1,16 @@
-import { useEffect, useState } from "react";
+import { lazy, Suspense, useEffect, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
   ArrowDownToLine, Braces, ChevronDown, ChevronRight, CircleCheck,
   CodeXml, Database, File, FileCode2, FileCog, FileText, Folder, FolderOpen,
   GitBranch, Hash, Image, LocateFixed, Paperclip, Plus, RefreshCw, Search,
-  Terminal, Upload, X,
+  Maximize2, Minimize2, RotateCcw, Save, Terminal, Upload, X,
 } from "lucide-react";
 import "./WorkbenchPanel.css";
 import {
   extractAttachment, getGitBranches, getGitDiff, getGitStatus, getWorkspaceState,
   listWorkspaceDirectory, openWorkspaceFile, previewWorkspaceFile, revealWorkspaceFile,
-  runGitAction, switchGitBranch, switchWorkspace,
+  runGitAction, saveWorkspaceFile, switchGitBranch, switchWorkspace,
   searchRepository,
 } from "../api/runtime";
 import type {
@@ -21,7 +21,9 @@ import type {
 
 type Tab = "files" | "git";
 
-export function WorkspacePicker({ onChanged }: { onChanged: () => void }) {
+const CodeEditor = lazy(() => import("./CodeEditor").then((module) => ({ default: module.CodeEditor })));
+
+export function WorkspacePicker({ onChanged, compact = false }: { onChanged: () => void; compact?: boolean }) {
   const [state, setState] = useState<WorkspaceState | null>(null);
   const [expanded, setExpanded] = useState(false);
   const [error, setError] = useState("");
@@ -50,14 +52,14 @@ export function WorkspacePicker({ onChanged }: { onChanged: () => void }) {
   }
 
   return (
-    <div className="workspace-picker">
+    <div className={`workspace-picker${compact ? " workspace-picker--compact" : ""}`}>
       <button className="workspace-current" type="button" onClick={() => setExpanded(!expanded)} aria-expanded={expanded} title={state?.current.path ?? "工作区路径"}>
-        <span className="workspace-glyph"><FolderOpen size={15} /></span>
+        <span className="workspace-glyph"><FolderOpen size={compact ? 13 : 15} /></span>
         <span className="workspace-info">
           <strong>{state?.current.name ?? "工作区"}</strong>
-          {state?.current.path && <small>{state.current.path.replace(/^\\\\\?\\/, '').replace(/\\/g, '/')}</small>}
+          {!compact && state?.current.path && <small>{state.current.path.replace(/^\\\\\?\\/, '').replace(/\\/g, '/')}</small>}
         </span>
-        <ChevronDown size={14} />
+        <ChevronDown size={compact ? 12 : 14} />
       </button>
       {expanded && (
         <div className="workspace-menu">
@@ -101,14 +103,56 @@ function FilesView({ onAttach }: { onAttach: (attachment: AttachmentContent) => 
   const [query, setQuery] = useState("");
   const [results, setResults] = useState<SearchResult[]>([]);
   const [hasWorkspace, setHasWorkspace] = useState(true);
+  const [draft, setDraft] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [notice, setNotice] = useState("");
+  const [editorMaximized, setEditorMaximized] = useState(false);
+  const dirty = Boolean(preview?.editable && draft !== (preview.content ?? ""));
 
   async function select(path: string) {
+    if (path === preview?.path) return;
+    if (dirty && !window.confirm("当前文件有未保存的修改，放弃修改并打开其他文件？")) return;
     try {
-      setPreview(await previewWorkspaceFile(path));
+      const next = await previewWorkspaceFile(path);
+      setPreview(next);
+      setDraft(next.content ?? "");
+      setEditorMaximized(false);
       setError("");
+      setNotice("");
     } catch (error) {
       setError(toReadableError(error));
     }
+  }
+
+  async function save() {
+    if (!preview?.editable || !preview.contentHash || !dirty || saving) return;
+    setSaving(true);
+    setNotice("");
+    try {
+      const saved = await saveWorkspaceFile({
+        path: preview.path,
+        content: draft,
+        expectedHash: preview.contentHash,
+      });
+      setPreview(saved);
+      setDraft(saved.content ?? "");
+      setError("");
+      setNotice("已保存");
+      setRevision((value) => value + 1);
+    } catch (reason) {
+      setError(toReadableError(reason));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  function closePreview() {
+    if (dirty && !window.confirm("当前文件有未保存的修改，确定关闭？")) return;
+    setPreview(null);
+    setDraft("");
+    setEditorMaximized(false);
+    setNotice("");
+    setError("");
   }
 
   async function attach() {
@@ -125,7 +169,7 @@ function FilesView({ onAttach }: { onAttach: (attachment: AttachmentContent) => 
     return (
       <div className="files-view">
         <div className="panel-toolbar">
-          <strong>资源管理器</strong>
+          <WorkspacePicker onChanged={() => setRevision((value) => value + 1)} compact />
         </div>
         <div className="panel-empty">
           <Folder size={48} />
@@ -145,24 +189,28 @@ function FilesView({ onAttach }: { onAttach: (attachment: AttachmentContent) => 
   }
 
   return (
-    <div className="files-view">
-      <div className="panel-toolbar"><strong>资源管理器</strong><button type="button" title="刷新" aria-label="刷新文件树" onClick={() => setRevision((value) => value + 1)}><RefreshCw size={14} /></button></div>
+    <div className={`files-view ${preview ? "files-view--has-preview" : ""} ${editorMaximized ? "files-view--editor-maximized" : ""}`}>
+      <div className="panel-toolbar"><WorkspacePicker onChanged={() => setRevision((value) => value + 1)} compact /><button type="button" title="刷新" aria-label="刷新文件树" onClick={() => setRevision((value) => value + 1)}><RefreshCw size={14} /></button></div>
       <form className="repository-search" onSubmit={(event) => { event.preventDefault(); if (query.trim()) void searchRepository(query.trim()).then(setResults).catch((reason) => setError(String(reason))); }}>
         <Search size={14} />
         <input value={query} onChange={(event) => { setQuery(event.target.value); if (!event.target.value) setResults([]); }} placeholder="搜索仓库" aria-label="搜索仓库" />
         <button type="submit" aria-label="执行搜索"><Search size={13} /></button>
       </form>
-      {results.length > 0 ? <div className="repository-results">{results.map((result) => <button type="button" key={`${result.path}:${result.line}`} onClick={() => void select(result.path)}><strong>{result.path}:{result.line}</strong><span>{result.preview}</span></button>)}</div> : <div className="file-tree" key={revision}><DirectoryNode path="" depth={0} onSelect={(path) => void select(path)} /></div>}
+      {results.length > 0 ? <div className="repository-results">{results.map((result) => <button type="button" key={`${result.path}:${result.line}`} onClick={() => void select(result.path)}><strong>{result.path}:{result.line}</strong><span>{result.preview}</span></button>)}</div> : <div className="file-tree" key={revision}><DirectoryNode path="" depth={0} selectedPath={preview?.path ?? null} onSelect={(path) => void select(path)} /></div>}
       {error && <div className="panel-error">{error}</div>}
       {preview && (
-        <div className="file-preview">
-          <div className="preview-header"><span title={preview.path}>{preview.name}</span><button type="button" aria-label="关闭预览" onClick={() => setPreview(null)}><X size={14} /></button></div>
-          {preview.dataUrl ? <img src={preview.dataUrl} alt={preview.name} /> : <pre><code>{preview.content}</code></pre>}
-          {preview.truncated && <small>预览已截断</small>}
+        <div className={`file-preview ${editorMaximized ? "file-preview--maximized" : ""}`}>
+          <div className="preview-header"><span title={preview.path}>{preview.name}{dirty && <i className="preview-dirty" title="有未保存的修改" aria-label="有未保存的修改" />}</span><div className="preview-header-actions"><button type="button" aria-label={editorMaximized ? "还原编辑器" : "最大化编辑器"} title={editorMaximized ? "还原编辑器" : "最大化编辑器"} onClick={() => setEditorMaximized((value) => !value)}>{editorMaximized ? <Minimize2 size={14} /> : <Maximize2 size={14} />}</button><button type="button" aria-label="关闭预览" onClick={closePreview}><X size={14} /></button></div></div>
+          {preview.dataUrl ? <img src={preview.dataUrl} alt={preview.name} /> : <Suspense fallback={<div className="code-editor-loading">正在载入编辑器...</div>}><CodeEditor key={preview.path} path={preview.path} language={preview.language} value={draft} readOnly={!preview.editable} onChange={setDraft} onSave={save} /></Suspense>}
+          {preview.truncated && <small>文件超过 256 KiB，已截断并以只读方式打开</small>}
+          {!preview.dataUrl && !preview.truncated && !preview.editable && <small>该文件不是 UTF-8 文本，仅支持查看</small>}
+          {notice && <div className="preview-notice" role="status">{notice}</div>}
           <div className="preview-actions">
+            <button className="preview-save-action" type="button" disabled={!dirty || saving} title="保存 (Ctrl+S)" onClick={() => void save()}><Save size={14} />{saving ? "保存中" : "保存"}</button>
+            <button type="button" disabled={!dirty || saving} title="放弃未保存的修改" onClick={() => setDraft(preview.content ?? "")}><RotateCcw size={14} />放弃</button>
             <button type="button" title="附加到消息" onClick={() => void attach()}><Paperclip size={14} />附加</button>
-            <button type="button" title="使用系统编辑器打开" onClick={() => void openWorkspaceFile(preview.path)}><Upload size={14} /></button>
-            <button type="button" title="在资源管理器中定位" onClick={() => void revealWorkspaceFile(preview.path)}><LocateFixed size={14} /></button>
+            <button className="preview-icon-action" type="button" aria-label="使用系统编辑器打开" title="使用系统编辑器打开" onClick={() => void openWorkspaceFile(preview.path)}><Upload size={14} /></button>
+            <button className="preview-icon-action" type="button" aria-label="在资源管理器中定位" title="在资源管理器中定位" onClick={() => void revealWorkspaceFile(preview.path)}><LocateFixed size={14} /></button>
           </div>
         </div>
       )}
@@ -170,7 +218,7 @@ function FilesView({ onAttach }: { onAttach: (attachment: AttachmentContent) => 
   );
 }
 
-function DirectoryNode({ path, depth, onSelect }: { path: string; depth: number; onSelect: (path: string) => void }) {
+function DirectoryNode({ path, depth, selectedPath, onSelect }: { path: string; depth: number; selectedPath: string | null; onSelect: (path: string) => void }) {
   const [entries, setEntries] = useState<FileEntry[]>([]);
   const [error, setError] = useState("");
   useEffect(() => {
@@ -180,20 +228,20 @@ function DirectoryNode({ path, depth, onSelect }: { path: string; depth: number;
       .catch((reason) => { if (!disposed) setError(toReadableError(reason)); });
     return () => { disposed = true; };
   }, [path]);
-  return <>{error && <div className="tree-error" role="alert">{error}</div>}{entries.map((entry) => entry.isDirectory ? <FolderNode key={entry.path} entry={entry} depth={depth} onSelect={onSelect} /> : (
-    <button className="tree-row" style={{ paddingLeft: 25 + depth * 14 }} type="button" key={entry.path} onClick={() => onSelect(entry.path)}>
+  return <>{error && <div className="tree-error" role="alert">{error}</div>}{entries.map((entry) => entry.isDirectory ? <FolderNode key={entry.path} entry={entry} depth={depth} selectedPath={selectedPath} onSelect={onSelect} /> : (
+    <button className={`tree-row ${selectedPath === entry.path ? "tree-row--selected" : ""}`} aria-current={selectedPath === entry.path ? "true" : undefined} style={{ paddingLeft: 25 + depth * 14 }} type="button" key={entry.path} onClick={() => onSelect(entry.path)}>
       <FileTypeIcon name={entry.name} /><span>{entry.name}</span>
     </button>
   ))}</>;
 }
 
-function FolderNode({ entry, depth, onSelect }: { entry: FileEntry; depth: number; onSelect: (path: string) => void }) {
+function FolderNode({ entry, depth, selectedPath, onSelect }: { entry: FileEntry; depth: number; selectedPath: string | null; onSelect: (path: string) => void }) {
   const [open, setOpen] = useState(false);
   return <div>
     <button className="tree-row" style={{ paddingLeft: 8 + depth * 14 }} type="button" onClick={() => setOpen(!open)} aria-expanded={open}>
       {open ? <ChevronDown size={13} /> : <ChevronRight size={13} />}<Folder size={14} /><span>{entry.name}</span>
     </button>
-    {open && <DirectoryNode path={entry.path} depth={depth + 1} onSelect={onSelect} />}
+    {open && <DirectoryNode path={entry.path} depth={depth + 1} selectedPath={selectedPath} onSelect={onSelect} />}
   </div>;
 }
 
@@ -245,7 +293,7 @@ function GitView() {
   }
   async function changeBranch(branch: string, create = false) {
     if (!branch || (!create && branch === branches?.current)) return;
-    if (!window.confirm(`${create ? "创建并切换到" : "切换到"}分支“${branch}”？\n\n未提交的更改会保留；如有冲突，Git 将拒绝切换。`)) return;
+    if (!window.confirm(`${create ? "创建并切换到" : "切换到"}分支"${branch}"？\n\n未提交的更改会保留；如有冲突，Git 将拒绝切换。`)) return;
     try { await switchGitBranch(branch, create, true); setDiff(""); await refresh(); } catch (reason) { setError(toReadableError(reason)); }
   }
   if (status && !status.isRepository) return <div className="panel-empty"><GitBranch size={22} /><span>当前工作区不是 Git 仓库</span></div>;

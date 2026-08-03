@@ -14,6 +14,7 @@ test.beforeEach(async ({ page }) => {
     let reasoningEffort: "off" | "minimal" | "low" | "medium" | "high" | "x_high" = "medium";
     const runTurnCalls: unknown[] = [];
     const runTurnResolvers: Array<(value: unknown) => void> = [];
+    const invocationArgs: Record<string, unknown> = {};
     const responses: Record<string, unknown> = {
       runtime_status: { ready: true, phase: "advanced-agent", version: "0.10.0", uptimeSeconds: 12, capabilities: ["skills", "mcp-stdio", "tool-hooks", "persistent-plans", "budgeted-goals"] },
       get_approval_mode: "ask",
@@ -23,8 +24,8 @@ test.beforeEach(async ({ page }) => {
         { id: "step-1", step: "检查工作区", status: "completed", detail: "已读取关键文件" },
         { id: "step-2", step: "验证实现", status: "in_progress", detail: "正在运行测试" },
       ] },
-      get_goal: { schemaVersion: 1, id: "goal-1", threadId: "thread-1", objective: "完成 Phase 9 高级智能体能力", state: "active", tokenBudget: 100000, tokensUsed: 24000, timeBudgetMs: 3600000, elapsedMs: 420000, reason: null, createdAtMs: 2, updatedAtMs: 3, revision: 2 },
-      transition_goal: { schemaVersion: 1, id: "goal-1", threadId: "thread-1", objective: "完成 Phase 9 高级智能体能力", state: "paused", tokenBudget: 100000, tokensUsed: 24000, timeBudgetMs: 3600000, elapsedMs: 420000, reason: null, createdAtMs: 2, updatedAtMs: 4, revision: 3 },
+      get_goal: { schemaVersion: 1, id: "goal-1", threadId: "thread-1", objective: "完成 Phase 9 高级智能体能力", state: "active", tokenBudget: null, tokensUsed: 24000, timeBudgetMs: 3600000, elapsedMs: 420000, reason: null, createdAtMs: 2, updatedAtMs: 3, revision: 2 },
+      transition_goal: { schemaVersion: 1, id: "goal-1", threadId: "thread-1", objective: "完成 Phase 9 高级智能体能力", state: "paused", tokenBudget: null, tokensUsed: 24000, timeBudgetMs: 3600000, elapsedMs: 420000, reason: null, createdAtMs: 2, updatedAtMs: 4, revision: 3 },
       get_memory_settings: { enabled: false },
       set_memory_enabled: { enabled: true },
       list_memories: [],
@@ -36,26 +37,31 @@ test.beforeEach(async ({ page }) => {
       run_regression_evaluation: { total: 3, passed: 3, passRate: 1, failures: [] },
       cancel_turn: true,
       retry_turn: { schemaVersion: 1, threadId: "thread-1", turnId: "turn-retry", state: "completed", error: null },
+      recognize_image: { text: "hidden OCR fixture", lineCount: 1, durationMs: 12 },
       list_threads: [thread],
       read_thread: { schemaVersion: 1, summary: thread, messages: [
         { schemaVersion: 1, id: "message-user", role: "user", content: [{ type: "text", text: "检查工作区" }], createdAtMs: 1 },
         { schemaVersion: 1, id: "message-assistant", role: "assistant", content: [{ type: "text", text: "检查完成。" }], createdAtMs: 2 },
       ], messageTurnIds: { "message-assistant": "turn-1" }, lastTurn: null, toolActivities: [
-        { turnId: "turn-1", call: { id: "call-edit", name: "apply_patch", arguments: {}, metadata: {} }, state: "completed", result: { success: true, output: "applied", metadata: {} }, startedAtMs: 1000, completedAtMs: 1200, durationMs: 200 },
+        { turnId: "turn-1", call: { id: "call-edit", name: "apply_patch", arguments: { patch: "*** Begin Patch\n*** Update File: src/App.css\n@@\n-old\n+new\n*** End Patch" }, metadata: {} }, state: "completed", result: { success: true, output: "applied", metadata: {} }, startedAtMs: 1000, completedAtMs: 1200, durationMs: 200 },
+        { turnId: "turn-1", call: { id: "call-read", name: "read_file", arguments: { path: "src/stores/workbenchStore.ts", startLine: 42, lineCount: 1 }, metadata: {} }, state: "completed", result: { success: true, output: "export const fixture = true;\n", metadata: { path: "src/stores/workbenchStore.ts", offset: 920, bytesReturned: 29, totalBytes: 4096, startLine: 42, endLine: 42, linesReturned: 1, totalLines: 200, truncated: true } }, startedAtMs: 1210, completedAtMs: 1224, durationMs: 14 },
         { turnId: "turn-1", call: { id: "call-test", name: "run_command", arguments: { program: "pnpm", args: ["build"], cwd: "D:\\code\\k-coder", timeoutMs: 120000 }, metadata: {} }, state: "completed", result: { success: true, output: "tests passed", metadata: { durationMs: 1530 } }, startedAtMs: 1300, completedAtMs: 2830, durationMs: 1530 },
       ], turnTimeline: [
         { type: "text", id: "progress-1", turnId: "turn-1", text: "我先检查相关文件并修改实现。" },
-        { type: "tool", activity: { turnId: "turn-1", call: { id: "call-edit", name: "apply_patch", arguments: {}, metadata: {} }, state: "completed", result: { success: true, output: "applied", metadata: {} }, startedAtMs: 1000, completedAtMs: 1200, durationMs: 200 } },
+        { type: "tool", activity: { turnId: "turn-1", call: { id: "call-edit", name: "apply_patch", arguments: { patch: "*** Begin Patch\n*** Update File: src/App.css\n@@\n-old\n+new\n*** End Patch" }, metadata: {} }, state: "completed", result: { success: true, output: "applied", metadata: {} }, startedAtMs: 1000, completedAtMs: 1200, durationMs: 200 } },
+        { type: "tool", activity: { turnId: "turn-1", call: { id: "call-read", name: "read_file", arguments: { path: "src/stores/workbenchStore.ts", startLine: 42, lineCount: 1 }, metadata: {} }, state: "completed", result: { success: true, output: "export const fixture = true;\n", metadata: { path: "src/stores/workbenchStore.ts", offset: 920, bytesReturned: 29, totalBytes: 4096, startLine: 42, endLine: 42, linesReturned: 1, totalLines: 200, truncated: true } }, startedAtMs: 1210, completedAtMs: 1224, durationMs: 14 } },
         { type: "text", id: "progress-2", turnId: "turn-1", text: "修改完成，接着运行验证。" },
         { type: "tool", activity: { turnId: "turn-1", call: { id: "call-test", name: "run_command", arguments: { program: "pnpm", args: ["build"], cwd: "D:\\code\\k-coder", timeoutMs: 120000 }, metadata: {} }, state: "completed", result: { success: true, output: "tests passed", metadata: { durationMs: 1530 } }, startedAtMs: 1300, completedAtMs: 2830, durationMs: 1530 } },
         { type: "text", id: "message-assistant", turnId: "turn-1", text: "检查完成。" },
+        { type: "event", itemId: "turn-completed-turn-1", turnId: "turn-1", kind: "turn_completed", title: "Turn 已完成", detail: null, durationMs: 1830 },
       ], approvals: [], changes: [] },
       workspace_state: { current: { id: "project-1", name: "k-coder", path: "D:\\code\\k-coder", trusted: true, lastOpenedAtMs: 2 }, recent: [] },
       list_workspace_directory: [
         { name: "src", path: "src", isDirectory: true, size: null, modifiedAtMs: 2 },
         { name: "README.md", path: "README.md", isDirectory: false, size: 120, modifiedAtMs: 2 },
       ],
-      preview_workspace_file: { path: "README.md", name: "README.md", language: "markdown", content: "# k-Coder", dataUrl: null, size: 12, truncated: false },
+      preview_workspace_file: { path: "README.md", name: "README.md", language: "markdown", content: "# k-Coder", dataUrl: null, size: 9, truncated: false, editable: true, contentHash: "hash-readme" },
+      save_workspace_file: { path: "README.md", name: "README.md", language: "markdown", content: "# k-Coder\n\nEdited", dataUrl: null, size: 17, truncated: false, editable: true, contentHash: "hash-edited" },
       git_status: { isRepository: true, branch: "main", upstream: "origin/main", ahead: 0, behind: 0, files: [{ path: "src/App.tsx", indexStatus: " ", worktreeStatus: "M" }] },
       git_branches: { current: "main", branches: ["main", "feature/workbench"] },
       extension_overview: {
@@ -71,13 +77,13 @@ test.beforeEach(async ({ page }) => {
       list_subagents: [{
         schemaVersion: 1, id: "agent-1", parentAgentId: null, parentThreadId: "thread-1", threadId: "thread-agent-1",
         label: "检查后端", task: "分析后端接口", state: "completed", depth: 1, workspaceRoot: "D:\\code\\k-coder",
-        capabilities: ["list_directory", "read_file"], tokenBudget: 64000, tokensUsed: 420, timeoutMs: 600000,
+        capabilities: ["list_directory", "read_file"], tokenBudget: null, tokensUsed: 420, timeoutMs: 600000,
         createdAtMs: 2, updatedAtMs: 3, summary: "后端检查完成", error: null,
       }],
       create_subagent: {
         schemaVersion: 1, id: "agent-2", parentAgentId: null, parentThreadId: "thread-1", threadId: "thread-agent-2",
         label: "检查测试", task: "检查测试", state: "running", depth: 1, workspaceRoot: "D:\\code\\k-coder",
-        capabilities: ["list_directory", "read_file"], tokenBudget: 64000, tokensUsed: 0, timeoutMs: 600000,
+        capabilities: ["list_directory", "read_file"], tokenBudget: null, tokensUsed: 0, timeoutMs: 600000,
         createdAtMs: 4, updatedAtMs: 4, summary: null, error: null,
       },
       "plugin:event|listen": 1,
@@ -89,6 +95,7 @@ test.beforeEach(async ({ page }) => {
         unregisterCallback: (id: number) => callbacks.delete(id),
         invoke: async (command: string, args?: Record<string, unknown>) => {
           (window as unknown as { __invoked: string[] }).__invoked.push(command);
+          invocationArgs[command] = args ?? {};
           if (command === "plugin:event|listen") {
             if (args?.event === "agent-event" && typeof args.handler === "number") {
               agentEventCallbackId = args.handler;
@@ -165,6 +172,7 @@ test.beforeEach(async ({ page }) => {
       },
       __TAURI_EVENT_PLUGIN_INTERNALS__: { unregisterListener: () => undefined },
       __invoked: [],
+      __invocationArgs: invocationArgs,
       __runTurnCalls: runTurnCalls,
       __lastProviderRequest: null,
       __lastActivatedProvider: null,
@@ -179,22 +187,74 @@ test.beforeEach(async ({ page }) => {
 
 test("supports the primary workbench inspection flow", async ({ page }, testInfo) => {
   await page.goto("/");
+  await expect.poll(() => page.evaluate(() => (window as unknown as { __invocationArgs: Record<string, unknown> }).__invocationArgs.get_plan)).toEqual({ threadId: "thread-1" });
+  await expect.poll(() => page.evaluate(() => (window as unknown as { __invocationArgs: Record<string, unknown> }).__invocationArgs.get_goal)).toEqual({ threadId: "thread-1" });
   await expect(page.getByRole("heading", { name: "Phase 6 workbench" })).toBeVisible();
+  await expect(page.getByText("检查完成。", { exact: true })).toBeVisible();
+  await expect(page.getByText("执行了 1.8s", { exact: true })).toBeVisible();
+  await expect(page.getByText("我先检查相关文件并修改实现。", { exact: true })).toBeHidden();
+  await page.screenshot({ path: testInfo.outputPath("collapsed-turn.png"), fullPage: true });
+  await page.getByText("执行了 1.8s", { exact: true }).click();
   await expect(page.locator(".turn-plan").getByText("检查工作区", { exact: true })).toBeVisible();
   await expect(page.getByText("我先检查相关文件并修改实现。", { exact: true })).toBeVisible();
   await expect(page.locator(".turn-timeline-tool").getByText("应用补丁", { exact: true })).toBeVisible();
+  await expect(page.locator(".turn-timeline-tool .turn-tool-meta > span").getByText("src/App.css", { exact: true })).toBeVisible();
+  await page.getByText("查看补丁", { exact: true }).click();
+  await expect(page.locator(".turn-command-details pre").filter({ hasText: "*** Update File: src/App.css" })).toBeVisible();
+  await expect(page.locator(".turn-timeline-tool").getByText("读取文件", { exact: true })).toBeVisible();
+  await expect(page.locator(".turn-timeline-tool .turn-tool-meta > span").getByText("src/stores/workbenchStore.ts · 第 42 行", { exact: true })).toBeVisible();
+  await page.getByText("查看读取内容", { exact: true }).click();
+  const readDetails = page.locator(".turn-tool-details").filter({ hasText: "查看读取内容" });
+  await expect(readDetails.locator(".turn-file-editor .monaco-editor")).toBeVisible();
+  await expect(readDetails.getByRole("textbox", { name: "查看 src/stores/workbenchStore.ts" })).toBeAttached();
+  await expect(readDetails.locator(".view-lines")).toContainText("export const fixture = true;");
+  await expect(readDetails.locator(".line-numbers").filter({ hasText: "42" })).toBeVisible();
+  await expect.poll(async () => (await readDetails.locator(".turn-file-editor").boundingBox())?.height ?? 0).toBe(96);
+  await expect(readDetails).toContainText("第 42 行");
+  await expect(readDetails).toContainText("共 200 行");
+  await expect(page.locator(".turn-command-details pre").filter({ hasText: "export const fixture = true;" })).toHaveCount(0);
   await expect(page.getByText("修改完成，接着运行验证。", { exact: true })).toBeVisible();
   await expect(page.locator(".turn-timeline-tool").getByText("执行命令", { exact: true })).toBeVisible();
-  await expect(page.getByText("检查完成。", { exact: true })).toBeVisible();
-  await expect(page.getByText("执行了 2 个操作", { exact: true })).toHaveCount(0);
+  await expect(page.getByText("3 个操作", { exact: true })).toBeVisible();
   await page.screenshot({ path: testInfo.outputPath("inline-plan-and-tools.png"), fullPage: true });
   await page.evaluate(() => localStorage.setItem("kcoder_theme", "dark"));
   await page.reload();
+  await expect(page.locator(".turn-timeline-tool").getByText("执行命令", { exact: true })).toBeHidden();
+  await page.getByText("执行了 1.8s", { exact: true }).click();
   await expect(page.locator(".turn-timeline-tool").getByText("执行命令", { exact: true })).toBeVisible();
   await page.screenshot({ path: testInfo.outputPath("inline-plan-and-tools-dark.png"), fullPage: true });
-  await page.getByRole("button", { name: "切换工作台面板" }).click();
-  await page.getByRole("button", { name: /README.md/ }).click();
-  await expect(page.getByText("# k-Coder")).toBeVisible();
+  await page.getByRole("button", { name: "工作台", exact: true }).click();
+  const readmeRow = page.getByRole("button", { name: /README.md/ });
+  await expect(readmeRow).toHaveCSS("font-size", "12px");
+  await readmeRow.click();
+  await expect(readmeRow).toHaveAttribute("aria-current", "true");
+  const editor = page.locator(".monaco-editor");
+  await expect(editor).toBeVisible();
+  await expect.poll(async () => {
+    const box = await page.locator(".code-editor").boundingBox();
+    return box ? { width: Math.round(box.width), height: Math.round(box.height) } : null;
+  }).toMatchObject({ width: expect.any(Number), height: expect.any(Number) });
+  const editorBox = await page.locator(".code-editor").boundingBox();
+  expect(editorBox?.width ?? 0).toBeGreaterThan(340);
+  expect(editorBox?.height ?? 0).toBeGreaterThan(380);
+  await expect(editor.locator(".line-numbers").first()).toHaveText("1");
+  await expect(editor.locator(".view-lines")).toContainText("# k-Coder");
+  await expect(editor.locator('[class*="mtk"]')).not.toHaveCount(0);
+  await editor.click();
+  await page.keyboard.press("Control+A");
+  await page.keyboard.insertText("# k-Coder\n\nEdited");
+  const saveButton = page.getByRole("button", { name: "保存", exact: true });
+  await expect(saveButton).toBeEnabled();
+  await saveButton.click();
+  await expect(page.getByText("已保存", { exact: true })).toBeVisible();
+  await expect.poll(() => page.evaluate(() => (window as unknown as { __invocationArgs: Record<string, unknown> }).__invocationArgs.save_workspace_file)).toEqual({
+    request: { path: "README.md", content: "# k-Coder\n\nEdited", expectedHash: "hash-readme" },
+  });
+  await page.screenshot({ path: testInfo.outputPath("workspace-code-editor.png"), fullPage: true });
+  await page.getByRole("button", { name: "最大化编辑器" }).click();
+  await expect(page.getByPlaceholder("搜索仓库")).toBeHidden();
+  await expect.poll(async () => (await page.locator(".code-editor").boundingBox())?.height ?? 0).toBeGreaterThan(600);
+  await page.screenshot({ path: testInfo.outputPath("workspace-code-editor-maximized.png"), fullPage: true });
   await page.getByRole("tab", { name: "Git" }).click();
   await expect(page.getByLabel("当前分支")).toHaveValue("main");
   await page.getByRole("button", { name: "暂存 src/App.tsx" }).click();
@@ -214,6 +274,73 @@ test("supports the primary workbench inspection flow", async ({ page }, testInfo
   await expect(page.getByText("local", { exact: true })).toBeVisible();
   await page.getByRole("button", { name: /规则与审计/ }).click();
   await expect(page.getByText("extensions_ready", { exact: true })).toBeVisible();
+});
+
+test("keeps the mid-width workbench bounded without toolbar overflow", async ({ page }, testInfo) => {
+  await page.setViewportSize({ width: 1097, height: 820 });
+  await page.goto("/");
+  await expect(page.getByRole("heading", { name: "Phase 6 workbench" })).toBeVisible();
+  await page.getByRole("button", { name: "工作台", exact: true }).click();
+
+  const panel = page.locator(".workbench-panel");
+  const conversation = page.locator(".conversation");
+  const toolbar = panel.locator(".panel-toolbar");
+  const workspaceButton = toolbar.locator(".workspace-current");
+  await expect(panel).toBeVisible();
+  await expect(workspaceButton).toContainText("k-coder", { ignoreCase: true });
+  await expect.poll(() => panel.evaluate((element) => element.getBoundingClientRect().width)).toBeLessThanOrEqual(400);
+
+  const panelBox = await panel.evaluate((element) => { const rect = element.getBoundingClientRect(); return { x: rect.x, y: rect.y, width: rect.width, height: rect.height }; });
+  const conversationBox = await conversation.evaluate((element) => { const rect = element.getBoundingClientRect(); return { x: rect.x, y: rect.y, width: rect.width, height: rect.height }; });
+  const toolbarBox = await toolbar.boundingBox();
+  const workspaceBox = await workspaceButton.boundingBox();
+  expect(panelBox?.width ?? 0).toBeLessThanOrEqual(400);
+  expect(panelBox?.width ?? 0).toBeLessThan(1097 * 0.45);
+  expect((conversationBox?.x ?? 0) + (conversationBox?.width ?? 0)).toBeLessThanOrEqual(panelBox?.x ?? 0);
+  expect(workspaceBox?.x ?? 0).toBeGreaterThanOrEqual(toolbarBox?.x ?? 0);
+  expect(workspaceBox?.y ?? 0).toBeGreaterThanOrEqual(toolbarBox?.y ?? 0);
+  expect((workspaceBox?.y ?? 0) + (workspaceBox?.height ?? 0)).toBeLessThanOrEqual((toolbarBox?.y ?? 0) + (toolbarBox?.height ?? 0));
+  await page.screenshot({ path: testInfo.outputPath("mid-width-workbench.png"), fullPage: true });
+});
+
+test("keeps messages, composer, and send action inside the conversation when the workbench opens", async ({ page }, testInfo) => {
+  await page.setViewportSize({ width: 1536, height: 900 });
+  await page.goto("/");
+  await expect(page.getByRole("heading", { name: "Phase 6 workbench" })).toBeVisible();
+  await page.getByRole("button", { name: "工作台", exact: true }).click();
+
+  const panel = page.locator(".workbench-panel");
+  const conversation = page.locator(".conversation");
+  const messageArea = page.locator(".message-area");
+  const userMessage = page.locator(".message--user").first();
+  const composer = page.locator(".composer");
+  const sendButton = page.getByRole("button", { name: "发送消息" });
+  await expect(panel).toBeVisible();
+  await expect(composer).toBeVisible();
+  await expect(sendButton).toBeVisible();
+
+  const panelBox = await panel.boundingBox();
+  const conversationBox = await conversation.boundingBox();
+  const messageBox = await userMessage.boundingBox();
+  const composerBox = await composer.boundingBox();
+  const sendBox = await sendButton.boundingBox();
+  expect(panelBox).not.toBeNull();
+  expect(conversationBox).not.toBeNull();
+  expect(messageBox).not.toBeNull();
+  expect(composerBox).not.toBeNull();
+  expect(sendBox).not.toBeNull();
+
+  const conversationRight = (conversationBox?.x ?? 0) + (conversationBox?.width ?? 0);
+  const composerRight = (composerBox?.x ?? 0) + (composerBox?.width ?? 0);
+  expect(panelBox?.width ?? 0).toBeLessThanOrEqual(440);
+  expect(panelBox?.width ?? 0).toBeGreaterThanOrEqual(360);
+  expect(conversationRight).toBeLessThanOrEqual((panelBox?.x ?? 0) + 1);
+  expect((messageBox?.x ?? 0) + (messageBox?.width ?? 0)).toBeLessThanOrEqual(conversationRight + 1);
+  expect(composerRight).toBeLessThanOrEqual(conversationRight + 1);
+  expect((sendBox?.x ?? 0) + (sendBox?.width ?? 0)).toBeLessThanOrEqual(composerRight + 1);
+  await expect.poll(() => composer.evaluate((element) => element.scrollWidth - element.clientWidth)).toBeLessThanOrEqual(1);
+  await expect.poll(() => messageArea.evaluate((element) => element.scrollWidth - element.clientWidth)).toBeLessThanOrEqual(1);
+  await page.screenshot({ path: testInfo.outputPath("workbench-composer-bounds.png"), fullPage: true });
 });
 
 test("selects and persists the global reasoning effort", async ({ page }) => {
@@ -238,12 +365,15 @@ test("streams thinking, safe reasoning summaries, and command output inline", as
     emit({ ...base, type: "turn_started", phase: "exploring" });
     emit({ ...base, type: "activity_status_changed", phase: "exploring", status: "thinking" });
   });
-  await expect(page.getByText("Thinking", { exact: true })).toBeVisible();
+  await expect(page.getByText("思考中", { exact: true })).toBeVisible();
+  await expect(page.locator(".message-avatar")).toHaveCount(0);
+  await expect(page.getByText("正在执行", { exact: true })).toHaveCount(0);
 
   await page.evaluate(() => {
     const emit = (window as unknown as { __emitAgentEvent: (event: unknown) => void }).__emitAgentEvent;
     const base = { schemaVersion: 1, threadId: "thread-1", turnId: "turn-live" };
     emit({ ...base, type: "reasoning_summary_delta", phase: "planning", itemId: "rs-live", delta: "正在检查公开事件契约。" });
+    emit({ ...base, type: "reasoning_summary_completed", phase: "planning", itemId: "rs-live", summary: "正在检查公开事件契约。" });
     emit({ ...base, type: "tool_started", phase: "executing", call: { id: "call-live", name: "run_command", arguments: { program: "pnpm", args: ["build"] }, metadata: {} } });
     emit({ ...base, type: "tool_output_delta", phase: "executing", callId: "call-live", stream: "stdout", cursor: 0, delta: "building client\n" });
     emit({ ...base, type: "tool_output_delta", phase: "executing", callId: "call-live", stream: "stderr", cursor: 1, delta: "warning: fixture\n" });
@@ -254,7 +384,9 @@ test("streams thinking, safe reasoning summaries, and command output inline", as
     } });
   });
 
-  await expect(page.getByText("推理摘要", { exact: true })).toBeVisible();
+  const reasoning = page.locator(".turn-reasoning").last();
+  await expect(page.getByText("思考内容", { exact: true })).toBeVisible();
+  await expect(reasoning).toHaveAttribute("open", "");
   await expect(page.getByText("正在检查公开事件契约。", { exact: true })).toBeVisible();
   await page.locator(".turn-tool-output").last().locator("summary").click();
   await expect(page.locator(".turn-tool-output-line--stdout").filter({ hasText: "building client" })).toBeVisible();
@@ -341,6 +473,63 @@ test("keeps the composer usable during thinking and drains queued messages after
   await expect.poll(() => page.evaluate(() => (window as unknown as { __runTurnCalls: unknown[] }).__runTurnCalls.length)).toBe(1);
 });
 
+test("keeps OCR text hidden while adding it to the model context", async ({ page }, testInfo) => {
+  await page.goto("/");
+  const composer = page.getByRole("textbox", { name: "消息" });
+  await composer.evaluate((element) => {
+    const transfer = new DataTransfer();
+    transfer.items.add(new File([new Uint8Array([137, 80, 78, 71])], "ocr-fixture.png", { type: "image/png" }));
+    element.dispatchEvent(new ClipboardEvent("paste", { bubbles: true, clipboardData: transfer }));
+  });
+
+  await expect(page.getByAltText("ocr-fixture.png")).toBeVisible();
+  await expect.poll(() => page.evaluate(() => (window as unknown as { __invoked: string[] }).__invoked.filter((command) => command === "recognize_image").length)).toBe(1);
+  await expect(page.getByText("hidden OCR fixture", { exact: true })).toHaveCount(0);
+  await expect(page.getByText("查看识别文字", { exact: true })).toHaveCount(0);
+  await expect(page.locator(".attachment-ocr-state, .attachment-ocr-details")).toHaveCount(0);
+  await page.screenshot({ path: testInfo.outputPath("ocr-hidden-from-composer.png"), fullPage: true });
+
+  await page.getByRole("button", { name: "发送消息", exact: true }).click();
+  const imageMessage = page.locator(".message--user").filter({ has: page.locator(".message-image-attachment") });
+  await expect(imageMessage.getByText("ocr-fixture.png", { exact: true })).toBeVisible();
+  await expect(imageMessage.locator(".message-content")).toHaveCount(0);
+  await expect(page.getByText("hidden OCR fixture", { exact: true })).toHaveCount(0);
+  await expect.poll(() => page.evaluate(() => (window as unknown as { __runTurnCalls: Array<{ request?: { input?: string } }> }).__runTurnCalls[0]?.request?.input)).toBe("");
+  await expect.poll(() => page.evaluate(() => (window as unknown as { __runTurnCalls: Array<{ attachments?: unknown[] }> }).__runTurnCalls[0]?.attachments?.length)).toBe(1);
+  await expect.poll(() => page.evaluate(() => (window as unknown as { __runTurnCalls: Array<{ attachments?: Array<{ ocrText?: string }> }> }).__runTurnCalls[0]?.attachments?.[0]?.ocrText)).toBe("hidden OCR fixture");
+  await page.screenshot({ path: testInfo.outputPath("image-attachment-in-user-message.png"), fullPage: true });
+
+  await page.evaluate(() => localStorage.setItem("kcoder_e2e_thread_detail", JSON.stringify({
+    schemaVersion: 1,
+    summary: { schemaVersion: 1, id: "thread-1", title: "Phase 6 workbench", createdAtMs: 1, updatedAtMs: 2, archived: false },
+    messages: [{
+      schemaVersion: 1,
+      id: "message-image-history",
+      role: "user",
+      content: [
+        { type: "context", text: "请分析用户提供的图片。" },
+        { type: "context", text: "[图片文字识别: ocr-fixture.png]\nhidden OCR fixture" },
+        { type: "image", name: "ocr-fixture.png", dataUrl: "data:image/png;base64,iVBORw0KGgo=" },
+      ],
+      createdAtMs: 1,
+    }],
+    messageTurnIds: {},
+    turnUserMessageIds: {},
+    lastTurn: null,
+    toolActivities: [],
+    turnTimeline: [],
+    approvals: [],
+    userInputs: [],
+    changes: [],
+    todos: [],
+    lastUsage: null,
+  })));
+  await page.reload();
+  await expect(imageMessage.getByText("ocr-fixture.png", { exact: true })).toBeVisible();
+  await expect(imageMessage.locator(".message-content")).toHaveCount(0);
+  await expect(page.getByText("hidden OCR fixture", { exact: true })).toHaveCount(0);
+});
+
 test("queues concurrent approvals and drops an expired request", async ({ page }) => {
   await page.goto("/");
   await expect(page.getByRole("heading", { name: "Phase 6 workbench" })).toBeVisible();
@@ -388,7 +577,7 @@ test("queues concurrent approvals and drops an expired request", async ({ page }
   await expect(page.getByText(/approval request was not found/)).toHaveCount(0);
 });
 
-test("streams progress and tools in event order before the turn completes", async ({ page }) => {
+test("streams progress and tools in event order before the turn completes", async ({ page }, testInfo) => {
   await page.goto("/");
   const emit = (event: Record<string, unknown>) => page.evaluate((payload) => {
     (window as unknown as { __emitAgentEvent: (value: unknown) => void }).__emitAgentEvent(payload);
@@ -396,27 +585,34 @@ test("streams progress and tools in event order before the turn completes", asyn
   const base = { schemaVersion: 1, threadId: "thread-1", turnId: "turn-live" };
 
   await emit({ ...base, type: "turn_started", phase: "exploring" });
-  await emit({ ...base, type: "text_delta", phase: "planning", delta: "我先读取工作区结构。" });
+  await emit({ ...base, type: "text_delta", phase: "planning", delta: "我先读取入口文件。" });
   await emit({
     ...base,
     type: "tool_started",
     phase: "executing",
-    call: { id: "call-live", name: "list_directory", arguments: { path: "src" }, metadata: {} },
+    call: { id: "call-live", name: "read_file", arguments: { path: "src/App.tsx", startLine: 3370, lineCount: 50 }, metadata: {} },
   });
 
   const liveMessage = page.locator(".message--assistant").last();
-  await expect(liveMessage.getByText("我先读取工作区结构。", { exact: true })).toBeVisible();
-  await expect(liveMessage.locator(".turn-timeline-tool--running").getByText("查看目录", { exact: true })).toBeVisible();
+  await expect(liveMessage.getByText("我先读取入口文件。", { exact: true })).toBeVisible();
+  await expect(liveMessage.locator(".turn-timeline-tool--running").getByText("正在读取文件", { exact: true })).toBeVisible();
+  await expect(liveMessage.locator(".turn-tool-meta > span").getByText("src/App.tsx · 第 3370-3419 行", { exact: true })).toBeVisible();
+  await expect(liveMessage.locator(".turn-timeline-tool--running .turn-tool-running")).toBeVisible();
+  await expect(liveMessage.locator(".turn-execution > summary")).toHaveCount(0);
+  await expect(liveMessage.locator(".message-avatar")).toHaveCount(0);
+  await page.screenshot({ path: testInfo.outputPath("active-file-read.png"), fullPage: true });
 
   await emit({
     ...base,
     type: "tool_completed",
     phase: "executing",
     callId: "call-live",
-    name: "list_directory",
-    result: { success: true, output: "src/App.tsx", metadata: {} },
+    name: "read_file",
+    result: { success: true, output: "export function App() {}", metadata: { path: "src/App.tsx", bytesReturned: 24, startLine: 3370, endLine: 3382 } },
   });
-  await emit({ ...base, type: "text_delta", phase: "planning", delta: "结构已读取。" });
+  await expect(liveMessage.locator(".turn-tool-meta > span").getByText("src/App.tsx · 第 3370-3382 行", { exact: true })).toBeVisible();
+  await expect(liveMessage.getByText("思考中", { exact: true })).toBeVisible();
+  await emit({ ...base, type: "text_delta", phase: "planning", delta: "入口文件已读取。" });
   await emit({
     ...base,
     type: "turn_completed",
@@ -425,15 +621,56 @@ test("streams progress and tools in event order before the turn completes", asyn
       schemaVersion: 1,
       id: "message-live",
       role: "assistant",
-      content: [{ type: "text", text: "结构已读取。" }],
+      content: [{ type: "text", text: "入口文件已读取。" }],
       createdAtMs: 5,
     },
     usage: null,
+    startedAtMs: 1000,
+    completedAtMs: 5200,
+    durationMs: 4200,
   });
 
-  await expect(liveMessage.locator(".turn-timeline-tool--completed").getByText("查看目录", { exact: true })).toBeVisible();
-  await expect(liveMessage.getByText("结构已读取。", { exact: true })).toBeVisible();
-  await expect(liveMessage.locator(".turn-timeline > *")).toHaveCount(4);
+  await expect(liveMessage.getByText("入口文件已读取。", { exact: true })).toBeVisible();
+  await expect(liveMessage.getByText("执行了 4.2s", { exact: true })).toBeVisible();
+  await expect(liveMessage.locator(".turn-timeline-tool--completed").getByText("读取文件", { exact: true })).toBeHidden();
+  await liveMessage.getByText("执行了 4.2s", { exact: true }).click();
+  await expect(liveMessage.locator(".turn-timeline-tool--completed").getByText("读取文件", { exact: true })).toBeVisible();
+  await expect(liveMessage.locator(".turn-timeline > *")).toHaveCount(3);
+});
+
+test("shows the backend error instead of failed tool arguments", async ({ page }) => {
+  await page.goto("/");
+  const emit = (event: Record<string, unknown>) => page.evaluate((payload) => {
+    (window as unknown as { __emitAgentEvent: (value: unknown) => void }).__emitAgentEvent(payload);
+  }, event);
+  const base = { schemaVersion: 1, threadId: "thread-1", turnId: "turn-tool-failure" };
+  const error = "tool execution denied: the tool is not allowed by the workspace policy";
+
+  await emit({ ...base, type: "turn_started", phase: "exploring" });
+  await emit({
+    ...base,
+    type: "tool_started",
+    phase: "executing",
+    call: {
+      id: "call-search-failure",
+      name: "search_repository",
+      arguments: { query: "workbench--panel-open" },
+      metadata: {},
+    },
+  });
+  await emit({
+    ...base,
+    type: "tool_completed",
+    phase: "executing",
+    callId: "call-search-failure",
+    name: "search_repository",
+    result: { success: false, output: error, metadata: { error: true } },
+  });
+
+  const failedTool = page.locator(".message--assistant").last().locator(".turn-timeline-tool--failed");
+  await expect(failedTool.getByText("搜索代码", { exact: true })).toBeVisible();
+  await expect(failedTool.getByText(error, { exact: true })).toBeVisible();
+  await expect(failedTool.getByText("workbench--panel-open", { exact: true })).toHaveCount(0);
 });
 
 test("completes and restores an approved edit test repair workflow", async ({ page }, testInfo) => {
@@ -517,10 +754,15 @@ test("completes and restores an approved edit test repair workflow", async ({ pa
     phase: "complete",
     message: { schemaVersion: 1, id: "message-self-edit", role: "assistant", content: [{ type: "text", text: "修复完成，测试已经通过。" }], createdAtMs: 3 },
     usage: null,
+    startedAtMs: 1000,
+    completedAtMs: 126000,
+    durationMs: 125000,
   });
 
   const liveMessage = page.locator(".message--assistant").last();
   await expect(liveMessage.locator(".turn-timeline-tool")).toHaveCount(5);
+  await expect(liveMessage.locator(".turn-timeline-tool").first()).toBeHidden();
+  await liveMessage.getByText("执行了 2分05秒", { exact: true }).click();
   await expect(liveMessage.getByText("测试失败，修正实现后重新验证。", { exact: true })).toBeVisible();
   await expect(liveMessage.locator(".turn-tool-output-line--stderr")).toHaveText("test failed\n");
   await expect(liveMessage.getByText("修复完成，测试已经通过。", { exact: true })).toHaveCount(1);
@@ -536,6 +778,7 @@ test("completes and restores an approved edit test repair workflow", async ({ pa
     { type: "tool", activity: { turnId: "turn-self-edit", call: repairPatchCall, state: "completed", result: result(true, "applied") } },
     { type: "tool", activity: { turnId: "turn-self-edit", call: passedTestCall, state: "completed", result: result(true, "all tests passed") } },
     { type: "text", id: "message-self-edit", turnId: "turn-self-edit", text: "修复完成，测试已经通过。" },
+    { type: "event", itemId: "turn-completed-turn-self-edit", turnId: "turn-self-edit", kind: "turn_completed", title: "Turn 已完成", detail: null, durationMs: 125000 },
   ];
   await page.evaluate((detail) => localStorage.setItem("kcoder_e2e_thread_detail", JSON.stringify(detail)), {
     schemaVersion: 1,
@@ -555,6 +798,8 @@ test("completes and restores an approved edit test repair workflow", async ({ pa
 
   const restoredMessage = page.locator(".message--assistant").last();
   await expect(restoredMessage.locator(".turn-timeline-tool")).toHaveCount(5);
+  await expect(restoredMessage.locator(".turn-timeline-tool").first()).toBeHidden();
+  await restoredMessage.getByText("执行了 2分05秒", { exact: true }).click();
   await expect(restoredMessage.locator(".turn-tool-output-line--stderr")).toHaveText("test failed\n");
   await expect(restoredMessage.getByText("修复完成，测试已经通过。", { exact: true })).toHaveCount(1);
   await expect(restoredMessage.locator(".changes-toggle")).toContainText("2 个文件");
@@ -672,28 +917,35 @@ test("replays live events received while a thread snapshot is loading", async ({
   await expect(page.getByText("live event survived snapshot hydration", { exact: true })).toBeVisible();
 });
 
-test("shows and starts bounded subagent activity", async ({ page }) => {
+test("shows and starts subagent activity without a default token budget", async ({ page }) => {
   await page.goto("/");
-  await page.getByRole("button", { name: "切换子智能体面板" }).click();
+  await page.getByRole("button", { name: "子智能体", exact: true }).click();
   await page.getByRole("button", { name: /检查后端/ }).click();
   await expect(page.getByText("后端检查完成", { exact: true })).toBeVisible();
+  await expect(page.getByText("420 / 无上限 tokens", { exact: true })).toBeVisible();
   await page.getByRole("button", { name: "创建新任务" }).click();
   await page.getByLabel("子任务描述").fill("检查测试");
   await page.getByRole("button", { name: "启动" }).click();
   await expect(page.getByRole("button", { name: /检查测试/ })).toBeVisible();
   await expect.poll(() => page.evaluate(() => (window as unknown as { __invoked: string[] }).__invoked.includes("create_subagent"))).toBe(true);
+  await expect.poll(() => page.evaluate(() => {
+    const args = (window as unknown as { __invocationArgs: Record<string, { request?: Record<string, unknown> }> }).__invocationArgs.create_subagent;
+    return args?.request && Object.prototype.hasOwnProperty.call(args.request, "tokenBudget");
+  })).toBe(false);
 });
 
-test("shows a bounded goal with visible budget and controls", async ({ page }, testInfo) => {
+test("shows unbounded goal token consumption and controls", async ({ page }, testInfo) => {
   await page.goto("/");
   const goal = page.locator(".goal-slim");
-  await expect(goal).toContainText("24,000 / 100,000 tokens");
+  await expect(goal).toContainText("24,000 / 无上限 tokens");
+  await expect(goal.locator(".goal-slim-track")).toHaveCount(0);
   await goal.click();
 
   const dialog = page.getByRole("dialog", { name: "设置" });
   await expect(dialog.getByRole("heading", { name: "目标与预算" })).toBeVisible();
   await expect(dialog).toContainText("完成 Phase 9 高级智能体能力");
-  await expect(dialog).toContainText("24,000 / 100,000 tokens");
+  await expect(dialog).toContainText("24,000 / 无上限 tokens");
+  await expect(dialog.locator(".goal-progress")).toHaveCount(0);
   await dialog.getByRole("button", { name: "暂停" }).click();
   await expect.poll(() => page.evaluate(() => (window as unknown as { __invoked: string[] }).__invoked.includes("transition_goal"))).toBe(true);
   await page.screenshot({ path: testInfo.outputPath(`goal-${testInfo.project.name}.png`), fullPage: true });
@@ -779,6 +1031,7 @@ test("switches the runtime approval mode from the composer", async ({ page }, te
       },
     });
   });
+  await page.locator(".message--activity-only").last().locator(".turn-execution > summary").click();
   await expect(page.getByText("已自动批准操作", { exact: true })).toBeVisible();
   await expect(page.locator(".message--approval")).toHaveCount(0);
   await trigger.click();
@@ -868,7 +1121,7 @@ test("colors file formats and wires complete Git actions", async ({ page }, test
     };
   });
 
-  await page.getByRole("button", { name: "切换工作台面板" }).click();
+  await page.getByRole("button", { name: "工作台", exact: true }).click();
   await page.getByRole("button", { name: "刷新文件树" }).click();
   await expect(page.locator(".file-type-icon--typescript")).toBeVisible();
   await expect(page.locator(".file-type-icon--json")).toBeVisible();

@@ -237,6 +237,8 @@ pub enum TurnTimelineItem {
         kind: TimelineEventKind,
         title: String,
         detail: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        duration_ms: Option<u64>,
     },
 }
 
@@ -521,6 +523,7 @@ fn project_thread(thread_id: &str, events: &[StoredEvent]) -> Result<ThreadDetai
     let mut changes: Vec<ChangeSet> = Vec::new();
     let mut todos: Vec<TodoItem> = Vec::new();
     let mut last_usage: Option<TokenUsage> = None;
+    let mut turn_started_at_ms = HashMap::<String, u64>::new();
     let mut updated_at_ms = created.1;
 
     for event in events {
@@ -533,7 +536,7 @@ fn project_thread(thread_id: &str, events: &[StoredEvent]) -> Result<ThreadDetai
         match &event.kind {
             StoredEventKind::UserMessage { message } => {
                 if title == "新会话" && message.role == MessageRole::User {
-                    title = title_from_message(&message.text());
+                    title = title_from_message(&message.visible_text());
                 }
                 if let Some(turn_id) = &event.turn_id {
                     message_turn_ids.insert(message.id.clone(), turn_id.clone());
@@ -811,6 +814,7 @@ fn project_thread(thread_id: &str, events: &[StoredEvent]) -> Result<ThreadDetai
             }
             StoredEventKind::TurnStarted => {
                 if let Some(turn_id) = &event.turn_id {
+                    turn_started_at_ms.insert(turn_id.clone(), event.created_at_ms);
                     last_usage = None;
                     if let Some(message_id) = &latest_user_message_id {
                         turn_user_message_ids.insert(turn_id.clone(), message_id.clone());
@@ -826,22 +830,24 @@ fn project_thread(thread_id: &str, events: &[StoredEvent]) -> Result<ThreadDetai
                 if usage.is_some() {
                     last_usage = *usage;
                 }
-                push_timeline_event(
+                push_timeline_event_with_duration(
                     &mut turn_timeline,
                     event,
                     TimelineEventKind::TurnCompleted,
                     "Turn 已完成",
                     None,
+                    turn_duration_ms(&turn_started_at_ms, event),
                 );
                 update_turn(&mut last_turn, event, TurnState::Completed, None)
             }
             StoredEventKind::TurnFailed { message } => {
-                push_timeline_event(
+                push_timeline_event_with_duration(
                     &mut turn_timeline,
                     event,
                     TimelineEventKind::TurnFailed,
                     "Turn 执行失败",
                     Some(message.clone()),
+                    turn_duration_ms(&turn_started_at_ms, event),
                 );
                 update_turn(
                     &mut last_turn,
@@ -851,12 +857,13 @@ fn project_thread(thread_id: &str, events: &[StoredEvent]) -> Result<ThreadDetai
                 )
             }
             StoredEventKind::TurnCancelled => {
-                push_timeline_event(
+                push_timeline_event_with_duration(
                     &mut turn_timeline,
                     event,
                     TimelineEventKind::TurnCancelled,
                     "Turn 已取消",
                     None,
+                    turn_duration_ms(&turn_started_at_ms, event),
                 );
                 update_turn(&mut last_turn, event, TurnState::Cancelled, None)
             }
@@ -898,6 +905,17 @@ fn push_timeline_event(
     title: impl Into<String>,
     detail: Option<String>,
 ) {
+    push_timeline_event_with_duration(timeline, event, kind, title, detail, None);
+}
+
+fn push_timeline_event_with_duration(
+    timeline: &mut Vec<TurnTimelineItem>,
+    event: &StoredEvent,
+    kind: TimelineEventKind,
+    title: impl Into<String>,
+    detail: Option<String>,
+    duration_ms: Option<u64>,
+) {
     let Some(turn_id) = &event.turn_id else {
         return;
     };
@@ -929,7 +947,16 @@ fn push_timeline_event(
         kind,
         title: bound_timeline_text(title.into()),
         detail: detail.map(bound_timeline_text),
+        duration_ms,
     });
+}
+
+fn turn_duration_ms(started_at: &HashMap<String, u64>, event: &StoredEvent) -> Option<u64> {
+    event
+        .turn_id
+        .as_ref()
+        .and_then(|turn_id| started_at.get(turn_id))
+        .map(|started_at_ms| event.created_at_ms.saturating_sub(*started_at_ms))
 }
 
 fn bound_timeline_text(value: String) -> String {
@@ -984,6 +1011,10 @@ fn update_turn(
 }
 
 fn title_from_message(message: &str) -> String {
+    let message = message
+        .split("\n\n[图片文字识别:")
+        .next()
+        .unwrap_or(message);
     let normalized = message.split_whitespace().collect::<Vec<_>>().join(" ");
     let mut chars = normalized.chars();
     let title = chars.by_ref().take(28).collect::<String>();
@@ -1032,12 +1063,16 @@ mod tests {
             .create_thread()
             .await
             .expect("thread should be created");
+        let mut user_message = message(MessageRole::User, "Explain this repository");
+        user_message.content.push(ContentBlock::Context {
+            text: "\n\n[图片文字识别: image.png]\nhidden text".into(),
+        });
         repository
             .append(StoredEvent::new(
                 &thread.id,
                 None,
                 StoredEventKind::UserMessage {
-                    message: message(MessageRole::User, "Explain this repository"),
+                    message: user_message,
                 },
             ))
             .await
@@ -1373,7 +1408,7 @@ mod tests {
             created_at_ms: now_ms(),
             expires_at_ms: now_ms() + 60_000,
         };
-        for kind in [
+        for (index, kind) in [
             StoredEventKind::UserMessage {
                 message: message(MessageRole::User, "先规划"),
             },
@@ -1382,11 +1417,13 @@ mod tests {
                 request: request.clone(),
             },
             StoredEventKind::TurnCancelled,
-        ] {
-            repository
-                .append(StoredEvent::new(&thread.id, Some(turn_id.clone()), kind))
-                .await
-                .unwrap();
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut event = StoredEvent::new(&thread.id, Some(turn_id.clone()), kind);
+            event.created_at_ms = 10_000 + index as u64 * 25;
+            repository.append(event).await.unwrap();
         }
 
         let detail = repository.read_thread(&thread.id).await.unwrap();
@@ -1406,6 +1443,7 @@ mod tests {
                 },
                 TurnTimelineItem::Event {
                     kind: TimelineEventKind::TurnCancelled,
+                    duration_ms: Some(50),
                     ..
                 },
             ]

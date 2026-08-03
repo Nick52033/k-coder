@@ -114,7 +114,7 @@ interface WorkbenchState {
   deleteProvider: (providerId: string) => Promise<boolean>;
   setApprovalMode: (mode: ApprovalMode) => Promise<boolean>;
   setReasoningEffort: (effort: ReasoningEffort) => Promise<boolean>;
-  createActiveGoal: (objective: string, tokenBudget: number, timeBudgetMs: number) => Promise<boolean>;
+  createActiveGoal: (objective: string, tokenBudget: number | null, timeBudgetMs: number) => Promise<boolean>;
   transitionActiveGoal: (state: GoalState, reason?: string) => Promise<boolean>;
   resolvePendingApproval: (resolution: ApprovalResolution) => Promise<boolean>;
   resolvePendingUserInput: (resolution: UserInputResolution) => Promise<boolean>;
@@ -132,6 +132,9 @@ function toConversationMessage(message: ChatMessage, turnId?: string): Conversat
       .filter((block) => block.type === "text")
       .map((block) => block.text)
       .join(""),
+    attachments: message.content
+      .filter((block) => block.type === "image")
+      .map((block) => ({ name: block.name, dataUrl: block.dataUrl })),
     createdAtMs: message.createdAtMs,
     turnId,
   };
@@ -207,9 +210,10 @@ function appendTimelineEvent(
   kind: TimelineEventKind,
   title: string,
   detail: string | null = null,
+  durationMs?: number,
 ) {
   if (timeline.some((item) => item.type === "event" && item.itemId === itemId)) return timeline;
-  return [...timeline, { type: "event" as const, itemId, turnId, kind, title, detail }];
+  return [...timeline, { type: "event" as const, itemId, turnId, kind, title, detail, durationMs }];
 }
 
 let initializationPromise: Promise<void> | null = null;
@@ -472,7 +476,7 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
   sendMessage: async (input, attachments = [], agentMode) => {
     const threadId = get().activeThreadId;
     const text = input.trim();
-    if (!threadId || !text) return;
+    if (!threadId || (!text && attachments.length === 0)) return;
 
     // 创建队列项
     const queuedMessage: QueuedMessage = {
@@ -498,6 +502,7 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
           id: optimisticId,
           role: "user",
           text,
+          attachments: attachments.map(({ name, dataUrl }) => ({ name, dataUrl })),
           createdAtMs: Date.now(),
         },
       ],
@@ -625,7 +630,10 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
     const threadId = get().activeThreadId;
     if (!threadId || !get().activeTurnId) return;
     try {
-      const accepted = await cancelTurn(threadId);
+      const accepted = await Promise.race([
+        cancelTurn(threadId),
+        new Promise<boolean>((resolve) => window.setTimeout(() => resolve(false), 3_000)),
+      ]);
       if (!accepted) await get().selectThread(threadId);
     } catch (error) {
       set({ error: errorMessage(error) });
@@ -1134,7 +1142,9 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
             `turn-completed-${event.turnId}`,
             event.turnId,
             "turn_completed",
-            "Turn 已完成",
+            "任务完成",
+            null,
+            event.durationMs,
           );
           return {
           activeTurnId: null,
@@ -1184,6 +1194,7 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
             "turn_failed",
             "Turn 执行失败",
             event.message,
+            event.durationMs,
           ),
         }));
         // 5秒后自动清除错误提示，避免错误一直显示
@@ -1195,28 +1206,49 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
         setTimeout(() => get().processQueue(), 500);
         break;
       case "turn_cancelled":
-        set((state) => ({
-          activeTurnId: null,
-          activeTurnThreadId: null,
-          activityStatus: null,
-          pendingApproval: null,
-          pendingApprovals: [],
-          pendingUserInput: null,
-          pendingUserInputs: [],
-          lastTurn: { turnId: event.turnId, state: "cancelled", error: null },
-          messages: state.messages.map((message) =>
-            message.turnId === event.turnId
-              ? { ...message, status: "cancelled" as const }
-              : message,
-          ),
-          turnTimeline: appendTimelineEvent(
-            state.turnTimeline,
-            `turn-cancelled-${event.turnId}`,
-            event.turnId,
-            "turn_cancelled",
-            "Turn 已取消",
-          ),
-        }));
+        set((state) => {
+          const cancelledAtMs = Date.now();
+          return {
+            activeTurnId: null,
+            activeTurnThreadId: null,
+            activityStatus: null,
+            pendingApproval: null,
+            pendingApprovals: [],
+            pendingUserInput: null,
+            pendingUserInputs: [],
+            lastTurn: { turnId: event.turnId, state: "cancelled", error: null },
+            messages: state.messages.map((message) =>
+              message.turnId === event.turnId
+                ? { ...message, status: "cancelled" as const }
+                : message,
+            ),
+            turnTimeline: appendTimelineEvent(
+              state.turnTimeline.map((item) =>
+                item.type === "tool"
+                  && item.activity.turnId === event.turnId
+                  && item.activity.state === "running"
+                  ? {
+                    ...item,
+                    activity: {
+                      ...item.activity,
+                      state: "cancelled",
+                      completedAtMs: cancelledAtMs,
+                      durationMs: item.activity.startedAtMs
+                        ? Math.max(0, cancelledAtMs - item.activity.startedAtMs)
+                        : undefined,
+                    },
+                  }
+                  : item,
+              ),
+              `turn-cancelled-${event.turnId}`,
+              event.turnId,
+              "turn_cancelled",
+              "Turn 已取消",
+              null,
+              event.durationMs,
+            ),
+          };
+        });
         setTimeout(() => get().processQueue(), 500);
         break;
       case "todo_updated":

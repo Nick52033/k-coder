@@ -9,9 +9,23 @@ export interface RuntimeStatus {
 export interface ProjectRecord { id: string; name: string; path: string; trusted: boolean; lastOpenedAtMs: number; }
 export interface WorkspaceState { current: ProjectRecord; recent: ProjectRecord[]; }
 export interface FileEntry { name: string; path: string; isDirectory: boolean; size: number | null; modifiedAtMs: number | null; }
-export interface FilePreview { path: string; name: string; language: string; content: string | null; dataUrl: string | null; size: number; truncated: boolean; }
-export interface AttachmentContent { path: string; name: string; kind: "image" | "document"; content: string; size: number; truncated: boolean; }
-export interface ImageAttachment { name: string; dataUrl: string; }
+export interface FilePreview { path: string; name: string; language: string; content: string | null; dataUrl: string | null; size: number; truncated: boolean; editable: boolean; contentHash: string | null; }
+export interface SaveWorkspaceFileRequest { path: string; content: string; expectedHash: string; }
+export type OcrStatus = "processing" | "complete" | "failed";
+export interface AttachmentContent {
+  path: string;
+  name: string;
+  kind: "image" | "document";
+  content: string;
+  size: number;
+  truncated: boolean;
+  ocrStatus?: OcrStatus;
+  ocrText?: string;
+  ocrLineCount?: number;
+  ocrDurationMs?: number;
+  ocrError?: string;
+}
+export interface ImageAttachment { name: string; dataUrl: string; ocrText?: string; }
 export interface GitFileStatus { path: string; indexStatus: string; worktreeStatus: string; }
 export interface GitStatusView { isRepository: boolean; branch: string | null; upstream: string | null; ahead: number; behind: number; files: GitFileStatus[]; }
 export interface GitBranchView { current: string | null; branches: string[]; }
@@ -46,7 +60,7 @@ export interface SubagentView {
   depth: number;
   workspaceRoot: string;
   capabilities: string[];
-  tokenBudget: number;
+  tokenBudget: number | null;
   tokensUsed: number;
   timeoutMs: number;
   createdAtMs: number;
@@ -163,7 +177,12 @@ export interface ImageContentBlock {
   dataUrl: string;
 }
 
-export type ContentBlock = TextContentBlock | ImageContentBlock;
+export interface ContextContentBlock {
+  type: "context";
+  text: string;
+}
+
+export type ContentBlock = TextContentBlock | ImageContentBlock | ContextContentBlock;
 
 export interface ChatMessage {
   schemaVersion: number;
@@ -304,7 +323,7 @@ export interface ToolResult {
 export interface ToolActivity {
   turnId: string;
   call: ToolCall;
-  state: "running" | "completed" | "failed";
+  state: "running" | "completed" | "failed" | "cancelled";
   result: ToolResult | null;
   outputChunks?: ToolOutputDelta[];
   startedAtMs?: number;
@@ -335,7 +354,7 @@ export type TurnTimelineItem =
   | { type: "text"; id: string; turnId: string; text: string }
   | { type: "reasoning"; itemId: string; turnId: string; summary: string; complete?: boolean }
   | { type: "tool"; activity: ToolActivity }
-  | { type: "event"; itemId: string; turnId: string; kind: TimelineEventKind; title: string; detail: string | null };
+  | { type: "event"; itemId: string; turnId: string; kind: TimelineEventKind; title: string; detail: string | null; durationMs?: number };
 
 export type ProviderKind = "open_ai_compatible";
 export type ProviderTransport =
@@ -400,10 +419,10 @@ export interface PlanUpdateRequest { threadId: string; steps: Array<{ id?: strin
 export type GoalState = "active" | "paused" | "blocked" | "completed" | "budget_exhausted";
 export interface GoalView {
   schemaVersion: number; id: string; threadId: string; objective: string; state: GoalState;
-  tokenBudget: number; tokensUsed: number; timeBudgetMs: number; elapsedMs: number;
+  tokenBudget: number | null; tokensUsed: number; timeBudgetMs: number; elapsedMs: number;
   reason: string | null; createdAtMs: number; updatedAtMs: number; revision: number;
 }
-export interface CreateGoalRequest { threadId: string; objective: string; tokenBudget: number; timeBudgetMs: number; }
+export interface CreateGoalRequest { threadId: string; objective: string; tokenBudget: number | null; timeBudgetMs: number; }
 
 export interface SearchResult { path: string; line: number; column: number; preview: string; score: number; }
 export interface MemorySettings { enabled: boolean; }
@@ -422,6 +441,9 @@ export interface TurnOutcome {
   turnId: string;
   state: TurnState;
   error: string | null;
+  startedAtMs: number;
+  completedAtMs: number;
+  durationMs: number;
 }
 
 interface EventBase {
@@ -472,9 +494,12 @@ export type AgentEvent =
       type: "turn_completed";
       message: ChatMessage;
       usage: TokenUsage | null;
+      startedAtMs: number;
+      completedAtMs: number;
+      durationMs: number;
     })
-  | (EventBase & { type: "turn_failed"; message: string })
-  | (EventBase & { type: "turn_cancelled" })
+  | (EventBase & { type: "turn_failed"; message: string; startedAtMs: number; completedAtMs: number; durationMs: number })
+  | (EventBase & { type: "turn_cancelled"; startedAtMs: number; completedAtMs: number; durationMs: number })
   | (EventBase & { type: "user_input_requested"; request: UserInputRequest })
   | (EventBase & {
       type: "user_input_resolved";
@@ -487,6 +512,7 @@ export interface ConversationMessage {
   id: string;
   role: MessageRole;
   text: string;
+  attachments?: ImageAttachment[];
   createdAtMs: number;
   turnId?: string;
   status?: "streaming" | "failed" | "cancelled";

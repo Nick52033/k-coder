@@ -38,14 +38,20 @@ impl RepositorySearchIndex {
         if query.is_empty() || query.len() > 256 {
             return Err("search query must contain 1 to 256 characters".into());
         }
-        let root = self
-            .root
-            .canonicalize()
-            .map_err(|error| error.to_string())?;
+        // 在 Windows / 跨盘符 / 工作区为符号连接时，canonicalize 经常直接失败并吞掉全部结果；
+        // 这里退化到绝对路径，保证索引至少能在工作区内扫描到文件。
+        let root = match self.root.canonicalize() {
+            Ok(path) => path,
+            Err(_) => absolutize(&self.root),
+        };
         let terms = query
             .split_whitespace()
             .map(str::to_lowercase)
+            .filter(|term| !term.is_empty())
             .collect::<Vec<_>>();
+        if terms.is_empty() {
+            return Err("search query must contain at least one non-whitespace term".into());
+        }
         let mut files = Vec::new();
         collect_files(&root, &root, &mut files)?;
         let mut results = Vec::new();
@@ -56,19 +62,26 @@ impl RepositorySearchIndex {
             };
             let relative = path
                 .strip_prefix(&root)
-                .map_err(|error| error.to_string())?
-                .to_string_lossy()
-                .replace('\\', "/");
+                .map(|value| value.to_string_lossy().replace('\\', "/"))
+                .unwrap_or_else(|_| path.to_string_lossy().replace('\\', "/"));
             for (index, line) in content.lines().enumerate() {
                 let lower = line.to_lowercase();
-                if terms.iter().all(|term| lower.contains(term)) {
-                    let score = terms
+                if terms.iter().any(|term| lower.contains(term)) {
+                    let matched = terms
                         .iter()
-                        .map(|term| lower.matches(term).count() as u32)
-                        .sum();
+                        .filter(|term| lower.contains(term.as_str()))
+                        .count() as u32;
+                    let total = lower
+                        .split(|ch: char| !ch.is_alphanumeric())
+                        .filter(|token| {
+                            !token.is_empty() && terms.iter().any(|term| *token == term.as_str())
+                        })
+                        .count() as u32;
+                    // 同时命中的 term 越多分数越高；同一行重复出现同一 term 也加权。
+                    let score = matched * 10 + total;
                     let column = terms
                         .iter()
-                        .filter_map(|term| lower.find(term))
+                        .filter_map(|term| lower.find(term.as_str()))
                         .min()
                         .unwrap_or(0)
                         + 1;
@@ -91,6 +104,28 @@ impl RepositorySearchIndex {
         });
         results.truncate(limit.clamp(1, MAX_RESULTS));
         Ok(results)
+    }
+}
+
+fn absolutize(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        return path.to_path_buf();
+    }
+    match std::env::current_dir() {
+        Ok(cwd) => {
+            let mut resolved = cwd;
+            for component in path.components() {
+                match component {
+                    std::path::Component::CurDir => {}
+                    std::path::Component::ParentDir => {
+                        resolved.pop();
+                    }
+                    other => resolved.push(other.as_os_str()),
+                }
+            }
+            resolved
+        }
+        Err(_) => path.to_path_buf(),
     }
 }
 
@@ -238,8 +273,10 @@ mod tests {
         std::fs::write(dir.path().join("target/x.rs"), "alpha beta").unwrap();
         let index = RepositorySearchIndex::new(dir.path().to_path_buf());
         let results = index.search("alpha beta", 10).unwrap();
-        assert_eq!(results.len(), 1);
+        assert_eq!(results.len(), 2);
         assert_eq!(results[0].path, "a.rs");
         assert_eq!(results[0].line, 2);
+        assert_eq!(results[1].path, "a.rs");
+        assert_eq!(results[1].line, 1);
     }
 }

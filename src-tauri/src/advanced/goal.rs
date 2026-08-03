@@ -12,7 +12,6 @@ use crate::protocol::{PROTOCOL_VERSION, ToolDefinition, ToolResult};
 use crate::storage::now_ms;
 use crate::tools::{ToolContext, ToolError, ToolHandler};
 
-const MAX_GOAL_TOKENS: u64 = 2_000_000;
 const MAX_GOAL_TIME_MS: u64 = 24 * 60 * 60 * 1_000;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -39,7 +38,7 @@ pub struct GoalView {
     pub thread_id: String,
     pub objective: String,
     pub state: GoalState,
-    pub token_budget: u64,
+    pub token_budget: Option<u64>,
     pub tokens_used: u64,
     pub time_budget_ms: u64,
     pub elapsed_ms: u64,
@@ -54,7 +53,8 @@ pub struct GoalView {
 pub struct CreateGoalRequest {
     pub thread_id: String,
     pub objective: String,
-    pub token_budget: u64,
+    #[serde(default)]
+    pub token_budget: Option<u64>,
     pub time_budget_ms: u64,
 }
 
@@ -111,10 +111,8 @@ impl GoalStore {
                 "goal requires a thread and an objective of at most 2000 characters".into(),
             );
         }
-        if request.token_budget == 0 || request.token_budget > MAX_GOAL_TOKENS {
-            return Err(format!(
-                "goal token budget must contain 1 to {MAX_GOAL_TOKENS} tokens"
-            ));
+        if request.token_budget == Some(0) {
+            return Err("goal token budget must be greater than zero when provided".into());
         }
         if request.time_budget_ms == 0 || request.time_budget_ms > MAX_GOAL_TIME_MS {
             return Err(format!(
@@ -188,14 +186,15 @@ impl GoalStore {
         Ok(goal)
     }
 
-    pub fn turn_budget(&self, thread_id: &str) -> Result<Option<(String, u64)>, String> {
+    pub fn turn_budget(&self, thread_id: &str) -> Result<Option<(String, Option<u64>)>, String> {
         let Some(goal) = self.current(thread_id)? else {
             return Ok(None);
         };
         match goal.state {
             GoalState::Active => Ok(Some((
                 goal.id,
-                goal.token_budget.saturating_sub(goal.tokens_used),
+                goal.token_budget
+                    .map(|budget| budget.saturating_sub(goal.tokens_used)),
             ))),
             GoalState::Paused => Err("goal is paused".into()),
             GoalState::Blocked => Err("goal is blocked".into()),
@@ -221,10 +220,13 @@ impl GoalStore {
         }
         goal.tokens_used = goal.tokens_used.saturating_add(tokens);
         goal.elapsed_ms = goal.elapsed_ms.saturating_add(elapsed_ms);
-        if goal.tokens_used >= goal.token_budget || goal.elapsed_ms >= goal.time_budget_ms {
+        let token_budget_exhausted = goal
+            .token_budget
+            .is_some_and(|budget| goal.tokens_used >= budget);
+        if token_budget_exhausted || goal.elapsed_ms >= goal.time_budget_ms {
             goal.state = GoalState::BudgetExhausted;
             goal.reason = Some(
-                if goal.tokens_used >= goal.token_budget {
+                if token_budget_exhausted {
                     "token budget exhausted"
                 } else {
                     "time budget exhausted"
@@ -304,11 +306,11 @@ mod tests {
             .create(CreateGoalRequest {
                 thread_id: "thread".into(),
                 objective: "finish phase".into(),
-                token_budget: 100,
+                token_budget: Some(100),
                 time_budget_ms: 1_000,
             })
             .unwrap();
-        assert_eq!(store.turn_budget("thread").unwrap().unwrap().1, 100);
+        assert_eq!(store.turn_budget("thread").unwrap().unwrap().1, Some(100));
         let exhausted = store.record_turn(&goal.id, 100, 10).unwrap();
         assert_eq!(exhausted.state, GoalState::BudgetExhausted);
         assert!(
@@ -320,5 +322,36 @@ mod tests {
                 })
                 .is_err()
         );
+    }
+
+    #[test]
+    fn goal_without_token_budget_tracks_usage_until_time_exhaustion() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = GoalStore::new(dir.path()).unwrap();
+        let goal = store
+            .create(CreateGoalRequest {
+                thread_id: "thread".into(),
+                objective: "finish without a token cap".into(),
+                token_budget: None,
+                time_budget_ms: 1_000,
+            })
+            .unwrap();
+
+        assert_eq!(store.turn_budget("thread").unwrap().unwrap().1, None);
+        let active = store.record_turn(&goal.id, 2_500_000, 10).unwrap();
+        assert_eq!(active.state, GoalState::Active);
+        assert_eq!(active.tokens_used, 2_500_000);
+    }
+
+    #[test]
+    fn omitted_goal_token_budget_defaults_to_unlimited() {
+        let request: CreateGoalRequest = serde_json::from_value(json!({
+            "threadId": "thread",
+            "objective": "finish the task",
+            "timeBudgetMs": 1000
+        }))
+        .unwrap();
+
+        assert_eq!(request.token_budget, None);
     }
 }

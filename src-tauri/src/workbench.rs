@@ -1,9 +1,11 @@
 use std::collections::HashSet;
+use std::fmt::Write as _;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
 use base64::Engine;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::persistence::{ProjectRecord, ProjectionDb};
@@ -28,6 +30,8 @@ pub enum WorkbenchError {
     Invalid(String),
     #[error("workspace I/O failed: {0}")]
     Io(String),
+    #[error("workspace file changed: {0}")]
+    Conflict(String),
     #[error("Git operation failed: {0}")]
     Git(String),
     #[error("project registry failed: {0}")]
@@ -61,6 +65,16 @@ pub struct FilePreview {
     pub data_url: Option<String>,
     pub size: u64,
     pub truncated: bool,
+    pub editable: bool,
+    pub content_hash: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SaveWorkspaceFileRequest {
+    pub path: String,
+    pub content: String,
+    pub expected_hash: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -220,11 +234,14 @@ pub fn preview_file(root: &Path, relative: &str) -> Result<FilePreview, Workbenc
             )),
             size: metadata.len(),
             truncated: false,
+            editable: false,
+            content_hash: None,
         });
     }
     let bytes = std::fs::read(&path).map_err(|error| WorkbenchError::Io(error.to_string()))?;
     let truncated = bytes.len() > MAX_PREVIEW_BYTES;
     let end = bytes.len().min(MAX_PREVIEW_BYTES);
+    let editable = !truncated && std::str::from_utf8(&bytes).is_ok();
     let content = String::from_utf8_lossy(&bytes[..end]).to_string();
     Ok(FilePreview {
         path: relative.into(),
@@ -234,7 +251,51 @@ pub fn preview_file(root: &Path, relative: &str) -> Result<FilePreview, Workbenc
         data_url: None,
         size: metadata.len(),
         truncated,
+        editable,
+        content_hash: editable.then(|| hash_bytes(&bytes)),
     })
+}
+
+pub fn save_file(
+    root: &Path,
+    request: SaveWorkspaceFileRequest,
+) -> Result<FilePreview, WorkbenchError> {
+    if request.content.len() > MAX_PREVIEW_BYTES {
+        return Err(WorkbenchError::Invalid(format!(
+            "editable files are limited to {MAX_PREVIEW_BYTES} bytes"
+        )));
+    }
+    if request.expected_hash.is_empty() {
+        return Err(WorkbenchError::Invalid(
+            "expectedHash is required when saving a file".into(),
+        ));
+    }
+
+    let path = resolve(root, &request.path, false)?;
+    let current = std::fs::read(&path).map_err(|error| WorkbenchError::Io(error.to_string()))?;
+    if current.len() > MAX_PREVIEW_BYTES || std::str::from_utf8(&current).is_err() {
+        return Err(WorkbenchError::Invalid(
+            "only UTF-8 text files within the preview limit can be edited".into(),
+        ));
+    }
+    if hash_bytes(&current) != request.expected_hash {
+        return Err(WorkbenchError::Conflict(
+            "the file was modified after it was opened; reload it before saving".into(),
+        ));
+    }
+
+    std::fs::write(&path, request.content.as_bytes())
+        .map_err(|error| WorkbenchError::Io(error.to_string()))?;
+    preview_file(root, &request.path)
+}
+
+fn hash_bytes(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .fold(String::with_capacity(64), |mut output, byte| {
+            let _ = write!(output, "{byte:02x}");
+            output
+        })
 }
 
 pub fn extract_attachment(
@@ -632,6 +693,77 @@ mod tests {
             "rust"
         );
         assert!(preview_file(root.path(), "../outside").is_err());
+    }
+
+    #[test]
+    fn saves_utf8_files_with_an_optimistic_content_hash() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("notes.txt"), "before\n").unwrap();
+        let preview = preview_file(root.path(), "notes.txt").unwrap();
+
+        let saved = save_file(
+            root.path(),
+            SaveWorkspaceFileRequest {
+                path: "notes.txt".into(),
+                content: "after\n".into(),
+                expected_hash: preview.content_hash.unwrap(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(saved.content.as_deref(), Some("after\n"));
+        assert!(saved.editable);
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("notes.txt")).unwrap(),
+            "after\n"
+        );
+    }
+
+    #[test]
+    fn save_rejects_stale_hashes_without_overwriting_newer_content() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("notes.txt");
+        std::fs::write(&path, "first\n").unwrap();
+        let preview = preview_file(root.path(), "notes.txt").unwrap();
+        std::fs::write(&path, "external change\n").unwrap();
+
+        let result = save_file(
+            root.path(),
+            SaveWorkspaceFileRequest {
+                path: "notes.txt".into(),
+                content: "editor change\n".into(),
+                expected_hash: preview.content_hash.unwrap(),
+            },
+        );
+
+        assert!(matches!(result, Err(WorkbenchError::Conflict(_))));
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "external change\n");
+    }
+
+    #[test]
+    fn save_rejects_workspace_escape_and_non_utf8_files() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("binary.bin"), [0xff, 0xfe]).unwrap();
+
+        let escaped = save_file(
+            root.path(),
+            SaveWorkspaceFileRequest {
+                path: "../outside.txt".into(),
+                content: "nope".into(),
+                expected_hash: "hash".into(),
+            },
+        );
+        assert!(matches!(escaped, Err(WorkbenchError::Invalid(_))));
+
+        let binary = save_file(
+            root.path(),
+            SaveWorkspaceFileRequest {
+                path: "binary.bin".into(),
+                content: "text".into(),
+                expected_hash: hash_bytes(&[0xff, 0xfe]),
+            },
+        );
+        assert!(matches!(binary, Err(WorkbenchError::Invalid(_))));
     }
 
     #[test]

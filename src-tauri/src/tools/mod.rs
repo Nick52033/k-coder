@@ -239,6 +239,7 @@ impl ToolRegistry {
         hooks: Option<Arc<dyn ToolHookRunner>>,
     ) -> Result<Self, ToolError> {
         let mut registered = self.handlers.as_ref().clone();
+        let mut registered_risks = self.extension_risks.as_ref().clone();
         for handler in handlers {
             let definition = handler.definition();
             if registered.contains_key(&definition.name) {
@@ -253,16 +254,17 @@ impl ToolRegistry {
                     definition.name
                 ))
             })?;
-            if !risks.contains_key(&definition.name) {
-                return Err(ToolError::InvalidArguments(format!(
+            let risk = risks.get(&definition.name).copied().ok_or_else(|| {
+                ToolError::InvalidArguments(format!(
                     "extension tool is missing risk metadata: {}",
                     definition.name
-                )));
-            }
+                ))
+            })?;
+            registered_risks.insert(definition.name.clone(), risk);
             registered.insert(definition.name, handler);
         }
         self.handlers = Arc::new(registered);
-        self.extension_risks = Arc::new(risks);
+        self.extension_risks = Arc::new(registered_risks);
         self.hooks = hooks;
         Ok(self)
     }
@@ -524,9 +526,12 @@ impl Workspace {
 
 const DEFAULT_DIRECTORY_LIMIT: usize = 200;
 const MAX_DIRECTORY_LIMIT: usize = 500;
-const DEFAULT_READ_BYTES: usize = 128 * 1024;
+const DEFAULT_READ_BYTES: usize = 64 * 1024;
 const MAX_READ_BYTES: usize = 256 * 1024;
+const DEFAULT_READ_LINES: usize = 400;
+const MAX_READ_LINES: usize = 2_000;
 const MAX_FILE_SIZE_BYTES: u64 = 4 * 1024 * 1024;
+const COMMAND_CANCEL_GRACE_MS: u64 = 2_000;
 const IGNORED_NAMES: &[&str] = &[".git", "node_modules", "target", "dist", "build"];
 
 struct ListDirectoryTool;
@@ -619,14 +624,16 @@ impl ToolHandler for ReadFileTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "read_file".to_string(),
-            description: "Read a bounded text range from a file inside the current workspace."
+            description: "Read a bounded text range from a file inside the current workspace. Prefer startLine/lineCount for code inspection; offset/limit remain available for byte-precise reads."
                 .to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "path": { "type": "string", "minLength": 1 },
                     "offset": { "type": "integer", "minimum": 0 },
-                    "limit": { "type": "integer", "minimum": 1, "maximum": MAX_READ_BYTES }
+                    "limit": { "type": "integer", "minimum": 1, "maximum": MAX_READ_BYTES },
+                    "startLine": { "type": "integer", "minimum": 1 },
+                    "lineCount": { "type": "integer", "minimum": 1, "maximum": MAX_READ_LINES }
                 },
                 "required": ["path"],
                 "additionalProperties": false
@@ -641,8 +648,16 @@ impl ToolHandler for ReadFileTool {
         cancellation: CancellationToken,
     ) -> Result<ToolResult, ToolError> {
         let path = required_string(&arguments, "path")?;
-        let offset = optional_usize(&arguments, "offset")?.unwrap_or(0);
-        let limit = optional_usize(&arguments, "limit")?.unwrap_or(DEFAULT_READ_BYTES);
+        let byte_offset = optional_usize(&arguments, "offset")?;
+        let byte_limit = optional_usize(&arguments, "limit")?;
+        let requested_start_line = optional_usize(&arguments, "startLine")?;
+        let requested_line_count = optional_usize(&arguments, "lineCount")?;
+        let uses_line_range = requested_start_line.is_some() || requested_line_count.is_some();
+        if uses_line_range && (byte_offset.is_some() || byte_limit.is_some()) {
+            return Err(ToolError::InvalidArguments(
+                "startLine/lineCount cannot be combined with offset/limit".to_string(),
+            ));
+        }
         let workspace = Workspace::new(&context.workspace_root)?;
         let file = workspace.resolve_existing(path)?;
         if !file.is_file() {
@@ -665,17 +680,58 @@ impl ToolHandler for ReadFileTool {
         }
         .map_err(|error| ToolError::Execution(error.to_string()))?;
         let text = decode_text(&bytes)?;
+        let line_starts = line_start_offsets(&text);
+        let total_lines = line_starts.len();
+        let (offset, requested_end, start_line, output_limit) = if uses_line_range {
+            let start_line = requested_start_line.unwrap_or(1);
+            if start_line > total_lines {
+                return Err(ToolError::InvalidArguments(format!(
+                    "startLine must be within the decoded text (1..={total_lines})"
+                )));
+            }
+            let line_count = requested_line_count.unwrap_or(DEFAULT_READ_LINES);
+            let start_index = start_line - 1;
+            let end_index = start_index.saturating_add(line_count).min(total_lines);
+            let requested_end = line_starts.get(end_index).copied().unwrap_or(text.len());
+            let output_limit = if requested_line_count.is_some() {
+                MAX_READ_BYTES
+            } else {
+                DEFAULT_READ_BYTES
+            };
+            (
+                line_starts[start_index],
+                requested_end,
+                start_line,
+                output_limit,
+            )
+        } else {
+            let offset = byte_offset.unwrap_or(0);
+            if offset > text.len() || !text.is_char_boundary(offset) {
+                return Err(ToolError::InvalidArguments(
+                    "offset must be a valid UTF-8 byte boundary within the decoded text"
+                        .to_string(),
+                ));
+            }
+            let limit = byte_limit.unwrap_or(DEFAULT_READ_BYTES);
+            let start_line = text[..offset].bytes().filter(|byte| *byte == b'\n').count() + 1;
+            (offset, text.len(), start_line, limit)
+        };
         if offset > text.len() || !text.is_char_boundary(offset) {
             return Err(ToolError::InvalidArguments(
                 "offset must be a valid UTF-8 byte boundary within the decoded text".to_string(),
             ));
         }
-        let end_limit = offset.saturating_add(limit).min(text.len());
+        let end_limit = offset
+            .saturating_add(output_limit)
+            .min(requested_end)
+            .min(text.len());
         let mut end = end_limit;
         while end > offset && !text.is_char_boundary(end) {
             end -= 1;
         }
         let output = text[offset..end].to_string();
+        let lines_returned = output.lines().count();
+        let end_line = start_line.saturating_add(lines_returned.saturating_sub(1));
         Ok(ToolResult {
             success: true,
             output,
@@ -684,10 +740,23 @@ impl ToolHandler for ReadFileTool {
                 "offset": offset,
                 "bytesReturned": end - offset,
                 "totalBytes": text.len(),
-                "truncated": end < text.len()
+                "startLine": start_line,
+                "endLine": end_line,
+                "linesReturned": lines_returned,
+                "totalLines": total_lines,
+                "truncated": offset > 0 || end < text.len()
             }),
         })
     }
+}
+
+fn line_start_offsets(text: &str) -> Vec<usize> {
+    let mut offsets = vec![0];
+    offsets.extend(
+        text.char_indices()
+            .filter_map(|(index, value)| (value == '\n').then_some(index + 1)),
+    );
+    offsets
 }
 
 struct ApplyPatchTool {
@@ -842,8 +911,32 @@ impl ToolHandler for RunCommandTool {
                     }
                     _ = cancellation.cancelled() => {
                         let _ = self.runtime.cancel(&id).await;
-                        let _ = (&mut wait).await;
-                        let _ = self.runtime.close(&id).await;
+                        // The command watcher normally observes the cancellation and
+                        // terminates the process tree. Do not let a child that keeps
+                        // stdout/stderr open hold the whole Turn forever.
+                        let finished = tokio::time::timeout(
+                            std::time::Duration::from_millis(COMMAND_CANCEL_GRACE_MS),
+                            &mut wait,
+                        )
+                        .await
+                        .is_ok();
+                        if finished {
+                            let _ = self.runtime.close(&id).await;
+                        } else {
+                            let runtime = self.runtime.clone();
+                            let cleanup_id = id.clone();
+                            tokio::spawn(async move {
+                                let finished = tokio::time::timeout(
+                                    std::time::Duration::from_secs(10),
+                                    runtime.wait(&cleanup_id),
+                                )
+                                .await
+                                .is_ok();
+                                if finished {
+                                    let _ = runtime.close(&cleanup_id).await;
+                                }
+                            });
+                        }
                         return Err(ToolError::Cancelled);
                     }
                 }
@@ -1115,6 +1208,7 @@ fn decode_text(bytes: &[u8]) -> Result<String, ToolError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     struct ExtensionTestTool {
         name: String,
@@ -1252,6 +1346,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_command_cancellation_returns_without_waiting_for_a_stuck_child() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = CommandRuntime::new(directory.path()).unwrap();
+        let tool = RunCommandTool { runtime };
+        let cancellation = CancellationToken::new();
+        let tool_context = context(directory.path());
+        let arguments = if cfg!(windows) {
+            json!({
+                "program": "powershell",
+                "args": ["-NoProfile", "-Command", "Start-Sleep -Seconds 30"]
+            })
+        } else {
+            json!({ "program": "sleep", "args": ["30"] })
+        };
+        let task = tokio::spawn({
+            let cancellation = cancellation.clone();
+            async move { tool.execute(&tool_context, arguments, cancellation).await }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        cancellation.cancel();
+        let result = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("cancelled command should return promptly")
+            .unwrap();
+        assert!(matches!(result, Err(ToolError::Cancelled)));
+    }
+
+    #[tokio::test]
     async fn extension_tools_cannot_replace_builtins_and_use_host_risk_metadata() {
         let duplicate = Arc::new(ExtensionTestTool {
             name: "read_file".into(),
@@ -1309,6 +1431,41 @@ mod tests {
                 .await,
             Err(ToolError::ApprovalRequired(_))
         ));
+    }
+
+    #[test]
+    fn extension_registration_preserves_additional_risks_without_overriding_builtins() {
+        let additional_name = "search_repository".to_string();
+        let extension_name = "mcp__local__read".to_string();
+        let registry = ToolRegistry::read_only()
+            .with_additional_handlers(
+                vec![Arc::new(ExtensionTestTool {
+                    name: additional_name.clone(),
+                })],
+                HashMap::from([(additional_name.clone(), ToolRisk::Read)]),
+            )
+            .unwrap()
+            .with_extensions(
+                vec![Arc::new(ExtensionTestTool {
+                    name: extension_name.clone(),
+                })],
+                HashMap::from([
+                    (extension_name.clone(), ToolRisk::Read),
+                    ("read_file".to_string(), ToolRisk::External),
+                ]),
+                None,
+            )
+            .unwrap();
+
+        for (name, arguments) in [
+            (additional_name.as_str(), json!({})),
+            (extension_name.as_str(), json!({})),
+            ("read_file", json!({ "path": "README.md" })),
+        ] {
+            let authorization = registry.authorization(name, &arguments).unwrap();
+            assert_eq!(authorization.decision, PolicyDecision::Allow);
+            assert_eq!(authorization.risk, ToolRisk::Read);
+        }
     }
 
     #[tokio::test]
@@ -1392,6 +1549,79 @@ mod tests {
             .unwrap();
         assert_eq!(read.output, "hello");
         assert_eq!(read.metadata["truncated"], true);
+        assert_eq!(read.metadata["startLine"], 1);
+        assert_eq!(read.metadata["linesReturned"], 1);
+    }
+
+    #[tokio::test]
+    async fn read_file_prefers_bounded_line_ranges_and_keeps_byte_ranges_compatible() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(
+            workspace.path().join("lines.txt"),
+            "one\ntwo\nthree\nfour\n",
+        )
+        .unwrap();
+        let registry = ToolRegistry::read_only();
+
+        let lines = registry
+            .dispatch(
+                &context(workspace.path()),
+                "read_file",
+                json!({ "path": "lines.txt", "startLine": 2, "lineCount": 2 }),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(lines.output, "two\nthree\n");
+        assert_eq!(lines.metadata["startLine"], 2);
+        assert_eq!(lines.metadata["endLine"], 3);
+        assert_eq!(lines.metadata["linesReturned"], 2);
+        assert_eq!(lines.metadata["totalLines"], 5);
+
+        let bytes = registry
+            .dispatch(
+                &context(workspace.path()),
+                "read_file",
+                json!({ "path": "lines.txt", "offset": 4, "limit": 3 }),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bytes.output, "two");
+        assert_eq!(bytes.metadata["offset"], 4);
+        assert_eq!(bytes.metadata["startLine"], 2);
+    }
+
+    #[tokio::test]
+    async fn read_file_defaults_to_64_kib_and_rejects_mixed_range_units() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("large.txt"), "x".repeat(70 * 1024)).unwrap();
+        let registry = ToolRegistry::read_only();
+
+        let default_read = registry
+            .dispatch(
+                &context(workspace.path()),
+                "read_file",
+                json!({ "path": "large.txt" }),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(default_read.output.len(), 64 * 1024);
+        assert_eq!(default_read.metadata["bytesReturned"], 64 * 1024);
+        assert_eq!(default_read.metadata["truncated"], true);
+
+        let mixed = registry
+            .dispatch(
+                &context(workspace.path()),
+                "read_file",
+                json!({ "path": "large.txt", "offset": 0, "startLine": 1 }),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(
+            matches!(mixed, Err(ToolError::InvalidArguments(message)) if message.contains("cannot be combined"))
+        );
     }
 
     #[tokio::test]

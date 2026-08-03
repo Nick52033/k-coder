@@ -14,7 +14,7 @@ use super::{
     Provider, ProviderConfig, ProviderError, ProviderEvent, ProviderMessage, ProviderRequest,
     ProviderStream,
 };
-use crate::protocol::{MessageRole, TokenUsage, ToolCall};
+use crate::protocol::{MessageRole, ReasoningEffort, TokenUsage, ToolCall};
 
 pub struct GoogleGeminiProvider {
     client: Client,
@@ -42,6 +42,8 @@ struct GeminiResponsePart {
     text: Option<String>,
     function_call: Option<GeminiFunctionCall>,
     thought_signature: Option<String>,
+    #[serde(default)]
+    thought: bool,
 }
 
 #[derive(Deserialize)]
@@ -140,9 +142,8 @@ impl Provider for GoogleGeminiProvider {
                 })).collect::<Vec<_>>()
             }]);
         }
-        if let Some(thinking_budget) = request.reasoning_effort.gemini_budget_tokens() {
-            payload["generationConfig"] =
-                json!({ "thinkingConfig": { "thinkingBudget": thinking_budget } });
+        if let Some(thinking_config) = gemini_thinking_config(request.reasoning_effort) {
+            payload["generationConfig"] = json!({ "thinkingConfig": thinking_config });
         }
 
         let response = tokio::select! {
@@ -164,6 +165,8 @@ impl Provider for GoogleGeminiProvider {
         Ok(Box::pin(async_stream::stream! {
             let mut body = response.bytes_stream();
             let mut decoder = SseDecoder::default();
+            let reasoning_item_id = format!("gemini-reasoning-{}", Uuid::new_v4());
+            let mut reasoning_summary = String::new();
             loop {
                 let chunk = tokio::select! {
                     _ = cancellation.cancelled() => { yield Err(ProviderError::Cancelled); return; }
@@ -172,10 +175,24 @@ impl Provider for GoogleGeminiProvider {
                 match chunk {
                     Some(Ok(bytes)) => match decoder.push(&bytes) {
                         Ok(frames) => for frame in frames {
-                            match parse_sse_data(&frame) {
+                            match parse_sse_data(&frame, &reasoning_item_id) {
                                 Ok(parsed) => {
-                                    for event in parsed.events.into_iter().map(|event| redact_event(event, &secret)) { yield Ok(event); }
-                                    if parsed.completed { yield Ok(ProviderEvent::Completed); return; }
+                                    for event in parsed.events {
+                                        if let ProviderEvent::ReasoningSummaryDelta { delta, .. } = &event {
+                                            reasoning_summary.push_str(delta);
+                                        }
+                                        yield Ok(redact_event(event, &secret));
+                                    }
+                                    if parsed.completed {
+                                        if !reasoning_summary.is_empty() {
+                                            yield Ok(redact_event(ProviderEvent::ReasoningSummaryCompleted {
+                                                item_id: reasoning_item_id.clone(),
+                                                summary: reasoning_summary,
+                                            }, &secret));
+                                        }
+                                        yield Ok(ProviderEvent::Completed);
+                                        return;
+                                    }
                                 }
                                 Err(error) => { yield Err(redact_error(error, &secret)); return; }
                             }
@@ -188,6 +205,15 @@ impl Provider for GoogleGeminiProvider {
             }
         }))
     }
+}
+
+fn gemini_thinking_config(reasoning_effort: ReasoningEffort) -> Option<Value> {
+    reasoning_effort.gemini_budget_tokens().map(|budget| {
+        json!({
+            "thinkingBudget": budget,
+            "includeThoughts": true
+        })
+    })
 }
 
 fn gemini_contents(messages: &[ProviderMessage]) -> Vec<Value> {
@@ -239,7 +265,7 @@ fn gemini_contents(messages: &[ProviderMessage]) -> Vec<Value> {
         .collect()
 }
 
-fn parse_sse_data(data: &str) -> Result<ParsedGeminiEvent, ProviderError> {
+fn parse_sse_data(data: &str, reasoning_item_id: &str) -> Result<ParsedGeminiEvent, ProviderError> {
     let response: GeminiResponse = serde_json::from_str(data).map_err(|error| {
         ProviderError::InvalidResponse(format!("malformed Gemini event: {error}"))
     })?;
@@ -272,7 +298,14 @@ fn parse_sse_data(data: &str) -> Result<ParsedGeminiEvent, ProviderError> {
         if let Some(content) = &candidate.content {
             for part in &content.parts {
                 if let Some(delta) = part.text.clone().filter(|delta| !delta.is_empty()) {
-                    events.push(ProviderEvent::TextDelta { delta });
+                    if part.thought {
+                        events.push(ProviderEvent::ReasoningSummaryDelta {
+                            item_id: reasoning_item_id.to_string(),
+                            delta,
+                        });
+                    } else {
+                        events.push(ProviderEvent::TextDelta { delta });
+                    }
                 }
                 if let Some(call) = &part.function_call {
                     events.push(ProviderEvent::ToolCall {
@@ -336,7 +369,11 @@ mod tests {
 
     #[test]
     fn parses_text_usage_and_function_calls() {
-        let parsed = parse_sse_data(r#"{"candidates":[{"content":{"parts":[{"text":"hello"},{"functionCall":{"id":"call-1","name":"read_file","args":{"path":"README.md"}},"thoughtSignature":"opaque"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":3,"candidatesTokenCount":2}}"#).unwrap();
+        let parsed = parse_sse_data(
+            r#"{"candidates":[{"content":{"parts":[{"text":"hello"},{"functionCall":{"id":"call-1","name":"read_file","args":{"path":"README.md"}},"thoughtSignature":"opaque"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":3,"candidatesTokenCount":2}}"#,
+            "reasoning-1",
+        )
+        .unwrap();
         assert!(
             matches!(&parsed.events[0], ProviderEvent::TextDelta { delta } if delta == "hello")
         );
@@ -347,6 +384,37 @@ mod tests {
             matches!(&parsed.events[1], ProviderEvent::ToolCall { call } if call.id == "call-1" && call.metadata["thoughtSignature"] == "opaque")
         );
         assert!(parsed.completed);
+    }
+
+    #[test]
+    fn parses_only_marked_gemini_thought_summaries_as_reasoning() {
+        let parsed = parse_sse_data(
+            r#"{"candidates":[{"content":{"parts":[{"text":"Checking the repository.","thought":true},{"text":"Final answer."}]}}]}"#,
+            "reasoning-1",
+        )
+        .unwrap();
+
+        assert!(matches!(
+            &parsed.events[0],
+            ProviderEvent::ReasoningSummaryDelta { item_id, delta }
+                if item_id == "reasoning-1" && delta == "Checking the repository."
+        ));
+        assert!(matches!(
+            &parsed.events[1],
+            ProviderEvent::TextDelta { delta } if delta == "Final answer."
+        ));
+    }
+
+    #[test]
+    fn requests_thought_summaries_only_when_reasoning_is_enabled() {
+        assert_eq!(gemini_thinking_config(ReasoningEffort::Off), None);
+        assert_eq!(
+            gemini_thinking_config(ReasoningEffort::High),
+            Some(json!({
+                "thinkingBudget": 8192,
+                "includeThoughts": true
+            }))
+        );
     }
 
     #[test]

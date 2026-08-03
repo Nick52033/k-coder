@@ -89,10 +89,14 @@ impl AdvancedServices {
         );
         if let Some(goal) = self.goals.current(thread_id)? {
             if goal.state == GoalState::Active {
+                let token_budget = goal
+                    .token_budget
+                    .map(|budget| budget.saturating_sub(goal.tokens_used).to_string())
+                    .unwrap_or_else(|| "unlimited".into());
                 instructions.push_str(&format!(
                     "Active Goal: {}. Remaining token budget: {}. Remaining time budget: {} ms. Complete it when the objective is achieved; use update_goal with blocked and a concrete reason only when progress cannot continue.\n",
                     goal.objective.replace('\n', " "),
-                    goal.token_budget.saturating_sub(goal.tokens_used),
+                    token_budget,
                     goal.time_budget_ms.saturating_sub(goal.elapsed_ms),
                 ));
             }

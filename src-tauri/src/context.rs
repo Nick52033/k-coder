@@ -50,6 +50,11 @@ pub fn needs_compaction(messages: &[ProviderMessage], limit: usize) -> bool {
     estimate_tokens(messages) * 100 >= limit * AUTO_COMPACT_THRESHOLD_PERCENT
 }
 
+pub fn needs_compaction_for_usage(total_tokens: u64, limit: usize) -> bool {
+    total_tokens.saturating_mul(100)
+        >= (limit as u64).saturating_mul(AUTO_COMPACT_THRESHOLD_PERCENT as u64)
+}
+
 pub fn compact(
     messages: &[ProviderMessage],
     limit: usize,
@@ -136,11 +141,26 @@ pub fn compact(
 }
 
 pub fn render_summary(summary: &CompactionSummary) -> String {
+    let recent_tool_results = summary
+        .recent_tool_results
+        .iter()
+        .filter_map(|message| match message {
+            ProviderMessage::ToolResult {
+                name,
+                success,
+                output,
+                ..
+            } => Some(format!("tool {name} ({success}): {}", bound(output, 1_000))),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
     format!(
-        "[Compacted context v{}]\nSummary:\n{}\nUser constraints:\n{}",
+        "[Compacted context v{}]\nSummary:\n{}\nUser constraints:\n{}\nRecent tool results:\n{}",
         summary.contract_version,
         summary.summary,
-        summary.user_constraints.join("\n")
+        summary.user_constraints.join("\n"),
+        recent_tool_results
     )
 }
 
@@ -215,6 +235,13 @@ mod tests {
                 .any(|value| value.contains("never delete"))
         );
         assert_eq!(summary.recent_tool_results.len(), 1);
+        assert!(render_summary(&summary).contains("tool read_file (true): important"));
         assert!(estimate_tokens(&compacted) < estimate_tokens(&messages));
+    }
+
+    #[test]
+    fn reported_context_usage_uses_the_auto_compact_threshold() {
+        assert!(!needs_compaction_for_usage(159_999, 200_000));
+        assert!(needs_compaction_for_usage(160_000, 200_000));
     }
 }

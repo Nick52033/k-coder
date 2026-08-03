@@ -1,21 +1,27 @@
 import { Fragment, FormEvent, KeyboardEvent, useEffect, useRef, useState } from "react";
 import {
   Activity,
-  Archive,
   ArrowUp,
+  ChevronRight,
   CircleAlert,
   Bot,
   Code2,
   FileDiff,
+  Folder,
+  FolderPlus,
   Hammer,
+  PanelRightOpen,
+  PanelRightClose,
   Loader2,
   Maximize2,
   MessageSquare,
   Minus,
+  MoreHorizontal,
   Moon,
   Paperclip,
-  PanelRight,
   Pencil,
+  Pin,
+  PinOff,
   Plus,
   RefreshCw,
   Search,
@@ -27,14 +33,13 @@ import {
   X,
   Target,
   ImageIcon,
-  Scissors,
 } from "lucide-react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { getRuntimeStatus, subscribeToAgentEvents, listSubagents, captureScreen } from "./api/runtime";
+import { getRuntimeStatus, switchWorkspace, subscribeToAgentEvents, listSubagents, recognizeImage } from "./api/runtime";
 import { useWorkbenchStore } from "./stores/workbenchStore";
 import { PatchReviewDialog } from "./components/PatchReviewDialog";
 import { SettingsDialog, type SettingsSection } from "./components/SettingsDialog";
-import { WorkbenchPanel, WorkspacePicker } from "./components/WorkbenchPanel";
+import { WorkbenchPanel } from "./components/WorkbenchPanel";
 import { AgentActivityPanel } from "./components/AgentActivityPanel";
 import { ModelSelector } from "./components/ModelSelector";
 import { ApprovalModeSelector } from "./components/ApprovalModeSelector";
@@ -86,8 +91,8 @@ function App() {
   const [settingsSection, setSettingsSection] = useState<SettingsSection>("providers");
   const [selectedChangeId, setSelectedChangeId] = useState<string | null>(null);
   const [attachments, setAttachments] = useState<AttachmentContent[]>([]);
-  const [screenshotDataUrl, setScreenshotDataUrl] = useState<string | null>(null);
-  const [screenshotCapturing, setScreenshotCapturing] = useState(false);
+  const ocrTasksRef = useRef(new Map<string, Promise<string>>());
+  const ocrResultsRef = useRef(new Map<string, string>());
   const [threadQuery, setThreadQuery] = useState("");
   const [workbenchOpen, setWorkbenchOpen] = useState(false);
   const [agentPanelOpen, setAgentPanelOpen] = useState(false);
@@ -97,6 +102,16 @@ function App() {
     readStored(STORAGE_THEME, "light"),
   );
   const [subagentThreadIds, setSubagentThreadIds] = useState<Set<string>>(new Set());
+  const [sideView, setSideView] = useState<"conversations" | "projects">("conversations");
+  const [workspacePath, setWorkspacePath] = useState("");
+  const [threadProjectMap, setThreadProjectMap] = useState<Record<string, string>>({});
+  const [expandedProjects, setExpandedProjects] = useState<Set<string>>(new Set());
+  const [projectMenuOpen, setProjectMenuOpen] = useState<string | null>(null);
+  const [pinnedProjects, setPinnedProjects] = useState<Set<string>>(() => {
+    try {
+      return new Set(JSON.parse(localStorage.getItem("kcoder_pinned_projects") ?? "[]") as string[]);
+    } catch { return new Set<string>(); }
+  });
   const [agentMode, setAgentMode] = useState<"craft" | "ask" | "plan">("craft");
   const [modeMenuOpen, setModeMenuOpen] = useState(false);
   const [expandedChangeSets, setExpandedChangeSets] = useState<Set<string>>(new Set());
@@ -131,7 +146,6 @@ function App() {
     initialize,
     createThread,
     selectThread,
-    archiveActiveThread,
     sendMessage,
     retryLastTurn,
     stopTurn,
@@ -213,11 +227,92 @@ function App() {
     document.documentElement.setAttribute("data-theme", themeMode);
   }, [skin, themeMode]);
 
+  // ===== 线程-项目关联管理 =====
+  const THREAD_PROJECT_KEY = "kcoder_thread_project_map";
+
+  const readThreadProjectMap = (): Record<string, string> => {
+    try {
+      const raw = localStorage.getItem(THREAD_PROJECT_KEY);
+      return raw ? JSON.parse(raw) : {};
+    } catch { return {}; }
+  };
+
+  const saveThreadProjectMap = (map: Record<string, string>) => {
+    try { localStorage.setItem(THREAD_PROJECT_KEY, JSON.stringify(map)); } catch { /* noop */ }
+  };
+
+  useEffect(() => {
+    setThreadProjectMap(readThreadProjectMap());
+  }, []);
+
+  // 在指定项目（路径）下创建一个新会话。
+  // "会话"tab 调用时不传项目路径，会话保持"未分类"；"项目"tab 调用时传入项目路径，
+  // store 创建线程后立即把 threadId 关联到该项目，避免被自动绑定到当前工作区。
+  const createSessionUnderProject = async (projectPath: string | null) => {
+    await createThread();
+    if (!projectPath) return;
+    const newThreadId = useWorkbenchStore.getState().activeThreadId;
+    if (!newThreadId) return;
+    const map = readThreadProjectMap();
+    if (map[newThreadId] === projectPath) return;
+    const next = { ...map, [newThreadId]: projectPath };
+    setThreadProjectMap(next);
+    saveThreadProjectMap(next);
+  };
+
+  // 弹出"选择项目"对话框（允许多选），把所选目录注册到 known 列表并切换第一个为活动工作区。
+  // 供 titlebar 的"切换工作台"和侧边栏的"添加项目"按钮共用。
+  const pickAndSwitchWorkspace = async () => {
+    try {
+      const selected = await open({ directory: true, multiple: true, title: "选择项目工作区（可多选）" });
+      if (!selected) return;
+      const paths = (Array.isArray(selected) ? selected : [selected])
+        .map((p) => typeof p === "string" ? p : null)
+        .filter((p): p is string => Boolean(p));
+      if (!paths.length) return;
+      const summary = paths.length === 1
+        ? `信任并打开此工作区？\n\n${paths[0]}\n\n信任后，智能体可以读取文件并在审批后修改内容。`
+        : `信任并打开 ${paths.length} 个工作区？\n\n${paths.join("\n")}\n\n信任后，智能体可以读取文件并在审批后修改内容。第一个项目会作为活动工作区，其余仅注册到项目列表（其下尚无会话，会在创建首个会话后显示）。`;
+      const trusted = window.confirm(summary);
+      if (!trusted) return;
+      await switchWorkspace(paths[0], true);
+      setWorkspacePath(paths[0]);
+      const knownRaw = localStorage.getItem("kcoder_known_projects");
+      const known = knownRaw ? (JSON.parse(knownRaw) as string[]) : [];
+      const merged = Array.from(new Set([...known, ...paths]));
+      localStorage.setItem("kcoder_known_projects", JSON.stringify(merged));
+      setThreadProjectMap(readThreadProjectMap());
+      setWorkspaceRevision((value) => value + 1);
+      void initialize();
+    } catch (err) {
+      console.error("切换工作区失败:", err);
+    }
+  };
+
+  // 仅在初始启动时（没有任何线程和映射时）把第一个会话归到当前工作区，
+  // 后续用户在"会话"tab 下新建的会话都不自动归到工作区。
+  const bootstrappedRef = useRef(false);
+  useEffect(() => {
+    if (bootstrappedRef.current) return;
+    if (!threads.length || !workspacePath) return;
+    const map = readThreadProjectMap();
+    const hasAnyBinding = threads.some((t) => Boolean(map[t.id]));
+    if (hasAnyBinding) {
+      bootstrappedRef.current = true;
+      return;
+    }
+    const first = threads[0];
+    const next = { ...map, [first.id]: workspacePath };
+    setThreadProjectMap(next);
+    saveThreadProjectMap(next);
+    bootstrappedRef.current = true;
+  }, [threads, workspacePath]);
+
   useEffect(() => {
     function handleShortcut(event: globalThis.KeyboardEvent) {
       if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "n") {
         event.preventDefault();
-        void createThread();
+        void createSessionUnderProject(null);
       }
       if ((event.ctrlKey || event.metaKey) && event.key === ",") {
         event.preventDefault();
@@ -233,6 +328,62 @@ function App() {
     window.addEventListener("keydown", handleShortcut);
     return () => window.removeEventListener("keydown", handleShortcut);
   }, [createThread]);
+
+  // 点击外部关闭项目菜单
+  useEffect(() => {
+    if (!projectMenuOpen) return;
+    const handler = (event: MouseEvent) => {
+      if (!(event.target instanceof Element)) return;
+      if (!event.target.closest(".project-group-menu")) setProjectMenuOpen(null);
+    };
+    document.addEventListener("mousedown", handler);
+    return () => document.removeEventListener("mousedown", handler);
+  }, [projectMenuOpen]);
+
+  const togglePinProject = (projectPath: string) => {
+    setPinnedProjects((prev) => {
+      const next = new Set(prev);
+      if (next.has(projectPath)) next.delete(projectPath);
+      else next.add(projectPath);
+      localStorage.setItem("kcoder_pinned_projects", JSON.stringify([...next]));
+      return next;
+    });
+  };
+
+  const getProjectsWithThreads = () => {
+    const projects = new Map<string, { name: string; threads: typeof threads; updatedAtMs: number }>();
+    // 只把显式归到某个项目的会话算作"项目内"会话；没有归类的会话不出现在"项目"tab。
+    for (const thread of threads) {
+      const projectPath = threadProjectMap[thread.id];
+      if (!projectPath) continue;
+      if (!projects.has(projectPath)) {
+        const name = projectPath.split(/[/\\]/).filter(Boolean).pop() || projectPath;
+        projects.set(projectPath, { name, threads: [], updatedAtMs: 0 });
+      }
+      const entry = projects.get(projectPath)!;
+      entry.threads.push(thread);
+      entry.updatedAtMs = Math.max(entry.updatedAtMs, thread.updatedAtMs);
+    }
+    // 合并"已添加但暂无会话"的项目（多选添加但还未创建会话的项目）。
+    // 读一次 localStorage 避免重复 IO。
+    try {
+      const knownRaw = localStorage.getItem("kcoder_known_projects");
+      const known = knownRaw ? (JSON.parse(knownRaw) as string[]) : [];
+      for (const projectPath of known) {
+        if (projects.has(projectPath)) continue;
+        const name = projectPath.split(/[/\\]/).filter(Boolean).pop() || projectPath;
+        projects.set(projectPath, { name, threads: [], updatedAtMs: 0 });
+      }
+    } catch { /* noop */ }
+    return Array.from(projects.entries())
+      .map(([path, data]) => ({ path, name: data.name, threads: data.threads, updatedAtMs: data.updatedAtMs }))
+      .sort((a, b) => {
+        const aPinned = pinnedProjects.has(a.path) ? 1 : 0;
+        const bPinned = pinnedProjects.has(b.path) ? 1 : 0;
+        if (aPinned !== bPinned) return bPinned - aPinned;
+        return b.updatedAtMs - a.updatedAtMs;
+      });
+  };
 
   const setSkin = (next: Skin) => {
     setSkinState(next);
@@ -301,11 +452,6 @@ function App() {
   function renderOrphanTurn(turnId: string) {
     return (
       <article className="message message--assistant message--activity-only" key={`activity-${turnId}`}>
-        <div className="message-avatar" aria-hidden="true">
-          <span className="message-avatar-mark">
-            <BrandGlyph size={18} />
-          </span>
-        </div>
         <div className="message-body">
           <div className="message-role">k-Coder</div>
           <ConversationTurnActivity
@@ -322,44 +468,70 @@ function App() {
     );
   }
 
-  function submitMessage(event: FormEvent) {
+  function startAttachmentOcr(path: string, dataUrl: string) {
+    const task = recognizeImage(dataUrl)
+      .then((result) => {
+        ocrResultsRef.current.set(path, result.text);
+        setAttachments((items) => items.map((item) => item.path === path
+          ? {
+              ...item,
+              ocrStatus: "complete",
+              ocrText: result.text,
+              ocrLineCount: result.lineCount,
+              ocrDurationMs: result.durationMs,
+              ocrError: undefined,
+            }
+          : item));
+        return result.text;
+      })
+      .catch((error: unknown) => {
+        const message = typeof error === "string" ? error : error instanceof Error ? error.message : "图片文字识别失败";
+        ocrResultsRef.current.set(path, "");
+        setAttachments((items) => items.map((item) => item.path === path
+          ? { ...item, ocrStatus: "failed", ocrError: message }
+          : item));
+        return "";
+      });
+    ocrTasksRef.current.set(path, task);
+    void task.finally(() => {
+      if (ocrTasksRef.current.get(path) === task) ocrTasksRef.current.delete(path);
+    });
+  }
+
+  function addImageAttachment(attachment: AttachmentContent) {
+    setAttachments((items) => {
+      if (items.some((item) => item.path === attachment.path)) return items;
+      return [...items, { ...attachment, ocrStatus: "processing" }];
+    });
+    startAttachmentOcr(attachment.path, attachment.content);
+  }
+
+  async function submitMessage(event: FormEvent) {
     event.preventDefault();
     const message = draft.trim();
-    if (!message) return;
+    if (!message && attachments.length === 0) return;
     const attachmentContext = attachments.filter((attachment) => attachment.kind === "document").map((attachment) =>
       `\n\n[附件: ${attachment.name}]\n${attachment.content}`,
     ).join("");
-    const imageAttachments = attachments
+    const imageAttachments = await Promise.all(attachments
       .filter((attachment) => attachment.kind === "image")
-      .map((attachment) => ({ name: attachment.name, dataUrl: attachment.content }));
+      .map(async (attachment) => {
+        // Prefer the local result cache, then wait for an in-flight OCR task.
+        // React state can lag behind a completed promise when the user sends immediately.
+        const text = attachment.ocrText
+          || ocrResultsRef.current.get(attachment.path)
+          || await (ocrTasksRef.current.get(attachment.path) ?? Promise.resolve(""));
+        return {
+          name: attachment.name,
+          dataUrl: attachment.content,
+          ocrText: text?.trim() || undefined,
+        };
+      }));
+    attachments.forEach((attachment) => ocrTasksRef.current.delete(attachment.path));
+    attachments.forEach((attachment) => ocrResultsRef.current.delete(attachment.path));
     setDraft("");
     setAttachments([]);
     void sendMessage(message + attachmentContext, imageAttachments, agentMode);
-  }
-
-  async function startScreenshot() {
-    setScreenshotCapturing(true);
-    try {
-      const result = await captureScreen();
-      setScreenshotDataUrl(result.dataUrl);
-    } catch (error) {
-      setRuntimeError(typeof error === "string" ? error : "截图失败");
-    } finally {
-      setScreenshotCapturing(false);
-    }
-  }
-
-  function handleScreenshotCrop(croppedDataUrl: string) {
-    const path = `screenshot://${Date.now()}.png`;
-    const size = Math.ceil(croppedDataUrl.length * 0.75); // base64 解码后的近似字节数
-    setAttachments((items) => {
-      if (items.some((a) => a.path === path)) return items;
-      return [
-        ...items,
-        { kind: "image", name: `screenshot-${Date.now()}.png`, path, content: croppedDataUrl, size, truncated: false },
-      ];
-    });
-    setScreenshotDataUrl(null);
   }
 
   function handleComposerKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
@@ -431,21 +603,13 @@ function App() {
       reader.onload = () => {
         const dataUrl = reader.result as string;
         const name = file.name || `paste-${Date.now()}.png`;
-        setAttachments((items) => {
-          // 避免重复添加同名图片
-          const path = `clipboard://${name}`;
-          if (items.some((a) => a.path === path)) return items;
-          return [
-            ...items,
-            {
-              path,
-              name,
-              kind: "image",
-              content: dataUrl,
-              size: file.size,
-              truncated: false,
-            },
-          ];
+        addImageAttachment({
+          path: `clipboard://${name}`,
+          name,
+          kind: "image",
+          content: dataUrl,
+          size: file.size,
+          truncated: false,
         });
       };
       reader.readAsDataURL(file);
@@ -476,20 +640,13 @@ function App() {
       const reader = new FileReader();
       reader.onload = () => {
         const dataUrl = reader.result as string;
-        setAttachments((items) => {
-          const path = `drop://${file.name}`;
-          if (items.some((a) => a.path === path)) return items;
-          return [
-            ...items,
-            {
-              path,
-              name: file.name,
-              kind: "image",
-              content: dataUrl,
-              size: file.size,
-              truncated: false,
-            },
-          ];
+        addImageAttachment({
+          path: `drop://${file.name}`,
+          name: file.name,
+          kind: "image",
+          content: dataUrl,
+          size: file.size,
+          truncated: false,
         });
       };
       reader.readAsDataURL(file);
@@ -533,19 +690,13 @@ function App() {
           const dataUrl = `data:${mime};base64,${base64}`;
           const name = filePath.split(/[/\\]/).pop() ?? `image.${ext}`;
           const pathKey = `file://${filePath}`;
-          setAttachments((items) => {
-            if (items.some((a) => a.path === pathKey)) return items;
-            return [
-              ...items,
-              {
-                path: pathKey,
-                name,
-                kind: "image",
-                content: dataUrl,
-                size: bytes.length,
-                truncated: false,
-              },
-            ];
+          addImageAttachment({
+            path: pathKey,
+            name,
+            kind: "image",
+            content: dataUrl,
+            size: bytes.length,
+            truncated: false,
           });
         } catch {
           // silently skip unreadable files
@@ -561,6 +712,7 @@ function App() {
     setWorkbenchOpen(false);
     setAgentPanelOpen(false);
     setSettingsSection("providers");
+    setSideView("conversations");
     setSettingsOpen(true);
   }
 
@@ -583,6 +735,28 @@ function App() {
             {runtimeError ? <CircleAlert size={14} /> : <Activity size={14} />}
             {runtimeError ? "运行时不可用" : runtime ? "运行时就绪" : "正在连接"}
           </span>
+          <div className="titlebar-segmented" role="group" aria-label="面板切换">
+            <button
+              className={cn("segmented-button", workbenchOpen && "segmented-button--active")}
+              type="button"
+              aria-label="工作台"
+              title="工作台"
+              aria-pressed={workbenchOpen}
+              onClick={() => { setWorkbenchOpen((value) => !value); setAgentPanelOpen(false); }}
+            >
+              {workbenchOpen ? <PanelRightOpen size={16} /> : <PanelRightClose size={16} />}
+            </button>
+            <button
+              className={cn("segmented-button", agentPanelOpen && "segmented-button--active")}
+              type="button"
+              aria-label="子智能体"
+              title="子智能体"
+              aria-pressed={agentPanelOpen}
+              onClick={() => { setAgentPanelOpen((value) => !value); setWorkbenchOpen(false); }}
+            >
+              <Bot size={16} />
+            </button>
+          </div>
           <button
             className="icon-button"
             type="button"
@@ -634,54 +808,243 @@ function App() {
       </header>
 
       <aside className="sidebar">
-        <div className="sidebar-header">
-          <WorkspacePicker onChanged={() => { setWorkspaceRevision((value) => value + 1); void initialize(); }} />
-          <button className="new-thread-button" type="button" onClick={() => void createThread()} title="新建会话" aria-label="新建会话">
-            <Plus size={18} />
-          </button>
-        </div>
         <section className="thread-section" aria-labelledby="thread-section-title">
           <div className="thread-section-heading">
-            <span id="thread-section-title">会话</span>
-            <span className="thread-count" aria-label={`${threads.length} 个会话`}>{threads.length}</span>
+            <div className="sidebar-segmented" role="tablist" aria-label="侧边栏视图">
+              <button
+                type="button"
+                role="tab"
+                aria-selected={sideView === "conversations"}
+                className={cn(sideView === "conversations" && "is-active")}
+                onClick={() => setSideView("conversations")}
+              >
+                <MessageSquare size={15} />
+                <span>会话</span>
+              </button>
+              <button
+                type="button"
+                role="tab"
+                aria-selected={sideView === "projects"}
+                className={cn(sideView === "projects" && "is-active")}
+                onClick={() => setSideView("projects")}
+              >
+                <Folder size={15} />
+                <span>项目</span>
+              </button>
+            </div>
+            <div className="sidebar-heading-actions">
+              <button
+                type="button"
+                className="sidebar-icon-button"
+                title="添加会话（与项目无关）"
+                aria-label="添加会话"
+                onClick={() => void createSessionUnderProject(null)}
+              >
+                <Plus size={15} />
+              </button>
+              <button
+                type="button"
+                className="sidebar-icon-button"
+                title="添加项目（可多选）"
+                aria-label="添加项目"
+                onClick={() => void pickAndSwitchWorkspace()}
+              >
+                <FolderPlus size={15} />
+              </button>
+            </div>
           </div>
           <label className="thread-search">
             <Search size={14} aria-hidden="true" />
-            <input aria-label="搜索会话" placeholder="搜索会话" value={threadQuery} onChange={(event) => { const query = event.target.value; setThreadQuery(query); void searchThreadHistory(query); }} />
+            <input
+              aria-label="搜索会话"
+              placeholder={sideView === "conversations" ? "搜索会话" : "在会话中搜索"}
+              value={threadQuery}
+              onChange={(event) => { const query = event.target.value; setThreadQuery(query); void searchThreadHistory(query); }}
+            />
             {threadQuery && (
               <button type="button" title="清除搜索" aria-label="清除搜索" onClick={() => { setThreadQuery(""); void searchThreadHistory(""); }}>
                 <X size={13} />
               </button>
             )}
           </label>
-          <nav className="thread-list" aria-label="会话列表">
-            {threads.map((thread) => {
-              const isSubagentThread = subagentThreadIds.has(thread.id);
-              return (
-                <div className={cn("thread-item", thread.id === activeThreadId && "thread-item--active")} key={thread.id}>
-                  <button className="thread-item-main" type="button" onClick={() => void selectThread(thread.id)}>
-                    <MessageSquare size={15} />
-                    <span>{thread.title}</span>
-                    {isSubagentThread && (
-                      <span className="subagent-badge" title="子智能体线程">
-                        <Bot size={12} />
-                      </span>
-                    )}
-                  </button>
-                  <span className="thread-actions">
-                    <button type="button" title="重命名" aria-label={`重命名会话 ${thread.title}`} onClick={() => { const title = window.prompt("会话名称", thread.title); if (title) void renameConversation(thread.id, title); }}><Pencil size={12} /></button>
-                    <button type="button" title="删除" aria-label={`删除会话 ${thread.title}`} onClick={async () => { if (window.confirm(`删除会话"${thread.title}"？`)) await deleteConversation(thread.id); }}><Trash2 size={12} /></button>
-                  </span>
+          {sideView === "conversations" ? (
+            <nav className="thread-list" aria-label="会话列表">
+              {threads.map((thread) => {
+                const isSubagentThread = subagentThreadIds.has(thread.id);
+                return (
+                  <div className={cn("thread-item", thread.id === activeThreadId && "thread-item--active")} key={thread.id}>
+                    <button className="thread-item-main" type="button" onClick={() => void selectThread(thread.id)}>
+                      <MessageSquare size={15} />
+                      <span>{thread.title}</span>
+                      {isSubagentThread && (
+                        <span className="subagent-badge" title="子智能体线程">
+                          <Bot size={12} />
+                        </span>
+                      )}
+                    </button>
+                    <span className="thread-actions">
+                      <button type="button" title="重命名" aria-label={`重命名会话 ${thread.title}`} onClick={() => { const title = window.prompt("会话名称", thread.title); if (title) void renameConversation(thread.id, title); }}><Pencil size={12} /></button>
+                      <button type="button" title="删除" aria-label={`删除会话 ${thread.title}`} onClick={async () => { if (window.confirm(`删除会话"${thread.title}"？`)) await deleteConversation(thread.id); }}><Trash2 size={12} /></button>
+                    </span>
+                  </div>
+                );
+              })}
+              {!threads.length && (
+                <div className="thread-empty">
+                  <MessageSquare size={16} />
+                  <span>{threadQuery ? "没有匹配的会话" : "还没有会话"}</span>
                 </div>
-              );
-            })}
-            {!threads.length && (
-              <div className="thread-empty">
-                <MessageSquare size={16} />
-                <span>{threadQuery ? "没有匹配的会话" : "还没有会话"}</span>
-              </div>
-            )}
-          </nav>
+              )}
+            </nav>
+          ) : (
+            <nav className="thread-list" aria-label="项目列表">
+              {(() => {
+                const projects = getProjectsWithThreads();
+                if (!projects.length) {
+                  return (
+                    <div className="thread-empty">
+                      <Folder size={16} />
+                      <span>还没有打开过项目</span>
+                    </div>
+                  );
+                }
+                return projects.map((project) => {
+                  const isExpanded = expandedProjects.has(project.path);
+                  return (
+                    <div className="project-group" key={project.path}>
+                      <div className={cn("project-group-header", isExpanded && "project-group-header--expanded")}>
+                        <button
+                          type="button"
+                          className="project-group-toggle"
+                          aria-label={isExpanded ? "折叠项目" : "展开项目"}
+                          aria-expanded={isExpanded}
+                          onClick={() => {
+                            setExpandedProjects((prev) => {
+                              const next = new Set(prev);
+                              if (next.has(project.path)) next.delete(project.path);
+                              else next.add(project.path);
+                              return next;
+                            });
+                          }}
+                        >
+                          <ChevronRight size={13} className={cn("project-group-chevron", isExpanded && "is-expanded")} />
+                          <Folder size={15} />
+                          <span className="project-group-name">{project.name}</span>
+                        </button>
+                        <span className="project-group-count">{project.threads.length}</span>
+                        <span className="project-group-actions">
+                          <button
+                            type="button"
+                            className="project-group-action"
+                            title="在项目中新建会话"
+                            aria-label="在项目中新建会话"
+                            onClick={async (event) => {
+                              event.stopPropagation();
+                              await createSessionUnderProject(project.path);
+                            }}
+                          >
+                            <Plus size={13} />
+                          </button>
+                          <div className="project-group-menu-anchor">
+                            <button
+                              type="button"
+                              className="project-group-action"
+                              title="更多操作"
+                              aria-label="更多操作"
+                              onClick={(event) => {
+                                event.stopPropagation();
+                                setProjectMenuOpen(projectMenuOpen === project.path ? null : project.path);
+                              }}
+                            >
+                              <MoreHorizontal size={13} />
+                            </button>
+                            {projectMenuOpen === project.path && (
+                              <div className="project-group-menu">
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    togglePinProject(project.path);
+                                    setProjectMenuOpen(null);
+                                  }}
+                                >
+                                  {pinnedProjects.has(project.path) ? (
+                                    <><PinOff size={13} /><span>取消置顶</span></>
+                                  ) : (
+                                    <><Pin size={13} /><span>置顶</span></>
+                                  )}
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    if (window.confirm(`确定从项目列表中删除"${project.name}"？\n\n该操作不会删除项目内的会话。`)) {
+                                      const map = readThreadProjectMap();
+                                      let changed = false;
+                                      for (const id of Object.keys(map)) {
+                                        if (map[id] === project.path) { delete map[id]; changed = true; }
+                                      }
+                                      if (changed) {
+                                        setThreadProjectMap(map);
+                                        saveThreadProjectMap(map);
+                                      }
+                                      // 同时从 known 列表移除空项目
+                                      try {
+                                        const knownRaw = localStorage.getItem("kcoder_known_projects");
+                                        const known = knownRaw ? (JSON.parse(knownRaw) as string[]) : [];
+                                        const filtered = known.filter((p) => p !== project.path);
+                                        if (filtered.length !== known.length) {
+                                          localStorage.setItem("kcoder_known_projects", JSON.stringify(filtered));
+                                        }
+                                      } catch { /* noop */ }
+                                      setExpandedProjects((prev) => {
+                                        const next = new Set(prev);
+                                        next.delete(project.path);
+                                        return next;
+                                      });
+                                    }
+                                    setProjectMenuOpen(null);
+                                  }}
+                                >
+                                  <Trash2 size={13} /><span>删除</span>
+                                </button>
+                              </div>
+                            )}
+                          </div>
+                        </span>
+                      </div>
+                      {isExpanded && (
+                        <div className="project-group-children">
+                          {project.threads.length ? (
+                            project.threads.map((thread) => {
+                              const isSubagentThread = subagentThreadIds.has(thread.id);
+                              return (
+                                <div className={cn("thread-item thread-item--child", thread.id === activeThreadId && "thread-item--active")} key={thread.id}>
+                                  <button className="thread-item-main" type="button" onClick={() => void selectThread(thread.id)}>
+                                    <MessageSquare size={14} />
+                                    <span>{thread.title}</span>
+                                    {isSubagentThread && (
+                                      <span className="subagent-badge" title="子智能体线程">
+                                        <Bot size={12} />
+                                      </span>
+                                    )}
+                                  </button>
+                                  <span className="thread-actions">
+                                    <button type="button" title="重命名" aria-label={`重命名会话 ${thread.title}`} onClick={() => { const title = window.prompt("会话名称", thread.title); if (title) void renameConversation(thread.id, title); }}><Pencil size={12} /></button>
+                                    <button type="button" title="删除" aria-label={`删除会话 ${thread.title}`} onClick={async () => { if (window.confirm(`删除会话"${thread.title}"？`)) await deleteConversation(thread.id); }}><Trash2 size={12} /></button>
+                                  </span>
+                                </div>
+                              );
+                            })
+                          ) : (
+                            <div className="project-group-empty">尚无会话，点击 + 创建</div>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  );
+                });
+              })()}
+            </nav>
+          )}
         </section>
 
         <div className="sidebar-footer">
@@ -705,24 +1068,6 @@ function App() {
             <span className="mode-label">
               {currentThreadBusy ? "正在生成" : usage ? `${usage.totalTokens} tokens` : "纯文本对话"}
             </span>
-          </div>
-          <div className="conversation-actions">
-            <button className={cn("icon-button", agentPanelOpen && "icon-button--active")} type="button" aria-label="切换子智能体面板" title="子智能体" onClick={() => { setAgentPanelOpen((value) => !value); setWorkbenchOpen(false); }}>
-              <Bot size={17} />
-            </button>
-            <button className={cn("icon-button", workbenchOpen && "icon-button--active")} type="button" aria-label="切换工作台面板" title="切换工作台面板" onClick={() => { setWorkbenchOpen((value) => !value); setAgentPanelOpen(false); }}>
-              <PanelRight size={17} />
-            </button>
-            <button
-              className="icon-button"
-              type="button"
-              aria-label="归档会话"
-              title="归档会话"
-              disabled={!activeThread || currentThreadBusy}
-              onClick={() => void archiveActiveThread()}
-            >
-              <Archive size={17} />
-            </button>
           </div>
         </div>
 
@@ -759,16 +1104,18 @@ function App() {
                 return (
                   <Fragment key={message.id}>
                   <article className={cn("message", `message--${message.role}`, message.status === "streaming" && "message--streaming")}>
-                    {message.role === "assistant" && (
-                      <div className="message-avatar" aria-hidden="true">
-                        <span className="message-avatar-mark">
-                          <BrandGlyph size={18} />
-                        </span>
-                        <span className="message-avatar-pulse" />
-                      </div>
-                    )}
                     <div className="message-body">
                       <div className="message-role">{message.role === "user" ? "你" : "k-Coder"}</div>
+                      {message.role === "user" && message.attachments?.length ? (
+                        <div className="message-attachments" aria-label="图片附件">
+                          {message.attachments.map((attachment, index) => (
+                            <span className="message-image-attachment" key={`${message.id}-${index}-${attachment.name}`} title={attachment.name}>
+                              <ImageIcon size={15} />
+                              <span>{attachment.name}</span>
+                            </span>
+                          ))}
+                        </div>
+                      ) : null}
                       {message.role === "assistant" && (
                         <ConversationTurnActivity
                           activities={messageActivities}
@@ -777,10 +1124,11 @@ function App() {
                           plan={messagePlan}
                           streaming={message.status === "streaming"}
                           activityStatus={messageActivityStatus}
+                          finalMessageId={message.id}
                           renderText={renderMessageText}
                         />
                       )}
-                      {!messageTimeline.length ? <div className="message-content">
+                      {!messageTimeline.length && (message.text || (message.status === "streaming" && !messageActivityStatus)) ? <div className="message-content">
                         {message.text
                           ? renderMessageText(message.text)
                           : message.status === "streaming" && !messageActivityStatus ? (
@@ -846,11 +1194,6 @@ function App() {
 
               {plan?.steps.length && !planIsAttached && !planIsAttachedToOrphan ? (
                 <article className="message message--assistant message--activity-only">
-                  <div className="message-avatar" aria-hidden="true">
-                    <span className="message-avatar-mark">
-                      <BrandGlyph size={18} />
-                    </span>
-                  </div>
                   <div className="message-body">
                     <div className="message-role">k-Coder</div>
                     <ConversationTurnActivity activities={[]} plan={plan} />
@@ -861,11 +1204,6 @@ function App() {
               {/* 内嵌授权请求 */}
               {pendingApproval && (
                 <article className="message message--approval">
-                  <div className="message-avatar" aria-hidden="true">
-                    <span className="message-avatar-mark">
-                      <BrandGlyph size={18} />
-                    </span>
-                  </div>
                   <div className="message-body">
                     <div className="message-role">k-Coder</div>
                     <div className="approval-inline">
@@ -1020,7 +1358,23 @@ function App() {
           onDragOver={handleDragOver}
           onDrop={handleDrop}
         >
-          {attachments.length > 0 && <div className="attachment-strip">{attachments.map((attachment) => <span key={attachment.path} className={attachment.kind === "image" ? "attachment-tag attachment-tag--image" : "attachment-tag"}>{attachment.kind === "image" ? <img src={attachment.content} alt={attachment.name} className="attachment-thumb" /> : <Paperclip size={12} />}{attachment.name}<button type="button" aria-label={`移除 ${attachment.name}`} onClick={() => setAttachments((items) => items.filter((item) => item.path !== attachment.path))}><X size={12} /></button></span>)}</div>}
+          {attachments.length > 0 && (
+            <div className="attachment-strip">
+              {attachments.map((attachment) => (
+                <span
+                  key={attachment.path}
+                  className={attachment.kind === "image" ? "attachment-tag attachment-tag--image" : "attachment-tag"}
+                  title={attachment.name}
+                >
+                  {attachment.kind === "image"
+                    ? <img src={attachment.content} alt={attachment.name} className="attachment-thumb" />
+                    : <Paperclip size={12} />}
+                  <span className="attachment-name">{attachment.name}</span>
+                  <button type="button" aria-label={`移除 ${attachment.name}`} onClick={() => setAttachments((items) => items.filter((item) => item.path !== attachment.path))}><X size={12} /></button>
+                </span>
+              ))}
+            </div>
+          )}
           <textarea
             aria-label="消息"
             value={draft}
@@ -1041,7 +1395,6 @@ function App() {
                 display: "flex",
                 alignItems: "center",
                 justifyContent: "center",
-                width: 32,
                 height: 32,
                 padding: 0,
                 border: "1px solid transparent",
@@ -1050,28 +1403,6 @@ function App() {
                 cursor: "pointer",
               }}
             ><ImageIcon size={18} /></button>
-            <button
-              type="button"
-              className="composer-pick-image"
-              aria-label="屏幕截图"
-              title="屏幕截图（框选屏幕任意区域）"
-              disabled={screenshotCapturing}
-              onClick={() => void startScreenshot()}
-              style={{
-                display: "flex",
-                alignItems: "center",
-                justifyContent: "center",
-                width: 32,
-                height: 32,
-                padding: 0,
-                border: "1px solid transparent",
-                borderRadius: "var(--radius-sm)",
-                background: "transparent",
-                cursor: screenshotCapturing ? "default" : "pointer",
-              }}
-            >
-              {screenshotCapturing ? <Loader2 size={18} className="spin" /> : <Scissors size={18} />}
-            </button>
             <div className="composer-mode-selector">
               <button
                 type="button"
@@ -1181,7 +1512,7 @@ function App() {
                 type="submit"
                 aria-label="发送消息"
                 title="发送消息"
-                disabled={!draft.trim()}
+                disabled={!draft.trim() && attachments.length === 0}
               >
                 <ArrowUp size={18} strokeWidth={2.2} />
               </button>
@@ -1189,14 +1520,6 @@ function App() {
           </div>
         </form>
       </section>
-
-      {screenshotDataUrl && (
-        <ScreenshotOverlay
-          imageDataUrl={screenshotDataUrl}
-          onCancel={() => setScreenshotDataUrl(null)}
-          onConfirm={handleScreenshotCrop}
-        />
-      )}
 
       <WorkbenchPanel key={workspaceRevision} open={workbenchOpen} onAttach={(attachment) => setAttachments((items) => items.some((item) => item.path === attachment.path) ? items : [...items, attachment])} />
       <AgentActivityPanel open={agentPanelOpen} parentThreadId={activeThreadId} onClose={() => setAgentPanelOpen(false)} />
@@ -1317,12 +1640,14 @@ function GoalControl({
   if (!goal || goal.state === "completed" || goal.state === "budget_exhausted") {
     return null;
   }
-  const percent = Math.min(100, Math.round((goal.tokensUsed / goal.tokenBudget) * 100));
+  const percent = goal.tokenBudget
+    ? Math.min(100, Math.round((goal.tokensUsed / goal.tokenBudget) * 100))
+    : null;
   const paused = goal.state === "paused";
   const blocked = goal.state === "blocked";
   return (
     <div
-      className="goal-slim"
+      className={`goal-slim${percent === null ? " goal-slim--unlimited" : ""}`}
       role="button"
       tabIndex={0}
       aria-label="Goal 状态，点击管理"
@@ -1338,15 +1663,23 @@ function GoalControl({
       <span className={`goal-slim-icon ${paused ? "goal-slim-icon--paused" : blocked ? "goal-slim-icon--blocked" : ""}`}>
         <Target size={13} />
       </span>
-      <span className="goal-slim-track" aria-hidden="true">
-        <span style={{ width: `${percent}%` }} />
-      </span>
+      {percent !== null && (
+        <span className="goal-slim-track" aria-hidden="true">
+          <span style={{ width: `${percent}%` }} />
+        </span>
+      )}
       <span className="goal-slim-copy">
-        {paused ? "已暂停" : blocked ? "已阻塞" : "运行中"} · {goal.tokensUsed.toLocaleString()} / {goal.tokenBudget.toLocaleString()} tokens
+        {paused ? "已暂停" : blocked ? "已阻塞" : "运行中"} · {formatTokenUsage(goal.tokensUsed, goal.tokenBudget)}
       </span>
       <span className="goal-slim-manage" aria-hidden="true">管理</span>
     </div>
   );
+}
+
+function formatTokenUsage(tokensUsed: number, tokenBudget: number | null) {
+  return tokenBudget === null
+    ? `${tokensUsed.toLocaleString()} / 无上限 tokens`
+    : `${tokensUsed.toLocaleString()} / ${tokenBudget.toLocaleString()} tokens`;
 }
 
 function stateLabel(state: string) {
@@ -1362,12 +1695,13 @@ function stateLabel(state: string) {
 }
 
 function toolActivityDetail(activity: {
-  state: "running" | "completed" | "failed";
+  state: "running" | "completed" | "failed" | "cancelled";
   call: { arguments: Record<string, unknown> };
   result: { output: string } | null;
 }) {
   if (activity.state === "running") return "执行中";
   if (activity.state === "failed") return activity.result?.output || "执行失败";
+  if (activity.state === "cancelled") return "已取消";
   const path = activity.call.arguments.path;
   return typeof path === "string" ? path : "已完成";
 }
@@ -1398,11 +1732,6 @@ function UserInputCard({ request, onResolve }: {
 
   return (
     <article className="message message--approval">
-      <div className="message-avatar" aria-hidden="true">
-        <span className="message-avatar-mark">
-          <BrandGlyph size={18} />
-        </span>
-      </div>
       <div className="message-body">
         <div className="message-role">k-Coder 提问</div>
         <div className="approval-inline">
@@ -1448,132 +1777,6 @@ function UserInputCard({ request, onResolve }: {
 
 function renderMessageText(text: string): React.ReactNode {
   return <MarkdownContent text={text} />;
-}
-
-/**
- * 屏幕截图框选遮罩：显示整屏截图，用户拖拽选择一个矩形区域，
- * 确认后把裁剪出的部分作为图片 dataUrl 交回给调用方。
- */
-function ScreenshotOverlay({ imageDataUrl, onCancel, onConfirm }: {
-  imageDataUrl: string;
-  onCancel: () => void;
-  onConfirm: (croppedDataUrl: string) => void;
-}) {
-  const containerRef = useRef<HTMLDivElement>(null);
-  const imgRef = useRef<HTMLImageElement>(null);
-  const [imgSize, setImgSize] = useState<{ width: number; height: number } | null>(null);
-  const [selection, setSelection] = useState<{
-    x: number;
-    y: number;
-    width: number;
-    height: number;
-  } | null>(null);
-  const dragStart = useRef<{ x: number; y: number } | null>(null);
-
-  function handleMouseDown(e: React.MouseEvent) {
-    const img = imgRef.current;
-    if (!img) return;
-    const rect = img.getBoundingClientRect();
-    const x = e.clientX - rect.left;
-    const y = e.clientY - rect.top;
-    dragStart.current = { x, y };
-    setSelection({ x, y, width: 0, height: 0 });
-  }
-
-  function handleMouseMove(e: React.MouseEvent) {
-    if (!dragStart.current) return;
-    const img = imgRef.current;
-    if (!img) return;
-    const rect = img.getBoundingClientRect();
-    const curX = e.clientX - rect.left;
-    const curY = e.clientY - rect.top;
-    const x = Math.min(dragStart.current.x, curX);
-    const y = Math.min(dragStart.current.y, curY);
-    setSelection({
-      x,
-      y,
-      width: Math.abs(curX - dragStart.current.x),
-      height: Math.abs(curY - dragStart.current.y),
-    });
-  }
-
-  function handleMouseUp() {
-    dragStart.current = null;
-  }
-
-  function confirmCrop() {
-    if (!selection || selection.width < 2 || selection.height < 2) return;
-    const img = imgRef.current;
-    if (!img) return;
-    // 考虑图片实际尺寸与显示尺寸的比例
-    const scaleX = img.naturalWidth / img.getBoundingClientRect().width;
-    const scaleY = img.naturalHeight / img.getBoundingClientRect().height;
-    const sx = Math.max(0, Math.floor(selection.x * scaleX));
-    const sy = Math.max(0, Math.floor(selection.y * scaleY));
-    const sw = Math.min(img.naturalWidth - sx, Math.floor(selection.width * scaleX));
-    const sh = Math.min(img.naturalHeight - sy, Math.floor(selection.height * scaleY));
-    if (sw < 1 || sh < 1) return;
-
-    const canvas = document.createElement("canvas");
-    canvas.width = sw;
-    canvas.height = sh;
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return;
-    ctx.drawImage(img, sx, sy, sw, sh, 0, 0, sw, sh);
-    onConfirm(canvas.toDataURL("image/png"));
-  }
-
-  return (
-    <div className="screenshot-overlay" onMouseUp={handleMouseUp}>
-      <div
-        ref={containerRef}
-        className="screenshot-stage"
-        style={{
-          width: imgSize ? `${imgSize.width}px` : "auto",
-          height: imgSize ? `${imgSize.height}px` : "auto",
-        }}
-      >
-        <img
-          ref={imgRef}
-          src={imageDataUrl}
-          alt="屏幕截图预览"
-          className="screenshot-stage-img"
-          style={{ cursor: selection ? "crosshair" : "crosshair" }}
-          onMouseDown={handleMouseDown}
-          onMouseMove={handleMouseMove}
-          onLoad={() => {
-            const el = imgRef.current;
-            if (el) setImgSize({ width: el.width, height: el.height });
-          }}
-        />
-        {selection && selection.width > 0 && selection.height > 0 && (
-          <div
-            className="screenshot-selection"
-            style={{
-              left: selection.x,
-              top: selection.y,
-              width: selection.width,
-              height: selection.height,
-            }}
-          />
-        )}
-      </div>
-      <div className="screenshot-toolbar">
-        <span className="screenshot-hint">拖拽框选截图区域</span>
-        <button type="button" className="screenshot-btn screenshot-btn--danger" onClick={onCancel}>
-          取消
-        </button>
-        <button
-          type="button"
-          className="screenshot-btn screenshot-btn--primary"
-          disabled={!selection || selection.width < 2 || selection.height < 2}
-          onClick={confirmCrop}
-        >
-          确认
-        </button>
-      </div>
-    </div>
-  );
 }
 
 export default App;

@@ -36,14 +36,12 @@ use crate::tools::{
 const MAX_INPUT_BYTES: usize = 100_000;
 const MAX_IMAGE_COUNT: usize = 4;
 const MAX_IMAGE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_OCR_TEXT_BYTES: usize = 16 * 1024;
 const MAX_TOTAL_IMAGE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_RESPONSE_BYTES: usize = 512 * 1024;
 const MAX_REASONING_SUMMARY_BYTES: usize = 64 * 1024;
 const MAX_PROVIDER_CONTEXT_BYTES: usize = 512 * 1024;
 const MAX_TOOL_OUTPUT_BYTES: usize = 256 * 1024;
-const MAX_TOTAL_TOKENS: u64 = 1_000_000;
-const MAX_TOOL_ITERATIONS: usize = 24;
-const MAX_TOOL_CALLS: usize = 24;
 const MAX_IDENTICAL_TOOL_CALLS: usize = 2;
 const PROGRESS_CHECK_WINDOW: usize = 5;
 const MAX_NO_PROGRESS_WINDOWS: usize = 3;
@@ -61,32 +59,34 @@ pub struct ToolExecutionResult {
 /// 进展快照：用于检测任务是否有实质性进展
 #[derive(Clone, PartialEq, Eq)]
 struct ProgressSnapshot {
-    /// 已修改的文件路径集合
-    changed_files: HashSet<String>,
-    /// 工具输出的哈希值（用于检测是否有新的工具执行）
-    events_hash: u64,
+    /// 已观察到的不同文件内容变更和成功工具结果。
+    progress_fingerprints: HashSet<u64>,
 }
 
 impl ProgressSnapshot {
     fn from_events(events: &[StoredEvent]) -> Self {
-        let mut changed_files = HashSet::new();
-        let mut hasher = DefaultHasher::new();
+        let mut progress_fingerprints = HashSet::new();
 
         for event in events {
-            // 收集文件修改
-            if let StoredEventKind::ChangeApplied { change_set } = &event.kind {
-                for file in &change_set.files {
-                    changed_files.insert(file.path.clone());
+            let mut hasher = DefaultHasher::new();
+            match &event.kind {
+                StoredEventKind::ChangeApplied { change_set } => {
+                    "change".hash(&mut hasher);
+                    format!("{:?}", change_set.files).hash(&mut hasher);
+                    progress_fingerprints.insert(hasher.finish());
                 }
+                StoredEventKind::ToolResult { name, result, .. } if result.success => {
+                    "tool".hash(&mut hasher);
+                    name.hash(&mut hasher);
+                    result.output.hash(&mut hasher);
+                    progress_fingerprints.insert(hasher.finish());
+                }
+                _ => {}
             }
-
-            // 计算事件哈希
-            format!("{:?}", event.kind).hash(&mut hasher);
         }
 
         Self {
-            changed_files,
-            events_hash: hasher.finish(),
+            progress_fingerprints,
         }
     }
 }
@@ -107,6 +107,16 @@ pub struct TurnOutcome {
     pub turn_id: String,
     pub state: TurnState,
     pub error: Option<String>,
+    pub started_at_ms: u64,
+    pub completed_at_ms: u64,
+    pub duration_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TurnTiming {
+    started_at_ms: u64,
+    completed_at_ms: u64,
+    duration_ms: u64,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -254,7 +264,7 @@ impl AgentRuntime {
         cancellation: CancellationToken,
         publisher: Arc<dyn EventPublisher>,
     ) -> Result<TurnOutcome, AgentRuntimeError> {
-        let input = validate_input(&request.input)?;
+        let input = validate_input(&request.input, !attachments.is_empty())?;
         let message = user_message(input, attachments)?;
         self.run_turn_inner(
             provider,
@@ -371,18 +381,15 @@ impl AgentRuntime {
         let mut total_usage = TokenUsage::default();
         let mut has_usage = false;
         let mut provider_context_bytes = 0usize;
-        let mut tool_call_count = 0usize;
         let mut repeated_calls = HashMap::<String, usize>::new();
-        let token_budget = self
-            .max_total_tokens
-            .unwrap_or(MAX_TOTAL_TOKENS)
-            .min(MAX_TOTAL_TOKENS);
+        let token_budget = self.max_total_tokens;
 
         // 进展检测变量
         let mut no_progress_count = 0usize;
         let mut last_snapshot: Option<ProgressSnapshot> = None;
 
-        for iteration in 0..MAX_TOOL_ITERATIONS {
+        let mut iteration = 0usize;
+        loop {
             // 进展检测：每 PROGRESS_CHECK_WINDOW 轮检查一次
             if iteration > 0 && iteration % PROGRESS_CHECK_WINDOW == 0 {
                 let events = self.repository.load(&thread_id).await?;
@@ -434,8 +441,14 @@ impl AgentRuntime {
                 last_snapshot = Some(current_snapshot);
             }
 
-            let mut history = provider_history(self.repository.load(&thread_id).await?);
-            if context::needs_compaction(&history, self.context_limit) {
+            let events = self.repository.load(&thread_id).await?;
+            let last_context_usage = last_active_context_usage(&events);
+            let mut history = provider_history(events);
+            if context::needs_compaction(&history, self.context_limit)
+                || last_context_usage.is_some_and(|usage| {
+                    context::needs_compaction_for_usage(usage.total_tokens, self.context_limit)
+                })
+            {
                 let (summary, compacted) = context::compact(&history, self.context_limit);
                 if summary.compacted_message_count > 0 {
                     self.repository
@@ -675,7 +688,9 @@ impl AgentRuntime {
                         Some(Ok(ProviderEvent::Usage { usage })) => {
                             iteration_usage_inner = Some(usage);
                             let aggregate = add_usage(total_usage, usage);
-                            if aggregate.total_tokens > token_budget {
+                            if let Some(budget) =
+                                token_budget.filter(|budget| aggregate.total_tokens > *budget)
+                            {
                                 self.repository
                                     .append(StoredEvent::new(
                                         &thread_id,
@@ -692,7 +707,7 @@ impl AgentRuntime {
                                         &turn_id,
                                         format!(
                                             "token_budget_exceeded: used {} of {} tokens",
-                                            aggregate.total_tokens, token_budget
+                                            aggregate.total_tokens, budget
                                         ),
                                         &publisher,
                                     )
@@ -835,27 +850,6 @@ impl AgentRuntime {
                     .await;
             }
 
-            if iteration + 1 >= MAX_TOOL_ITERATIONS {
-                return self
-                    .finish_failed(
-                        &thread_id,
-                        &turn_id,
-                        format!("tool_iteration_limit: exceeded {MAX_TOOL_ITERATIONS} provider iterations"),
-                        &publisher,
-                    )
-                    .await;
-            }
-            if tool_call_count.saturating_add(pending_tool_calls.len()) > MAX_TOOL_CALLS {
-                return self
-                    .finish_failed(
-                        &thread_id,
-                        &turn_id,
-                        format!("tool_call_limit: exceeded {MAX_TOOL_CALLS} calls in one turn"),
-                        &publisher,
-                    )
-                    .await;
-            }
-            tool_call_count += pending_tool_calls.len();
             publisher.publish(AgentEventEnvelope::new(AgentEvent::ActivityStatusChanged {
                 thread_id: thread_id.clone(),
                 turn_id: turn_id.clone(),
@@ -974,15 +968,8 @@ impl AgentRuntime {
                     .finish_failed(&thread_id, &turn_id, reason, &publisher)
                     .await;
             }
+            iteration = iteration.saturating_add(1);
         }
-
-        self.finish_failed(
-            &thread_id,
-            &turn_id,
-            format!("tool_iteration_limit: exceeded {MAX_TOOL_ITERATIONS} provider iterations"),
-            &publisher,
-        )
-        .await
     }
 
     /// 生成工具执行的 Future（用于异步流式执行）
@@ -1582,23 +1569,28 @@ impl AgentRuntime {
                 },
             ))
             .await?;
-        self.repository
-            .append(StoredEvent::new(
-                thread_id,
-                Some(turn_id.to_string()),
-                StoredEventKind::TurnCompleted { usage },
-            ))
+        let timing = self
+            .append_terminal_event(thread_id, turn_id, StoredEventKind::TurnCompleted { usage })
             .await?;
         publisher.publish(AgentEventEnvelope::new(AgentEvent::TurnCompleted {
             thread_id: thread_id.to_string(),
             turn_id: turn_id.to_string(),
             message,
             usage,
+            started_at_ms: timing.started_at_ms,
+            completed_at_ms: timing.completed_at_ms,
+            duration_ms: timing.duration_ms,
         }));
         if let Some(metrics) = &self.metrics {
             metrics.task(true);
         }
-        Ok(outcome(thread_id, turn_id, TurnState::Completed, None))
+        Ok(outcome(
+            thread_id,
+            turn_id,
+            TurnState::Completed,
+            None,
+            timing,
+        ))
     }
 
     async fn finish_failed(
@@ -1608,19 +1600,22 @@ impl AgentRuntime {
         message: String,
         publisher: &Arc<dyn EventPublisher>,
     ) -> Result<TurnOutcome, AgentRuntimeError> {
-        self.repository
-            .append(StoredEvent::new(
+        let timing = self
+            .append_terminal_event(
                 thread_id,
-                Some(turn_id.to_string()),
+                turn_id,
                 StoredEventKind::TurnFailed {
                     message: message.clone(),
                 },
-            ))
+            )
             .await?;
         publisher.publish(AgentEventEnvelope::new(AgentEvent::TurnFailed {
             thread_id: thread_id.to_string(),
             turn_id: turn_id.to_string(),
             message: message.clone(),
+            started_at_ms: timing.started_at_ms,
+            completed_at_ms: timing.completed_at_ms,
+            duration_ms: timing.duration_ms,
         }));
         if let Some(metrics) = &self.metrics {
             metrics.task(false);
@@ -1630,6 +1625,7 @@ impl AgentRuntime {
             turn_id,
             TurnState::Failed,
             Some(message),
+            timing,
         ))
     }
 
@@ -1639,21 +1635,53 @@ impl AgentRuntime {
         turn_id: &str,
         publisher: &Arc<dyn EventPublisher>,
     ) -> Result<TurnOutcome, AgentRuntimeError> {
-        self.repository
-            .append(StoredEvent::new(
-                thread_id,
-                Some(turn_id.to_string()),
-                StoredEventKind::TurnCancelled,
-            ))
+        let timing = self
+            .append_terminal_event(thread_id, turn_id, StoredEventKind::TurnCancelled)
             .await?;
         publisher.publish(AgentEventEnvelope::new(AgentEvent::TurnCancelled {
             thread_id: thread_id.to_string(),
             turn_id: turn_id.to_string(),
+            started_at_ms: timing.started_at_ms,
+            completed_at_ms: timing.completed_at_ms,
+            duration_ms: timing.duration_ms,
         }));
         if let Some(metrics) = &self.metrics {
             metrics.task(false);
         }
-        Ok(outcome(thread_id, turn_id, TurnState::Cancelled, None))
+        Ok(outcome(
+            thread_id,
+            turn_id,
+            TurnState::Cancelled,
+            None,
+            timing,
+        ))
+    }
+
+    async fn append_terminal_event(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        kind: StoredEventKind,
+    ) -> Result<TurnTiming, AgentRuntimeError> {
+        let started_at_ms = self
+            .repository
+            .load(thread_id)
+            .await?
+            .into_iter()
+            .find(|event| {
+                event.turn_id.as_deref() == Some(turn_id)
+                    && matches!(event.kind, StoredEventKind::TurnStarted)
+            })
+            .map(|event| event.created_at_ms)
+            .unwrap_or_else(now_ms);
+        let terminal = StoredEvent::new(thread_id, Some(turn_id.to_string()), kind);
+        let completed_at_ms = terminal.created_at_ms;
+        self.repository.append(terminal).await?;
+        Ok(TurnTiming {
+            started_at_ms,
+            completed_at_ms,
+            duration_ms: completed_at_ms.saturating_sub(started_at_ms),
+        })
     }
 
     fn record_provider_metric(
@@ -1702,7 +1730,6 @@ fn provider_history(events: Vec<StoredEvent>) -> Vec<ProviderMessage> {
                     role: MessageRole::User,
                     text: context::render_summary(&summary),
                 });
-                history.extend(summary.recent_tool_results);
                 None
             }
             _ => None,
@@ -1712,6 +1739,14 @@ fn provider_history(events: Vec<StoredEvent>) -> Vec<ProviderMessage> {
         }
     }
     history
+}
+
+fn last_active_context_usage(events: &[StoredEvent]) -> Option<TokenUsage> {
+    events.iter().fold(None, |usage, event| match &event.kind {
+        StoredEventKind::ProviderCallUsage { usage, .. } => Some(*usage),
+        StoredEventKind::ContextCompacted { .. } => None,
+        _ => usage,
+    })
 }
 
 fn preview_hashes(preview: &PatchPreview) -> Vec<ExpectedFileHash> {
@@ -1886,8 +1921,15 @@ fn user_message(
         )));
     }
     let mut total = 0usize;
-    let mut content = vec![ContentBlock::Text { text }];
+    let mut content = if text.is_empty() {
+        vec![ContentBlock::Context {
+            text: "请分析用户提供的图片。".into(),
+        }]
+    } else {
+        vec![ContentBlock::Text { text }]
+    };
     for attachment in attachments {
+        let name: String = attachment.name.chars().take(255).collect();
         let (_, encoded) = parse_image_data_url(&attachment.data_url)?;
         let decoded = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, encoded)
             .map_err(|_| {
@@ -1904,8 +1946,19 @@ fn user_message(
                 "attached images exceed the 8 MiB total limit".into(),
             ));
         }
+        if let Some(ocr_text) = attachment
+            .ocr_text
+            .as_deref()
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+        {
+            let ocr_text = truncate_utf8(ocr_text, MAX_OCR_TEXT_BYTES);
+            content.push(ContentBlock::Context {
+                text: format!("\n\n[图片文字识别: {name}]\n{ocr_text}"),
+            });
+        }
         content.push(ContentBlock::Image {
-            name: attachment.name.chars().take(255).collect(),
+            name,
             data_url: attachment.data_url,
         });
     }
@@ -1916,6 +1969,17 @@ fn user_message(
         content,
         created_at_ms: now_ms(),
     })
+}
+
+fn truncate_utf8(value: &str, max_bytes: usize) -> &str {
+    if value.len() <= max_bytes {
+        return value;
+    }
+    let mut end = max_bytes;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
 }
 
 fn parse_image_data_url(value: &str) -> Result<(&str, &str), AgentRuntimeError> {
@@ -1944,7 +2008,7 @@ fn chat_to_provider(message: ChatMessage) -> Option<ProviderMessage> {
         .into_iter()
         .filter_map(|block| match block {
             ContentBlock::Image { name, data_url } => Some(ProviderImage { name, data_url }),
-            ContentBlock::Text { .. } => None,
+            ContentBlock::Text { .. } | ContentBlock::Context { .. } => None,
         })
         .collect::<Vec<_>>();
     if message.role == MessageRole::User && !images.is_empty() {
@@ -1957,9 +2021,9 @@ fn chat_to_provider(message: ChatMessage) -> Option<ProviderMessage> {
     }
 }
 
-fn validate_input(input: &str) -> Result<String, AgentRuntimeError> {
+fn validate_input(input: &str, allow_empty: bool) -> Result<String, AgentRuntimeError> {
     let input = input.trim();
-    if input.is_empty() {
+    if input.is_empty() && !allow_empty {
         return Err(AgentRuntimeError::InvalidInput(
             "input must not be empty".to_string(),
         ));
@@ -1972,13 +2036,22 @@ fn validate_input(input: &str) -> Result<String, AgentRuntimeError> {
     Ok(input.to_string())
 }
 
-fn outcome(thread_id: &str, turn_id: &str, state: TurnState, error: Option<String>) -> TurnOutcome {
+fn outcome(
+    thread_id: &str,
+    turn_id: &str,
+    state: TurnState,
+    error: Option<String>,
+    timing: TurnTiming,
+) -> TurnOutcome {
     TurnOutcome {
         schema_version: PROTOCOL_VERSION,
         thread_id: thread_id.to_string(),
         turn_id: turn_id.to_string(),
         state,
         error,
+        started_at_ms: timing.started_at_ms,
+        completed_at_ms: timing.completed_at_ms,
+        duration_ms: timing.duration_ms,
     }
 }
 
@@ -2003,13 +2076,20 @@ mod tests {
             vec![ImageAttachment {
                 name: "screen.png".into(),
                 data_url: "data:image/png;base64,iVBORw0KGgo=".into(),
+                ocr_text: Some("compiler error E0308".into()),
             }],
         )
         .unwrap();
         assert!(matches!(
+            &message.content[1],
+            ContentBlock::Context { text } if text.contains("compiler error E0308")
+        ));
+        assert!(matches!(
             chat_to_provider(message),
             Some(ProviderMessage::UserContent { text, images })
-                if text == "inspect this screenshot" && images.len() == 1
+                if text.contains("inspect this screenshot")
+                    && text.contains("compiler error E0308")
+                    && images.len() == 1
         ));
         assert!(
             user_message(
@@ -2017,10 +2097,26 @@ mod tests {
                 vec![ImageAttachment {
                     name: "bad.svg".into(),
                     data_url: "data:image/svg+xml;base64,PHN2Zy8+".into(),
+                    ocr_text: None,
                 }],
             )
             .is_err()
         );
+
+        let image_only = user_message(
+            String::new(),
+            vec![ImageAttachment {
+                name: "only.png".into(),
+                data_url: "data:image/png;base64,iVBORw0KGgo=".into(),
+                ocr_text: None,
+            }],
+        )
+        .unwrap();
+        assert!(matches!(
+            chat_to_provider(image_only),
+            Some(ProviderMessage::UserContent { text, images })
+                if text == "请分析用户提供的图片。" && images.len() == 1
+        ));
     }
 
     #[derive(Default)]
@@ -2248,6 +2344,11 @@ mod tests {
             .unwrap();
         let detail = repository.read_thread(&thread_id).await.unwrap();
         assert_eq!(result.state, TurnState::Completed);
+        assert!(result.completed_at_ms >= result.started_at_ms);
+        assert_eq!(
+            result.duration_ms,
+            result.completed_at_ms.saturating_sub(result.started_at_ms)
+        );
         assert_eq!(detail.messages[1].text(), "hello world");
         assert_eq!(provider.requests()[0].messages.len(), 1);
         assert!(matches!(
@@ -2257,7 +2358,14 @@ mod tests {
                 .unwrap()
                 .last()
                 .map(|event| &event.event),
-            Some(AgentEvent::TurnCompleted { .. })
+            Some(AgentEvent::TurnCompleted {
+                started_at_ms,
+                completed_at_ms,
+                duration_ms,
+                ..
+            }) if *started_at_ms == result.started_at_ms
+                && *completed_at_ms == result.completed_at_ms
+                && *duration_ms == result.duration_ms
         ));
     }
 
@@ -2477,21 +2585,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn allows_a_complex_turn_to_continue_past_eight_provider_iterations() {
-        let (_directory, _repository, runtime, thread_id) = runtime_fixture().await;
-        let paths = [
-            ".",
-            "src",
-            "src-tauri",
-            "docs",
-            "e2e",
-            "public",
-            "target",
-            "dist",
-            "src/components",
-        ];
+    async fn allows_a_progressing_turn_to_continue_past_twenty_four_tool_calls() {
+        let (directory, _repository, runtime, thread_id) = runtime_fixture().await;
+        let paths = (0..25)
+            .map(|index| {
+                let path = format!("inspection-{index}");
+                std::fs::create_dir(directory.path().join(&path)).unwrap();
+                std::fs::write(
+                    directory
+                        .path()
+                        .join(&path)
+                        .join(format!("result-{index}.txt")),
+                    format!("result {index}"),
+                )
+                .unwrap();
+                path
+            })
+            .collect::<Vec<_>>();
         let mut scripts = paths
-            .into_iter()
+            .iter()
             .enumerate()
             .map(|(index, path)| {
                 vec![
@@ -2530,6 +2642,278 @@ mod tests {
             .unwrap();
 
         assert_eq!(outcome.state, TurnState::Completed);
+    }
+
+    #[tokio::test]
+    async fn no_progress_detection_stops_an_unbounded_failed_tool_loop() {
+        let (_directory, _repository, runtime, thread_id) = runtime_fixture().await;
+        let mut scripts = (0..21)
+            .map(|index| {
+                vec![
+                    Ok(ProviderEvent::ToolCall {
+                        call: ToolCall {
+                            id: format!("failed-call-{index}"),
+                            name: "list_directory".to_string(),
+                            arguments: json!({ "path": format!("missing-{index}") }),
+                            metadata: json!({}),
+                        },
+                    }),
+                    Ok(ProviderEvent::Completed),
+                ]
+            })
+            .collect::<Vec<_>>();
+        scripts.push(vec![
+            Ok(ProviderEvent::TextDelta {
+                delta: "This response must not be reached".to_string(),
+            }),
+            Ok(ProviderEvent::Completed),
+        ]);
+
+        let outcome = runtime
+            .run_turn(
+                Arc::new(FakeProvider::script(scripts)),
+                "fake".to_string(),
+                RunTurnRequest {
+                    thread_id,
+                    input: "keep retrying missing paths".to_string(),
+                    agent_mode: None,
+                },
+                CancellationToken::new(),
+                Arc::new(RecordingPublisher::default()),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.state, TurnState::Failed);
+        assert!(outcome.error.unwrap().contains("无实质进展"));
+    }
+
+    #[tokio::test]
+    async fn ordinary_turn_does_not_fail_on_cumulative_million_token_usage() {
+        let (_directory, repository, runtime, thread_id) = runtime_fixture().await;
+        let mut scripts = (0..7)
+            .map(|index| {
+                vec![
+                    Ok(ProviderEvent::Usage {
+                        usage: TokenUsage {
+                            input_tokens: 145_000,
+                            output_tokens: 100,
+                            total_tokens: 145_100,
+                        },
+                    }),
+                    Ok(ProviderEvent::ToolCall {
+                        call: ToolCall {
+                            id: format!("million-token-call-{index}"),
+                            name: "list_directory".to_string(),
+                            arguments: json!({ "path": format!("missing-{index}") }),
+                            metadata: json!({}),
+                        },
+                    }),
+                    Ok(ProviderEvent::Completed),
+                ]
+            })
+            .collect::<Vec<_>>();
+        scripts.push(vec![
+            Ok(ProviderEvent::Usage {
+                usage: TokenUsage {
+                    input_tokens: 145_000,
+                    output_tokens: 100,
+                    total_tokens: 145_100,
+                },
+            }),
+            Ok(ProviderEvent::TextDelta {
+                delta: "Long turn completed".to_string(),
+            }),
+            Ok(ProviderEvent::Completed),
+        ]);
+
+        let outcome = runtime
+            .run_turn(
+                Arc::new(FakeProvider::script(scripts)),
+                "fake".to_string(),
+                RunTurnRequest {
+                    thread_id: thread_id.clone(),
+                    input: "complete a long task".to_string(),
+                    agent_mode: None,
+                },
+                CancellationToken::new(),
+                Arc::new(RecordingPublisher::default()),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.state, TurnState::Completed);
+        let total_tokens = repository
+            .load(&thread_id)
+            .await
+            .unwrap()
+            .iter()
+            .filter_map(|event| match event.kind {
+                StoredEventKind::ProviderCallUsage { usage, .. } => Some(usage.total_tokens),
+                _ => None,
+            })
+            .sum::<u64>();
+        assert_eq!(total_tokens, 1_160_800);
+    }
+
+    #[tokio::test]
+    async fn explicit_token_budget_still_stops_a_turn() {
+        let (_directory, _repository, runtime, thread_id) = runtime_fixture().await;
+        let provider = Arc::new(FakeProvider::new(vec![
+            Ok(ProviderEvent::Usage {
+                usage: TokenUsage {
+                    input_tokens: 900,
+                    output_tokens: 101,
+                    total_tokens: 1_001,
+                },
+            }),
+            Ok(ProviderEvent::Completed),
+        ]));
+
+        let outcome = runtime
+            .with_token_budget(1_000)
+            .run_turn(
+                provider,
+                "fake".to_string(),
+                RunTurnRequest {
+                    thread_id,
+                    input: "bounded task".to_string(),
+                    agent_mode: None,
+                },
+                CancellationToken::new(),
+                Arc::new(RecordingPublisher::default()),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.state, TurnState::Failed);
+        assert_eq!(
+            outcome.error.as_deref(),
+            Some("token_budget_exceeded: used 1001 of 1000 tokens")
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_context_usage_triggers_mid_turn_compaction() {
+        let (_directory, repository, runtime, thread_id) = runtime_fixture().await;
+        for index in 0..20 {
+            let role = if index % 2 == 0 {
+                MessageRole::User
+            } else {
+                MessageRole::Assistant
+            };
+            repository
+                .append(StoredEvent::new(
+                    &thread_id,
+                    None,
+                    StoredEventKind::AssistantMessage {
+                        message: text_message(
+                            role,
+                            format!("history-{index} {}", "x".repeat(1_000)),
+                        ),
+                    },
+                ))
+                .await
+                .unwrap();
+        }
+        let provider = Arc::new(FakeProvider::script(vec![
+            vec![
+                Ok(ProviderEvent::Usage {
+                    usage: TokenUsage {
+                        input_tokens: 8_800,
+                        output_tokens: 200,
+                        total_tokens: 9_000,
+                    },
+                }),
+                Ok(ProviderEvent::ToolCall {
+                    call: ToolCall {
+                        id: "context-pressure-call".to_string(),
+                        name: "list_directory".to_string(),
+                        arguments: json!({ "path": "." }),
+                        metadata: json!({}),
+                    },
+                }),
+                Ok(ProviderEvent::Completed),
+            ],
+            vec![
+                Ok(ProviderEvent::Usage {
+                    usage: TokenUsage {
+                        input_tokens: 150,
+                        output_tokens: 50,
+                        total_tokens: 200,
+                    },
+                }),
+                Ok(ProviderEvent::TextDelta {
+                    delta: "Compacted and completed".to_string(),
+                }),
+                Ok(ProviderEvent::Completed),
+            ],
+        ]));
+
+        let outcome = runtime
+            .with_context_limit(10_000)
+            .run_turn(
+                provider.clone(),
+                "fake".to_string(),
+                RunTurnRequest {
+                    thread_id: thread_id.clone(),
+                    input: "continue after compaction".to_string(),
+                    agent_mode: None,
+                },
+                CancellationToken::new(),
+                Arc::new(RecordingPublisher::default()),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.state, TurnState::Completed);
+        assert!(
+            repository
+                .load(&thread_id)
+                .await
+                .unwrap()
+                .iter()
+                .any(|event| matches!(
+                    event.kind,
+                    StoredEventKind::ContextCompacted {
+                        automatic: true,
+                        ..
+                    }
+                ))
+        );
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].messages.len() < requests[0].messages.len());
+    }
+
+    #[test]
+    fn restored_compaction_renders_recent_tools_as_text() {
+        let summary = CompactionSummary {
+            contract_version: 1,
+            summary: "repository inspected".to_string(),
+            user_constraints: Vec::new(),
+            recent_tool_results: vec![ProviderMessage::ToolResult {
+                call_id: "orphaned-call".to_string(),
+                name: "read_file".to_string(),
+                success: true,
+                output: "important result".to_string(),
+            }],
+            compacted_message_count: 10,
+        };
+        let history = provider_history(vec![StoredEvent::new(
+            "thread",
+            None,
+            StoredEventKind::ContextCompacted {
+                summary,
+                automatic: true,
+            },
+        )]);
+
+        assert!(matches!(
+            history.as_slice(),
+            [ProviderMessage::Text { text, .. }]
+                if text.contains("tool read_file (true): important result")
+        ));
     }
 
     #[tokio::test]

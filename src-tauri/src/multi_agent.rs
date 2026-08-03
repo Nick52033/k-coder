@@ -24,9 +24,7 @@ use crate::tools::{ToolContext, ToolError, ToolHandler, ToolRegistry};
 
 pub const MAX_SUBAGENT_DEPTH: u8 = 1;
 pub const MAX_ACTIVE_SUBAGENTS: usize = 4;
-pub const MAX_SUBAGENT_TOKENS: u64 = 200_000;
 pub const MAX_SUBAGENT_RUNTIME_MS: u64 = 30 * 60 * 1_000;
-const DEFAULT_SUBAGENT_TOKENS: u64 = 64_000;
 const DEFAULT_SUBAGENT_RUNTIME_MS: u64 = 10 * 60 * 1_000;
 const MAX_TASK_BYTES: usize = 100_000;
 const MAX_MESSAGE_BYTES: usize = 100_000;
@@ -60,15 +58,12 @@ pub struct CreateSubagentRequest {
     pub label: Option<String>,
     #[serde(default)]
     pub capabilities: Vec<String>,
-    #[serde(default = "default_token_budget")]
-    pub token_budget: u64,
+    #[serde(default)]
+    pub token_budget: Option<u64>,
     #[serde(default = "default_timeout_ms")]
     pub timeout_ms: u64,
 }
 
-fn default_token_budget() -> u64 {
-    DEFAULT_SUBAGENT_TOKENS
-}
 fn default_timeout_ms() -> u64 {
     DEFAULT_SUBAGENT_RUNTIME_MS
 }
@@ -87,7 +82,7 @@ pub struct SubagentView {
     pub depth: u8,
     pub workspace_root: String,
     pub capabilities: Vec<String>,
-    pub token_budget: u64,
+    pub token_budget: Option<u64>,
     pub tokens_used: u64,
     pub timeout_ms: u64,
     pub created_at_ms: u64,
@@ -433,15 +428,19 @@ impl MultiAgentCoordinator {
         )?;
         let manager = self.clone();
         tokio::spawn(async move {
-            let remaining_tokens = record.token_budget.saturating_sub(record.tokens_used);
-            let runtime = AgentRuntime::with_tools_and_approvals(
+            let remaining_tokens = record
+                .token_budget
+                .map(|budget| budget.saturating_sub(record.tokens_used));
+            let mut runtime = AgentRuntime::with_tools_and_approvals(
                 context.repository.clone(), allowed_tools, context.workspace_root.clone(), context.approvals.clone(),
             ).with_approval_mode(context.approval_mode).with_runtime_instructions(
                 "You are a bounded subagent. Complete only the delegated task. Return a concise result for the parent agent; do not claim access outside your provided tools or workspace.".into(),
             )
             .with_context_limit(context.context_limit)
-            .with_reasoning_effort(context.reasoning_effort)
-            .with_token_budget(remaining_tokens);
+            .with_reasoning_effort(context.reasoning_effort);
+            if let Some(remaining_tokens) = remaining_tokens {
+                runtime = runtime.with_token_budget(remaining_tokens);
+            }
             let publisher: Arc<dyn EventPublisher> = Arc::new(ChildEventPublisher {
                 agent_id: id.clone(),
                 manager: manager.clone(),
@@ -586,7 +585,10 @@ impl MultiAgentCoordinator {
         let record = self.get(id)?;
         if record.state.is_active() {
             Err(MultiAgentError::AlreadyActive(id.into()))
-        } else if record.tokens_used >= record.token_budget {
+        } else if record
+            .token_budget
+            .is_some_and(|budget| record.tokens_used >= budget)
+        {
             Err(MultiAgentError::Limit(
                 "subagent token budget is exhausted".into(),
             ))
@@ -668,10 +670,10 @@ fn validate_request(
             "task must contain 1 to 100000 bytes".into(),
         ));
     }
-    if request.token_budget == 0 || request.token_budget > MAX_SUBAGENT_TOKENS {
-        return Err(MultiAgentError::Limit(format!(
-            "token budget must be between 1 and {MAX_SUBAGENT_TOKENS}"
-        )));
+    if request.token_budget == Some(0) {
+        return Err(MultiAgentError::Limit(
+            "token budget must be greater than zero when provided".into(),
+        ));
     }
     if request.timeout_ms == 0 || request.timeout_ms > MAX_SUBAGENT_RUNTIME_MS {
         return Err(MultiAgentError::Limit(format!(
@@ -939,10 +941,7 @@ impl ToolHandler for AgentToolHandler {
                             task,
                             label: optional_string_arg(&arguments, "label"),
                             capabilities,
-                            token_budget: arguments
-                                .get("tokenBudget")
-                                .and_then(Value::as_u64)
-                                .unwrap_or(DEFAULT_SUBAGENT_TOKENS),
+                            token_budget: arguments.get("tokenBudget").and_then(Value::as_u64),
                             timeout_ms: arguments
                                 .get("timeoutMs")
                                 .and_then(Value::as_u64)
@@ -1076,9 +1075,20 @@ mod tests {
             task: task.into(),
             label: None,
             capabilities: Vec::new(),
-            token_budget: DEFAULT_SUBAGENT_TOKENS,
+            token_budget: None,
             timeout_ms: DEFAULT_SUBAGENT_RUNTIME_MS,
         }
+    }
+
+    #[test]
+    fn omitted_subagent_token_budget_defaults_to_unlimited() {
+        let request: CreateSubagentRequest = serde_json::from_value(json!({
+            "parentThreadId": "parent",
+            "task": "inspect the workspace"
+        }))
+        .unwrap();
+
+        assert_eq!(request.token_budget, None);
     }
 
     fn context(
@@ -1417,7 +1427,7 @@ mod tests {
         ]));
         let manager = MultiAgentCoordinator::new(data.path()).unwrap();
         let mut bounded = request("parent", "stay within budget");
-        bounded.token_budget = 10;
+        bounded.token_budget = Some(10);
         let agent = manager
             .create(
                 bounded,

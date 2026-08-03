@@ -97,6 +97,12 @@ impl AppState {
         let command_runtime = CommandRuntime::with_recovery(&workspace_root, &data_root)?;
         let pty_runtime = NativePtyRuntime::new(&workspace_root)?;
         let repository = Arc::new(JsonlThreadRepository::new(&data_root)?);
+        let approval_mode = repository
+            .projection()
+            .setting("approval_mode")
+            .map_err(|error| AppStateError::Workspace(error.to_string()))?
+            .and_then(|raw| serde_json::from_str::<ApprovalMode>(&raw).ok())
+            .unwrap_or_default();
         let reasoning_effort = repository
             .projection()
             .setting("reasoning_effort")
@@ -130,7 +136,7 @@ impl AppState {
             tool_registry: RwLock::new(tool_registry),
             patch_service,
             approvals: Arc::new(ApprovalManager::new(Duration::from_secs(5 * 60))),
-            approval_mode: RwLock::new(ApprovalMode::Ask),
+            approval_mode: RwLock::new(approval_mode),
             reasoning_effort: RwLock::new(reasoning_effort),
             user_inputs: Arc::new(UserInputManager::new(Duration::from_secs(10 * 60))),
             command_runtime: RwLock::new(command_runtime),
@@ -198,6 +204,14 @@ impl AppState {
         if !active_turns.is_empty() || self.subagents.has_active() {
             return Err(AppStateError::ApprovalModeBusy);
         }
+        self.repository
+            .projection()
+            .set_setting(
+                "approval_mode",
+                &serde_json::to_string(&mode)
+                    .map_err(|error| AppStateError::Workspace(error.to_string()))?,
+            )
+            .map_err(|error| AppStateError::Workspace(error.to_string()))?;
         *self
             .approval_mode
             .write()
@@ -802,6 +816,7 @@ mod tests {
     use std::sync::Mutex as StdMutex;
 
     use super::*;
+    use crate::policy::PolicyDecision;
     use crate::protocol::{
         ApprovalRequest, ExpectedFileHash, ToolRisk, UserInputQuestion, UserInputRequest,
     };
@@ -969,11 +984,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn approval_mode_defaults_to_ask_and_cannot_change_during_a_turn() {
+    async fn approval_mode_persists_and_cannot_change_during_a_turn() {
         let directory = tempfile::tempdir().expect("temporary directory should be created");
-        let state =
-            AppState::with_credentials(directory.path(), Arc::new(FakeCredentials::default()))
-                .expect("state should initialize");
+        let credentials = Arc::new(FakeCredentials::default());
+        let state = AppState::with_credentials(directory.path(), credentials.clone())
+            .expect("state should initialize");
 
         assert_eq!(state.approval_mode(), ApprovalMode::Ask);
         state.begin_turn("thread").await.expect("turn starts");
@@ -989,6 +1004,10 @@ mod tests {
                 .unwrap(),
             ApprovalMode::FullAccess
         );
+
+        let restored = AppState::with_credentials(directory.path(), credentials)
+            .expect("state should restore");
+        assert_eq!(restored.approval_mode(), ApprovalMode::FullAccess);
     }
 
     #[tokio::test]
@@ -1070,6 +1089,30 @@ mod tests {
         )
         .unwrap();
         state.prepare_extensions(false).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn extension_refresh_keeps_repository_search_authorized() {
+        let data = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let state = AppState::with_workspace_and_credentials(
+            data.path(),
+            workspace.path(),
+            Arc::new(FakeCredentials::default()),
+        )
+        .unwrap();
+
+        state.prepare_extensions(false).await.unwrap();
+        let authorization = state
+            .tool_registry()
+            .authorization(
+                "search_repository",
+                &serde_json::json!({ "query": "needle" }),
+            )
+            .unwrap();
+
+        assert_eq!(authorization.decision, PolicyDecision::Allow);
+        assert_eq!(authorization.risk, ToolRisk::Read);
     }
 
     #[tokio::test]
