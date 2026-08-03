@@ -19,6 +19,7 @@ use crate::execution::{
     StartPtyRequest,
 };
 use crate::extensions::ExtensionOverview;
+use crate::logging::{LogQuery, LogQueryResult};
 use crate::multi_agent::{
     CreateSubagentRequest, MultiAgentError, SubagentEventPublisher, SubagentExecutionContext,
     SubagentView, delegation_tools,
@@ -65,6 +66,10 @@ impl CommandError {
             message: error.to_string(),
         }
     }
+
+    fn internal(error: impl std::fmt::Display) -> Self {
+        Self::new("internal_error", error)
+    }
 }
 
 type CommandResult<T> = Result<T, CommandError>;
@@ -109,6 +114,7 @@ fn subagent_context(
         reasoning_effort: state.reasoning_effort(),
         agent_events: Arc::new(TauriEventPublisher { app: app.clone() }),
         lifecycle_events: Arc::new(TauriSubagentEventPublisher { app: app.clone() }),
+        logger: Some(state.logger()),
     }
 }
 
@@ -260,6 +266,26 @@ pub fn runtime_status(state: State<'_, AppState>) -> RuntimeStatus {
             "runtime-metrics".to_string(),
         ],
     }
+}
+
+#[tauri::command]
+pub fn read_logs(
+    state: State<'_, AppState>,
+    limit: Option<usize>,
+    level: Option<String>,
+    event: Option<String>,
+    after_timestamp_ms: Option<u64>,
+) -> Result<LogQueryResult, CommandError> {
+    let query = LogQuery {
+        limit,
+        level,
+        event,
+        after_timestamp_ms,
+    };
+    state
+        .logger()
+        .read_logs(query)
+        .map_err(|error| CommandError::internal(error.to_string()))
 }
 
 #[tauri::command]
@@ -1050,7 +1076,8 @@ pub async fn run_turn(
     .with_context_limit(context_limit)
     .with_metrics(advanced.metrics.clone())
     .with_reasoning_effort(state.reasoning_effort())
-    .with_user_inputs(state.user_inputs());
+    .with_user_inputs(state.user_inputs())
+    .with_logger(state.logger());
     if let Some((_, Some(remaining_tokens))) = &goal_budget {
         runtime = runtime.with_token_budget(*remaining_tokens);
     }
@@ -1082,7 +1109,11 @@ pub async fn run_turn(
     let _ = state.logger().log(
         if result.is_ok() { "info" } else { "error" },
         "turn_finished",
-        serde_json::json!({"threadId": thread_id, "success": result.is_ok()}),
+        serde_json::json!({
+            "threadId": thread_id,
+            "success": result.is_ok(),
+            "error": result.as_ref().err().map(|e| e.to_string()),
+        }),
     );
     result.map_err(|error| CommandError::new("agent_runtime", error))
 }
@@ -1164,7 +1195,8 @@ pub async fn retry_turn(
     .with_runtime_instructions(runtime_instructions)
     .with_context_limit(context_limit)
     .with_metrics(advanced.metrics.clone())
-    .with_reasoning_effort(state.reasoning_effort());
+    .with_reasoning_effort(state.reasoning_effort())
+    .with_logger(state.logger());
     if let Some((_, Some(remaining_tokens))) = &goal_budget {
         runtime = runtime.with_token_budget(*remaining_tokens);
     }
@@ -1186,6 +1218,15 @@ pub async fn retry_turn(
             .record_turn(&goal_id, tokens, started.elapsed().as_millis() as u64);
     }
     state.finish_turn(&thread_id).await;
+    let _ = state.logger().log(
+        if result.is_ok() { "info" } else { "error" },
+        "turn_finished",
+        serde_json::json!({
+            "threadId": thread_id,
+            "success": result.is_ok(),
+            "error": result.as_ref().err().map(|e| e.to_string()),
+        }),
+    );
     result.map_err(|error| CommandError::new("agent_runtime", error))
 }
 

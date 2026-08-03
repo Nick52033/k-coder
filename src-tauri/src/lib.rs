@@ -122,6 +122,7 @@ pub fn run() {
             commands::wait_pty,
             commands::close_pty,
             commands::recognize_image,
+            commands::read_logs,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

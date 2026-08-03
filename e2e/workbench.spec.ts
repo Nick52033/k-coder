@@ -197,31 +197,24 @@ test("supports the primary workbench inspection flow", async ({ page }, testInfo
   await page.getByText("执行了 1.8s", { exact: true }).click();
   await expect(page.locator(".turn-plan").getByText("检查工作区", { exact: true })).toBeVisible();
   await expect(page.getByText("我先检查相关文件并修改实现。", { exact: true })).toBeVisible();
-  await expect(page.locator(".turn-timeline-tool").getByText("应用补丁", { exact: true })).toBeVisible();
-  await expect(page.locator(".turn-timeline-tool .turn-tool-meta > span").getByText("src/App.css", { exact: true })).toBeVisible();
+  await expect(page.locator(".turn-timeline-tool").getByText("应用补丁 src/App.css", { exact: true })).toBeVisible();
   await page.getByText("查看补丁", { exact: true }).click();
   await expect(page.locator(".turn-command-details pre").filter({ hasText: "*** Update File: src/App.css" })).toBeVisible();
-  await expect(page.locator(".turn-timeline-tool").getByText("读取文件", { exact: true })).toBeVisible();
-  await expect(page.locator(".turn-timeline-tool .turn-tool-meta > span").getByText("src/stores/workbenchStore.ts · 第 42 行", { exact: true })).toBeVisible();
-  await page.getByText("查看读取内容", { exact: true }).click();
-  const readDetails = page.locator(".turn-tool-details").filter({ hasText: "查看读取内容" });
-  await expect(readDetails.locator(".turn-file-editor .monaco-editor")).toBeVisible();
-  await expect(readDetails.getByRole("textbox", { name: "查看 src/stores/workbenchStore.ts" })).toBeAttached();
-  await expect(readDetails.locator(".view-lines")).toContainText("export const fixture = true;");
-  await expect(readDetails.locator(".line-numbers").filter({ hasText: "42" })).toBeVisible();
-  await expect.poll(async () => (await readDetails.locator(".turn-file-editor").boundingBox())?.height ?? 0).toBe(96);
-  await expect(readDetails).toContainText("第 42 行");
-  await expect(readDetails).toContainText("共 200 行");
+  const readTool = page.locator(".turn-timeline-tool").filter({ hasText: "读取 src/stores/workbenchStore.ts L42" });
+  await expect(readTool).toBeVisible();
+  await expect(readTool.getByText("查看读取内容", { exact: true })).toHaveCount(0);
+  await expect(readTool.locator(".turn-tool-details")).toHaveCount(0);
+  await expect(page.locator(".turn-file-editor")).toHaveCount(0);
   await expect(page.locator(".turn-command-details pre").filter({ hasText: "export const fixture = true;" })).toHaveCount(0);
   await expect(page.getByText("修改完成，接着运行验证。", { exact: true })).toBeVisible();
-  await expect(page.locator(".turn-timeline-tool").getByText("执行命令", { exact: true })).toBeVisible();
+  await expect(page.locator(".turn-timeline-tool").getByText("执行 pnpm build", { exact: true })).toBeVisible();
   await expect(page.getByText("3 个操作", { exact: true })).toBeVisible();
   await page.screenshot({ path: testInfo.outputPath("inline-plan-and-tools.png"), fullPage: true });
   await page.evaluate(() => localStorage.setItem("kcoder_theme", "dark"));
   await page.reload();
-  await expect(page.locator(".turn-timeline-tool").getByText("执行命令", { exact: true })).toBeHidden();
+  await expect(page.locator(".turn-timeline-tool").getByText("执行 pnpm build", { exact: true })).toBeHidden();
   await page.getByText("执行了 1.8s", { exact: true }).click();
-  await expect(page.locator(".turn-timeline-tool").getByText("执行命令", { exact: true })).toBeVisible();
+  await expect(page.locator(".turn-timeline-tool").getByText("执行 pnpm build", { exact: true })).toBeVisible();
   await page.screenshot({ path: testInfo.outputPath("inline-plan-and-tools-dark.png"), fullPage: true });
   await page.getByRole("button", { name: "工作台", exact: true }).click();
   const readmeRow = page.getByRole("button", { name: /README.md/ });
@@ -366,6 +359,12 @@ test("streams thinking, safe reasoning summaries, and command output inline", as
     emit({ ...base, type: "activity_status_changed", phase: "exploring", status: "thinking" });
   });
   await expect(page.getByText("思考中", { exact: true })).toBeVisible();
+  const waitingPlaceholder = page.getByText("等待工具调用…", { exact: true });
+  await expect(waitingPlaceholder).toBeVisible();
+  const waitingBox = await waitingPlaceholder.locator("..").boundingBox();
+  expect(waitingBox?.height ?? Number.POSITIVE_INFINITY).toBeLessThanOrEqual(28);
+  await expect(waitingPlaceholder.locator("..")).toHaveCSS("border-top-style", "none");
+  await page.screenshot({ path: testInfo.outputPath("compact-thinking-placeholder.png"), fullPage: true });
   await expect(page.locator(".message-avatar")).toHaveCount(0);
   await expect(page.getByText("正在执行", { exact: true })).toHaveCount(0);
 
@@ -374,6 +373,8 @@ test("streams thinking, safe reasoning summaries, and command output inline", as
     const base = { schemaVersion: 1, threadId: "thread-1", turnId: "turn-live" };
     emit({ ...base, type: "reasoning_summary_delta", phase: "planning", itemId: "rs-live", delta: "正在检查公开事件契约。" });
     emit({ ...base, type: "reasoning_summary_completed", phase: "planning", itemId: "rs-live", summary: "正在检查公开事件契约。" });
+    emit({ ...base, type: "reasoning_summary_delta", phase: "planning", itemId: "rs-live-2", delta: "正在核对工具输出边界。" });
+    emit({ ...base, type: "reasoning_summary_completed", phase: "planning", itemId: "rs-live-2", summary: "正在核对工具输出边界。" });
     emit({ ...base, type: "tool_started", phase: "executing", call: { id: "call-live", name: "run_command", arguments: { program: "pnpm", args: ["build"] }, metadata: {} } });
     emit({ ...base, type: "tool_output_delta", phase: "executing", callId: "call-live", stream: "stdout", cursor: 0, delta: "building client\n" });
     emit({ ...base, type: "tool_output_delta", phase: "executing", callId: "call-live", stream: "stderr", cursor: 1, delta: "warning: fixture\n" });
@@ -385,9 +386,20 @@ test("streams thinking, safe reasoning summaries, and command output inline", as
   });
 
   const reasoning = page.locator(".turn-reasoning").last();
-  await expect(page.getByText("思考内容", { exact: true })).toBeVisible();
+  await expect(page.getByText("思考内容", { exact: true })).toHaveCount(1);
+  await expect(reasoning.locator(".turn-reasoning-segment")).toHaveCount(2);
+  await expect(reasoning.getByText("2 段", { exact: true })).toBeVisible();
   await expect(reasoning).toHaveAttribute("open", "");
   await expect(page.getByText("正在检查公开事件契约。", { exact: true })).toBeVisible();
+  await expect(page.getByText("正在核对工具输出边界。", { exact: true })).toBeVisible();
+  const liveExecution = page.locator(".message--assistant").last().locator(".turn-execution--live");
+  await expect(liveExecution.locator(":scope > summary .turn-disclosure-chevron")).toHaveCount(0);
+  await expect.poll(async () => {
+    const toolBox = await liveExecution.locator(".turn-timeline-tool").last().boundingBox();
+    const statusBox = await liveExecution.locator(":scope > summary").boundingBox();
+    return toolBox && statusBox ? statusBox.y >= toolBox.y + toolBox.height : false;
+  }).toBe(true);
+  await page.screenshot({ path: testInfo.outputPath("grouped-reasoning-summaries.png"), fullPage: true });
   await page.locator(".turn-tool-output").last().locator("summary").click();
   await expect(page.locator(".turn-tool-output-line--stdout").filter({ hasText: "building client" })).toBeVisible();
   await expect(page.locator(".turn-tool-output-line--stderr").filter({ hasText: "warning: fixture" })).toBeVisible();
@@ -437,7 +449,7 @@ test("renders streamed assistant markdown as structured content", async ({ page 
   await page.screenshot({ path: testInfo.outputPath("assistant-markdown.png"), fullPage: true });
 });
 
-test("keeps the composer usable during thinking and drains queued messages after stop", async ({ page }) => {
+test("queues messages during thinking and interrupts only from the queued send action", async ({ page }, testInfo) => {
   await page.goto("/");
   await page.evaluate(() => {
     (window as unknown as { __emitAgentEvent: (event: unknown) => void }).__emitAgentEvent({
@@ -453,13 +465,22 @@ test("keeps the composer usable during thinking and drains queued messages after
   await expect(composer).toBeEnabled();
   await composer.fill("queued first");
   await page.getByRole("button", { name: "发送消息", exact: true }).click();
+  await expect(page.locator(".message-queue")).toContainText("队列 (1)");
+  await expect(page.locator(".message--user").getByText("queued first", { exact: true })).toHaveCount(0);
+  await expect(page.locator(".queue-list")).toContainText("queued first");
+  await expect.poll(() => page.evaluate(() => (window as unknown as { __invoked: string[] }).__invoked.filter((command) => command === "cancel_turn").length)).toBe(0);
+
   await composer.fill("queued second");
   await page.getByRole("button", { name: "发送消息", exact: true }).click();
 
   await expect(page.locator(".message-queue")).toContainText("队列 (2)");
+  await expect(page.locator(".queue-list")).toContainText("queued first");
+  await expect(page.locator(".queue-list")).toContainText("queued second");
+  await expect(page.locator(".message--user").getByText("queued second", { exact: true })).toHaveCount(0);
   await expect.poll(() => page.evaluate(() => (window as unknown as { __runTurnCalls: unknown[] }).__runTurnCalls.length)).toBe(0);
+  await page.screenshot({ path: testInfo.outputPath("queued-message-actions.png"), fullPage: true });
 
-  await page.getByRole("button", { name: "停止生成", exact: true }).click();
+  await page.getByRole("button", { name: "立即发送 queued first", exact: true }).click();
   await expect.poll(() => page.evaluate(() => (window as unknown as { __invoked: string[] }).__invoked.filter((command) => command === "cancel_turn").length)).toBe(1);
   await page.evaluate(() => {
     (window as unknown as { __emitAgentEvent: (event: unknown) => void }).__emitAgentEvent({
@@ -471,6 +492,8 @@ test("keeps the composer usable during thinking and drains queued messages after
     });
   });
   await expect.poll(() => page.evaluate(() => (window as unknown as { __runTurnCalls: unknown[] }).__runTurnCalls.length)).toBe(1);
+  await expect(page.locator(".message--user").getByText("queued first", { exact: true })).toBeVisible();
+  await expect(page.locator(".message--user").getByText("queued second", { exact: true })).toHaveCount(0);
 });
 
 test("keeps OCR text hidden while adding it to the model context", async ({ page }, testInfo) => {
@@ -595,10 +618,12 @@ test("streams progress and tools in event order before the turn completes", asyn
 
   const liveMessage = page.locator(".message--assistant").last();
   await expect(liveMessage.getByText("我先读取入口文件。", { exact: true })).toBeVisible();
-  await expect(liveMessage.locator(".turn-timeline-tool--running").getByText("正在读取文件", { exact: true })).toBeVisible();
-  await expect(liveMessage.locator(".turn-tool-meta > span").getByText("src/App.tsx · 第 3370-3419 行", { exact: true })).toBeVisible();
+  await expect(liveMessage.locator(".turn-timeline-tool--running").getByText("读取 src/App.tsx L3370-3419", { exact: true })).toBeVisible();
+  await expect(liveMessage.locator(".turn-tool-meta > span").getByText("执行中", { exact: true })).toBeVisible();
   await expect(liveMessage.locator(".turn-timeline-tool--running .turn-tool-running")).toBeVisible();
-  await expect(liveMessage.locator(".turn-execution > summary")).toHaveCount(0);
+  const liveExecution = liveMessage.locator(".turn-execution--live");
+  await expect(liveExecution).toHaveAttribute("open", "");
+  await expect(liveExecution.locator("summary").getByText("处理工具结果中", { exact: true })).toBeVisible();
   await expect(liveMessage.locator(".message-avatar")).toHaveCount(0);
   await page.screenshot({ path: testInfo.outputPath("active-file-read.png"), fullPage: true });
 
@@ -610,7 +635,8 @@ test("streams progress and tools in event order before the turn completes", asyn
     name: "read_file",
     result: { success: true, output: "export function App() {}", metadata: { path: "src/App.tsx", bytesReturned: 24, startLine: 3370, endLine: 3382 } },
   });
-  await expect(liveMessage.locator(".turn-tool-meta > span").getByText("src/App.tsx · 第 3370-3382 行", { exact: true })).toBeVisible();
+  await expect(liveMessage.locator(".turn-timeline-tool--completed").getByText("读取 src/App.tsx L3370-3382", { exact: true })).toBeVisible();
+  await expect(liveMessage.locator(".turn-tool-meta > span").getByText("已完成", { exact: true })).toBeVisible();
   await expect(liveMessage.getByText("思考中", { exact: true })).toBeVisible();
   await emit({ ...base, type: "text_delta", phase: "planning", delta: "入口文件已读取。" });
   await emit({
@@ -632,9 +658,9 @@ test("streams progress and tools in event order before the turn completes", asyn
 
   await expect(liveMessage.getByText("入口文件已读取。", { exact: true })).toBeVisible();
   await expect(liveMessage.getByText("执行了 4.2s", { exact: true })).toBeVisible();
-  await expect(liveMessage.locator(".turn-timeline-tool--completed").getByText("读取文件", { exact: true })).toBeHidden();
+  await expect(liveMessage.locator(".turn-timeline-tool--completed").getByText("读取 src/App.tsx L3370-3382", { exact: true })).toBeHidden();
   await liveMessage.getByText("执行了 4.2s", { exact: true }).click();
-  await expect(liveMessage.locator(".turn-timeline-tool--completed").getByText("读取文件", { exact: true })).toBeVisible();
+  await expect(liveMessage.locator(".turn-timeline-tool--completed").getByText("读取 src/App.tsx L3370-3382", { exact: true })).toBeVisible();
   await expect(liveMessage.locator(".turn-timeline > *")).toHaveCount(3);
 });
 
@@ -763,6 +789,17 @@ test("completes and restores an approved edit test repair workflow", async ({ pa
   await expect(liveMessage.locator(".turn-timeline-tool")).toHaveCount(5);
   await expect(liveMessage.locator(".turn-timeline-tool").first()).toBeHidden();
   await liveMessage.getByText("执行了 2分05秒", { exact: true }).click();
+  const timelineOrder = await liveMessage.locator(".turn-timeline").first().evaluate((timeline) =>
+    Array.from(timeline.children).map((child) => child.className),
+  );
+  const approvalRequestIndex = timelineOrder.findIndex((className) => className.includes("approval_requested"));
+  const approvalResolvedIndex = timelineOrder.findIndex((className) => className.includes("approval_resolved"));
+  const toolIndexes = timelineOrder
+    .map((className, index) => className.includes("turn-timeline-tool") ? index : -1)
+    .filter((index) => index >= 0);
+  expect(approvalRequestIndex).toBeGreaterThanOrEqual(0);
+  expect(approvalResolvedIndex).toBeGreaterThan(approvalRequestIndex);
+  expect(approvalResolvedIndex).toBeLessThan(toolIndexes[1]);
   await expect(liveMessage.getByText("测试失败，修正实现后重新验证。", { exact: true })).toBeVisible();
   await expect(liveMessage.locator(".turn-tool-output-line--stderr")).toHaveText("test failed\n");
   await expect(liveMessage.getByText("修复完成，测试已经通过。", { exact: true })).toHaveCount(1);
@@ -773,6 +810,8 @@ test("completes and restores an approved edit test repair workflow", async ({ pa
     { type: "tool", activity: { turnId: "turn-self-edit", call: readCall, state: "completed", result: result(true, "before") } },
     { type: "text", id: "progress-edit", turnId: "turn-self-edit", text: "开始应用第一版修改。" },
     { type: "tool", activity: { turnId: "turn-self-edit", call: firstPatchCall, state: "completed", result: result(true, "applied") } },
+    { type: "event", itemId: "approval-requested-approval-edit-1", turnId: "turn-self-edit", kind: "approval_requested", title: "已请求操作确认", detail: "apply_patch · review the proposed file change" },
+    { type: "event", itemId: "approval-resolved-approval-edit-1", turnId: "turn-self-edit", kind: "approval_resolved", title: "操作确认已处理", detail: "approved" },
     { type: "tool", activity: { turnId: "turn-self-edit", call: failedTestCall, state: "failed", result: result(false, "test failed", { outputChunks: [{ stream: "stderr", cursor: 1, text: "test failed\n" }] }) } },
     { type: "text", id: "progress-repair", turnId: "turn-self-edit", text: "测试失败，修正实现后重新验证。" },
     { type: "tool", activity: { turnId: "turn-self-edit", call: repairPatchCall, state: "completed", result: result(true, "applied") } },
@@ -791,7 +830,7 @@ test("completes and restores an approved edit test repair workflow", async ({ pa
     lastTurn: { turnId: "turn-self-edit", state: "completed", error: null },
     toolActivities: [],
     turnTimeline: persistedTimeline,
-    approvals: [],
+    approvals: [{ request: approval("approval-edit-1", firstPatchCall.id), resolution: { action: "approved", patch: null, selectedPaths: [], expectedHashes: [] } }],
     changes: [firstChange, repairedChange],
   });
   await page.reload();
@@ -800,6 +839,16 @@ test("completes and restores an approved edit test repair workflow", async ({ pa
   await expect(restoredMessage.locator(".turn-timeline-tool")).toHaveCount(5);
   await expect(restoredMessage.locator(".turn-timeline-tool").first()).toBeHidden();
   await restoredMessage.getByText("执行了 2分05秒", { exact: true }).click();
+  const restoredTimelineOrder = await restoredMessage.locator(".turn-timeline").first().evaluate((timeline) =>
+    Array.from(timeline.children).map((child) => child.className),
+  );
+  const restoredRequestIndex = restoredTimelineOrder.findIndex((className) => className.includes("approval_requested"));
+  const restoredResolutionIndex = restoredTimelineOrder.findIndex((className) => className.includes("approval_resolved"));
+  const restoredToolIndexes = restoredTimelineOrder
+    .map((className, index) => className.includes("turn-timeline-tool") ? index : -1)
+    .filter((index) => index >= 0);
+  expect(restoredRequestIndex).toBeLessThan(restoredToolIndexes[1]);
+  expect(restoredResolutionIndex).toBeLessThan(restoredToolIndexes[1]);
   await expect(restoredMessage.locator(".turn-tool-output-line--stderr")).toHaveText("test failed\n");
   await expect(restoredMessage.getByText("修复完成，测试已经通过。", { exact: true })).toHaveCount(1);
   await expect(restoredMessage.locator(".changes-toggle")).toContainText("2 个文件");

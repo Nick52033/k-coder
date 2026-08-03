@@ -51,6 +51,8 @@ import type {
   PlanUpdateRequest,
   PlanView,
   SearchResult,
+  LogQuery,
+  LogQueryResult,
 } from "../types/runtime";
 
 export function getRuntimeStatus() {
@@ -284,6 +286,15 @@ export interface OcrResult {
 
 export function recognizeImage(dataUrl: string): Promise<OcrResult> {
   return invoke<OcrResult>("recognize_image", { dataUrl });
+}
+
+export function readLogs(query: LogQuery = {}): Promise<LogQueryResult> {
+  return invoke<LogQueryResult>("read_logs", {
+    limit: query.limit,
+    level: query.level,
+    event: query.event,
+    afterTimestampMs: query.afterTimestampMs,
+  });
 }
 
 export function subscribeToAgentEvents(

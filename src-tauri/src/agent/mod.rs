@@ -24,6 +24,7 @@ use crate::protocol::{
     ImageAttachment, MessageRole, PROTOCOL_VERSION, PatchPreview, ReasoningEffort, TokenUsage,
     ToolCall, ToolResult, TurnState, UserInputAction, UserInputRequest, UserInputResolution,
 };
+use crate::logging::StructuredLogger;
 use crate::providers::{
     Provider, ProviderError, ProviderEvent, ProviderImage, ProviderMessage, ProviderRequest,
 };
@@ -150,6 +151,7 @@ pub struct AgentRuntime {
     context_limit: usize,
     metrics: Option<RuntimeMetrics>,
     reasoning_effort: ReasoningEffort,
+    logger: Option<StructuredLogger>,
 }
 
 impl AgentRuntime {
@@ -194,11 +196,17 @@ impl AgentRuntime {
             context_limit: DEFAULT_CONTEXT_LIMIT,
             metrics: None,
             reasoning_effort: ReasoningEffort::default(),
+            logger: None,
         }
     }
 
     pub fn with_runtime_instructions(mut self, instructions: String) -> Self {
         self.runtime_instructions = instructions;
+        self
+    }
+
+    pub fn with_logger(mut self, logger: StructuredLogger) -> Self {
+        self.logger = Some(logger);
         self
     }
 
@@ -994,6 +1002,7 @@ impl AgentRuntime {
             max_total_tokens: self.max_total_tokens,
             metrics: self.metrics.clone(),
             reasoning_effort: self.reasoning_effort,
+            logger: self.logger.clone(),
         };
 
         Box::pin(async move {
@@ -1600,6 +1609,17 @@ impl AgentRuntime {
         message: String,
         publisher: &Arc<dyn EventPublisher>,
     ) -> Result<TurnOutcome, AgentRuntimeError> {
+        if let Some(logger) = &self.logger {
+            let _ = logger.log(
+                "error",
+                "turn_failed",
+                serde_json::json!({
+                    "threadId": thread_id,
+                    "turnId": turn_id,
+                    "message": message,
+                }),
+            );
+        }
         let timing = self
             .append_terminal_event(
                 thread_id,
@@ -1738,7 +1758,7 @@ fn provider_history(events: Vec<StoredEvent>) -> Vec<ProviderMessage> {
             history.push(message);
         }
     }
-    history
+    context::repair_tool_history(history)
 }
 
 fn last_active_context_usage(events: &[StoredEvent]) -> Option<TokenUsage> {
@@ -2376,7 +2396,13 @@ mod tests {
         let call = ToolCall {
             id: "call-1".to_string(),
             name: "read_file".to_string(),
-            arguments: json!({ "path": "README.md" }),
+            arguments: json!({
+                "path": "README.md",
+                "offset": 0,
+                "limit": 262_144,
+                "startLine": 1,
+                "lineCount": 220
+            }),
             metadata: json!({}),
         };
         let provider = Arc::new(FakeProvider::script(vec![
@@ -2913,6 +2939,133 @@ mod tests {
             history.as_slice(),
             [ProviderMessage::Text { text, .. }]
                 if text.contains("tool read_file (true): important result")
+        ));
+    }
+
+    #[test]
+    fn provider_history_repairs_incomplete_persisted_tool_groups() {
+        let calls = vec![
+            ToolCall {
+                id: "call-a".to_string(),
+                name: "read_file".to_string(),
+                arguments: json!({ "path": "a.md" }),
+                metadata: json!({}),
+            },
+            ToolCall {
+                id: "call-b".to_string(),
+                name: "read_file".to_string(),
+                arguments: json!({ "path": "b.md" }),
+                metadata: json!({}),
+            },
+        ];
+        let history = provider_history(vec![
+            StoredEvent::new(
+                "thread",
+                Some("interrupted-turn".to_string()),
+                StoredEventKind::AssistantToolCalls {
+                    text: "Inspecting files".to_string(),
+                    calls,
+                },
+            ),
+            StoredEvent::new(
+                "thread",
+                Some("interrupted-turn".to_string()),
+                StoredEventKind::ToolResult {
+                    call_id: "call-a".to_string(),
+                    name: "read_file".to_string(),
+                    result: ToolResult {
+                        success: true,
+                        output: "a".to_string(),
+                        metadata: json!({}),
+                    },
+                },
+            ),
+        ]);
+
+        assert!(matches!(
+            history.as_slice(),
+            [ProviderMessage::Text { role: MessageRole::Assistant, text }]
+                if text == "Inspecting files"
+        ));
+    }
+
+    #[tokio::test]
+    async fn recovered_turn_sends_only_complete_tool_groups_to_provider() {
+        let (_directory, repository, runtime, thread_id) = runtime_fixture().await;
+        let interrupted_turn_id = "interrupted-turn".to_string();
+        repository
+            .append(StoredEvent::new(
+                &thread_id,
+                Some(interrupted_turn_id.clone()),
+                StoredEventKind::AssistantToolCalls {
+                    text: "Inspecting files".to_string(),
+                    calls: vec![
+                        ToolCall {
+                            id: "call-a".to_string(),
+                            name: "read_file".to_string(),
+                            arguments: json!({ "path": "a.md" }),
+                            metadata: json!({}),
+                        },
+                        ToolCall {
+                            id: "call-b".to_string(),
+                            name: "read_file".to_string(),
+                            arguments: json!({ "path": "b.md" }),
+                            metadata: json!({}),
+                        },
+                    ],
+                },
+            ))
+            .await
+            .unwrap();
+        repository
+            .append(StoredEvent::new(
+                &thread_id,
+                Some(interrupted_turn_id),
+                StoredEventKind::ToolResult {
+                    call_id: "call-a".to_string(),
+                    name: "read_file".to_string(),
+                    result: ToolResult {
+                        success: true,
+                        output: "a".to_string(),
+                        metadata: json!({}),
+                    },
+                },
+            ))
+            .await
+            .unwrap();
+
+        let provider = Arc::new(FakeProvider::text(&["Recovered"]));
+        let outcome = runtime
+            .run_turn(
+                provider.clone(),
+                "fake".to_string(),
+                RunTurnRequest {
+                    thread_id,
+                    input: "continue".to_string(),
+                    agent_mode: None,
+                },
+                CancellationToken::new(),
+                Arc::new(RecordingPublisher::default()),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.state, TurnState::Completed);
+        assert!(
+            provider.requests()[0]
+                .messages
+                .iter()
+                .all(|message| !matches!(
+                    message,
+                    ProviderMessage::AssistantToolCalls { .. } | ProviderMessage::ToolResult { .. }
+                ))
+        );
+        assert!(matches!(
+            provider.requests()[0].messages.as_slice(),
+            [
+                ProviderMessage::Text { role: MessageRole::Assistant, text },
+                ProviderMessage::Text { role: MessageRole::User, text: user_text }
+            ] if text == "Inspecting files" && user_text == "continue"
         ));
     }
 

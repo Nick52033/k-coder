@@ -13,6 +13,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::agent::{AgentRuntime, EventPublisher, RunTurnRequest};
+use crate::logging::StructuredLogger;
 use crate::policy::ApprovalManager;
 use crate::protocol::{
     AgentEvent, AgentEventEnvelope, ApprovalMode, ReasoningEffort, TokenUsage, ToolDefinition,
@@ -122,6 +123,7 @@ pub struct SubagentExecutionContext {
     pub reasoning_effort: ReasoningEffort,
     pub agent_events: Arc<dyn EventPublisher>,
     pub lifecycle_events: Arc<dyn SubagentEventPublisher>,
+    pub logger: Option<StructuredLogger>,
 }
 
 struct ActiveSubagent {
@@ -438,6 +440,9 @@ impl MultiAgentCoordinator {
             )
             .with_context_limit(context.context_limit)
             .with_reasoning_effort(context.reasoning_effort);
+            if let Some(logger) = &context.logger {
+                runtime = runtime.with_logger(logger.clone());
+            }
             if let Some(remaining_tokens) = remaining_tokens {
                 runtime = runtime.with_token_budget(remaining_tokens);
             }
@@ -1109,6 +1114,7 @@ mod tests {
             reasoning_effort: ReasoningEffort::default(),
             agent_events: Arc::new(NoopAgentPublisher),
             lifecycle_events: lifecycle,
+            logger: None,
         }
     }
 

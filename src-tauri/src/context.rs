@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use serde::{Deserialize, Serialize};
 
 use crate::protocol::MessageRole;
@@ -137,7 +139,55 @@ pub fn compact(
         });
     }
     result.extend(kept);
+    let result = repair_tool_history(result);
     (summary, result)
+}
+
+/// Keep only complete assistant-tool groups before sending history to a provider.
+pub(crate) fn repair_tool_history(messages: Vec<ProviderMessage>) -> Vec<ProviderMessage> {
+    let mut result: Vec<ProviderMessage> = Vec::with_capacity(messages.len());
+    let mut iter = messages.into_iter().peekable();
+    while let Some(message) = iter.next() {
+        match message {
+            ProviderMessage::AssistantToolCalls { text, calls } => {
+                let expected_ids = calls
+                    .iter()
+                    .map(|call| call.id.as_str())
+                    .collect::<HashSet<_>>();
+                let mut tool_results = Vec::new();
+                while matches!(iter.peek(), Some(ProviderMessage::ToolResult { .. })) {
+                    tool_results.push(iter.next().expect("peeked tool result must exist"));
+                }
+
+                let result_ids = tool_results
+                    .iter()
+                    .filter_map(|message| match message {
+                        ProviderMessage::ToolResult { call_id, .. } => Some(call_id.as_str()),
+                        _ => None,
+                    })
+                    .collect::<HashSet<_>>();
+                let complete = !calls.is_empty()
+                    && expected_ids.len() == calls.len()
+                    && tool_results.len() == calls.len()
+                    && result_ids == expected_ids;
+
+                if complete {
+                    result.push(ProviderMessage::AssistantToolCalls { text, calls });
+                    result.extend(tool_results);
+                } else if !text.trim().is_empty() {
+                    result.push(ProviderMessage::Text {
+                        role: MessageRole::Assistant,
+                        text,
+                    });
+                }
+            }
+            ProviderMessage::ToolResult { .. } => {
+                // Tool results are retained only as part of a complete group above.
+            }
+            other => result.push(other),
+        }
+    }
+    result
 }
 
 pub fn render_summary(summary: &CompactionSummary) -> String {
@@ -243,5 +293,100 @@ mod tests {
     fn reported_context_usage_uses_the_auto_compact_threshold() {
         assert!(!needs_compaction_for_usage(159_999, 200_000));
         assert!(needs_compaction_for_usage(160_000, 200_000));
+    }
+
+    #[test]
+    fn compaction_preserves_tool_call_pairing() {
+        let call = crate::protocol::ToolCall {
+            id: "call-1".into(),
+            name: "read_file".into(),
+            arguments: serde_json::json!({"path": "README.md"}),
+            metadata: serde_json::Value::Null,
+        };
+        let mut messages = vec![ProviderMessage::Text {
+            role: MessageRole::User,
+            text: "请阅读 README".into(),
+        }];
+        messages.extend((0..40).map(|n| ProviderMessage::Text {
+            role: MessageRole::Assistant,
+            text: format!("history {n} {}", "x".repeat(500)),
+        }));
+        messages.push(ProviderMessage::AssistantToolCalls {
+            text: String::new(),
+            calls: vec![call],
+        });
+        messages.push(ProviderMessage::ToolResult {
+            call_id: "call-1".into(),
+            name: "read_file".into(),
+            success: true,
+            output: "ok".into(),
+        });
+        let (_, compacted) = compact(&messages, 4_000);
+        let mut iter = compacted.iter();
+        while let Some(msg) = iter.next() {
+            if let ProviderMessage::AssistantToolCalls { calls, .. } = msg {
+                for _ in 0..calls.len() {
+                    let next = iter
+                        .next()
+                        .expect("missing tool result after assistant tool_calls");
+                    assert!(
+                        matches!(next, ProviderMessage::ToolResult { .. }),
+                        "assistant(tool_calls) must be followed by ToolResult"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn tool_history_repair_matches_every_result_by_call_id() {
+        let call = |id: &str| crate::protocol::ToolCall {
+            id: id.into(),
+            name: "read_file".into(),
+            arguments: serde_json::json!({"path": format!("{id}.md")}),
+            metadata: serde_json::Value::Null,
+        };
+        let result = |id: &str| ProviderMessage::ToolResult {
+            call_id: id.into(),
+            name: "read_file".into(),
+            success: true,
+            output: "ok".into(),
+        };
+
+        let complete = repair_tool_history(vec![
+            ProviderMessage::AssistantToolCalls {
+                text: String::new(),
+                calls: vec![call("a"), call("b")],
+            },
+            result("b"),
+            result("a"),
+        ]);
+        assert_eq!(complete.len(), 3);
+
+        let repaired = repair_tool_history(vec![
+            ProviderMessage::AssistantToolCalls {
+                text: "Checking files".into(),
+                calls: vec![call("a"), call("b")],
+            },
+            result("a"),
+            ProviderMessage::Text {
+                role: MessageRole::User,
+                text: "continue".into(),
+            },
+            result("orphan"),
+            ProviderMessage::AssistantToolCalls {
+                text: String::new(),
+                calls: vec![call("c")],
+            },
+            result("wrong-id"),
+        ]);
+
+        assert!(matches!(
+            repaired.as_slice(),
+            [
+                ProviderMessage::Text { role: MessageRole::Assistant, text },
+                ProviderMessage::Text { role: MessageRole::User, .. }
+            ] if text == "Checking files"
+        ));
     }
 }

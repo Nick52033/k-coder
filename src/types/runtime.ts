@@ -552,3 +552,24 @@ export interface UserInputSnapshot {
   request: UserInputRequest;
   resolution: UserInputResolution | null;
 }
+
+export type LogLevel = "trace" | "debug" | "info" | "warn" | "error";
+
+export interface LogRecord {
+  timestampMs: number;
+  level: string;
+  event: string;
+  fields: unknown;
+}
+
+export interface LogQueryResult {
+  records: LogRecord[];
+  total: number;
+}
+
+export interface LogQuery {
+  limit?: number;
+  level?: LogLevel;
+  event?: string;
+  afterTimestampMs?: number;
+}

@@ -24,6 +24,7 @@ import {
   PinOff,
   Plus,
   RefreshCw,
+  ScrollText,
   Search,
   Settings,
   Square,
@@ -39,6 +40,7 @@ import { getRuntimeStatus, switchWorkspace, subscribeToAgentEvents, listSubagent
 import { useWorkbenchStore } from "./stores/workbenchStore";
 import { PatchReviewDialog } from "./components/PatchReviewDialog";
 import { SettingsDialog, type SettingsSection } from "./components/SettingsDialog";
+import { LogViewerDialog } from "./components/LogViewerDialog";
 import { WorkbenchPanel } from "./components/WorkbenchPanel";
 import { AgentActivityPanel } from "./components/AgentActivityPanel";
 import { ModelSelector } from "./components/ModelSelector";
@@ -88,6 +90,7 @@ function App() {
   const [runtimeError, setRuntimeError] = useState("");
   const [draft, setDraft] = useState("");
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [logViewerOpen, setLogViewerOpen] = useState(false);
   const [settingsSection, setSettingsSection] = useState<SettingsSection>("providers");
   const [selectedChangeId, setSelectedChangeId] = useState<string | null>(null);
   const [attachments, setAttachments] = useState<AttachmentContent[]>([]);
@@ -164,6 +167,8 @@ function App() {
     deleteConversation,
     createActiveGoal,
     transitionActiveGoal,
+    sendQueuedMessageNow,
+    removeQueuedMessage,
     clearQueue,
     forceResetState,
   } = useWorkbenchStore();
@@ -249,10 +254,13 @@ function App() {
   // "会话"tab 调用时不传项目路径，会话保持"未分类"；"项目"tab 调用时传入项目路径，
   // store 创建线程后立即把 threadId 关联到该项目，避免被自动绑定到当前工作区。
   const createSessionUnderProject = async (projectPath: string | null) => {
-    await createThread();
+    let newThreadId: string;
+    try {
+      newThreadId = await createThread();
+    } catch {
+      return;
+    }
     if (!projectPath) return;
-    const newThreadId = useWorkbenchStore.getState().activeThreadId;
-    if (!newThreadId) return;
     const map = readThreadProjectMap();
     if (map[newThreadId] === projectPath) return;
     const next = { ...map, [newThreadId]: projectPath };
@@ -531,6 +539,7 @@ function App() {
     attachments.forEach((attachment) => ocrResultsRef.current.delete(attachment.path));
     setDraft("");
     setAttachments([]);
+    if (currentThreadBusy) setQueueExpanded(true);
     void sendMessage(message + attachmentContext, imageAttachments, agentMode);
   }
 
@@ -1058,6 +1067,16 @@ function App() {
             <Settings size={16} />
             <span>设置</span>
           </button>
+          <button
+            className="sidebar-settings-button"
+            type="button"
+            onClick={() => setLogViewerOpen(true)}
+            aria-label="查看本地日志"
+            title="查看本地运行日志"
+          >
+            <ScrollText size={16} />
+            <span>日志</span>
+          </button>
         </div>
       </aside>
 
@@ -1072,7 +1091,7 @@ function App() {
         </div>
 
         <div className={cn("message-area", hasConversationContent && "message-area--populated")} ref={messageAreaRef}>
-          {loading && !messages.length ? (
+          {loading && !hasConversationContent ? (
             <div className="empty-thread"><Activity className="spin" size={24} /><p>正在读取会话</p></div>
           ) : hasConversationContent ? (
             <div className="message-list">
@@ -1265,6 +1284,12 @@ function App() {
                 />
               )}
 
+              {loading && (
+                <div className="message-list-loading">
+                  <Activity className="spin" size={20} />
+                  <span>正在读取会话</span>
+                </div>
+              )}
               {retryable && (
                 <button className="retry-button" type="button" onClick={() => void retryLastTurn()}>
                   <RefreshCw size={15} />
@@ -1335,6 +1360,26 @@ function App() {
                         {queueItem.status === "failed" && "失败"}
                       </span>
                     </div>
+                    {queueItem.status === "pending" && (
+                      <div className="queue-item-actions">
+                        <button
+                          type="button"
+                          aria-label={`立即发送 ${queueItem.input || "图片消息"}`}
+                          title="立即发送并打断当前对话"
+                          onClick={() => void sendQueuedMessageNow(queueItem.id)}
+                        >
+                          <ArrowUp size={16} strokeWidth={2.2} />
+                        </button>
+                        <button
+                          type="button"
+                          aria-label={`删除队列消息 ${queueItem.input || "图片消息"}`}
+                          title="从队列删除"
+                          onClick={() => removeQueuedMessage(queueItem.id)}
+                        >
+                          <Trash2 size={16} />
+                        </button>
+                      </div>
+                    )}
                   </div>
                 ))}
                 {messageQueue.filter(m => m.status === "pending").length > 0 && (
@@ -1625,6 +1670,9 @@ function App() {
           onClose={() => setSelectedChangeId(null)}
         />
       )}
+      {logViewerOpen && (
+        <LogViewerDialog onClose={() => setLogViewerOpen(false)} />
+      )}
     </main>
   );
 }
@@ -1696,13 +1744,25 @@ function stateLabel(state: string) {
 
 function toolActivityDetail(activity: {
   state: "running" | "completed" | "failed" | "cancelled";
-  call: { arguments: Record<string, unknown> };
+  call: { name: string; arguments: Record<string, unknown> };
   result: { output: string } | null;
 }) {
   if (activity.state === "running") return "执行中";
   if (activity.state === "failed") return activity.result?.output || "执行失败";
   if (activity.state === "cancelled") return "已取消";
-  const path = activity.call.arguments.path;
+  const args = activity.call.arguments ?? {};
+  if (activity.call.name === "search_repository" && typeof args.query === "string") {
+    return `搜索 ${args.query}`;
+  }
+  if (activity.call.name === "read_file" && typeof args.path === "string") {
+    const startLine = typeof args.startLine === "number" ? args.startLine : null;
+    const lineCount = typeof args.lineCount === "number" ? args.lineCount : null;
+    const range = startLine !== null
+      ? lineCount !== null && lineCount > 1 ? ` L${startLine}-${startLine + lineCount - 1}` : ` L${startLine}`
+      : "";
+    return `读取 ${args.path}${range}`;
+  }
+  const path = args.path;
   return typeof path === "string" ? path : "已完成";
 }
 

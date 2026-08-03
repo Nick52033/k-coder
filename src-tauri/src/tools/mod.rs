@@ -624,16 +624,16 @@ impl ToolHandler for ReadFileTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "read_file".to_string(),
-            description: "Read a bounded text range from a file inside the current workspace. Prefer startLine/lineCount for code inspection; offset/limit remain available for byte-precise reads."
+            description: "Read a bounded text range from a file inside the current workspace. Prefer startLine/lineCount for code inspection. When either line-range field is present, the line range takes precedence and offset/limit are ignored; otherwise offset/limit remain available for byte-precise reads."
                 .to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "path": { "type": "string", "minLength": 1 },
-                    "offset": { "type": "integer", "minimum": 0 },
-                    "limit": { "type": "integer", "minimum": 1, "maximum": MAX_READ_BYTES },
-                    "startLine": { "type": "integer", "minimum": 1 },
-                    "lineCount": { "type": "integer", "minimum": 1, "maximum": MAX_READ_LINES }
+                    "offset": { "type": "integer", "minimum": 0, "description": "Zero-based byte offset. Ignored when startLine or lineCount is present." },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": MAX_READ_BYTES, "description": "Maximum bytes for a byte-range read. Ignored when startLine or lineCount is present." },
+                    "startLine": { "type": "integer", "minimum": 1, "description": "One-based starting line. Takes precedence over offset/limit." },
+                    "lineCount": { "type": "integer", "minimum": 1, "maximum": MAX_READ_LINES, "description": "Maximum lines to return. Takes precedence over offset/limit." }
                 },
                 "required": ["path"],
                 "additionalProperties": false
@@ -653,11 +653,6 @@ impl ToolHandler for ReadFileTool {
         let requested_start_line = optional_usize(&arguments, "startLine")?;
         let requested_line_count = optional_usize(&arguments, "lineCount")?;
         let uses_line_range = requested_start_line.is_some() || requested_line_count.is_some();
-        if uses_line_range && (byte_offset.is_some() || byte_limit.is_some()) {
-            return Err(ToolError::InvalidArguments(
-                "startLine/lineCount cannot be combined with offset/limit".to_string(),
-            ));
-        }
         let workspace = Workspace::new(&context.workspace_root)?;
         let file = workspace.resolve_existing(path)?;
         if !file.is_file() {
@@ -1593,7 +1588,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_file_defaults_to_64_kib_and_rejects_mixed_range_units() {
+    async fn read_file_defaults_to_64_kib_and_line_ranges_override_redundant_byte_ranges() {
         let workspace = tempfile::tempdir().unwrap();
         std::fs::write(workspace.path().join("large.txt"), "x".repeat(70 * 1024)).unwrap();
         let registry = ToolRegistry::read_only();
@@ -1615,13 +1610,21 @@ mod tests {
             .dispatch(
                 &context(workspace.path()),
                 "read_file",
-                json!({ "path": "large.txt", "offset": 0, "startLine": 1 }),
+                json!({
+                    "path": "large.txt",
+                    "offset": 0,
+                    "limit": MAX_READ_BYTES,
+                    "startLine": 1,
+                    "lineCount": 1
+                }),
                 CancellationToken::new(),
             )
-            .await;
-        assert!(
-            matches!(mixed, Err(ToolError::InvalidArguments(message)) if message.contains("cannot be combined"))
-        );
+            .await
+            .unwrap();
+        assert_eq!(mixed.output, "x".repeat(70 * 1024));
+        assert_eq!(mixed.metadata["startLine"], 1);
+        assert_eq!(mixed.metadata["endLine"], 1);
+        assert_eq!(mixed.metadata["linesReturned"], 1);
     }
 
     #[tokio::test]

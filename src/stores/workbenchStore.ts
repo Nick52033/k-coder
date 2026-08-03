@@ -33,6 +33,7 @@ import type {
   ApprovalMode,
   ReasoningEffort,
   ApprovalRequest,
+  ApprovalSnapshot,
   ApprovalResolution,
   ChatMessage,
   ChangeSet,
@@ -59,6 +60,7 @@ import type {
 
 interface QueuedMessage {
   id: string;
+  messageId: string;
   threadId: string;
   input: string;
   attachments: ImageAttachment[];
@@ -100,11 +102,13 @@ interface WorkbenchState {
   searchThreadHistory: (query: string) => Promise<void>;
   renameConversation: (threadId: string, title: string) => Promise<void>;
   deleteConversation: (threadId: string) => Promise<void>;
-  createThread: () => Promise<void>;
+  createThread: () => Promise<string>;
   selectThread: (threadId: string) => Promise<void>;
   archiveActiveThread: () => Promise<void>;
   sendMessage: (input: string, attachments?: ImageAttachment[], agentMode?: string) => Promise<void>;
   processQueue: () => Promise<void>;
+  sendQueuedMessageNow: (messageId: string) => Promise<void>;
+  removeQueuedMessage: (messageId: string) => void;
   clearQueue: () => void;
   retryLastTurn: () => Promise<void>;
   stopTurn: () => Promise<void>;
@@ -216,10 +220,85 @@ function appendTimelineEvent(
   return [...timeline, { type: "event" as const, itemId, turnId, kind, title, detail, durationMs }];
 }
 
+function insertApprovalRequestEvent(
+  timeline: TurnTimelineItem[],
+  itemId: string,
+  turnId: string,
+  kind: TimelineEventKind,
+  title: string,
+  detail: string | null,
+  toolCallId: string,
+) {
+  if (timeline.some((item) => item.type === "event" && item.itemId === itemId)) return timeline;
+  const event = { type: "event" as const, itemId, turnId, kind, title, detail };
+  const toolIndex = timeline.findIndex((item) => item.type === "tool"
+    && item.activity.turnId === turnId
+    && item.activity.call.id === toolCallId);
+  if (toolIndex < 0) return [...timeline, event];
+  return [...timeline.slice(0, toolIndex), event, ...timeline.slice(toolIndex)];
+}
+
+function insertApprovalResolutionEvent(
+  timeline: TurnTimelineItem[],
+  itemId: string,
+  turnId: string,
+  kind: TimelineEventKind,
+  title: string,
+  detail: string | null,
+  requestId: string,
+) {
+  if (timeline.some((item) => item.type === "event" && item.itemId === itemId)) return timeline;
+  const event = { type: "event" as const, itemId, turnId, kind, title, detail };
+  const requestIndex = timeline.findIndex((item) => item.type === "event" && item.itemId === `approval-requested-${requestId}`);
+  if (requestIndex >= 0) return [...timeline.slice(0, requestIndex + 1), event, ...timeline.slice(requestIndex + 1)];
+  return [...timeline, event];
+}
+
+function normalizeApprovalTimeline(timeline: TurnTimelineItem[], approvals: ApprovalSnapshot[]) {
+  let normalized = timeline;
+  for (const approval of approvals) {
+    normalized = moveTimelineItemBeforeTool(
+      normalized,
+      `approval-requested-${approval.request.id}`,
+      approval.request.turnId,
+      approval.request.toolCallId,
+    );
+    normalized = moveTimelineItemAfterRequest(
+      normalized,
+      `approval-resolved-${approval.request.id}`,
+      `approval-requested-${approval.request.id}`,
+    );
+  }
+  return normalized;
+}
+
+function moveTimelineItemBeforeTool(timeline: TurnTimelineItem[], itemId: string, turnId: string, toolCallId: string) {
+  const itemIndex = timeline.findIndex((item) => item.type === "event" && item.itemId === itemId);
+  if (itemIndex < 0) return timeline;
+  const item = timeline[itemIndex];
+  const withoutItem = [...timeline.slice(0, itemIndex), ...timeline.slice(itemIndex + 1)];
+  const toolIndex = withoutItem.findIndex((entry) => entry.type === "tool"
+    && entry.activity.turnId === turnId
+    && entry.activity.call.id === toolCallId);
+  if (toolIndex < 0) return timeline;
+  return [...withoutItem.slice(0, toolIndex), item, ...withoutItem.slice(toolIndex)];
+}
+
+function moveTimelineItemAfterRequest(timeline: TurnTimelineItem[], itemId: string, requestItemId: string) {
+  const itemIndex = timeline.findIndex((item) => item.type === "event" && item.itemId === itemId);
+  if (itemIndex < 0) return timeline;
+  const item = timeline[itemIndex];
+  const withoutItem = [...timeline.slice(0, itemIndex), ...timeline.slice(itemIndex + 1)];
+  const requestIndex = withoutItem.findIndex((entry) => entry.type === "event" && entry.itemId === requestItemId);
+  if (requestIndex < 0) return timeline;
+  return [...withoutItem.slice(0, requestIndex + 1), item, ...withoutItem.slice(requestIndex + 1)];
+}
+
 let initializationPromise: Promise<void> | null = null;
 let hydrationSequence = 0;
 const hydrationBuffers = new Map<string, { token: number; events: AgentEvent[] }>();
 let queueProcessing = false;
+let cancellationRequestedTurnId: string | null = null;
 
 const LEGACY_PROVIDER_STORAGE_KEY = "k-coder-providers";
 
@@ -381,8 +460,10 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
         goal: null,
         error: "",
       }));
+      return thread.id;
     } catch (error) {
       set({ error: errorMessage(error) });
+      throw error;
     }
   },
 
@@ -431,7 +512,7 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
         ),
         lastTurn: detail.lastTurn,
         turnTimeline: detail.turnTimeline?.length
-          ? detail.turnTimeline
+          ? normalizeApprovalTimeline(detail.turnTimeline, detail.approvals)
           : detail.toolActivities.map((activity) => ({ type: "tool" as const, activity })),
         turnUserMessageIds: detail.turnUserMessageIds ?? {},
         activityStatus: shouldSetActiveTurn
@@ -474,13 +555,15 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
   },
 
   sendMessage: async (input, attachments = [], agentMode) => {
-    const threadId = get().activeThreadId;
+    const { activeThreadId: threadId, activeTurnId, activeTurnThreadId } = get();
     const text = input.trim();
     if (!threadId || (!text && attachments.length === 0)) return;
+    const shouldQueueOnly = Boolean(activeTurnId && activeTurnThreadId === threadId);
 
     // 创建队列项
     const queuedMessage: QueuedMessage = {
       id: `queue-${crypto.randomUUID()}`,
+      messageId: `pending-${crypto.randomUUID()}`,
       threadId,
       input: text,
       attachments,
@@ -491,26 +574,12 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
     // 添加到队列
     set((state) => ({
       messageQueue: [...state.messageQueue, queuedMessage],
-    }));
-
-    // 添加乐观更新的用户消息
-    const optimisticId = `pending-${crypto.randomUUID()}`;
-    set((state) => ({
-      messages: [
-        ...state.messages,
-        {
-          id: optimisticId,
-          role: "user",
-          text,
-          attachments: attachments.map(({ name, dataUrl }) => ({ name, dataUrl })),
-          createdAtMs: Date.now(),
-        },
-      ],
       error: "",
     }));
 
-    // 处理队列
-    get().processQueue();
+    if (shouldQueueOnly) return;
+
+    void get().processQueue();
   },
 
   processQueue: async () => {
@@ -532,6 +601,18 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
         messageQueue: state.messageQueue.map(msg =>
           msg.id === queuedMessage.id ? { ...msg, status: "processing" as const } : msg
         ),
+        messages: state.messages.some((message) => message.id === queuedMessage.messageId)
+          ? state.messages
+          : [
+              ...state.messages,
+              {
+                id: queuedMessage.messageId,
+                role: "user" as const,
+                text: queuedMessage.input,
+                attachments: queuedMessage.attachments.map(({ name, dataUrl }) => ({ name, dataUrl })),
+                createdAtMs: Date.now(),
+              },
+            ],
       }));
 
       const outcome = await runTurn(
@@ -554,23 +635,25 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
           (msg, idx, arr) => msg.status !== "completed" || idx >= arr.length - 3
         ),
       }));
-
-      if (outcome.error) {
-        set({ error: outcome.error });
-        // 如果有错误，标记为失败
-        set((state) => ({
-          messageQueue: state.messageQueue.map(msg =>
-            msg.id === queuedMessage.id
-              ? { ...msg, status: "failed" as const, error: outcome.error ?? undefined }
-              : msg
-          ),
-        }));
-      }
+      
+      const outcomeError = outcome.error;
 
       // 重新加载线程，但不要重新设置 activeTurnId
       await get().reloadThreads();
       if (get().activeThreadId === queuedMessage.threadId) {
         await get().selectThread(queuedMessage.threadId);
+      }
+
+      if (outcomeError) {
+        set({ error: outcomeError });
+        // 如果有错误，标记为失败
+        set((state) => ({
+          messageQueue: state.messageQueue.map(msg =>
+            msg.id === queuedMessage.id
+              ? { ...msg, status: "failed" as const, error: outcomeError ?? undefined }
+              : msg
+          ),
+        }));
       }
 
       // 继续处理下一条消息
@@ -584,15 +667,15 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
         return;
       }
       const failedMessage = nextMessage;
+      const errorMsg = errorMessage(error);
 
       // 标记为失败
       set((state) => ({
         messageQueue: state.messageQueue.map(msg =>
           msg.id === failedMessage.id
-            ? { ...msg, status: "failed" as const, error: errorMessage(error) }
+            ? { ...msg, status: "failed" as const, error: errorMsg }
             : msg
         ),
-        error: errorMessage(error),
         activeTurnId: null,
         activeTurnThreadId: null,
       }));
@@ -601,6 +684,9 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
         await get().selectThread(failedMessage.threadId);
       }
 
+      // selectThread 会清除 error，所以在之后重新设置
+      set({ error: errorMsg });
+
       // 继续处理下一条消息
       setTimeout(() => get().processQueue(), 1000);
     } finally {
@@ -608,8 +694,45 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
     }
   },
 
+  sendQueuedMessageNow: async (messageId) => {
+    const queuedMessage = get().messageQueue.find((message) =>
+      message.id === messageId && message.status === "pending"
+    );
+    if (!queuedMessage) return;
+
+    set((state) => {
+      const target = state.messageQueue.find((message) => message.id === messageId);
+      if (!target) return state;
+      const messageQueue = state.messageQueue.filter((message) => message.id !== messageId);
+      const firstPendingIndex = messageQueue.findIndex((message) => message.status === "pending");
+      messageQueue.splice(firstPendingIndex < 0 ? messageQueue.length : firstPendingIndex, 0, target);
+      return { messageQueue };
+    });
+
+    const { activeTurnId, activeTurnThreadId } = get();
+    if (activeTurnId) {
+      if (activeTurnThreadId !== queuedMessage.threadId) {
+        set({ error: "当前活动 Turn 属于其他会话，无法用此队列项打断" });
+        return;
+      }
+      await get().stopTurn();
+      return;
+    }
+    void get().processQueue();
+  },
+
+  removeQueuedMessage: (messageId) => {
+    set((state) => ({
+      messageQueue: state.messageQueue.filter((message) =>
+        message.id !== messageId || message.status !== "pending"
+      ),
+    }));
+  },
+
   clearQueue: () => {
-    set({ messageQueue: [] });
+    set((state) => ({
+      messageQueue: state.messageQueue.filter((message) => message.status !== "pending"),
+    }));
   },
 
   retryLastTurn: async () => {
@@ -628,14 +751,20 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
 
   stopTurn: async () => {
     const threadId = get().activeThreadId;
-    if (!threadId || !get().activeTurnId) return;
+    const turnId = get().activeTurnId;
+    if (!threadId || !turnId || cancellationRequestedTurnId === turnId) return;
+    cancellationRequestedTurnId = turnId;
     try {
       const accepted = await Promise.race([
         cancelTurn(threadId),
-        new Promise<boolean>((resolve) => window.setTimeout(() => resolve(false), 3_000)),
+        new Promise<"timeout">((resolve) => window.setTimeout(() => resolve("timeout"), 3_000)),
       ]);
-      if (!accepted) await get().selectThread(threadId);
+      if (accepted !== true) {
+        if (accepted === false) cancellationRequestedTurnId = null;
+        await get().selectThread(threadId);
+      }
     } catch (error) {
+      cancellationRequestedTurnId = null;
       set({ error: errorMessage(error) });
     }
   },
@@ -795,6 +924,12 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
   },
 
   handleAgentEvent: (event) => {
+    if (
+      cancellationRequestedTurnId === event.turnId
+      && ["turn_completed", "turn_failed", "turn_cancelled"].includes(event.type)
+    ) {
+      cancellationRequestedTurnId = null;
+    }
     const hydration = hydrationBuffers.get(event.threadId);
     if (hydration) {
       hydration.events.push(event);
@@ -993,13 +1128,14 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
         set((state) => {
           if (event.request.autoApproved) {
             return {
-              turnTimeline: appendTimelineEvent(
+              turnTimeline: insertApprovalRequestEvent(
                 state.turnTimeline,
                 `approval-requested-${event.request.id}`,
                 event.turnId,
                 "approval_requested",
                 "已自动批准操作",
                 `${event.request.toolName} · ${event.request.reason}`,
+                event.request.toolCallId,
               ),
             };
           }
@@ -1008,13 +1144,14 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
             ...approvalQueueState(queue),
             activityStatus: { turnId: event.turnId, status: "awaiting_approval" },
             lastTurn: { turnId: event.turnId, state: "awaiting_approval", error: null },
-            turnTimeline: appendTimelineEvent(
+            turnTimeline: insertApprovalRequestEvent(
               state.turnTimeline,
               `approval-requested-${event.request.id}`,
               event.turnId,
               "approval_requested",
               "已请求操作确认",
               `${event.request.toolName} · ${event.request.reason}`,
+              event.request.toolCallId,
             ),
           };
         });
@@ -1033,13 +1170,14 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
               turnId: event.turnId,
               status: queue.length ? "awaiting_approval" : "thinking",
             },
-            turnTimeline: appendTimelineEvent(
+            turnTimeline: insertApprovalResolutionEvent(
               state.turnTimeline,
               `approval-resolved-${event.requestId}`,
               event.turnId,
               "approval_resolved",
               "操作确认已处理",
               event.resolution.action,
+              event.requestId,
             ),
           };
         });
@@ -1197,12 +1335,6 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
             event.durationMs,
           ),
         }));
-        // 5秒后自动清除错误提示，避免错误一直显示
-        setTimeout(() => {
-          if (get().error === event.message) {
-            set({ error: "" });
-          }
-        }, 5000);
         setTimeout(() => get().processQueue(), 500);
         break;
       case "turn_cancelled":
@@ -1268,6 +1400,7 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
   forceResetState: async () => {
     const threadId = get().activeThreadId;
     console.log("强制重置状态...");
+    cancellationRequestedTurnId = null;
 
     // 尝试取消任何正在运行的 turn
     if (threadId && get().activeTurnId) {

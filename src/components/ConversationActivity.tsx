@@ -13,7 +13,7 @@ import {
   LoaderCircle,
   SquareTerminal,
 } from "lucide-react";
-import { lazy, Suspense, useEffect, useState, type ReactNode } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import type {
   AgentActivityStatus,
   ChangeSet,
@@ -24,8 +24,6 @@ import type {
   TimelineEventKind,
   TurnTimelineItem,
 } from "../types/runtime";
-
-const CodeEditor = lazy(() => import("./CodeEditor").then((module) => ({ default: module.CodeEditor })));
 
 export function ConversationTurnActivity({
   activities,
@@ -56,23 +54,39 @@ export function ConversationTurnActivity({
     (item): item is Extract<TurnTimelineItem, { type: "event" }> => item.type === "event" && isTerminalEvent(item.kind),
   );
   const processItems = processTimeline.filter((item) => item !== terminalEvent);
-  const hasProcess = Boolean(plan?.steps.length || activities.length || processItems.length || activityStatus);
+  const hasItems = Boolean(plan?.steps.length || activities.length || processItems.length);
+  const hasProcess = hasItems || Boolean(activityStatus);
   const toolCount = processTimeline.filter((item) => item.type === "tool").length || activities.length;
   const summaryTitle = terminalEvent?.durationMs !== undefined
     ? `执行了 ${formatDuration(terminalEvent.durationMs)}`
     : "执行过程";
+  const statusLabel = activityStatus ? {
+    thinking: "思考中",
+    responding: "生成回复中",
+    running_tool: "处理工具结果中",
+    awaiting_approval: "等待确认",
+    finalizing: "整理结果中",
+  }[activityStatus] : null;
+  const groupedProcessTimeline = groupConsecutiveReasoning(processTimeline);
   const processContent = (
     <div className={streaming ? "turn-execution-live" : "turn-execution-content"}>
       {plan?.steps.length ? <ConversationPlan plan={plan} /> : null}
       {processTimeline.length ? (
         <div className="turn-timeline">
-          {processTimeline.map((item) => (
+          {groupedProcessTimeline.map((entry) => entry.type === "reasoning_group" ? (
+            <ReasoningGroup
+              items={entry.items}
+              active={streaming}
+              renderText={renderText}
+              key={`reasoning-group-${entry.items.map((item) => item.itemId).join("-")}`}
+            />
+          ) : (
             <TimelineItem
-              item={item}
+              item={entry.item}
               changes={changes}
               active={streaming}
               renderText={renderText}
-              key={timelineItemKey(item)}
+              key={timelineItemKey(entry.item)}
             />
           ))}
         </div>
@@ -80,19 +94,26 @@ export function ConversationTurnActivity({
         <div className="turn-timeline">
           {activities.map((activity) => <ToolActivityRow activity={activity} key={activity.call.id} />)}
         </div>
-      ) : null}
-      {streaming && activityStatus ? (
-        <ActivityStatusRow
-          status={activityStatus}
-          hasRunningTool={activities.some((activity) => activity.state === "running")}
-        />
+      ) : streaming && activityStatus ? (
+        <div className="turn-timeline turn-timeline--empty">
+          <span className="turn-timeline-placeholder">等待工具调用…</span>
+        </div>
       ) : null}
     </div>
   );
 
   return (
     <div className="turn-context">
-      {hasProcess && streaming ? processContent : null}
+      {hasProcess && streaming ? (
+        <details className="turn-disclosure turn-execution turn-execution--live" open>
+          <summary>
+            <LoaderCircle size={15} aria-hidden="true" />
+            <span className="turn-disclosure-title">{statusLabel}</span>
+            <span className="turn-live-status-dots" aria-hidden="true"><i /><i /><i /></span>
+          </summary>
+          {processContent}
+        </details>
+      ) : null}
       {hasProcess && !streaming ? (
         <details className="turn-disclosure turn-execution" open={streaming || undefined}>
           <summary>
@@ -136,19 +157,7 @@ function TimelineItem({
     );
   }
   if (item.type === "reasoning") {
-    return (
-      <details className="turn-disclosure turn-reasoning" open={active || !item.complete || undefined}>
-        <summary>
-          <Brain size={15} aria-hidden="true" />
-          <span className="turn-disclosure-title">思考内容</span>
-          <span className="turn-disclosure-status">{item.complete ? "已完成" : "生成中"}</span>
-          <ChevronDown className="turn-disclosure-chevron" size={15} aria-hidden="true" />
-        </summary>
-        <div className="turn-reasoning-content">
-          {renderText ? renderText(item.summary) : item.summary}
-        </div>
-      </details>
-    );
+    return <ReasoningGroup items={[item]} active={active} renderText={renderText} />;
   }
   if (item.type === "event") {
     const Icon = item.kind === "turn_completed"
@@ -179,30 +188,56 @@ function timelineItemKey(item: TurnTimelineItem) {
   return item.activity.call.id;
 }
 
-function ActivityStatusRow({
-  status,
-  hasRunningTool,
-}: {
-  status: AgentActivityStatus;
-  hasRunningTool: boolean;
-}) {
-  const labels: Record<AgentActivityStatus, string> = {
-    thinking: "思考中",
-    responding: "生成回复中",
-    running_tool: "处理工具结果中",
-    awaiting_approval: "等待确认",
-    finalizing: "整理结果中",
-  };
-  if (status === "running_tool" && hasRunningTool) return null;
+type ReasoningTimelineItem = Extract<TurnTimelineItem, { type: "reasoning" }>;
+type TimelineRenderEntry =
+  | { type: "reasoning_group"; items: ReasoningTimelineItem[] }
+  | { type: "item"; item: Exclude<TurnTimelineItem, { type: "reasoning" }> };
 
+function groupConsecutiveReasoning(items: TurnTimelineItem[]): TimelineRenderEntry[] {
+  const grouped: TimelineRenderEntry[] = [];
+  for (const item of items) {
+    const previous = grouped[grouped.length - 1];
+    if (item.type === "reasoning") {
+      if (previous?.type === "reasoning_group"
+        && Boolean(previous.items[0]?.complete) === Boolean(item.complete)) previous.items.push(item);
+      else grouped.push({ type: "reasoning_group", items: [item] });
+    } else {
+      grouped.push({ type: "item", item });
+    }
+  }
+  return grouped;
+}
+
+function ReasoningGroup({
+  items,
+  active,
+  renderText,
+}: {
+  items: ReasoningTimelineItem[];
+  active: boolean;
+  renderText?: (text: string) => ReactNode;
+}) {
+  const complete = items.every((item) => item.complete);
+  const status = complete && items.length > 1 ? `${items.length} 段` : complete ? "已完成" : "生成中";
   return (
-    <div className={`turn-live-status turn-live-status--${status}`} role="status" aria-live="polite">
-      <LoaderCircle size={15} aria-hidden="true" />
-      <span>{labels[status]}</span>
-      <span className="turn-live-status-dots" aria-hidden="true"><i /><i /><i /></span>
-    </div>
+    <details className="turn-disclosure turn-reasoning" open={active || !complete || undefined}>
+      <summary>
+        <Brain size={15} aria-hidden="true" />
+        <span className="turn-disclosure-title">思考内容</span>
+        <span className="turn-disclosure-status">{status}</span>
+        <ChevronDown className="turn-disclosure-chevron" size={15} aria-hidden="true" />
+      </summary>
+      <div className="turn-reasoning-content">
+        {items.map((item) => (
+          <div className="turn-reasoning-segment" key={`${item.turnId}-${item.itemId}`}>
+            {renderText ? renderText(item.summary) : item.summary}
+          </div>
+        ))}
+      </div>
+    </details>
   );
 }
+
 
 function ToolActivityRow({ activity }: { activity: ToolActivity }) {
   const outputChunks = visibleOutput(activity);
@@ -210,6 +245,12 @@ function ToolActivityRow({ activity }: { activity: ToolActivity }) {
   const command = activity.call.name === "run_command" ? commandDetails(activity.call.arguments) : null;
   const fileDetails = command ? null : fileActivityDetails(activity);
   const isRunning = activity.state === "running";
+  const failed = activity.state === "failed";
+  const target = failed ? "" : toolTarget(activity);
+  const title = target || (isRunning ? runningToolLabel(activity.call.name) : toolLabel(activity.call.name));
+  const meta = failed && activity.result?.output
+    ? truncate(activity.result.output, 120)
+    : activityStateLabel(activity);
   return (
     <div className={`turn-timeline-tool turn-timeline-tool--${activity.state}`}>
       {activity.state === "completed" ? (
@@ -222,9 +263,9 @@ function ToolActivityRow({ activity }: { activity: ToolActivity }) {
         <LoaderCircle className="turn-tool-running" size={15} aria-hidden="true" />
       )}
       <span>
-        <strong>{isRunning ? runningToolLabel(activity.call.name) : toolLabel(activity.call.name)}</strong>
+        <strong>{title}</strong>
         <small className="turn-tool-meta">
-          <span>{toolTarget(activity) || activityStateLabel(activity)}</span>
+          <span>{meta}</span>
           {elapsedMs !== null ? <span className="turn-tool-duration"><Clock3 size={12} aria-hidden="true" />耗时 {formatDuration(elapsedMs)}</span> : null}
         </small>
       </span>
@@ -249,43 +290,23 @@ function ToolActivityRow({ activity }: { activity: ToolActivity }) {
 }
 
 interface FileActivityDetailsValue {
-  kind: "read" | "patch" | "write";
+  kind: "patch" | "write";
   label: string;
-  path: string;
-  modelId: string;
-  language: string;
   content: string;
   meta: string;
   truncated: boolean;
-  lineNumberOffset: number;
 }
 
 function FileActivityDetails({ details }: { details: FileActivityDetailsValue }) {
-  const [open, setOpen] = useState(false);
   return (
-    <details className="turn-tool-details" onToggle={(event) => setOpen(event.currentTarget.open)}>
+    <details className="turn-tool-details">
       <summary>
         <FileText size={14} aria-hidden="true" />
         <span>{details.label}</span>
         <ChevronDown size={14} aria-hidden="true" />
       </summary>
       <div className="turn-command-details">
-        {details.kind === "read" ? (
-          open ? (
-            <div className="turn-file-editor" style={{ height: readEditorHeight(details.content) }}>
-              <Suspense fallback={<div className="code-editor-loading">正在载入读取内容...</div>}>
-                <CodeEditor
-                  path={details.path}
-                  modelPath={`kcoder-read://${details.modelId}/${details.path}`}
-                  language={details.language}
-                  value={details.content}
-                  readOnly
-                  lineNumberOffset={details.lineNumberOffset}
-                />
-              </Suspense>
-            </div>
-          ) : null
-        ) : <pre>{details.content}</pre>}
+        <pre>{details.content}</pre>
         {details.meta || details.truncated ? (
           <small>
             {details.meta}
@@ -376,37 +397,14 @@ function commandDetails(argumentsValue: Record<string, unknown>): CommandDetails
 function fileActivityDetails(activity: ToolActivity): FileActivityDetailsValue | null {
   const args = activity.call.arguments ?? {};
   const path = typeof args.path === "string" ? args.path : "";
+  if (activity.call.name === "read_file") return null;
   let label = "";
   let content = "";
   let meta = path;
-  let kind: FileActivityDetailsValue["kind"] = "read";
+  let kind: FileActivityDetailsValue["kind"] = "patch";
   let truncated = false;
-  let lineNumberOffset = 1;
 
-  if (activity.call.name === "read_file" && typeof activity.result?.output === "string") {
-    label = "查看读取内容";
-    content = activity.result.output;
-    const metadata = activity.result.metadata ?? {};
-    const offset = typeof metadata.offset === "number" ? metadata.offset : null;
-    const bytesReturned = typeof metadata.bytesReturned === "number" ? metadata.bytesReturned : null;
-    const totalBytes = typeof metadata.totalBytes === "number" ? metadata.totalBytes : null;
-    const startLine = typeof metadata.startLine === "number" ? metadata.startLine : null;
-    const endLine = typeof metadata.endLine === "number" ? metadata.endLine : null;
-    const totalLines = typeof metadata.totalLines === "number" ? metadata.totalLines : null;
-    lineNumberOffset = startLine ?? 1;
-    const lineRange = startLine !== null && endLine !== null
-      ? startLine === endLine ? `第 ${startLine} 行` : `第 ${startLine}-${endLine} 行`
-      : "";
-    meta = [
-      path,
-      lineRange,
-      offset !== null && bytesReturned !== null
-        ? bytesReturned > 0 ? `字节 ${offset}-${offset + bytesReturned - 1}` : `字节 ${offset}（空）`
-        : "",
-      totalLines !== null ? `共 ${totalLines} 行` : totalBytes !== null ? `共 ${totalBytes} 字节` : "",
-      metadata.truncated === true ? "文件仍有未读取内容" : "",
-    ].filter(Boolean).join(" · ");
-  } else if (activity.call.name === "apply_patch" && typeof args.patch === "string") {
+  if (activity.call.name === "apply_patch" && typeof args.patch === "string") {
     kind = "patch";
     label = "查看补丁";
     content = args.patch;
@@ -419,38 +417,16 @@ function fileActivityDetails(activity: ToolActivity): FileActivityDetailsValue |
     return null;
   }
 
-  if (kind !== "read") {
-    const bounded = boundDetail(content);
-    content = bounded.content;
-    truncated = bounded.truncated;
-  }
+  const bounded = boundDetail(content);
+  content = bounded.content;
+  truncated = bounded.truncated;
   return {
     kind,
     label,
-    path,
-    modelId: `${activity.turnId}-${activity.call.id}`,
-    language: languageForPath(path),
     content,
     meta,
     truncated,
-    lineNumberOffset,
   };
-}
-
-function languageForPath(path: string) {
-  const extension = path.toLowerCase().split(".").pop() ?? "";
-  const languages: Record<string, string> = {
-    c: "c", cpp: "cpp", cs: "csharp", css: "css", go: "go", h: "cpp", hpp: "cpp",
-    html: "html", java: "java", js: "javascript", json: "json", jsx: "javascript",
-    md: "markdown", py: "python", rs: "rust", scss: "scss", sh: "shell", sql: "sql",
-    toml: "ini", ts: "typescript", tsx: "typescript", xml: "xml", yaml: "yaml", yml: "yaml",
-  };
-  return languages[extension] ?? "plaintext";
-}
-
-function readEditorHeight(content: string) {
-  const lineCount = content.split(/\r\n|\r|\n/).length;
-  return Math.min(380, Math.max(96, lineCount * 19 + 16));
 }
 
 function patchFilePaths(patch: string) {
@@ -600,20 +576,32 @@ function toolTarget(activity: ToolActivity) {
       ?? (startLine !== null && requestedLineCount !== null
         ? startLine + requestedLineCount - 1
         : null);
-    if (startLine !== null) {
-      const range = endLine !== null && endLine !== startLine
-        ? `第 ${startLine}-${endLine} 行`
-        : `第 ${startLine} 行`;
-      return truncate(`${args.path} · ${range}`, 120);
-    }
+    const range = startLine !== null
+      ? endLine !== null && endLine !== startLine
+        ? ` L${startLine}-${endLine}`
+        : ` L${startLine}`
+      : "";
+    return truncate(`读取 ${args.path}${range}`, 120);
+  }
+  if (activity.call.name === "search_repository" && typeof args.query === "string") {
+    return truncate(`搜索 ${args.query}`, 120);
+  }
+  if (activity.call.name === "list_directory" && typeof args.path === "string") {
+    return truncate(`查看目录 ${args.path}`, 120);
+  }
+  if (activity.call.name === "write_file" && typeof args.path === "string") {
+    return truncate(`写入 ${args.path}`, 120);
   }
   if (activity.call.name === "run_command") {
     const command = commandDetails(args);
-    if (command) return truncate(command.text, 120);
+    if (command) return truncate(`执行 ${command.text}`, 120);
   }
   if (activity.call.name === "apply_patch" && typeof args.patch === "string") {
     const paths = patchFilePaths(args.patch);
-    if (paths.length) return truncate(paths.join("、"), 120);
+    if (paths.length) return truncate(`应用补丁 ${paths.join("、")}`, 120);
+  }
+  if (activity.call.name === "browser_navigate" && typeof args.url === "string") {
+    return truncate(`打开 ${args.url}`, 120);
   }
   for (const key of ["path", "filePath", "file_path", "command", "query", "url"]) {
     if (typeof args[key] === "string" && args[key]) return truncate(args[key], 88);
