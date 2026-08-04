@@ -111,6 +111,9 @@ test.beforeEach(async ({ page }) => {
             runTurnResolvers.shift()?.({ schemaVersion: 1, threadId: "thread-1", turnId: "turn-queued", state: "cancelled", error: null });
             return true;
           }
+          if (command === "retry_turn" && localStorage.getItem("kcoder_e2e_hold_retry") === "true") {
+            return new Promise(() => undefined);
+          }
           if (command === "read_thread") {
             const delayMs = Number(localStorage.getItem("kcoder_e2e_read_delay_ms") ?? 0);
             if (delayMs > 0) await new Promise((resolve) => setTimeout(resolve, delayMs));
@@ -919,6 +922,83 @@ test("keeps a cancelled turn busy until the terminal event and then retries", as
   await expect.poll(() => page.evaluate(() => (window as unknown as { __invoked: string[] }).__invoked.filter((command) => command === "retry_turn").length)).toBe(1);
 });
 
+test("keeps retry attempts in one assistant reply before and after recovery", async ({ page }, testInfo) => {
+  const failedDetail = {
+    schemaVersion: 1,
+    summary: { schemaVersion: 1, id: "thread-1", title: "Retry grouping", createdAtMs: 1, updatedAtMs: 2, archived: false },
+    messages: [{ schemaVersion: 1, id: "message-retry-user", role: "user", content: [{ type: "text", text: "修复这个问题" }], createdAtMs: 1 }],
+    messageTurnIds: {},
+    turnUserMessageIds: { "turn-first": "message-retry-user" },
+    lastTurn: { turnId: "turn-first", state: "failed", error: "provider failed" },
+    toolActivities: [],
+    turnTimeline: [{
+      type: "event",
+      itemId: "turn-failed-turn-first",
+      turnId: "turn-first",
+      kind: "turn_failed",
+      title: "Turn 已失败",
+      detail: "provider failed",
+      durationMs: 120,
+    }],
+    approvals: [],
+    userInputs: [],
+    changes: [],
+    todos: [],
+    lastUsage: null,
+  };
+  await page.addInitScript((detail) => {
+    localStorage.setItem("kcoder_e2e_hold_retry", "true");
+    if (!localStorage.getItem("kcoder_e2e_thread_detail")) {
+      localStorage.setItem("kcoder_e2e_thread_detail", JSON.stringify(detail));
+    }
+  }, failedDetail);
+  await page.goto("/");
+
+  await page.getByRole("button", { name: "重试", exact: true }).click();
+  await expect.poll(() => page.evaluate(() => (window as unknown as { __invoked: string[] }).__invoked.filter((command) => command === "retry_turn").length)).toBe(1);
+  await page.evaluate(() => {
+    const emit = (window as unknown as { __emitAgentEvent: (event: unknown) => void }).__emitAgentEvent;
+    const base = { schemaVersion: 1, threadId: "thread-1", turnId: "turn-second" };
+    emit({ ...base, type: "turn_started", phase: "exploring" });
+    emit({ ...base, type: "text_delta", phase: "responding", delta: "继续检查并修复。" });
+  });
+
+  const liveGroup = page.locator(".message--retry-group");
+  await expect(liveGroup).toHaveCount(1);
+  await expect(liveGroup.locator(".message-role")).toHaveText("k-Coder");
+  await expect(liveGroup.locator(".message-retry-attempt")).toHaveCount(2);
+  await expect(page.locator(".message--assistant .message-role")).toHaveCount(1);
+  await expect(liveGroup.getByText("继续检查并修复。", { exact: true })).toBeVisible();
+  await page.screenshot({ path: testInfo.outputPath("retry-group-live.png"), fullPage: true });
+
+  const completedDetail = {
+    ...failedDetail,
+    summary: { ...failedDetail.summary, updatedAtMs: 4 },
+    messages: [
+      ...failedDetail.messages,
+      { schemaVersion: 1, id: "message-retry-assistant", role: "assistant", content: [{ type: "text", text: "问题已经修复。" }], createdAtMs: 4 },
+    ],
+    messageTurnIds: { "message-retry-assistant": "turn-second" },
+    turnUserMessageIds: { "turn-first": "message-retry-user", "turn-second": "message-retry-user" },
+    lastTurn: { turnId: "turn-second", state: "completed", error: null },
+    turnTimeline: [
+      ...failedDetail.turnTimeline,
+      { type: "text", id: "message-retry-assistant", turnId: "turn-second", text: "问题已经修复。" },
+      { type: "event", itemId: "turn-completed-turn-second", turnId: "turn-second", kind: "turn_completed", title: "Turn 已完成", detail: null, durationMs: 240 },
+    ],
+  };
+  await page.evaluate((detail) => localStorage.setItem("kcoder_e2e_thread_detail", JSON.stringify(detail)), completedDetail);
+  await page.reload();
+
+  const restoredGroup = page.locator(".message--retry-group");
+  await expect(restoredGroup).toHaveCount(1);
+  await expect(restoredGroup.locator(".message-role")).toHaveText("k-Coder");
+  await expect(restoredGroup.locator(".message-retry-attempt")).toHaveCount(2);
+  await expect(page.locator(".message--assistant .message-role")).toHaveCount(1);
+  await expect(restoredGroup.getByText("问题已经修复。", { exact: true })).toBeVisible();
+  await page.screenshot({ path: testInfo.outputPath("retry-group-restored.png"), fullPage: true });
+});
+
 test("restores a pending user question after reopening the thread", async ({ page }) => {
   await page.addInitScript(() => {
     localStorage.setItem("kcoder_e2e_thread_detail", JSON.stringify({
@@ -1230,4 +1310,28 @@ test("colors file formats and wires complete Git actions", async ({ page }, test
     "push",
     "commit",
   ]);
+});
+
+test("hides project-bound sessions from the plain conversation list", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name === "narrow", "窄屏隐藏侧边栏，项目会话分组只在桌面侧边栏展示");
+  await page.addInitScript(() => {
+    localStorage.setItem("kcoder_thread_project_map", JSON.stringify({ "thread-1": "D:\\code\\k-coder" }));
+    localStorage.setItem("kcoder_known_projects", JSON.stringify(["D:\\code\\k-coder"]));
+  });
+  await page.goto("/");
+
+  // 绑定到项目的会话不再出现在"会话"tab 的普通列表中
+  const conversationList = page.getByRole("navigation", { name: "会话列表" });
+  await expect(conversationList).toBeVisible();
+  await expect(conversationList.getByText("Phase 6 workbench", { exact: true })).toHaveCount(0);
+  await expect(conversationList.getByText("还没有会话", { exact: true })).toBeVisible();
+
+  // 同一会话仍在"项目"tab 的项目分组中展示
+  await page.getByRole("tab", { name: "项目" }).click();
+  const projectList = page.getByRole("navigation", { name: "项目列表" });
+  await expect(projectList.getByText("k-coder", { exact: true })).toBeVisible();
+  await expect(projectList.locator(".project-group-count")).toHaveText("1");
+  await projectList.getByRole("button", { name: "展开项目" }).click();
+  await expect(projectList.getByText("Phase 6 workbench", { exact: true })).toBeVisible();
+  await page.screenshot({ path: testInfo.outputPath("project-session-list.png"), fullPage: true });
 });

@@ -69,12 +69,20 @@ function BrandGlyph({ size = 20 }: { size?: number }) {
   );
 }
 
-type Skin = "paper" | "midnight" | "vscode" | "amber" | "codebuddy";
 type ThemeMode = "light" | "dark";
 
-const STORAGE_SKIN = "kcoder_skin";
 const STORAGE_THEME = "kcoder_theme";
+const THREAD_PROJECT_KEY = "kcoder_thread_project_map";
 const appWindow = getCurrentWindow();
+
+function readThreadProjectMap(): Record<string, string> {
+  try {
+    const raw = localStorage.getItem(THREAD_PROJECT_KEY);
+    return raw ? JSON.parse(raw) : {};
+  } catch {
+    return {};
+  }
+}
 
 function readStored<T>(key: string, fallback: T): T {
   try {
@@ -100,14 +108,13 @@ function App() {
   const [workbenchOpen, setWorkbenchOpen] = useState(false);
   const [agentPanelOpen, setAgentPanelOpen] = useState(false);
   const [workspaceRevision, setWorkspaceRevision] = useState(0);
-  const [skin, setSkinState] = useState<Skin>(() => readStored(STORAGE_SKIN, "paper"));
   const [themeMode, setThemeModeState] = useState<ThemeMode>(() =>
     readStored(STORAGE_THEME, "light"),
   );
   const [subagentThreadIds, setSubagentThreadIds] = useState<Set<string>>(new Set());
   const [sideView, setSideView] = useState<"conversations" | "projects">("conversations");
   const [workspacePath, setWorkspacePath] = useState("");
-  const [threadProjectMap, setThreadProjectMap] = useState<Record<string, string>>({});
+  const [threadProjectMap, setThreadProjectMap] = useState<Record<string, string>>(() => readThreadProjectMap());
   const [expandedProjects, setExpandedProjects] = useState<Set<string>>(new Set());
   const [projectMenuOpen, setProjectMenuOpen] = useState<string | null>(null);
   const [pinnedProjects, setPinnedProjects] = useState<Set<string>>(() => {
@@ -173,6 +180,8 @@ function App() {
     forceResetState,
   } = useWorkbenchStore();
   const pendingQueueCount = messageQueue.filter((message) => message.status === "pending").length;
+  // 普通会话列表只展示未绑定到项目的会话；绑定到项目的会话只出现在"项目"tab。
+  const standaloneThreads = threads.filter((thread) => !threadProjectMap[thread.id]);
 
   useEffect(() => {
     let disposed = false;
@@ -229,27 +238,14 @@ function App() {
   }, [messages]);
 
   useEffect(() => {
-    document.documentElement.setAttribute("data-skin", skin);
+    document.documentElement.setAttribute("data-skin", "codebuddy");
     document.documentElement.setAttribute("data-theme", themeMode);
-  }, [skin, themeMode]);
+  }, [themeMode]);
 
   // ===== 线程-项目关联管理 =====
-  const THREAD_PROJECT_KEY = "kcoder_thread_project_map";
-
-  const readThreadProjectMap = (): Record<string, string> => {
-    try {
-      const raw = localStorage.getItem(THREAD_PROJECT_KEY);
-      return raw ? JSON.parse(raw) : {};
-    } catch { return {}; }
-  };
-
   const saveThreadProjectMap = (map: Record<string, string>) => {
     try { localStorage.setItem(THREAD_PROJECT_KEY, JSON.stringify(map)); } catch { /* noop */ }
   };
-
-  useEffect(() => {
-    setThreadProjectMap(readThreadProjectMap());
-  }, []);
 
   // 在指定项目（路径）下创建一个新会话。
   // "会话"tab 调用时不传项目路径，会话保持"未分类"；"项目"tab 调用时传入项目路径，
@@ -394,11 +390,6 @@ function App() {
       });
   };
 
-  const setSkin = (next: Skin) => {
-    setSkinState(next);
-    try { localStorage.setItem(STORAGE_SKIN, next); } catch { /* noop */ }
-  };
-
   const toggleTheme = () => {
     const next = themeMode === "light" ? "dark" : "light";
     setThemeModeState(next);
@@ -427,6 +418,38 @@ function App() {
   const representedTurnIds = new Set(
     messages.flatMap((message) => message.role === "assistant" && message.turnId ? [message.turnId] : []),
   );
+  const assistantMessagesByTurn = new Map(
+    messages.flatMap((message) => message.role === "assistant" && message.turnId
+      ? [[message.turnId, message] as const]
+      : []),
+  );
+  const orderedTurnIds: string[] = [];
+  const seenTurnIds = new Set<string>();
+  for (const item of turnTimeline) {
+    const turnId = item.type === "tool" ? item.activity.turnId : item.turnId;
+    if (!seenTurnIds.has(turnId)) {
+      seenTurnIds.add(turnId);
+      orderedTurnIds.push(turnId);
+    }
+  }
+  for (const message of messages) {
+    if (message.role === "assistant" && message.turnId && !seenTurnIds.has(message.turnId)) {
+      seenTurnIds.add(message.turnId);
+      orderedTurnIds.push(message.turnId);
+    }
+  }
+  const retryTurnGroupsByUserMessage = new Map<string, string[]>();
+  for (const turnId of orderedTurnIds) {
+    const userMessageId = turnUserMessageIds[turnId];
+    if (!userMessageId) continue;
+    const turnIds = retryTurnGroupsByUserMessage.get(userMessageId) ?? [];
+    turnIds.push(turnId);
+    retryTurnGroupsByUserMessage.set(userMessageId, turnIds);
+  }
+  for (const [userMessageId, turnIds] of retryTurnGroupsByUserMessage) {
+    if (turnIds.length < 2) retryTurnGroupsByUserMessage.delete(userMessageId);
+  }
+  const groupedRetryTurnIds = new Set([...retryTurnGroupsByUserMessage.values()].flat());
   const latestPlanActivity = [...toolActivities].reverse().find((activity) => activity.call.name === "update_plan");
   const latestAssistantTurnId = [...messages].reverse().find(
     (message) => message.role === "assistant" && message.turnId,
@@ -435,7 +458,7 @@ function App() {
     ? latestPlanActivity?.turnId ?? (currentThreadBusy ? activeTurnId : latestAssistantTurnId)
     : null;
   const orphanTurnIds = [...new Set([...activitiesByTurn.keys(), ...timelineByTurn.keys()])]
-    .filter((turnId) => !representedTurnIds.has(turnId));
+    .filter((turnId) => !representedTurnIds.has(turnId) && !groupedRetryTurnIds.has(turnId));
   const orphanTurnsByUserMessage = new Map<string, string[]>();
   const unanchoredOrphanTurnIds: string[] = [];
   for (const turnId of orphanTurnIds) {
@@ -451,6 +474,9 @@ function App() {
   const planIsAttached = Boolean(planTurnId && representedTurnIds.has(planTurnId));
   const planIsAttachedToOrphan = Boolean(
     planTurnId && orphanTurnIds.includes(planTurnId),
+  );
+  const planIsAttachedToRetryGroup = Boolean(
+    planTurnId && groupedRetryTurnIds.has(planTurnId),
   );
   const hasConversationContent = messages.length > 0
     || orphanTurnIds.length > 0
@@ -472,6 +498,83 @@ function App() {
             activityStatus={turnId === activityStatus?.turnId ? activityStatus.status : null}
             renderText={renderMessageText}
           />
+        </div>
+      </article>
+    );
+  }
+
+  function renderMessageChanges(ownerId: string, ownerChanges: typeof changes) {
+    if (!ownerChanges.length) return null;
+    return (
+      <div className="message-changes">
+        <button
+          type="button"
+          className="changes-toggle"
+          onClick={() => {
+            setExpandedChangeSets((previous) => {
+              const next = new Set(previous);
+              if (next.has(ownerId)) next.delete(ownerId);
+              else next.add(ownerId);
+              return next;
+            });
+          }}
+        >
+          <span className={cn("changes-arrow", expandedChangeSets.has(ownerId) && "changes-arrow--expanded")}>▶</span>
+          <span>{ownerChanges.reduce((sum, change) => sum + change.files.length, 0)} 个文件</span>
+        </button>
+
+        {expandedChangeSets.has(ownerId) ? (
+          <div className="changes-list">
+            {ownerChanges.flatMap((change) => change.files.map((file) => (
+              <button
+                type="button"
+                key={`${change.id}-${file.path}`}
+                className="change-file-item"
+                onClick={() => setSelectedChangeId(change.id)}
+              >
+                <span className="change-file-name">{file.path}</span>
+                <span className="change-operation">{file.operation}</span>
+              </button>
+            )))}
+          </div>
+        ) : null}
+      </div>
+    );
+  }
+
+  function renderRetryTurnGroup(userMessageId: string, turnIds: string[]) {
+    const groupChanges = changes.filter((change) => turnIds.includes(change.turnId) && !change.undone);
+    return (
+      <article className="message message--assistant message--retry-group" key={`retry-group-${userMessageId}`}>
+        <div className="message-body">
+          <div className="message-role">k-Coder</div>
+          {turnIds.map((turnId) => {
+            const assistantMessage = assistantMessagesByTurn.get(turnId);
+            const attemptTimeline = timelineByTurn.get(turnId) ?? [];
+            const attemptActivities = activitiesByTurn.get(turnId) ?? [];
+            const attemptPlan = turnId === planTurnId ? plan : null;
+            const attemptActivityStatus = turnId === activityStatus?.turnId ? activityStatus.status : null;
+            return (
+              <section className="message-retry-attempt" data-turn-id={turnId} key={turnId}>
+                <ConversationTurnActivity
+                  activities={attemptActivities}
+                  timeline={attemptTimeline}
+                  changes={changes}
+                  plan={attemptPlan}
+                  streaming={turnId === activeTurnId}
+                  activityStatus={attemptActivityStatus}
+                  finalMessageId={assistantMessage?.id}
+                  renderText={renderMessageText}
+                />
+                {!attemptTimeline.length && assistantMessage?.text ? (
+                  <div className="message-content">{renderMessageText(assistantMessage.text)}</div>
+                ) : null}
+                {assistantMessage?.status === "failed" ? <div className="message-status message-status--error">生成失败</div> : null}
+                {assistantMessage?.status === "cancelled" ? <div className="message-status">已停止</div> : null}
+              </section>
+            );
+          })}
+          {renderMessageChanges(`retry-group-${userMessageId}`, groupChanges)}
         </div>
       </article>
     );
@@ -879,7 +982,7 @@ function App() {
           </label>
           {sideView === "conversations" ? (
             <nav className="thread-list" aria-label="会话列表">
-              {threads.map((thread) => {
+              {standaloneThreads.map((thread) => {
                 const isSubagentThread = subagentThreadIds.has(thread.id);
                 return (
                   <div className={cn("thread-item", thread.id === activeThreadId && "thread-item--active")} key={thread.id}>
@@ -899,7 +1002,7 @@ function App() {
                   </div>
                 );
               })}
-              {!threads.length && (
+              {!standaloneThreads.length && (
                 <div className="thread-empty">
                   <MessageSquare size={16} />
                   <span>{threadQuery ? "没有匹配的会话" : "还没有会话"}</span>
@@ -1102,6 +1205,9 @@ function App() {
               )}
 
               {messages.map((message) => {
+                if (message.role === "assistant" && message.turnId && groupedRetryTurnIds.has(message.turnId)) {
+                  return null;
+                }
                 // 查找该消息对应回合的文件变更
                 const messageChanges = message.role === "assistant" && message.turnId
                   ? changes.filter(change => change.turnId === message.turnId && !change.undone)
@@ -1160,51 +1266,16 @@ function App() {
                         ) : null}
                       </div> : null}
 
-                      {message.role === "assistant" && messageChanges.length > 0 && (
-                        <div className="message-changes">
-                        <button
-                          type="button"
-                          className="changes-toggle"
-                          onClick={() => {
-                            setExpandedChangeSets(prev => {
-                              const next = new Set(prev);
-                              if (next.has(message.id)) {
-                                next.delete(message.id);
-                              } else {
-                                next.add(message.id);
-                              }
-                              return next;
-                            });
-                          }}
-                        >
-                          <span className={cn("changes-arrow", expandedChangeSets.has(message.id) && "changes-arrow--expanded")}>▶</span>
-                          <span>{messageChanges.reduce((sum, change) => sum + change.files.length, 0)} 个文件</span>
-                        </button>
-
-                        {expandedChangeSets.has(message.id) && (
-                          <div className="changes-list">
-                            {messageChanges.flatMap((change) => change.files.map((file) => (
-                              <button
-                                type="button"
-                                key={`${change.id}-${file.path}`}
-                                className="change-file-item"
-                                onClick={() => setSelectedChangeId(change.id)}
-                              >
-                                <span className="change-file-name">{file.path}</span>
-                                <span className="change-operation">{file.operation}</span>
-                              </button>
-                            )))}
-                          </div>
-                        )}
-                        </div>
-                      )}
+                      {message.role === "assistant" ? renderMessageChanges(message.id, messageChanges) : null}
 
                       {message.status === "failed" && <div className="message-status message-status--error">生成失败</div>}
                       {message.status === "cancelled" && <div className="message-status">已停止</div>}
                     </div>
                   </article>
                   {message.role === "user"
-                    ? (orphanTurnsByUserMessage.get(message.id) ?? []).map(renderOrphanTurn)
+                    ? retryTurnGroupsByUserMessage.has(message.id)
+                      ? renderRetryTurnGroup(message.id, retryTurnGroupsByUserMessage.get(message.id)!)
+                      : (orphanTurnsByUserMessage.get(message.id) ?? []).map(renderOrphanTurn)
                     : null}
                   </Fragment>
                 );
@@ -1212,7 +1283,7 @@ function App() {
 
               {unanchoredOrphanTurnIds.map(renderOrphanTurn)}
 
-              {plan?.steps.length && !planIsAttached && !planIsAttachedToOrphan ? (
+              {plan?.steps.length && !planIsAttached && !planIsAttachedToOrphan && !planIsAttachedToRetryGroup ? (
                 <article className="message message--assistant message--activity-only">
                   <div className="message-body">
                     <div className="message-role">k-Coder</div>
@@ -1651,10 +1722,8 @@ function App() {
           goal={goal}
           activeProviderId={activeProviderId}
           error={error}
-          skin={skin}
           themeMode={themeMode}
           onClose={() => setSettingsOpen(false)}
-          onSetSkin={setSkin}
           onToggleTheme={toggleTheme}
           onSaveProvider={saveProvider}
           onActivateProvider={activateProvider}

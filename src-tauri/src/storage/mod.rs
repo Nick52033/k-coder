@@ -1167,6 +1167,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn projects_retry_attempts_to_the_same_user_message() {
+        let directory = tempfile::tempdir().unwrap();
+        let repository = JsonlThreadRepository::new(directory.path()).unwrap();
+        let thread = repository.create_thread().await.unwrap();
+        let user = message(MessageRole::User, "fix the issue");
+        let user_id = user.id.clone();
+
+        repository
+            .append(StoredEvent::new(
+                &thread.id,
+                None,
+                StoredEventKind::UserMessage { message: user },
+            ))
+            .await
+            .unwrap();
+        for turn_id in ["turn-first", "turn-retry"] {
+            repository
+                .append(StoredEvent::new(
+                    &thread.id,
+                    Some(turn_id.to_string()),
+                    StoredEventKind::TurnStarted,
+                ))
+                .await
+                .unwrap();
+        }
+
+        let detail = repository.read_thread(&thread.id).await.unwrap();
+        assert_eq!(
+            detail.turn_user_message_ids.get("turn-first"),
+            Some(&user_id)
+        );
+        assert_eq!(
+            detail.turn_user_message_ids.get("turn-retry"),
+            Some(&user_id)
+        );
+    }
+
+    #[tokio::test]
     async fn projects_interleaved_turn_timeline_in_event_order() {
         let directory = tempfile::tempdir().unwrap();
         let repository = JsonlThreadRepository::new(directory.path()).unwrap();

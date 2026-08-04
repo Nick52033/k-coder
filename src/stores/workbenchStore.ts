@@ -977,24 +977,30 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
 
     switch (event.type) {
       case "turn_started":
-        set((state) => ({
-          activeTurnId: event.turnId,
-          activeTurnThreadId: event.threadId,
-          lastTurn: { turnId: event.turnId, state: "streaming", error: null },
-          pendingApproval: null,
-          pendingApprovals: [],
-          activityStatus: { turnId: event.turnId, status: "thinking" },
-          messages: state.messages.some((message) => message.turnId === event.turnId)
-            ? state.messages
-            : [...state.messages, {
-              id: `turn-${event.turnId}`,
-              role: "assistant",
-              text: "",
-              createdAtMs: Date.now(),
-              turnId: event.turnId,
-              status: "streaming",
-            }],
-        }));
+        set((state) => {
+          const latestUserMessage = [...state.messages].reverse().find((message) => message.role === "user");
+          return {
+            activeTurnId: event.turnId,
+            activeTurnThreadId: event.threadId,
+            lastTurn: { turnId: event.turnId, state: "streaming", error: null },
+            pendingApproval: null,
+            pendingApprovals: [],
+            activityStatus: { turnId: event.turnId, status: "thinking" },
+            turnUserMessageIds: state.turnUserMessageIds[event.turnId] || !latestUserMessage
+              ? state.turnUserMessageIds
+              : { ...state.turnUserMessageIds, [event.turnId]: latestUserMessage.id },
+            messages: state.messages.some((message) => message.turnId === event.turnId)
+              ? state.messages
+              : [...state.messages, {
+                id: `turn-${event.turnId}`,
+                role: "assistant",
+                text: "",
+                createdAtMs: Date.now(),
+                turnId: event.turnId,
+                status: "streaming",
+              }],
+          };
+        });
         break;
       case "activity_status_changed":
         set({ activityStatus: { turnId: event.turnId, status: event.status } });

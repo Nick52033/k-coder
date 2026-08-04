@@ -142,23 +142,7 @@ export type SettingsSection =
   | "browser"
   | "goal";
 
-type Skin = "paper" | "midnight" | "vscode" | "amber" | "codebuddy";
 type ThemeMode = "light" | "dark";
-
-interface SkinDefinition {
-  id: Skin;
-  label: string;
-  desc: string;
-  preview: string;
-}
-
-const skinDefinitions: SkinDefinition[] = [
-  { id: "paper", label: "纸墨精工", desc: "绿色品牌 · 浅色为主 · 日常精工", preview: "#176b4d" },
-  { id: "midnight", label: "午夜终端", desc: "OLED 深黑 · 翠绿高亮 · 纯暗色", preview: "#10b981" },
-  { id: "vscode", label: "编辑器经典", desc: "中性深灰 · 蓝色高亮 · 专注编码", preview: "#007acc" },
-  { id: "codebuddy", label: "CodeBuddy", desc: "冷调蓝灰 · 蓝色高亮 · 支持明暗", preview: "#4F8AFF" },
-  { id: "amber", label: "琥珀暖光", desc: "暖白纸感 · 橙金点缀 · 极度护眼", preview: "#D97706" },
-];
 
 interface SettingsDefinition {
   id: SettingsSection;
@@ -176,10 +160,8 @@ interface SettingsDialogProps {
   activeThreadId: string | null;
   goal: GoalView | null;
   error: string;
-  skin: Skin;
   themeMode: ThemeMode;
   onClose: () => void;
-  onSetSkin: (skin: Skin) => void;
   onToggleTheme: () => void;
   onSaveProvider: (request: SaveProviderConfigRequest) => Promise<boolean>;
   onActivateProvider: (providerId: string) => Promise<boolean>;
@@ -212,10 +194,8 @@ export function SettingsDialog({
   activeThreadId,
   goal,
   error,
-  skin,
   themeMode,
   onClose,
-  onSetSkin,
   onToggleTheme,
   onSaveProvider,
   onActivateProvider,
@@ -303,12 +283,7 @@ export function SettingsDialog({
                 onDelete={onDeleteProvider}
               />
             ) : section === "appearance" ? (
-              <AppearancePage
-                skin={skin}
-                themeMode={themeMode}
-                onSetSkin={onSetSkin}
-                onToggleTheme={onToggleTheme}
-              />
+              <AppearancePage themeMode={themeMode} onToggleTheme={onToggleTheme} />
             ) : section === "usage" ? (
               <UsagePage />
             ) : section === "knowledge" ? (
@@ -1286,14 +1261,10 @@ function riskText(risk: "read" | "write" | "delete" | "external") {
 }
 
 function AppearancePage({
-  skin,
   themeMode,
-  onSetSkin,
   onToggleTheme,
 }: {
-  skin: Skin;
   themeMode: ThemeMode;
-  onSetSkin: (skin: Skin) => void;
   onToggleTheme: () => void;
 }) {
   return (
@@ -1327,38 +1298,6 @@ function AppearancePage({
             深色
           </button>
         </div>
-      </div>
-
-      <p className="settings-eyebrow" style={{ marginBottom: 12 }}>皮肤主题</p>
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(180px, 1fr))", gap: 12 }}>
-        {skinDefinitions.map((item) => (
-          <button
-            key={item.id}
-            className={`settings-nav-item ${skin === item.id ? "settings-nav-item--active" : ""}`}
-            type="button"
-            onClick={() => onSetSkin(item.id)}
-            style={{ flexDirection: "column", alignItems: "flex-start", gap: 10, minHeight: 120, padding: 14 }}
-          >
-            <span
-              style={{
-                display: "block",
-                width: 28,
-                height: 28,
-                borderRadius: "var(--radius-sm)",
-                background: item.preview,
-                flexShrink: 0,
-              }}
-            />
-            <div style={{ textAlign: "left" }}>
-              <div style={{ fontWeight: 650, fontSize: "var(--font-size-md)", marginBottom: 3 }}>
-                {item.label}
-              </div>
-              <div style={{ fontSize: "var(--font-size-xs)", color: "var(--color-ink-subtle)", lineHeight: 1.4 }}>
-                {item.desc}
-              </div>
-            </div>
-          </button>
-        ))}
       </div>
     </section>
   );

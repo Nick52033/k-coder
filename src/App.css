@@ -142,11 +142,7 @@
   border: 0;
 }
 
-/* ════════════════════════════════════════════
-   🎨 Skin: Paper — 纸墨精工 (Default, Light)
-   ════════════════════════════════════════════ */
-:root,
-[data-skin="paper"] {
+:root {
   --color-brand: #176b4d;
   --color-brand-hover: #155e44;
   --color-brand-light: #5d8d77;
@@ -180,121 +176,6 @@
   --color-disabled-text: #8d9791;
   color: var(--color-ink);
   background: #f3f5f3;
-}
-
-/* ── Paper Dark ── */
-[data-skin="paper"][data-theme="dark"] {
-  --color-brand: #2fb880;
-  --color-brand-hover: #269a6c;
-  --color-brand-light: #5cc49a;
-  --color-brand-ring: rgba(47, 184, 128, 0.25);
-  --color-ink: #dee5e1;
-  --color-ink-rich: #e2e9e5;
-  --color-ink-muted: #8d9992;
-  --color-ink-subtle: #6f7b74;
-  --color-ink-faint: #4e5852;
-  --color-surface: #151d18;
-  --color-surface-raised: #18211b;
-  --color-surface-panel: #121915;
-  --color-surface-hover: #1e2b23;
-  --color-border: #263128;
-  --color-border-strong: #354138;
-  --color-border-input: #2d3a31;
-  --color-error: #e06060;
-  --color-error-text: #e88585;
-  --color-error-bg: rgba(224, 96, 96, 0.1);
-  --color-error-border: rgba(224, 96, 96, 0.25);
-  --color-success: #2fb880;
-  --color-success-text: #3dc98e;
-  --color-warning: #d6972f;
-  --color-warning-dot: #e8a840;
-  --color-user-msg-bg: rgba(47, 184, 128, 0.12);
-  --color-user-msg-border: rgba(47, 184, 128, 0.25);
-  --color-item-active-bg: #1e2b23;
-  --color-item-active-text: #5cc49a;
-  --color-item-active-border: #354138;
-  --color-disabled-bg: #1e2b23;
-  --color-disabled-text: #4e5852;
-  background: #0f1612;
-  color-scheme: dark;
-}
-
-/* ════════════════════════════════════════════
-   🎨 Skin: Midnight — 午夜终端 (Dark-only)
-   ════════════════════════════════════════════ */
-[data-skin="midnight"] {
-  --color-brand: #10b981;
-  --color-brand-hover: #059669;
-  --color-brand-light: #34d399;
-  --color-brand-ring: rgba(16, 185, 129, 0.25);
-  --color-ink: #f4f4f5;
-  --color-ink-rich: #fafafa;
-  --color-ink-muted: #a1a1aa;
-  --color-ink-subtle: #888894;
-  --color-ink-faint: #585865;
-  --color-surface: #18181b;
-  --color-surface-raised: #1f1f23;
-  --color-surface-panel: #0f0f12;
-  --color-surface-hover: #27272a;
-  --color-border: #27272a;
-  --color-border-strong: #3f3f46;
-  --color-border-input: #323238;
-  --color-error: #ef4444;
-  --color-error-text: #f87171;
-  --color-error-bg: rgba(239, 68, 68, 0.1);
-  --color-error-border: rgba(239, 68, 68, 0.25);
-  --color-success: #10b981;
-  --color-success-text: #34d399;
-  --color-warning: #f59e0b;
-  --color-warning-dot: #fbbf24;
-  --color-user-msg-bg: rgba(16, 185, 129, 0.1);
-  --color-user-msg-border: rgba(16, 185, 129, 0.22);
-  --color-item-active-bg: #27272a;
-  --color-item-active-text: #34d399;
-  --color-item-active-border: #3f3f46;
-  --color-disabled-bg: #27272a;
-  --color-disabled-text: #52525b;
-  background: #09090b;
-  color-scheme: dark;
-}
-
-/* ════════════════════════════════════════════
-   🎨 Skin: VSCode — 暗黑代码 (Dark-only)
-   ════════════════════════════════════════════ */
-[data-skin="vscode"] {
-  --color-brand: #007ACC;
-  --color-brand-hover: #005A9E;
-  --color-brand-light: #4FC3F7;
-  --color-brand-ring: rgba(0, 122, 204, 0.25);
-  --color-ink: #D4D4D4;
-  --color-ink-rich: #E5E5E5;
-  --color-ink-muted: #858585;
-  --color-ink-subtle: #6A6A6A;
-  --color-ink-faint: #4D4D4D;
-  --color-surface: #1E1E1E;
-  --color-surface-raised: #252526;
-  --color-surface-panel: #181818;
-  --color-surface-hover: #2A2D2E;
-  --color-border: #2D2D30;
-  --color-border-strong: #3E3E42;
-  --color-border-input: #3C3C3C;
-  --color-error: #F48771;
-  --color-error-text: #F48771;
-  --color-error-bg: rgba(244, 135, 113, 0.1);
-  --color-error-border: rgba(244, 135, 113, 0.25);
-  --color-success: #4EC9B0;
-  --color-success-text: #4EC9B0;
-  --color-warning: #CE9178;
-  --color-warning-dot: #D7BA7D;
-  --color-user-msg-bg: rgba(0, 122, 204, 0.12);
-  --color-user-msg-border: rgba(0, 122, 204, 0.22);
-  --color-item-active-bg: #2A2D2E;
-  --color-item-active-text: #4FC3F7;
-  --color-item-active-border: #3E3E42;
-  --color-disabled-bg: #2A2D2E;
-  --color-disabled-text: #4D4D4D;
-  background: #1E1E1E;
-  color-scheme: dark;
 }
 
 /* ════════════════════════════════════════════
@@ -372,82 +253,6 @@
   color: var(--color-ink);
   background: #f2f5fa;
   color-scheme: light;
-}
-
-/* ════════════════════════════════════════════
-   🎨 Skin: Amber — 琥珀暖光 (Light default)
-   ════════════════════════════════════════════ */
-[data-skin="amber"] {
-  --color-brand: #D97706;
-  --color-brand-hover: #B45309;
-  --color-brand-light: #F59E0B;
-  --color-brand-ring: rgba(217, 119, 6, 0.18);
-  --color-ink: #1C1917;
-  --color-ink-rich: #292524;
-  --color-ink-muted: #57534E;
-  --color-ink-subtle: #78716C;
-  --color-ink-faint: #A8A29E;
-  --color-surface: #FFFDF7;
-  --color-surface-raised: #FFFBEB;
-  --color-surface-panel: #FEF7EF;
-  --color-surface-hover: #FDEBD0;
-  --color-border: #F5E6D3;
-  --color-border-strong: #E7D4C0;
-  --color-border-input: #EDD8C4;
-  --color-error: #DC2626;
-  --color-error-text: #B91C1C;
-  --color-error-bg: #FEF2F2;
-  --color-error-border: #FECACA;
-  --color-success: #059669;
-  --color-success-text: #047857;
-  --color-warning: #D97706;
-  --color-warning-dot: #F59E0B;
-  --color-user-msg-bg: #FEF7EF;
-  --color-user-msg-border: #E7D4C0;
-  --color-item-active-bg: #FDEBD0;
-  --color-item-active-text: #92400E;
-  --color-item-active-border: #E7D4C0;
-  --color-disabled-bg: #F5F0E8;
-  --color-disabled-text: #A8A29E;
-  color: var(--color-ink);
-  background: #FFFBF0;
-}
-
-/* ── Amber Dark ── */
-[data-skin="amber"][data-theme="dark"] {
-  --color-brand: #F59E0B;
-  --color-brand-hover: #D97706;
-  --color-brand-light: #FBBF24;
-  --color-brand-ring: rgba(245, 158, 11, 0.25);
-  --color-ink: #F5F0E8;
-  --color-ink-rich: #FFFBF0;
-  --color-ink-muted: #C7B89E;
-  --color-ink-subtle: #9E9078;
-  --color-ink-faint: #6B6052;
-  --color-surface: #1C1814;
-  --color-surface-raised: #24201A;
-  --color-surface-panel: #14100C;
-  --color-surface-hover: #2E2820;
-  --color-border: #30281E;
-  --color-border-strong: #453A2C;
-  --color-border-input: #383022;
-  --color-error: #F87171;
-  --color-error-text: #FCA5A5;
-  --color-error-bg: rgba(248, 113, 113, 0.12);
-  --color-error-border: rgba(248, 113, 113, 0.25);
-  --color-success: #34D399;
-  --color-success-text: #6EE7B7;
-  --color-warning: #FBBF24;
-  --color-warning-dot: #FCD34D;
-  --color-user-msg-bg: rgba(245, 158, 11, 0.12);
-  --color-user-msg-border: rgba(245, 158, 11, 0.22);
-  --color-item-active-bg: #2E2820;
-  --color-item-active-text: #FBBF24;
-  --color-item-active-border: #453A2C;
-  --color-disabled-bg: #2E2820;
-  --color-disabled-text: #6B6052;
-  background: #0D0A08;
-  color-scheme: dark;
 }
 
 /* Shared interactive base */
@@ -1983,6 +1788,14 @@ button {
 
 .message-status--error {
   color: var(--color-error);
+}
+
+.message-retry-attempt {
+  min-width: 0;
+}
+
+.message-retry-attempt + .message-retry-attempt {
+  margin-top: 8px;
 }
 
 /* Turn-scoped plan and tool activity live in the conversation timeline. */

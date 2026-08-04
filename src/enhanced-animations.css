@@ -250,69 +250,6 @@ textarea:focus {
   transform: scale(0.95);
 }
 
-/* ── 皮肤卡片增强 ── */
-.skin-card {
-  transition: all var(--duration-base) var(--ease-out-expo);
-  position: relative;
-}
-
-.skin-card:hover {
-  transform: translateY(-4px);
-  box-shadow: 0 8px 20px rgba(0, 0, 0, 0.12);
-}
-
-.skin-card:active {
-  transform: scale(0.97);
-}
-
-/* 选中状态 */
-.skin-card--active {
-  box-shadow: 0 0 0 3px var(--color-brand-ring),
-              0 4px 12px rgba(0, 0, 0, 0.1);
-}
-
-/* 选中指示器 */
-.skin-card--active::after {
-  content: '✓';
-  position: absolute;
-  top: 10px;
-  right: 10px;
-  width: 24px;
-  height: 24px;
-  display: grid;
-  place-items: center;
-  background: var(--color-brand);
-  color: white;
-  border-radius: 50%;
-  font-size: 13px;
-  font-weight: 700;
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
-  animation: checkmark-pop 400ms var(--ease-out-expo);
-}
-
-@keyframes checkmark-pop {
-  0% {
-    transform: scale(0) rotate(-45deg);
-    opacity: 0;
-  }
-  50% {
-    transform: scale(1.15) rotate(5deg);
-  }
-  100% {
-    transform: scale(1) rotate(0);
-    opacity: 1;
-  }
-}
-
-/* 颜色预览球 */
-.skin-card__preview {
-  transition: transform var(--duration-slow) var(--ease-out-expo);
-}
-
-.skin-card:hover .skin-card__preview {
-  transform: scale(1.15) rotate(8deg);
-}
-
 /* ── 聊天界面增强 ── */
 
 /* 消息输入容器 */
