@@ -94,10 +94,6 @@ export function ConversationTurnActivity({
         <div className="turn-timeline">
           {activities.map((activity) => <ToolActivityRow activity={activity} key={activity.call.id} />)}
         </div>
-      ) : streaming && activityStatus ? (
-        <div className="turn-timeline turn-timeline--empty">
-          <span className="turn-timeline-placeholder">等待工具调用…</span>
-        </div>
       ) : null}
     </div>
   );

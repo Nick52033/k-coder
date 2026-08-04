@@ -411,7 +411,7 @@ impl ExtensionService {
                     "\n--- Skill {} (risk: {:?}, source: {}) ---\n{}\n",
                     skill.metadata.name,
                     skill.metadata.risk,
-                    skill.path.display(),
+                    user_facing_path(&skill.path),
                     skill.body
                 ));
                 self.record(
@@ -497,7 +497,7 @@ impl ExtensionService {
             schema_version: 1,
             config_paths: config_paths
                 .iter()
-                .map(|path| path.to_string_lossy().to_string())
+                .map(|path| user_facing_path(path))
                 .collect(),
             instructions: instructions
                 .iter()
@@ -508,7 +508,7 @@ impl ExtensionService {
                 .map(|skill| SkillDiagnostic {
                     name: skill.metadata.name.clone(),
                     description: skill.metadata.description.clone(),
-                    path: skill.path.to_string_lossy().to_string(),
+                    path: user_facing_path(&skill.path),
                     scope: skill.scope.clone(),
                     risk: skill.metadata.risk,
                     triggers: skill.metadata.triggers.clone(),
@@ -585,7 +585,7 @@ fn merge_configs(paths: &[PathBuf]) -> Result<ExtensionConfig, ExtensionError> {
             if !local_servers.insert(server.id.clone()) {
                 return Err(ExtensionError::Config(format!(
                     "{} contains duplicate MCP server {}",
-                    path.display(),
+                    user_facing_path(path),
                     server.id
                 )));
             }
@@ -597,7 +597,7 @@ fn merge_configs(paths: &[PathBuf]) -> Result<ExtensionConfig, ExtensionError> {
             if !local_hooks.insert(hook.id.clone()) {
                 return Err(ExtensionError::Config(format!(
                     "{} contains duplicate hook {}",
-                    path.display(),
+                    user_facing_path(path),
                     hook.id
                 )));
             }
@@ -621,13 +621,13 @@ fn read_config(path: &Path) -> Result<Option<ExtensionConfig>, ExtensionError> {
     if !metadata.is_file() || metadata.len() as usize > MAX_CONFIG_BYTES {
         return Err(ExtensionError::Config(format!(
             "{} must be a file no larger than {MAX_CONFIG_BYTES} bytes",
-            path.display()
+            user_facing_path(path)
         )));
     }
     let bytes = fs::read(path).map_err(|error| ExtensionError::Io(error.to_string()))?;
     serde_json::from_slice(&bytes)
         .map(Some)
-        .map_err(|error| ExtensionError::Config(format!("{}: {error}", path.display())))
+        .map_err(|error| ExtensionError::Config(format!("{}: {error}", user_facing_path(path))))
 }
 
 fn discover_instructions(
@@ -672,12 +672,12 @@ fn discover_instructions(
         if content.trim().is_empty() {
             return Err(ExtensionError::Config(format!(
                 "instruction file {} is empty",
-                path.display()
+                user_facing_path(&path)
             )));
         }
         result.push(LoadedInstruction {
             source: InstructionSource {
-                path: path.to_string_lossy().to_string(),
+                path: user_facing_path(&path),
                 scope,
                 priority,
                 bytes: content.len(),
@@ -725,7 +725,7 @@ fn discover_skills(
             if !canonical.starts_with(&canonical_root) {
                 return Err(ExtensionError::Skill(format!(
                     "{} escapes the Skill root",
-                    file.display()
+                    user_facing_path(&file)
                 )));
             }
             let content = read_bounded_utf8(&canonical, MAX_SKILL_BYTES)?;
@@ -737,7 +737,7 @@ fn discover_skills(
             if metadata.name != directory_name || !valid_skill_name(&metadata.name) {
                 return Err(ExtensionError::Skill(format!(
                     "{} name must match its directory and use lowercase kebab-case",
-                    canonical.display()
+                    user_facing_path(&canonical)
                 )));
             }
             let override_enabled = projection
@@ -769,23 +769,38 @@ fn discover_skills(
 }
 
 fn parse_skill(content: &str, path: &Path) -> Result<(SkillMetadata, String), ExtensionError> {
+    let content = content.strip_prefix('\u{feff}').unwrap_or(content);
     let body = content
         .strip_prefix("---\n")
         .or_else(|| content.strip_prefix("---\r\n"))
         .ok_or_else(|| {
             ExtensionError::Skill(format!(
                 "{} must start with YAML frontmatter",
-                path.display()
+                user_facing_path(path)
             ))
         })?;
-    let (frontmatter, body) = body
-        .split_once("\n---\n")
-        .or_else(|| body.split_once("\r\n---\r\n"))
-        .ok_or_else(|| {
-            ExtensionError::Skill(format!("{} frontmatter is not closed", path.display()))
-        })?;
+    let mut offset = 0;
+    let mut sections = None;
+    for line in body.split_inclusive('\n') {
+        let delimiter = line.strip_suffix('\n').unwrap_or(line);
+        let delimiter = delimiter.strip_suffix('\r').unwrap_or(delimiter);
+        if delimiter == "---" {
+            sections = Some((&body[..offset], &body[offset + line.len()..]));
+            break;
+        }
+        offset += line.len();
+    }
+    let (frontmatter, body) = sections.ok_or_else(|| {
+        ExtensionError::Skill(format!(
+            "{} frontmatter is not closed",
+            user_facing_path(path)
+        ))
+    })?;
     let metadata: SkillMetadata = serde_yaml::from_str(frontmatter).map_err(|error| {
-        ExtensionError::Skill(format!("{} metadata is invalid: {error}", path.display()))
+        ExtensionError::Skill(format!(
+            "{} metadata is invalid: {error}",
+            user_facing_path(path)
+        ))
     })?;
     if metadata.description.trim().is_empty()
         || metadata.description.len() > 512
@@ -799,7 +814,7 @@ fn parse_skill(content: &str, path: &Path) -> Result<(SkillMetadata, String), Ex
     {
         return Err(ExtensionError::Skill(format!(
             "{} metadata or instructions violate bounded Skill rules",
-            path.display()
+            user_facing_path(path)
         )));
     }
     Ok((metadata, body.trim().to_string()))
@@ -812,12 +827,26 @@ fn read_bounded_utf8(path: &Path, limit: usize) -> Result<String, ExtensionError
     if !metadata.is_file() || metadata.len() as usize > limit {
         return Err(ExtensionError::Config(format!(
             "{} must be a file no larger than {limit} bytes",
-            path.display()
+            user_facing_path(path)
         )));
     }
     let bytes = fs::read(path).map_err(|error| ExtensionError::Io(error.to_string()))?;
     String::from_utf8(bytes)
-        .map_err(|_| ExtensionError::Config(format!("{} must be UTF-8", path.display())))
+        .map_err(|_| ExtensionError::Config(format!("{} must be UTF-8", user_facing_path(path))))
+}
+
+fn user_facing_path(path: &Path) -> String {
+    let path = path.to_string_lossy();
+    #[cfg(windows)]
+    {
+        if let Some(unc) = path.strip_prefix(r"\\?\UNC\") {
+            return format!(r"\\{unc}");
+        }
+        if let Some(path) = path.strip_prefix(r"\\?\") {
+            return path.to_string();
+        }
+    }
+    path.into_owned()
 }
 
 fn valid_skill_name(value: &str) -> bool {
@@ -929,6 +958,67 @@ mod tests {
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].scope, "project");
         assert!(skills[0].body.contains("strictly"));
+    }
+
+    #[test]
+    fn rejects_skill_metadata_that_exceeds_bounded_description() {
+        let content = format!(
+            "---\nname: review\ndescription: {}\ntriggers: [review]\nrisk: read\n---\nInstructions",
+            "x".repeat(513)
+        );
+        let error = parse_skill(&content, Path::new("SKILL.md")).unwrap_err();
+        assert!(error.to_string().contains("bounded Skill rules"));
+    }
+
+    #[test]
+    fn accepts_skill_frontmatter_with_mixed_line_endings() {
+        let content = "---\r\nname: review\r\ndescription: Review code\ntriggers: [review]\r\nrisk: read\r\nenabled: true\n---\r\nInstructions";
+        let (metadata, body) = parse_skill(content, Path::new("SKILL.md")).unwrap();
+
+        assert_eq!(metadata.name, "review");
+        assert_eq!(body, "Instructions");
+    }
+
+    #[test]
+    fn accepts_utf8_bom_before_skill_frontmatter() {
+        let content = "\u{feff}---\nname: review\ndescription: Review code\ntriggers: [review]\nrisk: read\nenabled: true\n---\nInstructions";
+        let (metadata, body) = parse_skill(content, Path::new("SKILL.md")).unwrap();
+
+        assert_eq!(metadata.name, "review");
+        assert_eq!(body, "Instructions");
+    }
+
+    #[test]
+    fn rejects_non_bom_content_before_skill_frontmatter() {
+        let content = " \n---\nname: review\ndescription: Review code\ntriggers: [review]\nrisk: read\nenabled: true\n---\nInstructions";
+        let error = parse_skill(content, Path::new("SKILL.md")).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("must start with YAML frontmatter")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn hides_windows_verbatim_prefix_in_user_facing_paths() {
+        assert_eq!(
+            user_facing_path(Path::new(r"\\?\D:\code\k-coder\SKILL.md")),
+            r"D:\code\k-coder\SKILL.md"
+        );
+        assert_eq!(
+            user_facing_path(Path::new(r"\\?\UNC\server\share\SKILL.md")),
+            r"\\server\share\SKILL.md"
+        );
+    }
+
+    #[test]
+    fn rejects_skill_frontmatter_without_a_closing_delimiter_line() {
+        let content = "---\r\nname: review\r\ndescription: Review code\ntriggers: [review]\r\nrisk: read\r\nInstructions";
+        let error = parse_skill(content, Path::new("SKILL.md")).unwrap_err();
+
+        assert!(error.to_string().contains("frontmatter is not closed"));
     }
 
     #[test]

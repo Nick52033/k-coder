@@ -1,0 +1,25 @@
+{
+  "installedAt": "2026-06-05T08:32:55.716Z",
+  "requestedUrl": "https://ipsapro.isoftstone.com/psacowork/api/psahub/skills/browser-session-crawler/download?version=1.0.0",
+  "packageFormat": "psahub-skill-package@1",
+  "skill": {
+    "slug": "browser-session-crawler",
+    "name": "browser-session-crawler",
+    "displayName": "浏览器会话爬取",
+    "summary": "使用你已登录的 Chrome/Edge 浏览器会话爬取网站。自动复用现有登录状态；若未登录，会弹出提示提醒你登录，随后自动继续执行。适用于需要身份验证的站点（社交媒体、社区、管理后台等）。",
+    "description": "使用你已登录的 Chrome/Edge 浏览器会话爬取网站。自动复用现有登录状态；若未登录，会弹出提示提醒你登录，随后自动继续执行。适用于需要身份验证的站点（社交媒体、社区、管理后台等）。",
+    "version": "1.0.0",
+    "minAppVersion": "",
+    "supportedModes": [
+      "Cowork"
+    ],
+    "tags": [],
+    "owner": "Local Skills"
+  },
+  "source": {
+    "type": "psahub",
+    "slug": "browser-session-crawler",
+    "detailUrl": "https://ipsapro.isoftstone.com/psacowork/api/psahub/skills/browser-session-crawler",
+    "packageUrl": "https://ipsapro.isoftstone.com/psacowork/api/psahub/skills/browser-session-crawler/download?version=1.0.0"
+  }
+}

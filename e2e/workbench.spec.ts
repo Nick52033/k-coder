@@ -269,6 +269,35 @@ test("supports the primary workbench inspection flow", async ({ page }, testInfo
   await expect(page.getByText("extensions_ready", { exact: true })).toBeVisible();
 });
 
+test("supports a light CodeBuddy appearance", async ({ page }) => {
+  await page.goto("/");
+  await page.evaluate(() => {
+    localStorage.setItem("kcoder_skin", "codebuddy");
+    localStorage.setItem("kcoder_theme", "light");
+  });
+  await page.reload();
+
+  await expect(page.locator("html")).toHaveAttribute("data-skin", "codebuddy");
+  await expect(page.locator("html")).toHaveAttribute("data-theme", "light");
+  await expect.poll(() => page.evaluate(() => {
+    const styles = getComputedStyle(document.documentElement);
+    return {
+      surface: styles.getPropertyValue("--color-surface").trim(),
+      background: styles.backgroundColor,
+      colorScheme: styles.colorScheme,
+    };
+  })).toEqual({ surface: "#f8fafc", background: "rgb(242, 245, 250)", colorScheme: "light" });
+  await expect(page.getByRole("button", { name: "切换到深色模式" })).toBeVisible();
+
+  await page.getByRole("button", { name: "切换到深色模式" }).click();
+  await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
+  await expect.poll(() => page.evaluate(() => getComputedStyle(document.documentElement).getPropertyValue("--color-surface").trim())).toBe("#1B2030");
+
+  await page.getByRole("button", { name: "切换到浅色模式" }).click();
+  await expect(page.locator("html")).toHaveAttribute("data-theme", "light");
+  await expect.poll(() => page.evaluate(() => getComputedStyle(document.documentElement).getPropertyValue("--color-surface").trim())).toBe("#f8fafc");
+});
+
 test("keeps the mid-width workbench bounded without toolbar overflow", async ({ page }, testInfo) => {
   await page.setViewportSize({ width: 1097, height: 820 });
   await page.goto("/");
@@ -359,12 +388,9 @@ test("streams thinking, safe reasoning summaries, and command output inline", as
     emit({ ...base, type: "activity_status_changed", phase: "exploring", status: "thinking" });
   });
   await expect(page.getByText("思考中", { exact: true })).toBeVisible();
-  const waitingPlaceholder = page.getByText("等待工具调用…", { exact: true });
-  await expect(waitingPlaceholder).toBeVisible();
-  const waitingBox = await waitingPlaceholder.locator("..").boundingBox();
-  expect(waitingBox?.height ?? Number.POSITIVE_INFINITY).toBeLessThanOrEqual(28);
-  await expect(waitingPlaceholder.locator("..")).toHaveCSS("border-top-style", "none");
-  await page.screenshot({ path: testInfo.outputPath("compact-thinking-placeholder.png"), fullPage: true });
+  await expect(page.getByText("等待工具调用…", { exact: true })).toHaveCount(0);
+  await expect(page.locator(".turn-timeline--empty")).toHaveCount(0);
+  await page.screenshot({ path: testInfo.outputPath("compact-thinking-status.png"), fullPage: true });
   await expect(page.locator(".message-avatar")).toHaveCount(0);
   await expect(page.getByText("正在执行", { exact: true })).toHaveCount(0);
 
@@ -451,6 +477,7 @@ test("renders streamed assistant markdown as structured content", async ({ page 
 
 test("queues messages during thinking and interrupts only from the queued send action", async ({ page }, testInfo) => {
   await page.goto("/");
+  await expect(page.locator(".message-queue")).toHaveCount(0);
   await page.evaluate(() => {
     (window as unknown as { __emitAgentEvent: (event: unknown) => void }).__emitAgentEvent({
       schemaVersion: 1,

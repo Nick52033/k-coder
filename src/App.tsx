@@ -172,6 +172,7 @@ function App() {
     clearQueue,
     forceResetState,
   } = useWorkbenchStore();
+  const pendingQueueCount = messageQueue.filter((message) => message.status === "pending").length;
 
   useEffect(() => {
     let disposed = false;
@@ -806,9 +807,9 @@ function App() {
             <button
               className="window-control window-control--close"
               type="button"
-              aria-label="关闭窗口"
-              title="关闭"
-              onClick={() => void appWindow.close()}
+              aria-label="最小化到托盘"
+              title="最小化到托盘"
+              onClick={() => void appWindow.hide()}
             >
               <X size={16} />
             </button>
@@ -1335,7 +1336,7 @@ function App() {
         )}
 
         {/* 消息队列显示 */}
-        {messageQueue.length > 0 && (
+        {pendingQueueCount > 0 && (
           <div className="message-queue">
             <button
               type="button"
@@ -1343,7 +1344,7 @@ function App() {
               onClick={() => setQueueExpanded(!queueExpanded)}
             >
               <span className={cn("queue-arrow", queueExpanded && "queue-arrow--expanded")}>▶</span>
-              <span className="queue-title">队列 ({messageQueue.filter(m => m.status === "pending").length})</span>
+              <span className="queue-title">队列 ({pendingQueueCount})</span>
             </button>
 
             {queueExpanded && (
@@ -1382,7 +1383,7 @@ function App() {
                     )}
                   </div>
                 ))}
-                {messageQueue.filter(m => m.status === "pending").length > 0 && (
+                {pendingQueueCount > 0 && (
                   <button
                     type="button"
                     className="queue-clear-btn"

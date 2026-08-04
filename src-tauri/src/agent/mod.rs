@@ -1,13 +1,10 @@
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
-use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
-use std::pin::Pin;
 use std::sync::Arc;
 
 use futures_util::StreamExt;
-use futures_util::stream::FuturesUnordered;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
@@ -46,16 +43,6 @@ const MAX_TOOL_OUTPUT_BYTES: usize = 256 * 1024;
 const MAX_IDENTICAL_TOOL_CALLS: usize = 2;
 const PROGRESS_CHECK_WINDOW: usize = 5;
 const MAX_NO_PROGRESS_WINDOWS: usize = 3;
-
-/// 工具执行的 Future 类型（用于异步并发执行）
-pub type ToolExecutionFuture = Pin<Box<dyn Future<Output = ToolExecutionResult> + Send + 'static>>;
-
-/// 工具执行的结果（包含原始调用和执行结果）
-#[derive(Debug)]
-pub struct ToolExecutionResult {
-    pub call: ToolCall,
-    pub result: Result<Option<ToolResult>, AgentRuntimeError>,
-}
 
 /// 进展快照：用于检测任务是否有实质性进展
 #[derive(Clone, PartialEq, Eq)]
@@ -389,7 +376,8 @@ impl AgentRuntime {
         let mut total_usage = TokenUsage::default();
         let mut has_usage = false;
         let mut provider_context_bytes = 0usize;
-        let mut repeated_calls = HashMap::<String, usize>::new();
+        let mut last_call_signature = None::<String>;
+        let mut identical_call_streak = 0usize;
         let token_budget = self.max_total_tokens;
 
         // 进展检测变量
@@ -502,7 +490,6 @@ impl AgentRuntime {
 
             // 声明需要在重试循环外部的变量
             let response: String;
-            let mut in_flight: FuturesUnordered<ToolExecutionFuture>;
             let pending_tool_calls: Vec<ToolCall>;
             let iteration_usage: Option<crate::protocol::TokenUsage>;
             let completed: bool;
@@ -562,8 +549,6 @@ impl AgentRuntime {
                 let mut response_inner = String::new();
                 let mut reasoning_summary_bytes = HashMap::<String, usize>::new();
                 let mut responding_published = false;
-                let in_flight_inner: FuturesUnordered<ToolExecutionFuture> =
-                    FuturesUnordered::new();
                 let mut pending_tool_calls_inner = Vec::new(); // 暂存 ToolCall，等 Completed 后再启动
                 let mut iteration_usage_inner = None;
                 let completed_inner = loop {
@@ -794,7 +779,6 @@ impl AgentRuntime {
 
                 // 成功完成，跳出重试循环
                 response = response_inner;
-                in_flight = in_flight_inner;
                 pending_tool_calls = pending_tool_calls_inner;
                 iteration_usage = iteration_usage_inner;
                 completed = completed_inner;
@@ -877,22 +861,25 @@ impl AgentRuntime {
                 ))
                 .await?;
 
-            // 🔥 核心改动：启动所有工具的异步执行
             let mut stop_reason: Option<String> = None;
+            let mut cancelled_batch = false;
+            let mut fatal_error = None;
             for call in pending_tool_calls {
-                // 检查重复调用
                 let signature = call_signature(&call);
-                let repeat = repeated_calls.entry(signature).or_default();
-                *repeat += 1;
+                if last_call_signature.as_deref() == Some(signature.as_str()) {
+                    identical_call_streak = identical_call_streak.saturating_add(1);
+                } else {
+                    last_call_signature = Some(signature);
+                    identical_call_streak = 1;
+                }
 
-                if *repeat > MAX_IDENTICAL_TOOL_CALLS {
+                if identical_call_streak > MAX_IDENTICAL_TOOL_CALLS {
                     let reason = format!(
-                        "repeated_tool_call: {} was requested with identical arguments more than {MAX_IDENTICAL_TOOL_CALLS} times",
+                        "repeated_tool_call: {} was requested with identical arguments more than {MAX_IDENTICAL_TOOL_CALLS} consecutive times",
                         call.name
                     );
                     stop_reason = Some(reason.clone());
 
-                    // 创建失败结果并立即持久化
                     let result = failure_result(reason);
                     if let Some(metrics) = &self.metrics {
                         metrics.tool(result.success);
@@ -903,7 +890,6 @@ impl AgentRuntime {
                 }
 
                 if let Some(reason) = &stop_reason {
-                    // 前面的工具已经触发停止，跳过后续工具
                     let result = failure_result(format!("tool execution skipped: {reason}"));
                     if let Some(metrics) = &self.metrics {
                         metrics.tool(result.success);
@@ -913,7 +899,6 @@ impl AgentRuntime {
                     continue;
                 }
 
-                // 创建工具上下文并启动异步执行
                 let context = ToolContext {
                     thread_id: thread_id.clone(),
                     turn_id: turn_id.clone(),
@@ -923,24 +908,10 @@ impl AgentRuntime {
                     progress: None,
                 };
 
-                let future = self.spawn_tool_execution(
-                    context,
-                    call,
-                    cancellation.clone(),
-                    publisher.clone(),
-                    thread_id.clone(),
-                    turn_id.clone(),
-                );
-
-                in_flight.push(future);
-            }
-
-            // 🔥 等待所有工具执行完成
-            let mut cancelled_batch = false;
-            let mut fatal_error = None;
-            while let Some(exec_result) = in_flight.next().await {
-                let call = exec_result.call;
-                let result = match exec_result.result {
+                let result = match self
+                    .execute_tool_with_progress(context, &call, cancellation.clone(), &publisher)
+                    .await
+                {
                     Ok(Some(tool_result)) => bound_tool_result(tool_result),
                     Ok(None) => {
                         cancelled_batch = true;
@@ -951,6 +922,7 @@ impl AgentRuntime {
                         let message = error.to_string();
                         if fatal_error.is_none() {
                             cancellation.cancel();
+                            stop_reason = Some(format!("tool batch aborted: {message}"));
                             fatal_error = Some(error);
                         }
                         failure_result(message)
@@ -981,68 +953,55 @@ impl AgentRuntime {
         }
     }
 
-    /// 生成工具执行的 Future（用于异步流式执行）
-    fn spawn_tool_execution(
+    async fn execute_tool_with_progress(
         &self,
         mut context: ToolContext,
-        call: ToolCall,
+        call: &ToolCall,
         cancellation: CancellationToken,
-        publisher: Arc<dyn EventPublisher>,
-        thread_id: String,
-        turn_id: String,
-    ) -> ToolExecutionFuture {
-        let agent = AgentRuntime {
-            repository: self.repository.clone(),
-            tools: self.tools.clone(),
-            approvals: self.approvals.clone(),
-            approval_mode: self.approval_mode,
-            user_inputs: self.user_inputs.clone(),
-            workspace_root: self.workspace_root.clone(),
-            runtime_instructions: self.runtime_instructions.clone(),
-            context_limit: self.context_limit,
-            max_total_tokens: self.max_total_tokens,
-            metrics: self.metrics.clone(),
-            reasoning_effort: self.reasoning_effort,
-            logger: self.logger.clone(),
-        };
+        publisher: &Arc<dyn EventPublisher>,
+    ) -> Result<Option<ToolResult>, AgentRuntimeError> {
+        let (progress_tx, mut progress_rx) = tool_progress_channel();
+        context.progress = Some(progress_tx);
+        publisher.publish(AgentEventEnvelope::new(AgentEvent::ToolStarted {
+            thread_id: context.thread_id.clone(),
+            turn_id: context.turn_id.clone(),
+            call: call.clone(),
+        }));
 
-        Box::pin(async move {
-            let (progress_tx, mut progress_rx) = tool_progress_channel();
-            context.progress = Some(progress_tx);
-            // 发送工具开始事件
-            publisher.publish(AgentEventEnvelope::new(AgentEvent::ToolStarted {
-                thread_id: thread_id.clone(),
-                turn_id: turn_id.clone(),
-                call: call.clone(),
-            }));
-
-            // 执行工具，并把有界进展队列映射为公共事件。
-            let result = {
-                let execution = agent.execute_tool_call(&context, &call, cancellation, &publisher);
-                tokio::pin!(execution);
-                loop {
-                    tokio::select! {
-                        result = &mut execution => break result,
-                        progress = progress_rx.recv() => {
-                            if let Some(progress) = progress {
-                                publish_tool_progress(
-                                    &publisher,
-                                    &thread_id,
-                                    &turn_id,
-                                    &call.id,
-                                    progress,
-                                );
-                            }
+        let result = {
+            let execution = self.execute_tool_call(&context, call, cancellation, publisher);
+            tokio::pin!(execution);
+            let mut progress_open = true;
+            loop {
+                tokio::select! {
+                    result = &mut execution => break result,
+                    progress = progress_rx.recv(), if progress_open => {
+                        if let Some(progress) = progress {
+                            publish_tool_progress(
+                                publisher,
+                                &context.thread_id,
+                                &context.turn_id,
+                                &call.id,
+                                progress,
+                            );
+                        } else {
+                            progress_open = false;
                         }
                     }
                 }
-            };
-            while let Ok(progress) = progress_rx.try_recv() {
-                publish_tool_progress(&publisher, &thread_id, &turn_id, &call.id, progress);
             }
+        };
+        while let Ok(progress) = progress_rx.try_recv() {
+            publish_tool_progress(
+                publisher,
+                &context.thread_id,
+                &context.turn_id,
+                &call.id,
+                progress,
+            );
+        }
 
-            ToolExecutionResult { call, result }
-        })
+        result
     }
 
     async fn execute_tool_call(
@@ -2153,11 +2112,13 @@ mod tests {
 
     struct CancellingPublisher {
         cancellation: CancellationToken,
+        started_calls: Mutex<Vec<String>>,
     }
 
     impl EventPublisher for CancellingPublisher {
         fn publish(&self, event: AgentEventEnvelope) {
-            if matches!(event.event, AgentEvent::ToolStarted { .. }) {
+            if let AgentEvent::ToolStarted { call, .. } = event.event {
+                self.started_calls.lock().unwrap().push(call.id);
                 self.cancellation.cancel();
             }
         }
@@ -2515,7 +2476,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn publishes_parallel_tool_results_as_each_tool_finishes() {
+    async fn executes_tool_calls_in_provider_order() {
         let directory = tempfile::tempdir().unwrap();
         let repository = Arc::new(JsonlThreadRepository::new(directory.path()).unwrap());
         let thread = repository.create_thread().await.unwrap();
@@ -2565,17 +2526,26 @@ mod tests {
             .await
             .unwrap();
 
-        let completed = publisher
+        let lifecycle = publisher
             .events
             .lock()
             .unwrap()
             .iter()
             .filter_map(|event| match &event.event {
-                AgentEvent::ToolCompleted { call_id, .. } => Some(call_id.clone()),
+                AgentEvent::ToolStarted { call, .. } => Some(format!("started:{}", call.id)),
+                AgentEvent::ToolCompleted { call_id, .. } => Some(format!("completed:{call_id}")),
                 _ => None,
             })
             .collect::<Vec<_>>();
-        assert_eq!(completed, ["fast".to_string(), "slow".to_string()]);
+        assert_eq!(
+            lifecycle,
+            [
+                "started:slow",
+                "completed:slow",
+                "started:fast",
+                "completed:fast"
+            ]
+        );
     }
 
     #[tokio::test]
@@ -3229,6 +3199,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn allows_rechecking_identical_arguments_after_an_intervening_tool_call() {
+        let (_directory, repository, runtime, thread_id) = runtime_fixture().await;
+        let list = |id: &str, limit: Option<usize>| {
+            let mut arguments = json!({ "path": "." });
+            if let Some(limit) = limit {
+                arguments["limit"] = json!(limit);
+            }
+            vec![
+                Ok(ProviderEvent::ToolCall {
+                    call: ToolCall {
+                        id: id.to_string(),
+                        name: "list_directory".to_string(),
+                        arguments,
+                        metadata: json!({}),
+                    },
+                }),
+                Ok(ProviderEvent::Completed),
+            ]
+        };
+        let provider = Arc::new(FakeProvider::script(vec![
+            list("initial-check", None),
+            list("intervening-check", Some(1)),
+            list("final-check", None),
+            vec![
+                Ok(ProviderEvent::TextDelta {
+                    delta: "verified".to_string(),
+                }),
+                Ok(ProviderEvent::Completed),
+            ],
+        ]));
+
+        let outcome = runtime
+            .run_turn(
+                provider,
+                "fake".to_string(),
+                RunTurnRequest {
+                    thread_id: thread_id.clone(),
+                    input: "check, work, and check again".to_string(),
+                    agent_mode: None,
+                },
+                CancellationToken::new(),
+                Arc::new(RecordingPublisher::default()),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.state, TurnState::Completed);
+        assert_eq!(
+            repository
+                .load(&thread_id)
+                .await
+                .unwrap()
+                .iter()
+                .filter(|event| matches!(event.kind, StoredEventKind::ToolResult { .. }))
+                .count(),
+            3
+        );
+    }
+
+    #[tokio::test]
     async fn cancellation_is_persisted_and_published() {
         let (_directory, repository, runtime, thread_id) = runtime_fixture().await;
         let provider = Arc::new(FakeProvider::text(&["late"]).with_delay(Duration::from_secs(10)));
@@ -3290,6 +3320,7 @@ mod tests {
         let cancellation = CancellationToken::new();
         let publisher = Arc::new(CancellingPublisher {
             cancellation: cancellation.clone(),
+            started_calls: Mutex::new(Vec::new()),
         });
 
         let outcome = runtime
@@ -3302,7 +3333,7 @@ mod tests {
                     agent_mode: None,
                 },
                 cancellation,
-                publisher,
+                publisher.clone(),
             )
             .await
             .unwrap();
@@ -3316,6 +3347,7 @@ mod tests {
                 .count(),
             2
         );
+        assert_eq!(*publisher.started_calls.lock().unwrap(), ["call-1"]);
     }
 
     fn patch_call(patch: &str) -> ToolCall {

@@ -298,9 +298,9 @@
 }
 
 /* ════════════════════════════════════════════
-   🎨 Skin: CodeBuddy — 冷调深蓝灰 (Dark-only, Cursor 风格)
+   🎨 Skin: CodeBuddy — 冷调蓝灰 (Cursor 风格)
    ════════════════════════════════════════════ */
-[data-skin="codebuddy"] {
+[data-skin="codebuddy"][data-theme="dark"] {
   --color-brand: #4F8AFF;
   --color-brand-hover: #3B7AEE;
   --color-brand-light: #7FAEFF;
@@ -334,6 +334,44 @@
   --color-disabled-text: #4E5868;
   background: #161A26;
   color-scheme: dark;
+}
+
+/* ── CodeBuddy Light ── */
+[data-skin="codebuddy"][data-theme="light"] {
+  --color-brand: #2f6fe4;
+  --color-brand-hover: #2459b8;
+  --color-brand-light: #3f6fbd;
+  --color-brand-ring: rgba(47, 111, 228, 0.2);
+  --color-ink: #172033;
+  --color-ink-rich: #101827;
+  --color-ink-muted: #526078;
+  --color-ink-subtle: #68758a;
+  --color-ink-faint: #9aa6b7;
+  --color-surface: #f8fafc;
+  --color-surface-raised: #ffffff;
+  --color-surface-panel: #f1f5f9;
+  --color-surface-hover: #e7edf6;
+  --color-border: #d7dee9;
+  --color-border-strong: #bdc8d8;
+  --color-border-input: #cbd5e1;
+  --color-error: #c24145;
+  --color-error-text: #9f1d27;
+  --color-error-bg: #fff7f7;
+  --color-error-border: #efc1c5;
+  --color-success: #158a61;
+  --color-success-text: #13734f;
+  --color-warning: #ad6800;
+  --color-warning-dot: #c4830c;
+  --color-user-msg-bg: #eef4ff;
+  --color-user-msg-border: #d6e2fb;
+  --color-item-active-bg: #e4edff;
+  --color-item-active-text: #204b99;
+  --color-item-active-border: #c4d6f3;
+  --color-disabled-bg: #e7ebf1;
+  --color-disabled-text: #98a3b4;
+  color: var(--color-ink);
+  background: #f2f5fa;
+  color-scheme: light;
 }
 
 /* ════════════════════════════════════════════
@@ -2456,34 +2494,6 @@ button {
 
 .turn-live-status-dots i:nth-child(2) { animation-delay: 120ms; }
 .turn-live-status-dots i:nth-child(3) { animation-delay: 240ms; }
-
-.turn-timeline--empty {
-  display: flex;
-  align-items: center;
-  min-height: 0;
-  padding: 2px 8px 4px 27px;
-  border: 0;
-  background: transparent;
-  color: var(--color-ink-subtle);
-  font-size: var(--font-size-xs);
-  line-height: 1.4;
-}
-
-.turn-timeline-placeholder {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-}
-
-.turn-timeline-placeholder::before {
-  content: "";
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: currentColor;
-  opacity: 0.55;
-  animation: turn-live-dot 1.1s ease-in-out infinite;
-}
 
 .turn-tool-output {
   min-width: 0;

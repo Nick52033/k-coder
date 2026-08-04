@@ -156,7 +156,7 @@ const skinDefinitions: SkinDefinition[] = [
   { id: "paper", label: "纸墨精工", desc: "绿色品牌 · 浅色为主 · 日常精工", preview: "#176b4d" },
   { id: "midnight", label: "午夜终端", desc: "OLED 深黑 · 翠绿高亮 · 纯暗色", preview: "#10b981" },
   { id: "vscode", label: "编辑器经典", desc: "中性深灰 · 蓝色高亮 · 专注编码", preview: "#007acc" },
-  { id: "codebuddy", label: "CodeBuddy", desc: "冷调深蓝灰 · 蓝紫高亮 · 沉浸编码", preview: "#4F8AFF" },
+  { id: "codebuddy", label: "CodeBuddy", desc: "冷调蓝灰 · 蓝色高亮 · 支持明暗", preview: "#4F8AFF" },
   { id: "amber", label: "琥珀暖光", desc: "暖白纸感 · 橙金点缀 · 极度护眼", preview: "#D97706" },
 ];
 

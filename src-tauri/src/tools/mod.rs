@@ -533,6 +533,7 @@ const MAX_READ_LINES: usize = 2_000;
 const MAX_FILE_SIZE_BYTES: u64 = 4 * 1024 * 1024;
 const COMMAND_CANCEL_GRACE_MS: u64 = 2_000;
 const IGNORED_NAMES: &[&str] = &[".git", "node_modules", "target", "dist", "build"];
+const WORKSPACE_RELATIVE_PATH_DESCRIPTION: &str = "Workspace-relative path only. Use '.' for workspace root. Absolute paths and parent traversal are rejected.";
 
 struct ListDirectoryTool;
 
@@ -541,12 +542,12 @@ impl ToolHandler for ListDirectoryTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "list_directory".to_string(),
-            description: "List direct children of a directory inside the current workspace."
+            description: "List direct children of a directory inside the current workspace. The path must be workspace-relative; use '.' for the workspace root."
                 .to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string" },
+                    "path": { "type": "string", "description": WORKSPACE_RELATIVE_PATH_DESCRIPTION },
                     "limit": { "type": "integer", "minimum": 1, "maximum": MAX_DIRECTORY_LIMIT }
                 },
                 "required": ["path"],
@@ -624,12 +625,12 @@ impl ToolHandler for ReadFileTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "read_file".to_string(),
-            description: "Read a bounded text range from a file inside the current workspace. Prefer startLine/lineCount for code inspection. When either line-range field is present, the line range takes precedence and offset/limit are ignored; otherwise offset/limit remain available for byte-precise reads."
+            description: "Read a bounded text range from a file inside the current workspace. The path must be workspace-relative. Prefer startLine/lineCount for code inspection. When either line-range field is present, the line range takes precedence and offset/limit are ignored; otherwise offset/limit remain available for byte-precise reads."
                 .to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string", "minLength": 1 },
+                    "path": { "type": "string", "minLength": 1, "description": WORKSPACE_RELATIVE_PATH_DESCRIPTION },
                     "offset": { "type": "integer", "minimum": 0, "description": "Zero-based byte offset. Ignored when startLine or lineCount is present." },
                     "limit": { "type": "integer", "minimum": 1, "maximum": MAX_READ_BYTES, "description": "Maximum bytes for a byte-range read. Ignored when startLine or lineCount is present." },
                     "startLine": { "type": "integer", "minimum": 1, "description": "One-based starting line. Takes precedence over offset/limit." },
@@ -859,7 +860,7 @@ impl ToolHandler for RunCommandTool {
                 "properties": {
                     "program": { "type": "string", "minLength": 1, "maxLength": 260 },
                     "args": { "type": "array", "items": { "type": "string", "maxLength": 8192 }, "maxItems": 128 },
-                    "cwd": { "type": "string", "maxLength": 1024 },
+                    "cwd": { "type": "string", "maxLength": 1024, "description": WORKSPACE_RELATIVE_PATH_DESCRIPTION },
                     "timeoutMs": { "type": "integer", "minimum": 1, "maximum": 3600000 }
                 },
                 "required": ["program"],
@@ -1078,7 +1079,7 @@ impl ToolHandler for WriteFileTool {
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string", "minLength": 1 },
+                    "path": { "type": "string", "minLength": 1, "description": WORKSPACE_RELATIVE_PATH_DESCRIPTION },
                     "content": { "type": "string", "maxLength": 524288 }
                 },
                 "required": ["path", "content"],
@@ -1460,6 +1461,23 @@ mod tests {
             let authorization = registry.authorization(name, &arguments).unwrap();
             assert_eq!(authorization.decision, PolicyDecision::Allow);
             assert_eq!(authorization.risk, ToolRisk::Read);
+        }
+    }
+
+    #[test]
+    fn workspace_file_tool_schemas_explain_relative_paths() {
+        let registry = ToolRegistry::read_only();
+        for name in ["list_directory", "read_file"] {
+            let definition = registry
+                .definitions()
+                .into_iter()
+                .find(|definition| definition.name == name)
+                .expect("workspace file tool should be registered");
+            let description = definition.input_schema["properties"]["path"]["description"]
+                .as_str()
+                .expect("workspace path should have a schema description");
+            assert!(description.contains("Workspace-relative path only"));
+            assert!(description.contains("Absolute paths"));
         }
     }
 

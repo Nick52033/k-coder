@@ -17,6 +17,7 @@ const DEFAULT_BUFFER_BYTES: usize = 1024 * 1024;
 const MAX_BUFFER_BYTES: usize = 8 * 1024 * 1024;
 const MAX_TIMEOUT_MS: u64 = 60 * 60 * 1000;
 const OUTPUT_DRAIN_GRACE_MS: u64 = 500;
+const COMMAND_WAIT_STATUS_POLL_MS: u64 = 100;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -171,13 +172,21 @@ pub fn assess_command(program: &str, args: &[String]) -> CommandAssessment {
             reason: "command can communicate with an external system".into(),
         };
     }
+    let package_manager_build_or_test = |command: Option<&String>| {
+        command
+            .is_some_and(|value| matches!(value.as_str(), "test" | "build" | "lint" | "typecheck"))
+    };
     let build_or_test = match executable.as_str() {
         "cargo" => lowered.first().is_some_and(|arg| {
             matches!(arg.as_str(), "build" | "check" | "test" | "fmt" | "clippy")
         }),
-        "npm" | "pnpm" | "yarn" => lowered
-            .first()
-            .is_some_and(|arg| matches!(arg.as_str(), "test" | "build" | "lint" | "typecheck")),
+        "npm" | "pnpm" | "yarn" => package_manager_build_or_test(lowered.first()),
+        "corepack" => {
+            lowered
+                .first()
+                .is_some_and(|value| matches!(value.as_str(), "npm" | "pnpm" | "yarn"))
+                && package_manager_build_or_test(lowered.get(1))
+        }
         "pytest" => true,
         "go" => lowered
             .first()
@@ -539,7 +548,10 @@ impl CommandRuntime {
             if session.state.lock().await.finished() {
                 return self.status(id).await;
             }
-            changed.await;
+            tokio::select! {
+                _ = changed => {}
+                _ = tokio::time::sleep(Duration::from_millis(COMMAND_WAIT_STATUS_POLL_MS)) => {}
+            }
         }
     }
 
@@ -1165,6 +1177,11 @@ mod tests {
             CommandRisk::BuildOrTest
         );
         assert_eq!(
+            assess_command("corepack", &["pnpm".into(), "build".into()]).risk,
+            CommandRisk::BuildOrTest
+        );
+        assert!(!assess_command("corepack", &["pnpm".into(), "build".into()]).requires_approval);
+        assert_eq!(
             assess_command(
                 "powershell",
                 &["-Command".into(), "Remove-Item -Recurse target".into()]
@@ -1243,6 +1260,52 @@ mod tests {
             started.elapsed() < Duration::from_millis(1_500),
             "output drain must not hold a finished command session open indefinitely"
         );
+    }
+
+    #[tokio::test]
+    async fn wait_observes_a_finished_session_without_a_completion_notification() {
+        let workspace = tempfile::tempdir().unwrap();
+        let runtime = CommandRuntime::new(workspace.path()).unwrap();
+        let id = Uuid::new_v4().to_string();
+        let session = Arc::new(Session {
+            id: id.clone(),
+            mode: CommandMode::Foreground,
+            started_at_ms: now_ms(),
+            state: Mutex::new(CommandState::Running),
+            finished_at_ms: Mutex::new(None),
+            stdin: Mutex::new(None),
+            output: Mutex::new(OutputBuffer {
+                chunks: VecDeque::new(),
+                bytes: 0,
+                limit: 4096,
+                next_cursor: 0,
+                truncated: false,
+            }),
+            cancel: CancellationToken::new(),
+            changed: Notify::new(),
+        });
+        runtime
+            .sessions
+            .lock()
+            .await
+            .insert(id.clone(), session.clone());
+
+        let mut wait = Box::pin(runtime.wait(&id));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut wait)
+                .await
+                .is_err(),
+            "the synthetic session should still be running"
+        );
+        *session.state.lock().await = CommandState::Exited { code: 0 };
+        *session.finished_at_ms.lock().await = Some(now_ms());
+
+        let status = tokio::time::timeout(Duration::from_secs(1), &mut wait)
+            .await
+            .expect("wait should poll terminal state even when no notification arrives")
+            .unwrap();
+        assert_eq!(status.state, CommandState::Exited { code: 0 });
+        runtime.close(&id).await.unwrap();
     }
 
     #[tokio::test]

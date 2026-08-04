@@ -155,7 +155,7 @@ fn build_system_prompt(
         .and_then(|n| n.to_str())
         .unwrap_or("unknown");
     sections.push(format!(
-        "<workspace>\n工作区路径：{workspace_path}\n项目名称：{project_name}\n</workspace>"
+        "<workspace>\n工作区路径（仅用于识别，不是工具参数）：{workspace_path}\n项目名称：{project_name}\n工具路径规则：所有工作区路径参数必须是相对工作区根目录的路径。工作区根目录使用 `.`；例如使用 `docs/开发路线图.md` 或 `src-tauri/src`。不得把上面的绝对路径传给工具，也不得使用 `..` 或其他父目录遍历。\n</workspace>"
     ));
 
     // 3. collaboration mode — 当前协作模式指令
@@ -1640,12 +1640,25 @@ async fn enrich_image_attachments(app: &AppHandle, attachments: &mut [ImageAttac
 
 #[cfg(test)]
 mod tests {
-    use super::CRAFT_MODE_INSTRUCTIONS;
+    use std::path::Path;
+
+    use super::{CRAFT_MODE_INSTRUCTIONS, build_system_prompt};
 
     #[test]
     fn craft_mode_can_proactively_clarify_ambiguous_behavior() {
         assert!(CRAFT_MODE_INSTRUCTIONS.contains("request_user_input"));
         assert!(CRAFT_MODE_INSTRUCTIONS.contains("暂停当前 Turn"));
         assert!(CRAFT_MODE_INSTRUCTIONS.contains("破坏性操作"));
+    }
+
+    #[test]
+    fn workspace_prompt_requires_workspace_relative_tool_paths() {
+        let prompt = build_system_prompt(Path::new(r"D:\code\k-coder"), "", "", "", "", &[]);
+
+        assert!(prompt.contains("仅用于识别，不是工具参数"));
+        assert!(prompt.contains("必须是相对工作区根目录的路径"));
+        assert!(prompt.contains("工作区根目录使用 `.`"));
+        assert!(prompt.contains("不得把上面的绝对路径传给工具"));
+        assert!(prompt.contains("不得使用 `..`"));
     }
 }
