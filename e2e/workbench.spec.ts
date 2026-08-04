@@ -49,6 +49,8 @@ test.beforeEach(async ({ page }) => {
         { turnId: "turn-1", call: { id: "call-read", name: "read_file", arguments: { path: "src/stores/workbenchStore.ts", startLine: 42, lineCount: 1 }, metadata: {} }, state: "completed", result: { success: true, output: "export const fixture = true;\n", metadata: { path: "src/stores/workbenchStore.ts", offset: 920, bytesReturned: 29, totalBytes: 4096, startLine: 42, endLine: 42, linesReturned: 1, totalLines: 200, truncated: true } }, startedAtMs: 1210, completedAtMs: 1224, durationMs: 14 },
         { turnId: "turn-1", call: { id: "call-test", name: "run_command", arguments: { program: "pnpm", args: ["build"], cwd: "D:\\code\\k-coder", timeoutMs: 120000 }, metadata: {} }, state: "completed", result: { success: true, output: "tests passed", metadata: { durationMs: 1530 } }, startedAtMs: 1300, completedAtMs: 2830, durationMs: 1530 },
       ], turnTimeline: [
+        { type: "event", itemId: "provider-context-1", turnId: "turn-1", kind: "provider_context", title: "已保留模型上下文", detail: "openai_responses · reasoning · rs_fixture" },
+        { type: "event", itemId: "usage-1", turnId: "turn-1", kind: "usage", title: "模型调用 1 用量", detail: "输入 1200 · 输出 80 · 总计 1280 tokens" },
         { type: "text", id: "progress-1", turnId: "turn-1", text: "我先检查相关文件并修改实现。" },
         { type: "tool", activity: { turnId: "turn-1", call: { id: "call-edit", name: "apply_patch", arguments: { patch: "*** Begin Patch\n*** Update File: src/App.css\n@@\n-old\n+new\n*** End Patch" }, metadata: {} }, state: "completed", result: { success: true, output: "applied", metadata: {} }, startedAtMs: 1000, completedAtMs: 1200, durationMs: 200 } },
         { type: "tool", activity: { turnId: "turn-1", call: { id: "call-read", name: "read_file", arguments: { path: "src/stores/workbenchStore.ts", startLine: 42, lineCount: 1 }, metadata: {} }, state: "completed", result: { success: true, output: "export const fixture = true;\n", metadata: { path: "src/stores/workbenchStore.ts", offset: 920, bytesReturned: 29, totalBytes: 4096, startLine: 42, endLine: 42, linesReturned: 1, totalLines: 200, truncated: true } }, startedAtMs: 1210, completedAtMs: 1224, durationMs: 14 } },
@@ -200,6 +202,13 @@ test("supports the primary workbench inspection flow", async ({ page }, testInfo
   await expect(page.getByText("我先检查相关文件并修改实现。", { exact: true })).toBeHidden();
   await page.screenshot({ path: testInfo.outputPath("collapsed-turn.png"), fullPage: true });
   await page.getByText("执行了 1.8s", { exact: true }).click();
+  await page.screenshot({ path: testInfo.outputPath("collapsed-steps.png"), fullPage: true });
+  const providerContextStep = page.locator(".turn-event-step--provider_context");
+  await expect(providerContextStep.getByText("已保留模型上下文", { exact: true })).toBeVisible();
+  await expect(providerContextStep.getByText("openai_responses · reasoning · rs_fixture", { exact: true })).toBeHidden();
+  await providerContextStep.locator(":scope > summary").click();
+  await expect(providerContextStep.getByText("openai_responses · reasoning · rs_fixture", { exact: true })).toBeVisible();
+  await expect(page.locator(".turn-event-step--usage").getByText("输入 1200 · 输出 80 · 总计 1280 tokens", { exact: true })).toBeHidden();
   await expect(page.locator(".turn-plan").getByText("检查工作区", { exact: true })).toBeVisible();
   await expect(page.getByText("我先检查相关文件并修改实现。", { exact: true })).toBeVisible();
   const inspectionGroup = page.locator(".turn-tool-group").filter({ hasText: "执行了 2 个操作" });
@@ -429,9 +438,13 @@ test("streams thinking, safe reasoning summaries, and command output inline", as
   await expect(page.getByText("思考内容", { exact: true })).toHaveCount(1);
   await expect(reasoning.locator(".turn-reasoning-segment")).toHaveCount(2);
   await expect(reasoning.getByText("2 段", { exact: true })).toBeVisible();
-  await expect(reasoning).toHaveAttribute("open", "");
+  await expect(reasoning).not.toHaveAttribute("open", "");
+  await expect(page.getByText("正在检查公开事件契约。", { exact: true })).toBeHidden();
+  await reasoning.locator(":scope > summary").click();
   await expect(page.getByText("正在检查公开事件契约。", { exact: true })).toBeVisible();
   await expect(page.getByText("正在核对工具输出边界。", { exact: true })).toBeVisible();
+  await reasoning.locator(":scope > summary").click();
+  await expect(reasoning).not.toHaveAttribute("open", "");
   const liveExecution = page.locator(".message--assistant").last().locator(".turn-execution--live");
   await expect(liveExecution.locator(":scope > summary .turn-disclosure-chevron")).toHaveCount(0);
   await expect.poll(async () => {
@@ -449,6 +462,10 @@ test("streams thinking, safe reasoning summaries, and command output inline", as
   await expect(page.getByText("耗时 1.2s", { exact: true })).toBeVisible();
   await page.getByText("查看命令", { exact: true }).last().click();
   await expect(page.locator(".turn-command-details pre").last()).toContainText("pnpm build");
+  const changeStep = liveExecution.locator(".turn-event-step--change_applied");
+  await expect(changeStep.getByText("已应用 1 个文件变更", { exact: true })).toBeVisible();
+  await expect(changeStep.getByText("查看变更", { exact: true })).toBeHidden();
+  await changeStep.locator(":scope > summary").click();
   await page.getByText("查看变更", { exact: true }).last().click();
   await expect(page.getByText("修改 src/App.tsx", { exact: true }).last()).toBeVisible();
   await page.getByText("修改 src/App.tsx", { exact: true }).last().click();
@@ -1291,7 +1308,11 @@ test("switches the runtime approval mode from the composer", async ({ page }, te
     });
   });
   await page.locator(".message--activity-only").last().locator(".turn-execution > summary").click();
-  await expect(page.getByText("已自动批准操作", { exact: true })).toBeVisible();
+  const autoApprovalStep = page.locator(".turn-event-step--approval_requested").last();
+  await expect(autoApprovalStep.getByText("已自动批准操作", { exact: true })).toBeVisible();
+  await expect(autoApprovalStep.getByText("run_command · full-access mode automatically approved: fixture", { exact: true })).toBeHidden();
+  await autoApprovalStep.locator(":scope > summary").click();
+  await expect(autoApprovalStep.getByText("run_command · full-access mode automatically approved: fixture", { exact: true })).toBeVisible();
   await expect(page.locator(".message--approval")).toHaveCount(0);
   await trigger.click();
   await expect(menu.getByRole("menuitemradio", { name: /完整访问/ })).toHaveAttribute("aria-checked", "true");

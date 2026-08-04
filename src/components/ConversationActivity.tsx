@@ -76,7 +76,6 @@ export function ConversationTurnActivity({
           {groupedProcessTimeline.map((entry) => entry.type === "reasoning_group" ? (
             <ReasoningGroup
               items={entry.items}
-              active={streaming}
               renderText={renderText}
               key={`reasoning-group-${entry.items.map((item) => item.itemId).join("-")}`}
             />
@@ -89,7 +88,6 @@ export function ConversationTurnActivity({
             <TimelineItem
               item={entry.item}
               changes={changes}
-              active={streaming}
               renderText={renderText}
               key={timelineItemKey(entry.item)}
             />
@@ -142,12 +140,10 @@ function isTerminalEvent(kind: TimelineEventKind) {
 function TimelineItem({
   item,
   changes,
-  active = false,
   renderText,
 }: {
   item: TurnTimelineItem;
   changes: ChangeSet[];
-  active?: boolean;
   renderText?: (text: string) => ReactNode;
 }) {
   if (item.type === "text") {
@@ -158,7 +154,7 @@ function TimelineItem({
     );
   }
   if (item.type === "reasoning") {
-    return <ReasoningGroup items={[item]} active={active} renderText={renderText} />;
+    return <ReasoningGroup items={[item]} renderText={renderText} />;
   }
   if (item.type === "event") {
     const Icon = item.kind === "turn_completed"
@@ -168,15 +164,32 @@ function TimelineItem({
         : item.kind === "turn_cancelled"
           ? Circle
           : CircleDot;
+    const change = item.kind === "change_applied" ? findChange(item, changes) : null;
+    const hasDetails = Boolean(item.detail || change);
+    const expanded = item.kind === "turn_failed";
+    if (!hasDetails) {
+      return (
+        <div className={`turn-timeline-event turn-timeline-event--${item.kind}`}>
+          <Icon size={15} aria-hidden="true" />
+          <span><strong>{item.title}</strong></span>
+        </div>
+      );
+    }
     return (
-      <div className={`turn-timeline-event turn-timeline-event--${item.kind}`}>
-        <Icon size={15} aria-hidden="true" />
-        <span>
-          <strong>{item.title}</strong>
+      <details
+        className={`turn-disclosure turn-timeline-event turn-event-step turn-event-step--${item.kind} turn-timeline-event--${item.kind}`}
+        open={expanded || undefined}
+      >
+        <summary>
+          <Icon size={15} aria-hidden="true" />
+          <span className="turn-disclosure-title">{item.title}</span>
+          <ChevronDown className="turn-disclosure-chevron" size={15} aria-hidden="true" />
+        </summary>
+        <div className="turn-event-step-content">
           {item.detail ? <small>{item.detail}</small> : null}
-          {item.kind === "change_applied" ? <ChangeDetails change={findChange(item, changes)} /> : null}
-        </span>
-      </div>
+          {change ? <ChangeDetails change={change} /> : null}
+        </div>
+      </details>
     );
   }
   return <ToolActivityRow activity={item.activity} />;
@@ -215,17 +228,15 @@ function groupConsecutiveTimeline(items: TurnTimelineItem[]): TimelineRenderEntr
 
 function ReasoningGroup({
   items,
-  active,
   renderText,
 }: {
   items: ReasoningTimelineItem[];
-  active: boolean;
   renderText?: (text: string) => ReactNode;
 }) {
   const complete = items.every((item) => item.complete);
   const status = complete && items.length > 1 ? `${items.length} 段` : complete ? "已完成" : "生成中";
   return (
-    <details className="turn-disclosure turn-reasoning" open={active || !complete || undefined}>
+    <details className="turn-disclosure turn-reasoning" open={!complete || undefined}>
       <summary>
         <Brain size={15} aria-hidden="true" />
         <span className="turn-disclosure-title">思考内容</span>
