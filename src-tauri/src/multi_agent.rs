@@ -459,6 +459,7 @@ impl MultiAgentCoordinator {
                             context.provider.clone(),
                             context.model.clone(),
                             record.thread_id.clone(),
+                            crate::protocol::AgentMode::Craft,
                             cancellation.clone(),
                             publisher,
                         )

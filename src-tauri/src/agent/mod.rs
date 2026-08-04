@@ -17,7 +17,7 @@ use crate::policy::{
     ApprovalError, ApprovalManager, PolicyDecision, UserInputError, UserInputManager,
 };
 use crate::protocol::{
-    AgentActivityStatus, AgentEvent, AgentEventEnvelope, ApprovalAction, ApprovalMode,
+    AgentActivityStatus, AgentEvent, AgentEventEnvelope, AgentMode, ApprovalAction, ApprovalMode,
     ApprovalRequest, ApprovalResolution, ChangeSet, ChatMessage, ContentBlock, ExpectedFileHash,
     ImageAttachment, MessageRole, PROTOCOL_VERSION, PatchPreview, ReasoningEffort, TokenUsage,
     ToolCall, ToolResult, TurnState, UserInputAction, UserInputRequest, UserInputResolution,
@@ -261,11 +261,17 @@ impl AgentRuntime {
     ) -> Result<TurnOutcome, AgentRuntimeError> {
         let input = validate_input(&request.input, !attachments.is_empty())?;
         let message = user_message(input, attachments)?;
+        let agent_mode = request
+            .agent_mode
+            .as_deref()
+            .map(AgentMode::from_str)
+            .unwrap_or_default();
         self.run_turn_inner(
             provider,
             model,
             request.thread_id,
             Some(message),
+            agent_mode,
             cancellation,
             publisher,
         )
@@ -277,6 +283,7 @@ impl AgentRuntime {
         provider: Arc<dyn Provider>,
         model: String,
         thread_id: String,
+        agent_mode: AgentMode,
         cancellation: CancellationToken,
         publisher: Arc<dyn EventPublisher>,
     ) -> Result<TurnOutcome, AgentRuntimeError> {
@@ -300,8 +307,16 @@ impl AgentRuntime {
             ));
         }
 
-        self.run_turn_inner(provider, model, thread_id, None, cancellation, publisher)
-            .await
+        self.run_turn_inner(
+            provider,
+            model,
+            thread_id,
+            None,
+            agent_mode,
+            cancellation,
+            publisher,
+        )
+        .await
     }
 
     pub async fn compact_thread(
@@ -331,6 +346,7 @@ impl AgentRuntime {
         model: String,
         thread_id: String,
         new_input: Option<ChatMessage>,
+        agent_mode: AgentMode,
         cancellation: CancellationToken,
         publisher: Arc<dyn EventPublisher>,
     ) -> Result<TurnOutcome, AgentRuntimeError> {
@@ -359,6 +375,13 @@ impl AgentRuntime {
             .append(StoredEvent::new(
                 &thread_id,
                 Some(turn_id.clone()),
+                StoredEventKind::TurnModeSelected { mode: agent_mode },
+            ))
+            .await?;
+        self.repository
+            .append(StoredEvent::new(
+                &thread_id,
+                Some(turn_id.clone()),
                 StoredEventKind::TurnStarted,
             ))
             .await?;
@@ -367,6 +390,7 @@ impl AgentRuntime {
             turn_id: turn_id.clone(),
         }));
 
+        let result = async {
         if cancellation.is_cancelled() {
             return self
                 .finish_cancelled(&thread_id, &turn_id, &publisher)
@@ -375,6 +399,7 @@ impl AgentRuntime {
 
         let mut total_usage = TokenUsage::default();
         let mut has_usage = false;
+        let mut provider_call_index = 0u32;
         let mut provider_context_bytes = 0usize;
         let mut last_call_signature = None::<String>;
         let mut identical_call_streak = 0usize;
@@ -481,8 +506,6 @@ impl AgentRuntime {
                 turn_id: turn_id.clone(),
                 status: AgentActivityStatus::Thinking,
             }));
-            let provider_started = std::time::Instant::now();
-
             // 重试逻辑：对于不完整的工具调用错误，最多重试5次
             const MAX_RETRIES: u32 = 5;
             let mut retry_count = 0;
@@ -491,11 +514,13 @@ impl AgentRuntime {
             // 声明需要在重试循环外部的变量
             let response: String;
             let pending_tool_calls: Vec<ToolCall>;
-            let iteration_usage: Option<crate::protocol::TokenUsage>;
             let completed: bool;
 
             // 外层循环：支持整个请求的重试
             'retry_loop: loop {
+                let call_index = provider_call_index;
+                provider_call_index = provider_call_index.saturating_add(1);
+                let provider_started = std::time::Instant::now();
                 let mut stream = loop {
                     match provider.stream(request.clone(), cancellation.clone()).await {
                         Ok(stream) => break stream,
@@ -519,13 +544,6 @@ impl AgentRuntime {
                                 let wait_ms = 200 * (1 << (retry_count - 1));
                                 let wait_ms = wait_ms.min(4000); // 最多等待4秒
                                 tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
-
-                                // 发布重试通知
-                                publisher.publish(AgentEventEnvelope::new(AgentEvent::TextDelta {
-                                    thread_id: thread_id.clone(),
-                                    turn_id: turn_id.clone(),
-                                    delta: format!("\n[重试 {}/{}...]\n", retry_count, MAX_RETRIES),
-                                }));
 
                                 continue;
                             }
@@ -551,6 +569,7 @@ impl AgentRuntime {
                 let mut responding_published = false;
                 let mut pending_tool_calls_inner = Vec::new(); // 暂存 ToolCall，等 Completed 后再启动
                 let mut iteration_usage_inner = None;
+                let mut attempt_had_output = false;
                 let completed_inner = loop {
                     let event = tokio::select! {
                         _ = cancellation.cancelled() => {
@@ -561,6 +580,7 @@ impl AgentRuntime {
 
                     match event {
                         Some(Ok(ProviderEvent::TextDelta { delta })) => {
+                            attempt_had_output = true;
                             if response_inner.len().saturating_add(delta.len()) > MAX_RESPONSE_BYTES
                             {
                                 return self
@@ -590,6 +610,7 @@ impl AgentRuntime {
                             }));
                         }
                         Some(Ok(ProviderEvent::ReasoningSummaryDelta { item_id, delta })) => {
+                            attempt_had_output = true;
                             let total = reasoning_summary_bytes.entry(item_id.clone()).or_default();
                             *total = total.saturating_add(delta.len());
                             if *total > MAX_REASONING_SUMMARY_BYTES {
@@ -614,6 +635,7 @@ impl AgentRuntime {
                             ));
                         }
                         Some(Ok(ProviderEvent::ReasoningSummaryCompleted { item_id, summary })) => {
+                            attempt_had_output = true;
                             if summary.len() > MAX_REASONING_SUMMARY_BYTES {
                                 return self
                                     .finish_failed(
@@ -646,10 +668,12 @@ impl AgentRuntime {
                             ));
                         }
                         Some(Ok(ProviderEvent::ToolCall { call })) => {
+                            attempt_had_output = true;
                             // 先暂存，等 AI 完成后再启动执行
                             pending_tool_calls_inner.push(call);
                         }
                         Some(Ok(ProviderEvent::ProviderContext { provider, item })) => {
+                            attempt_had_output = true;
                             let item_bytes = serde_json::to_vec(&item)
                                 .map_err(|error| {
                                     AgentRuntimeError::InvalidInput(error.to_string())
@@ -685,23 +709,23 @@ impl AgentRuntime {
                             if let Some(budget) =
                                 token_budget.filter(|budget| aggregate.total_tokens > *budget)
                             {
-                                self.repository
-                                    .append(StoredEvent::new(
-                                        &thread_id,
-                                        Some(turn_id.clone()),
-                                        StoredEventKind::ProviderCallUsage {
-                                            call_index: iteration as u32,
-                                            usage,
-                                        },
-                                    ))
-                                    .await?;
+                                self.persist_provider_usage(
+                                    &thread_id,
+                                    &turn_id,
+                                    call_index,
+                                    usage,
+                                    &mut total_usage,
+                                    &mut has_usage,
+                                    &publisher,
+                                )
+                                .await?;
                                 return self
                                     .finish_failed(
                                         &thread_id,
                                         &turn_id,
                                         format!(
                                             "token_budget_exceeded: used {} of {} tokens",
-                                            aggregate.total_tokens, budget
+                                            total_usage.total_tokens, budget
                                         ),
                                         &publisher,
                                     )
@@ -722,6 +746,18 @@ impl AgentRuntime {
                                 false,
                                 iteration_usage_inner,
                             );
+                            if let Some(usage) = iteration_usage_inner {
+                                self.persist_provider_usage(
+                                    &thread_id,
+                                    &turn_id,
+                                    call_index,
+                                    usage,
+                                    &mut total_usage,
+                                    &mut has_usage,
+                                    &publisher,
+                                )
+                                .await?;
+                            }
                             return self
                                 .finish_cancelled(&thread_id, &turn_id, &publisher)
                                 .await;
@@ -739,7 +775,20 @@ impl AgentRuntime {
                                 || error_str.contains("invalid JSON arguments")
                                 || error_str.contains("returned invalid JSON");
 
-                            if is_retriable && retry_count < MAX_RETRIES {
+                            if let Some(usage) = iteration_usage_inner {
+                                self.persist_provider_usage(
+                                    &thread_id,
+                                    &turn_id,
+                                    call_index,
+                                    usage,
+                                    &mut total_usage,
+                                    &mut has_usage,
+                                    &publisher,
+                                )
+                                .await?;
+                            }
+
+                            if is_retriable && !attempt_had_output && retry_count < MAX_RETRIES {
                                 retry_count += 1;
 
                                 // 等待一小段时间后重试（指数退避）
@@ -747,16 +796,6 @@ impl AgentRuntime {
                                 let wait_ms = 200 * (1 << (retry_count - 1));
                                 let wait_ms = wait_ms.min(4000); // 最多等待4秒
                                 tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
-
-                                // 发布重试通知
-                                publisher.publish(AgentEventEnvelope::new(AgentEvent::TextDelta {
-                                    thread_id: thread_id.clone(),
-                                    turn_id: turn_id.clone(),
-                                    delta: format!(
-                                        "\n[流式传输中断，重试 {}/{}...]\n",
-                                        retry_count, MAX_RETRIES
-                                    ),
-                                }));
 
                                 // 跳出内层循环，重新开始整个请求
                                 continue 'retry_loop;
@@ -772,15 +811,38 @@ impl AgentRuntime {
                                 false,
                                 iteration_usage_inner,
                             );
+                            if let Some(usage) = iteration_usage_inner {
+                                self.persist_provider_usage(
+                                    &thread_id,
+                                    &turn_id,
+                                    call_index,
+                                    usage,
+                                    &mut total_usage,
+                                    &mut has_usage,
+                                    &publisher,
+                                )
+                                .await?;
+                                iteration_usage_inner = None;
+                            }
                             break false;
                         }
                     }
                 };
 
-                // 成功完成，跳出重试循环
+                if let Some(usage) = iteration_usage_inner {
+                    self.persist_provider_usage(
+                        &thread_id,
+                        &turn_id,
+                        call_index,
+                        usage,
+                        &mut total_usage,
+                        &mut has_usage,
+                        &publisher,
+                    )
+                    .await?;
+                }
                 response = response_inner;
                 pending_tool_calls = pending_tool_calls_inner;
-                iteration_usage = iteration_usage_inner;
                 completed = completed_inner;
                 break;
             } // 'retry_loop 结束
@@ -795,26 +857,6 @@ impl AgentRuntime {
                     )
                     .await;
             }
-            if let Some(usage) = iteration_usage {
-                total_usage = add_usage(total_usage, usage);
-                has_usage = true;
-                self.repository
-                    .append(StoredEvent::new(
-                        &thread_id,
-                        Some(turn_id.clone()),
-                        StoredEventKind::ProviderCallUsage {
-                            call_index: iteration as u32,
-                            usage,
-                        },
-                    ))
-                    .await?;
-                publisher.publish(AgentEventEnvelope::new(AgentEvent::UsageUpdated {
-                    thread_id: thread_id.clone(),
-                    turn_id: turn_id.clone(),
-                    usage: total_usage,
-                }));
-            }
-
             // AI 完成输出后的处理
             if pending_tool_calls.is_empty() {
                 if response.is_empty() {
@@ -951,6 +993,19 @@ impl AgentRuntime {
             }
             iteration = iteration.saturating_add(1);
         }
+        }
+        .await;
+
+        match result {
+            Ok(outcome) => Ok(outcome),
+            Err(error) => {
+                let message = error.to_string();
+                let _ = self
+                    .finish_failed(&thread_id, &turn_id, message, &publisher)
+                    .await;
+                Err(error)
+            }
+        }
     }
 
     async fn execute_tool_with_progress(
@@ -962,6 +1017,15 @@ impl AgentRuntime {
     ) -> Result<Option<ToolResult>, AgentRuntimeError> {
         let (progress_tx, mut progress_rx) = tool_progress_channel();
         context.progress = Some(progress_tx);
+        self.repository
+            .append(StoredEvent::new(
+                &context.thread_id,
+                Some(context.turn_id.clone()),
+                StoredEventKind::ToolStarted {
+                    call_id: call.id.clone(),
+                },
+            ))
+            .await?;
         publisher.publish(AgentEventEnvelope::new(AgentEvent::ToolStarted {
             thread_id: context.thread_id.clone(),
             turn_id: context.turn_id.clone(),
@@ -1662,6 +1726,33 @@ impl AgentRuntime {
             completed_at_ms,
             duration_ms: completed_at_ms.saturating_sub(started_at_ms),
         })
+    }
+
+    async fn persist_provider_usage(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        call_index: u32,
+        usage: TokenUsage,
+        total_usage: &mut TokenUsage,
+        has_usage: &mut bool,
+        publisher: &Arc<dyn EventPublisher>,
+    ) -> Result<(), AgentRuntimeError> {
+        *total_usage = add_usage(*total_usage, usage);
+        *has_usage = true;
+        self.repository
+            .append(StoredEvent::new(
+                thread_id,
+                Some(turn_id.to_string()),
+                StoredEventKind::ProviderCallUsage { call_index, usage },
+            ))
+            .await?;
+        publisher.publish(AgentEventEnvelope::new(AgentEvent::UsageUpdated {
+            thread_id: thread_id.to_string(),
+            turn_id: turn_id.to_string(),
+            usage: *total_usage,
+        }));
+        Ok(())
     }
 
     fn record_provider_metric(
@@ -2438,7 +2529,7 @@ mod tests {
                     agent_mode: None,
                 },
                 CancellationToken::new(),
-                publisher,
+                publisher.clone(),
             )
             .await
             .unwrap();
@@ -2671,6 +2762,7 @@ mod tests {
                 Arc::new(FakeProvider::text(&["retry completed"])),
                 "fake".to_string(),
                 thread_id.clone(),
+                AgentMode::Craft,
                 CancellationToken::new(),
                 Arc::new(RecordingPublisher::default()),
             )
@@ -2860,6 +2952,127 @@ mod tests {
             })
             .sum::<u64>();
         assert_eq!(total_tokens, 1_160_800);
+    }
+
+    #[tokio::test]
+    async fn retryable_provider_failure_counts_failed_attempt_usage() {
+        let (_directory, repository, runtime, thread_id) = runtime_fixture().await;
+        let provider = Arc::new(FakeProvider::script(vec![
+            vec![
+                Ok(ProviderEvent::Usage {
+                    usage: TokenUsage {
+                        input_tokens: 3,
+                        output_tokens: 2,
+                        total_tokens: 5,
+                    },
+                }),
+                Err(ProviderError::InvalidResponse(
+                    "function call returned invalid JSON arguments".into(),
+                )),
+            ],
+            vec![
+                Ok(ProviderEvent::Usage {
+                    usage: TokenUsage {
+                        input_tokens: 4,
+                        output_tokens: 3,
+                        total_tokens: 7,
+                    },
+                }),
+                Ok(ProviderEvent::TextDelta {
+                    delta: "complete".into(),
+                }),
+                Ok(ProviderEvent::Completed),
+            ],
+        ]));
+
+        let outcome = runtime
+            .run_turn(
+                provider.clone(),
+                "fake".into(),
+                RunTurnRequest {
+                    thread_id: thread_id.clone(),
+                    input: "retry safely".into(),
+                    agent_mode: None,
+                },
+                CancellationToken::new(),
+                Arc::new(RecordingPublisher::default()),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.state, TurnState::Completed);
+        assert_eq!(provider.requests().len(), 2);
+        let usage_events = repository
+            .load(&thread_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter_map(|event| match event.kind {
+                StoredEventKind::ProviderCallUsage { call_index, usage } => {
+                    Some((call_index, usage.total_tokens))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(usage_events, vec![(0, 5), (1, 7)]);
+        assert_eq!(
+            repository
+                .read_thread(&thread_id)
+                .await
+                .unwrap()
+                .last_usage
+                .unwrap()
+                .total_tokens,
+            12
+        );
+    }
+
+    #[tokio::test]
+    async fn provider_failure_after_visible_output_is_not_retried() {
+        let (_directory, repository, runtime, thread_id) = runtime_fixture().await;
+        let provider = Arc::new(FakeProvider::script(vec![vec![
+            Ok(ProviderEvent::TextDelta {
+                delta: "partial".into(),
+            }),
+            Ok(ProviderEvent::Usage {
+                usage: TokenUsage {
+                    input_tokens: 3,
+                    output_tokens: 2,
+                    total_tokens: 5,
+                },
+            }),
+            Err(ProviderError::InvalidResponse(
+                "function call returned invalid JSON arguments".into(),
+            )),
+        ]]));
+
+        let outcome = runtime
+            .run_turn(
+                provider.clone(),
+                "fake".into(),
+                RunTurnRequest {
+                    thread_id: thread_id.clone(),
+                    input: "do not duplicate output".into(),
+                    agent_mode: None,
+                },
+                CancellationToken::new(),
+                Arc::new(RecordingPublisher::default()),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.state, TurnState::Failed);
+        assert_eq!(provider.requests().len(), 1);
+        assert_eq!(
+            repository
+                .read_thread(&thread_id)
+                .await
+                .unwrap()
+                .last_usage
+                .unwrap()
+                .total_tokens,
+            5
+        );
     }
 
     #[tokio::test]
@@ -3430,7 +3643,7 @@ mod tests {
                     agent_mode: None,
                 },
                 CancellationToken::new(),
-                publisher,
+                publisher.clone(),
             )
             .await
             .unwrap();
@@ -3843,20 +4056,24 @@ mod tests {
                     agent_mode: None,
                 },
                 CancellationToken::new(),
-                publisher,
+                publisher.clone(),
             )
             .await;
 
         assert!(matches!(result, Err(AgentRuntimeError::Storage(_))));
         assert_eq!(std::fs::read_to_string(file).unwrap(), "before\n");
-        assert!(
-            inner
-                .read_thread(&thread.id)
-                .await
-                .unwrap()
-                .changes
-                .is_empty()
-        );
+        let detail = inner.read_thread(&thread.id).await.unwrap();
+        assert!(detail.changes.is_empty());
+        assert!(matches!(
+            detail.last_turn,
+            Some(crate::storage::TurnSnapshot {
+                state: TurnState::Failed,
+                ..
+            })
+        ));
+        assert!(publisher.events.lock().unwrap().iter().any(|event| {
+            matches!(&event.event, AgentEvent::TurnFailed { message, .. } if message.contains("injected change audit failure"))
+        }));
     }
 
     #[tokio::test]

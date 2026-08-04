@@ -34,7 +34,7 @@ use crate::protocol::{
 use crate::providers::{
     ProviderConfigView, ProviderEvent, ProviderMessage, ProviderRequest, SaveProviderConfigRequest,
 };
-use crate::storage::{StoredEventKind, ThreadDetail, ThreadSummary};
+use crate::storage::{StoredEvent, StoredEventKind, ThreadDetail, ThreadRepository, ThreadSummary};
 use crate::workbench::{
     self, AttachmentContent, FileEntry, FilePreview, GitBranchView, GitStatusView,
     SaveWorkspaceFileRequest, WorkspaceState,
@@ -51,6 +51,66 @@ const CRAFT_MODE_INSTRUCTIONS: &str = include_str!("../../templates/craft_mode.m
 
 const AGENT_EVENT_NAME: &str = "agent-event";
 const SUBAGENT_EVENT_NAME: &str = "subagent-event";
+
+fn instructions_for_mode(mode: AgentMode) -> &'static str {
+    match mode {
+        AgentMode::Plan => PLAN_MODE_INSTRUCTIONS,
+        AgentMode::Ask => ASK_MODE_INSTRUCTIONS,
+        AgentMode::Craft => CRAFT_MODE_INSTRUCTIONS,
+    }
+}
+
+fn tools_for_mode(
+    tools: crate::tools::ToolRegistry,
+    mode: AgentMode,
+) -> Result<crate::tools::ToolRegistry, String> {
+    if !mode.is_read_only() {
+        return Ok(tools);
+    }
+    let allowed = mode
+        .allowed_tools()
+        .iter()
+        .map(|name| name.to_string())
+        .collect::<Vec<_>>();
+    tools
+        .restricted_to(&allowed)
+        .map_err(|error| error.to_string())
+}
+
+fn retry_mode(events: &[StoredEvent]) -> AgentMode {
+    let retryable_turn_id = events
+        .iter()
+        .rev()
+        .find(|event| {
+            matches!(
+                event.kind,
+                StoredEventKind::TurnFailed { .. }
+                    | StoredEventKind::TurnCancelled
+                    | StoredEventKind::TurnCompleted { .. }
+            )
+        })
+        .and_then(|event| match &event.kind {
+            StoredEventKind::TurnFailed { .. } | StoredEventKind::TurnCancelled => {
+                event.turn_id.as_deref()
+            }
+            _ => None,
+        });
+    let Some(turn_id) = retryable_turn_id else {
+        return AgentMode::Craft;
+    };
+    events
+        .iter()
+        .rev()
+        .find_map(|event| {
+            (event.turn_id.as_deref() == Some(turn_id))
+                .then_some(&event.kind)
+                .and_then(|kind| match kind {
+                    StoredEventKind::TurnModeSelected { mode } => Some(*mode),
+                    _ => None,
+                })
+        })
+        .unwrap_or_default()
+}
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -986,27 +1046,11 @@ pub async fn run_turn(
         .as_deref()
         .map(AgentMode::from_str)
         .unwrap_or_default();
-    let mode_instructions = match agent_mode {
-        AgentMode::Plan => PLAN_MODE_INSTRUCTIONS.to_string(),
-        AgentMode::Ask => ASK_MODE_INSTRUCTIONS.to_string(),
-        AgentMode::Craft => CRAFT_MODE_INSTRUCTIONS.to_string(),
-    };
+    let mode_instructions = instructions_for_mode(agent_mode).to_string();
 
-    // Plan/Ask 模式下把工具限制为只读子集（借鉴 Codex 的 plan_mask）
-    let base_tools = if agent_mode.is_read_only() {
-        let allowed: Vec<String> = agent_mode
-            .allowed_tools()
-            .iter()
-            .map(|name| name.to_string())
-            .collect();
-        // 子代理委派工具在只读模式下也要过滤掉
-        state
-            .tool_registry()
-            .restricted_to(&allowed)
-            .map_err(|error| CommandError::new("agent_mode", error.to_string()))?
-    } else {
-        state.tool_registry()
-    };
+    // Plan/Ask 模式下把工具限制为只读子集（借鉴 Codex 的 plan_mask）。
+    let base_tools = tools_for_mode(state.tool_registry(), agent_mode)
+        .map_err(|error| CommandError::new("agent_mode", error))?;
 
     // 分层拼接 system prompt（identity/workspace/mode/tools/memory/context/extension）
     let tool_names = base_tools.definition_names();
@@ -1128,8 +1172,13 @@ pub async fn retry_turn(
         .prepare_extensions(false)
         .await
         .map_err(|error| CommandError::new("extensions", error))?;
-    let retry_input = state
-        .repository()
+    let repository = state.repository();
+    let events = repository
+        .load(&thread_id)
+        .await
+        .map_err(|error| CommandError::new("storage", error))?;
+    let agent_mode = retry_mode(&events);
+    let retry_input = repository
         .read_thread(&thread_id)
         .await
         .map_err(|error| CommandError::new("storage", error))?
@@ -1150,9 +1199,10 @@ pub async fn retry_turn(
         .memory
         .context()
         .map_err(|error| CommandError::new("memory", error))?;
-    // retry 时使用 Craft 模式（retry 不支持 plan/ask 只读模式）
-    let mode_instructions = CRAFT_MODE_INSTRUCTIONS.to_string();
-    let tool_names = state.tool_registry().definition_names();
+    let mode_instructions = instructions_for_mode(agent_mode).to_string();
+    let base_tools = tools_for_mode(state.tool_registry(), agent_mode)
+        .map_err(|error| CommandError::new("agent_mode", error))?;
+    let tool_names = base_tools.definition_names();
     let runtime_instructions = build_system_prompt(
         &state.workspace_root(),
         &extension_instructions,
@@ -1187,7 +1237,7 @@ pub async fn retry_turn(
     });
     let mut runtime = AgentRuntime::with_tools_and_approvals(
         state.runtime_repository(),
-        state.tool_registry(),
+        base_tools,
         state.workspace_root(),
         state.approvals(),
     )
@@ -1196,6 +1246,7 @@ pub async fn retry_turn(
     .with_context_limit(context_limit)
     .with_metrics(advanced.metrics.clone())
     .with_reasoning_effort(state.reasoning_effort())
+    .with_user_inputs(state.user_inputs())
     .with_logger(state.logger());
     if let Some((_, Some(remaining_tokens))) = &goal_budget {
         runtime = runtime.with_token_budget(*remaining_tokens);
@@ -1203,7 +1254,14 @@ pub async fn retry_turn(
     let publisher: Arc<dyn EventPublisher> = Arc::new(TauriEventPublisher { app });
     let started = std::time::Instant::now();
     let result = runtime
-        .retry_turn(provider, model, thread_id.clone(), cancellation, publisher)
+        .retry_turn(
+            provider,
+            model,
+            thread_id.clone(),
+            agent_mode,
+            cancellation,
+            publisher,
+        )
         .await;
     if let Some(timeout) = goal_timeout {
         timeout.abort();
@@ -1642,7 +1700,9 @@ async fn enrich_image_attachments(app: &AppHandle, attachments: &mut [ImageAttac
 mod tests {
     use std::path::Path;
 
-    use super::{CRAFT_MODE_INSTRUCTIONS, build_system_prompt};
+    use super::{CRAFT_MODE_INSTRUCTIONS, build_system_prompt, retry_mode};
+    use crate::protocol::AgentMode;
+    use crate::storage::{StoredEvent, StoredEventKind};
 
     #[test]
     fn craft_mode_can_proactively_clarify_ambiguous_behavior() {
@@ -1660,5 +1720,43 @@ mod tests {
         assert!(prompt.contains("工作区根目录使用 `.`"));
         assert!(prompt.contains("不得把上面的绝对路径传给工具"));
         assert!(prompt.contains("不得使用 `..`"));
+    }
+
+    #[test]
+    fn retry_restores_the_failed_turn_mode_from_persisted_events() {
+        let events = vec![
+            StoredEvent::new(
+                "thread",
+                Some("turn-plan".into()),
+                StoredEventKind::TurnModeSelected {
+                    mode: AgentMode::Plan,
+                },
+            ),
+            StoredEvent::new(
+                "thread",
+                Some("turn-plan".into()),
+                StoredEventKind::TurnStarted,
+            ),
+            StoredEvent::new(
+                "thread",
+                Some("turn-plan".into()),
+                StoredEventKind::TurnFailed {
+                    message: "failed".into(),
+                },
+            ),
+        ];
+
+        assert_eq!(retry_mode(&events), AgentMode::Plan);
+    }
+
+    #[test]
+    fn retry_uses_legacy_craft_mode_when_no_mode_event_exists() {
+        let events = vec![StoredEvent::new(
+            "thread",
+            Some("legacy-turn".into()),
+            StoredEventKind::TurnCancelled,
+        )];
+
+        assert_eq!(retry_mode(&events), AgentMode::Craft);
     }
 }

@@ -54,6 +54,12 @@ struct ResponsesStreamEvent {
 struct ResponsesObject {
     usage: Option<ResponsesUsage>,
     error: Option<ResponsesError>,
+    incomplete_details: Option<ResponsesIncompleteDetails>,
+}
+
+#[derive(Deserialize)]
+struct ResponsesIncompleteDetails {
+    reason: String,
 }
 
 #[derive(Deserialize)]
@@ -71,6 +77,7 @@ struct ResponsesError {
 struct ParsedResponsesEvent {
     events: Vec<ProviderEvent>,
     completed: bool,
+    terminal_error: Option<ProviderError>,
 }
 
 #[async_trait]
@@ -165,6 +172,10 @@ impl Provider for OpenAiResponsesProvider {
                                             if !emitted_calls.insert(call.id.clone()) { continue; }
                                         }
                                         yield Ok(event);
+                                    }
+                                    if let Some(error) = parsed.terminal_error {
+                                        yield Err(redact_error(error, &secret));
+                                        return;
                                     }
                                     if parsed.completed { yield Ok(ProviderEvent::Completed); return; }
                                 }
@@ -346,11 +357,23 @@ fn parse_sse_data(data: &str) -> Result<ParsedResponsesEvent, ProviderError> {
             },
         });
     }
-    let completed = matches!(
-        event.event_type.as_str(),
-        "response.completed" | "response.incomplete"
-    );
-    Ok(ParsedResponsesEvent { events, completed })
+    let completed = event.event_type == "response.completed";
+    let terminal_error = (event.event_type == "response.incomplete").then(|| {
+        let reason = event
+            .response
+            .as_ref()
+            .and_then(|response| response.incomplete_details.as_ref())
+            .map(|details| details.reason.as_str())
+            .unwrap_or("unknown reason");
+        ProviderError::InvalidResponse(format!(
+            "Responses API returned an incomplete response: {reason}"
+        ))
+    });
+    Ok(ParsedResponsesEvent {
+        events,
+        completed,
+        terminal_error,
+    })
 }
 
 #[cfg(test)]
@@ -373,6 +396,22 @@ mod tests {
             ProviderEvent::ProviderContext { provider, .. } if provider == "openai_responses"
         ));
         assert!(parse_sse_data(r#"{"type":"response.completed","response":{"usage":{"input_tokens":3,"output_tokens":2}}}"#).unwrap().completed);
+    }
+
+    #[test]
+    fn rejects_incomplete_response_after_preserving_usage() {
+        let parsed = parse_sse_data(
+            r#"{"type":"response.incomplete","response":{"usage":{"input_tokens":3,"output_tokens":2},"incomplete_details":{"reason":"max_output_tokens"}}}"#,
+        )
+        .unwrap();
+        assert!(!parsed.completed);
+        assert!(
+            matches!(parsed.events.as_slice(), [ProviderEvent::Usage { usage }] if usage.total_tokens == 5)
+        );
+        assert!(matches!(
+            parsed.terminal_error,
+            Some(ProviderError::InvalidResponse(message)) if message.contains("max_output_tokens")
+        ));
     }
 
     #[test]

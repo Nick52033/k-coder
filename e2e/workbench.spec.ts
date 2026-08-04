@@ -6,6 +6,7 @@ test.beforeEach(async ({ page }) => {
     let callbackId = 1;
     let agentEventCallbackId: number | null = null;
     const thread = { schemaVersion: 1, id: "thread-1", title: "Phase 6 workbench", createdAtMs: 1, updatedAtMs: 2, archived: false };
+    const secondThread = { schemaVersion: 1, id: "thread-2", title: "Parallel conversation", createdAtMs: 3, updatedAtMs: 3, archived: false };
     const openAiProvider = { schemaVersion: 1, id: "openai", kind: "open_ai_compatible", transport: "open_ai_chat_completions", name: "OpenAI", baseUrl: "https://api.openai.com/v1", model: "gpt-4.1", models: [{ id: "gpt-4.1", displayName: "GPT-4.1", contextWindow: 128000, fallback: false }, { id: "gpt-4o", displayName: "GPT-4 Omni", contextWindow: 64000, fallback: false }], endpoints: [], hasApiKey: true };
     const ziccProvider = { schemaVersion: 1, id: "zicc", kind: "open_ai_compatible", transport: "open_ai_responses", name: "zicc", baseUrl: "https://zicc.example.com/v1", model: "gpt-5.6-terra", models: [{ id: "gpt-5.6-terra", displayName: "gpt-5.6-terra", contextWindow: 128000, fallback: false }, { id: "gpt-5.5", displayName: "gpt-5.5", contextWindow: 128000, fallback: false }], endpoints: [], hasApiKey: true };
     const pendingProvider = { schemaVersion: 1, id: "pending", kind: "open_ai_compatible", transport: "anthropic_messages", name: "待配置供应商", baseUrl: "https://pending.example.com/v1", model: "claude-test", models: [{ id: "claude-test", displayName: "Claude Test", contextWindow: 128000, fallback: false }], endpoints: [], hasApiKey: false };
@@ -36,6 +37,7 @@ test.beforeEach(async ({ page }) => {
       advanced_metrics: { providerCalls: 2, providerFailures: 0, averageProviderLatencyMs: 120, inputTokens: 100, outputTokens: 20, toolCalls: 2, toolSuccessRate: 1, fallbackCount: 0, completedTasks: 1, failedTasks: 0, estimatedCostUsd: null },
       run_regression_evaluation: { total: 3, passed: 3, passRate: 1, failures: [] },
       cancel_turn: true,
+      create_thread: secondThread,
       retry_turn: { schemaVersion: 1, threadId: "thread-1", turnId: "turn-retry", state: "completed", error: null },
       recognize_image: { text: "hidden OCR fixture", lineCount: 1, durationMs: 12 },
       list_threads: [thread],
@@ -200,6 +202,10 @@ test("supports the primary workbench inspection flow", async ({ page }, testInfo
   await page.getByText("执行了 1.8s", { exact: true }).click();
   await expect(page.locator(".turn-plan").getByText("检查工作区", { exact: true })).toBeVisible();
   await expect(page.getByText("我先检查相关文件并修改实现。", { exact: true })).toBeVisible();
+  const inspectionGroup = page.locator(".turn-tool-group").filter({ hasText: "执行了 2 个操作" });
+  await expect(inspectionGroup).toBeVisible();
+  await expect(page.locator(".turn-timeline-tool").getByText("应用补丁 src/App.css", { exact: true })).toBeHidden();
+  await inspectionGroup.locator(":scope > summary").click();
   await expect(page.locator(".turn-timeline-tool").getByText("应用补丁 src/App.css", { exact: true })).toBeVisible();
   await page.getByText("查看补丁", { exact: true }).click();
   await expect(page.locator(".turn-command-details pre").filter({ hasText: "*** Update File: src/App.css" })).toBeVisible();
@@ -210,6 +216,10 @@ test("supports the primary workbench inspection flow", async ({ page }, testInfo
   await expect(page.locator(".turn-file-editor")).toHaveCount(0);
   await expect(page.locator(".turn-command-details pre").filter({ hasText: "export const fixture = true;" })).toHaveCount(0);
   await expect(page.getByText("修改完成，接着运行验证。", { exact: true })).toBeVisible();
+  const commandGroup = page.locator(".turn-tool-group").filter({ hasText: "运行了命令" }).first();
+  await expect(commandGroup).toBeVisible();
+  await expect(page.locator(".turn-timeline-tool").getByText("执行 pnpm build", { exact: true })).toBeHidden();
+  await commandGroup.locator(":scope > summary").click();
   await expect(page.locator(".turn-timeline-tool").getByText("执行 pnpm build", { exact: true })).toBeVisible();
   await expect(page.getByText("3 个操作", { exact: true })).toBeVisible();
   await page.screenshot({ path: testInfo.outputPath("inline-plan-and-tools.png"), fullPage: true });
@@ -217,6 +227,7 @@ test("supports the primary workbench inspection flow", async ({ page }, testInfo
   await page.reload();
   await expect(page.locator(".turn-timeline-tool").getByText("执行 pnpm build", { exact: true })).toBeHidden();
   await page.getByText("执行了 1.8s", { exact: true }).click();
+  await page.locator(".turn-tool-group").filter({ hasText: "运行了命令" }).first().locator(":scope > summary").click();
   await expect(page.locator(".turn-timeline-tool").getByText("执行 pnpm build", { exact: true })).toBeVisible();
   await page.screenshot({ path: testInfo.outputPath("inline-plan-and-tools-dark.png"), fullPage: true });
   await page.getByRole("button", { name: "工作台", exact: true }).click();
@@ -424,11 +435,14 @@ test("streams thinking, safe reasoning summaries, and command output inline", as
   const liveExecution = page.locator(".message--assistant").last().locator(".turn-execution--live");
   await expect(liveExecution.locator(":scope > summary .turn-disclosure-chevron")).toHaveCount(0);
   await expect.poll(async () => {
-    const toolBox = await liveExecution.locator(".turn-timeline-tool").last().boundingBox();
+    const toolBox = await liveExecution.locator(".turn-tool-group").last().boundingBox();
     const statusBox = await liveExecution.locator(":scope > summary").boundingBox();
     return toolBox && statusBox ? statusBox.y >= toolBox.y + toolBox.height : false;
   }).toBe(true);
   await page.screenshot({ path: testInfo.outputPath("grouped-reasoning-summaries.png"), fullPage: true });
+  const liveCommandGroup = liveExecution.locator(".turn-tool-group").filter({ hasText: "运行了命令" });
+  await expect(liveCommandGroup).not.toHaveAttribute("open", "");
+  await liveCommandGroup.locator(":scope > summary").click();
   await page.locator(".turn-tool-output").last().locator("summary").click();
   await expect(page.locator(".turn-tool-output-line--stdout").filter({ hasText: "building client" })).toBeVisible();
   await expect(page.locator(".turn-tool-output-line--stderr").filter({ hasText: "warning: fixture" })).toBeVisible();
@@ -524,6 +538,80 @@ test("queues messages during thinking and interrupts only from the queued send a
   await expect.poll(() => page.evaluate(() => (window as unknown as { __runTurnCalls: unknown[] }).__runTurnCalls.length)).toBe(1);
   await expect(page.locator(".message--user").getByText("queued first", { exact: true })).toBeVisible();
   await expect(page.locator(".message--user").getByText("queued second", { exact: true })).toHaveCount(0);
+});
+
+test("does not render a queued message in another conversation", async ({ page }) => {
+  await page.goto("/");
+  await page.evaluate(() => {
+    (window as unknown as { __emitAgentEvent: (event: unknown) => void }).__emitAgentEvent({
+      schemaVersion: 1,
+      threadId: "thread-1",
+      turnId: "turn-thread-1-active",
+      type: "turn_started",
+      phase: "exploring",
+    });
+  });
+
+  const composer = page.getByRole("textbox", { name: "消息" });
+  await composer.fill("thread one queued message");
+  await page.getByRole("button", { name: "发送消息", exact: true }).click();
+  await expect(page.locator(".queue-list")).toContainText("thread one queued message");
+
+  await page.keyboard.press("Control+n");
+  await expect(page.getByRole("heading", { name: "Parallel conversation" })).toBeVisible();
+  await expect(page.getByText("thread one queued message", { exact: true })).toHaveCount(0);
+
+  await page.evaluate(() => {
+    (window as unknown as { __emitAgentEvent: (event: unknown) => void }).__emitAgentEvent({
+      schemaVersion: 1,
+      threadId: "thread-1",
+      turnId: "turn-thread-1-active",
+      type: "turn_completed",
+      message: { schemaVersion: 1, id: "done-a", role: "assistant", content: [{ type: "text", text: "done" }], createdAtMs: 4 },
+      usage: null,
+      phase: "completed",
+    });
+  });
+
+  await expect.poll(() => page.evaluate(() =>
+    (window as unknown as { __runTurnCalls: unknown[] }).__runTurnCalls.length
+  )).toBe(1);
+  await expect(page.getByText("thread one queued message", { exact: true })).toHaveCount(0);
+});
+
+test("runs different conversations concurrently while keeping each conversation sequential", async ({ page }) => {
+  await page.goto("/");
+  const composer = page.getByRole("textbox", { name: "消息" });
+
+  await composer.fill("first conversation work");
+  await page.getByRole("button", { name: "发送消息", exact: true }).click();
+  await expect.poll(() => page.evaluate(() =>
+    (window as unknown as { __runTurnCalls: unknown[] }).__runTurnCalls.length
+  )).toBe(1);
+
+  await page.evaluate(() => {
+    (window as unknown as { __emitAgentEvent: (event: unknown) => void }).__emitAgentEvent({
+      schemaVersion: 1,
+      threadId: "thread-1",
+      turnId: "turn-parallel-1",
+      type: "turn_started",
+      phase: "exploring",
+    });
+  });
+
+  await page.keyboard.press("Control+n");
+  await expect(page.getByRole("heading", { name: "Parallel conversation" })).toBeVisible();
+  await composer.fill("second conversation work");
+  await page.getByRole("button", { name: "发送消息", exact: true }).click();
+
+  await expect.poll(() => page.evaluate(() =>
+    (window as unknown as { __runTurnCalls: unknown[] }).__runTurnCalls.length
+  )).toBe(2);
+  await expect.poll(() => page.evaluate(() =>
+    (window as unknown as { __runTurnCalls: Array<{ request: { threadId: string } }> })
+      .__runTurnCalls.map((call) => call.request.threadId)
+  )).toEqual(["thread-1", "thread-2"]);
+  await expect(page.locator(".message-queue")).toHaveCount(0);
 });
 
 test("keeps OCR text hidden while adding it to the model context", async ({ page }, testInfo) => {
@@ -665,6 +753,11 @@ test("streams progress and tools in event order before the turn completes", asyn
     name: "read_file",
     result: { success: true, output: "export function App() {}", metadata: { path: "src/App.tsx", bytesReturned: 24, startLine: 3370, endLine: 3382 } },
   });
+  const completedReadGroup = liveMessage.locator(".turn-tool-group").filter({ hasText: "执行了操作" });
+  await expect(completedReadGroup).toBeVisible();
+  await expect(completedReadGroup).not.toHaveAttribute("open", "");
+  await expect(liveMessage.locator(".turn-timeline-tool--completed").getByText("读取 src/App.tsx L3370-3382", { exact: true })).toBeHidden();
+  await completedReadGroup.locator(":scope > summary").click();
   await expect(liveMessage.locator(".turn-timeline-tool--completed").getByText("读取 src/App.tsx L3370-3382", { exact: true })).toBeVisible();
   await expect(liveMessage.locator(".turn-tool-meta > span").getByText("已完成", { exact: true })).toBeVisible();
   await expect(liveMessage.getByText("思考中", { exact: true })).toBeVisible();
@@ -690,6 +783,7 @@ test("streams progress and tools in event order before the turn completes", asyn
   await expect(liveMessage.getByText("执行了 4.2s", { exact: true })).toBeVisible();
   await expect(liveMessage.locator(".turn-timeline-tool--completed").getByText("读取 src/App.tsx L3370-3382", { exact: true })).toBeHidden();
   await liveMessage.getByText("执行了 4.2s", { exact: true }).click();
+  await liveMessage.locator(".turn-tool-group").filter({ hasText: "执行了操作" }).locator(":scope > summary").click();
   await expect(liveMessage.locator(".turn-timeline-tool--completed").getByText("读取 src/App.tsx L3370-3382", { exact: true })).toBeVisible();
   await expect(liveMessage.locator(".turn-timeline > *")).toHaveCount(3);
 });
@@ -825,7 +919,7 @@ test("completes and restores an approved edit test repair workflow", async ({ pa
   const approvalRequestIndex = timelineOrder.findIndex((className) => className.includes("approval_requested"));
   const approvalResolvedIndex = timelineOrder.findIndex((className) => className.includes("approval_resolved"));
   const toolIndexes = timelineOrder
-    .map((className, index) => className.includes("turn-timeline-tool") ? index : -1)
+    .map((className, index) => className.includes("turn-tool-group") ? index : -1)
     .filter((index) => index >= 0);
   expect(approvalRequestIndex).toBeGreaterThanOrEqual(0);
   expect(approvalResolvedIndex).toBeGreaterThan(approvalRequestIndex);
@@ -875,7 +969,7 @@ test("completes and restores an approved edit test repair workflow", async ({ pa
   const restoredRequestIndex = restoredTimelineOrder.findIndex((className) => className.includes("approval_requested"));
   const restoredResolutionIndex = restoredTimelineOrder.findIndex((className) => className.includes("approval_resolved"));
   const restoredToolIndexes = restoredTimelineOrder
-    .map((className, index) => className.includes("turn-timeline-tool") ? index : -1)
+    .map((className, index) => className.includes("turn-tool-group") ? index : -1)
     .filter((index) => index >= 0);
   expect(restoredRequestIndex).toBeLessThan(restoredToolIndexes[1]);
   expect(restoredResolutionIndex).toBeLessThan(restoredToolIndexes[1]);

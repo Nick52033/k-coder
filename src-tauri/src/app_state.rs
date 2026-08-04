@@ -968,7 +968,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn allows_only_one_active_turn_per_thread() {
+    async fn enforces_turn_exclusivity_per_thread() {
         let directory = tempfile::tempdir().expect("temporary directory should be created");
         let state =
             AppState::with_credentials(directory.path(), Arc::new(FakeCredentials::default()))
@@ -979,8 +979,15 @@ mod tests {
             state.begin_turn("thread").await,
             Err(AppStateError::TurnAlreadyActive(_))
         ));
+        state
+            .begin_turn("other-thread")
+            .await
+            .expect("a different thread may run concurrently");
+        assert!(state.is_turn_active("thread").await);
+        assert!(state.is_turn_active("other-thread").await);
         assert!(state.cancel_turn("thread").await);
         state.finish_turn("thread").await;
+        state.finish_turn("other-thread").await;
     }
 
     #[tokio::test]

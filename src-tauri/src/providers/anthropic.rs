@@ -57,6 +57,7 @@ struct AnthropicDelta {
     delta_type: Option<String>,
     text: Option<String>,
     partial_json: Option<String>,
+    stop_reason: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -97,6 +98,7 @@ struct ParsedAnthropicEvent {
     input_tokens: Option<u64>,
     output_tokens: Option<u64>,
     completed: bool,
+    stop_reason: Option<String>,
 }
 
 struct PendingTool {
@@ -186,6 +188,7 @@ impl Provider for AnthropicMessagesProvider {
             let mut decoder = SseDecoder::default();
             let mut usage = TokenUsage::default();
             let mut pending_tools = BTreeMap::<u64, PendingTool>::new();
+            let mut stop_reason = None::<String>;
             loop {
                 let chunk = tokio::select! {
                     _ = cancellation.cancelled() => { yield Err(ProviderError::Cancelled); return; }
@@ -229,9 +232,24 @@ impl Provider for AnthropicMessagesProvider {
                                         usage.total_tokens = usage.input_tokens + usage.output_tokens;
                                         yield Ok(ProviderEvent::Usage { usage });
                                     }
+                                    if let Some(reason) = parsed.stop_reason {
+                                        if !matches!(reason.as_str(), "end_turn" | "stop_sequence" | "tool_use") {
+                                            yield Err(ProviderError::InvalidResponse(format!(
+                                                "Anthropic stopped generation with stop_reason {reason}"
+                                            )));
+                                            return;
+                                        }
+                                        stop_reason = Some(reason);
+                                    }
                                     if parsed.completed {
                                         if !pending_tools.is_empty() {
                                             yield Err(ProviderError::InvalidResponse("Anthropic completed with an incomplete tool call".to_string()));
+                                            return;
+                                        }
+                                        if stop_reason.is_none() {
+                                            yield Err(ProviderError::InvalidResponse(
+                                                "Anthropic completed without a stop_reason".to_string()
+                                            ));
                                             return;
                                         }
                                         yield Ok(ProviderEvent::Completed);
@@ -352,6 +370,10 @@ fn parse_sse_data(data: &str) -> Result<ParsedAnthropicEvent, ProviderError> {
         .as_ref()
         .and_then(|usage| usage.output_tokens)
         .or_else(|| started_usage.and_then(|usage| usage.output_tokens));
+    let stop_reason = event
+        .delta
+        .as_ref()
+        .and_then(|delta| delta.stop_reason.clone());
     Ok(ParsedAnthropicEvent {
         delta,
         tool_start,
@@ -360,6 +382,7 @@ fn parse_sse_data(data: &str) -> Result<ParsedAnthropicEvent, ProviderError> {
         input_tokens,
         output_tokens,
         completed: event.event_type == "message_stop",
+        stop_reason,
     })
 }
 
@@ -381,6 +404,12 @@ mod tests {
                 .unwrap()
                 .completed
         );
+        let truncated = parse_sse_data(
+            r#"{"type":"message_delta","delta":{"stop_reason":"max_tokens"},"usage":{"output_tokens":12}}"#,
+        )
+        .unwrap();
+        assert_eq!(truncated.stop_reason.as_deref(), Some("max_tokens"));
+        assert_eq!(truncated.output_tokens, Some(12));
     }
 
     #[test]

@@ -2277,6 +2277,39 @@ button {
 .turn-reasoning-segment > :first-child { margin-top: 0; }
 .turn-reasoning-segment > :last-child { margin-bottom: 0; }
 
+.turn-tool-group > summary {
+  grid-template-columns: auto minmax(0, 1fr) auto auto;
+}
+
+.turn-tool-group > summary > svg:first-child {
+  color: var(--color-ink-muted);
+}
+
+.turn-tool-group--running > summary > svg:first-child {
+  color: var(--color-brand);
+}
+
+.turn-tool-group--failed > summary > svg:first-child {
+  color: var(--color-error);
+}
+
+.turn-tool-group--cancelled > summary > svg:first-child {
+  opacity: 0.7;
+}
+
+.turn-tool-group-content {
+  min-width: 0;
+  padding-left: 26px;
+}
+
+.turn-tool-group-content .turn-timeline-tool:first-child {
+  border-top-color: transparent;
+}
+
+.turn-tool-group-content .turn-timeline-tool:last-child {
+  border-bottom: 0;
+}
+
 .turn-live-status {
   display: inline-flex;
   min-height: 34px;
@@ -2420,7 +2453,8 @@ button {
 .turn-tools--failed .turn-tool-row > svg { color: var(--color-error); }
 .turn-plan-step--skipped { opacity: 0.58; }
 
-.turn-timeline-tool--running .turn-tool-running {
+.turn-timeline-tool--running .turn-tool-running,
+.turn-tool-group--running .turn-tool-running {
   animation: turn-tool-spin 900ms linear infinite;
 }
 

@@ -323,7 +323,7 @@ export interface ToolResult {
 export interface ToolActivity {
   turnId: string;
   call: ToolCall;
-  state: "running" | "completed" | "failed" | "cancelled";
+  state: "pending" | "running" | "completed" | "failed" | "cancelled";
   result: ToolResult | null;
   outputChunks?: ToolOutputDelta[];
   startedAtMs?: number;

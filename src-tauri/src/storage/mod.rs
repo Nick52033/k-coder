@@ -13,12 +13,12 @@ use uuid::Uuid;
 use crate::context::CompactionSummary;
 use crate::persistence::ProjectionDb;
 use crate::protocol::{
-    ApprovalAction, ApprovalRequest, ApprovalResolution, ApprovalSnapshot, ChangeSet, ChatMessage,
-    MessageRole, PROTOCOL_VERSION, TodoItem, TokenUsage, ToolCall, ToolResult, TurnState,
-    UserInputAction, UserInputRequest, UserInputResolution,
+    AgentMode, ApprovalAction, ApprovalRequest, ApprovalResolution, ApprovalSnapshot, ChangeSet,
+    ChatMessage, MessageRole, PROTOCOL_VERSION, TodoItem, TokenUsage, ToolCall, ToolResult,
+    TurnState, UserInputAction, UserInputRequest, UserInputResolution,
 };
 
-pub const EVENT_SCHEMA_VERSION: u32 = 3;
+pub const EVENT_SCHEMA_VERSION: u32 = 4;
 const MAX_TIMELINE_DETAIL_CHARS: usize = 2_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -59,6 +59,9 @@ pub enum StoredEventKind {
     UserMessage {
         message: ChatMessage,
     },
+    TurnModeSelected {
+        mode: AgentMode,
+    },
     TurnStarted,
     AssistantMessage {
         message: ChatMessage,
@@ -67,6 +70,9 @@ pub enum StoredEventKind {
         #[serde(default)]
         text: String,
         calls: Vec<ToolCall>,
+    },
+    ToolStarted {
+        call_id: String,
     },
     ReasoningSummary {
         item_id: String,
@@ -166,6 +172,7 @@ pub struct ThreadDetail {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolActivityState {
+    Pending,
     Running,
     Completed,
     Failed,
@@ -576,15 +583,33 @@ fn project_thread(thread_id: &str, events: &[StoredEvent]) -> Result<ThreadDetai
                         let activity = ToolActivitySnapshot {
                             turn_id: turn_id.clone(),
                             call,
-                            state: ToolActivityState::Running,
+                            state: ToolActivityState::Pending,
                             result: None,
-                            started_at_ms: Some(event.created_at_ms),
+                            started_at_ms: None,
                             completed_at_ms: None,
                             duration_ms: None,
                         };
                         tool_activities.push(activity.clone());
                         turn_timeline.push(TurnTimelineItem::Tool { activity });
                     }
+                }
+            }
+            StoredEventKind::ToolStarted { call_id } => {
+                if let Some(activity) = tool_activities
+                    .iter_mut()
+                    .rev()
+                    .find(|activity| activity.call.id == *call_id)
+                {
+                    activity.state = ToolActivityState::Running;
+                    activity.started_at_ms = Some(event.created_at_ms);
+                }
+                if let Some(TurnTimelineItem::Tool { activity }) = turn_timeline
+                    .iter_mut()
+                    .rev()
+                    .find(|item| matches!(item, TurnTimelineItem::Tool { activity } if activity.call.id == *call_id))
+                {
+                    activity.state = ToolActivityState::Running;
+                    activity.started_at_ms = Some(event.created_at_ms);
                 }
             }
             StoredEventKind::ReasoningSummary { item_id, summary } => {
@@ -813,6 +838,7 @@ fn project_thread(thread_id: &str, events: &[StoredEvent]) -> Result<ThreadDetai
                     Some(format!("变更 {change_id}")),
                 );
             }
+            StoredEventKind::TurnModeSelected { .. } => {}
             StoredEventKind::TurnStarted => {
                 if let Some(turn_id) = &event.turn_id {
                     turn_started_at_ms.insert(turn_id.clone(), event.created_at_ms);
@@ -988,7 +1014,12 @@ fn finish_running_tool_activities(
         return;
     };
     let finish = |activity: &mut ToolActivitySnapshot| {
-        if activity.turn_id == turn_id && activity.state == ToolActivityState::Running {
+        if activity.turn_id == turn_id
+            && matches!(
+                activity.state,
+                ToolActivityState::Pending | ToolActivityState::Running
+            )
+        {
             activity.state = terminal_state.clone();
             activity.completed_at_ms = Some(event.created_at_ms);
             activity.duration_ms = activity
@@ -1554,6 +1585,9 @@ mod tests {
                 text: String::new(),
                 calls,
             },
+            StoredEventKind::ToolStarted {
+                call_id: "build".to_string(),
+            },
             StoredEventKind::TurnCancelled,
         ]
         .into_iter()
@@ -1566,26 +1600,66 @@ mod tests {
 
         let detail = repository.read_thread(&thread.id).await.unwrap();
         assert_eq!(detail.tool_activities.len(), 2);
-        assert!(detail.tool_activities.iter().all(|activity| {
-            activity.state == ToolActivityState::Cancelled
-                && activity.completed_at_ms == Some(20_050)
-                && activity.duration_ms == Some(25)
-        }));
-        assert!(detail.turn_timeline.iter().take(2).all(|item| matches!(
-            item,
-            TurnTimelineItem::Tool { activity }
-                if activity.state == ToolActivityState::Cancelled
-                    && activity.completed_at_ms == Some(20_050)
-                    && activity.duration_ms == Some(25)
-        )));
+        assert_eq!(
+            detail.tool_activities[0].state,
+            ToolActivityState::Cancelled
+        );
+        assert_eq!(detail.tool_activities[0].completed_at_ms, Some(20_075));
+        assert_eq!(detail.tool_activities[0].duration_ms, Some(25));
+        assert_eq!(
+            detail.tool_activities[1].state,
+            ToolActivityState::Cancelled
+        );
+        assert_eq!(detail.tool_activities[1].completed_at_ms, Some(20_075));
+        assert_eq!(detail.tool_activities[1].duration_ms, None);
         assert!(matches!(
             detail.turn_timeline.last(),
             Some(TurnTimelineItem::Event {
                 kind: TimelineEventKind::TurnCancelled,
-                duration_ms: Some(50),
+                duration_ms: Some(75),
                 ..
             })
         ));
+    }
+
+    #[tokio::test]
+    async fn serial_tool_recovery_distinguishes_running_and_pending_calls() {
+        let directory = tempfile::tempdir().unwrap();
+        let repository = JsonlThreadRepository::new(directory.path()).unwrap();
+        let thread = repository.create_thread().await.unwrap();
+        let turn_id = "turn-serial-tools".to_string();
+        let calls = ["first", "second"]
+            .into_iter()
+            .map(|id| ToolCall {
+                id: id.to_string(),
+                name: "read_file".to_string(),
+                arguments: serde_json::json!({ "path": id }),
+                metadata: serde_json::json!({}),
+            })
+            .collect::<Vec<_>>();
+        for (index, kind) in [
+            StoredEventKind::TurnStarted,
+            StoredEventKind::AssistantToolCalls {
+                text: String::new(),
+                calls,
+            },
+            StoredEventKind::ToolStarted {
+                call_id: "first".to_string(),
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut event = StoredEvent::new(&thread.id, Some(turn_id.clone()), kind);
+            event.created_at_ms = 30_000 + index as u64 * 25;
+            repository.append(event).await.unwrap();
+        }
+
+        let detail = repository.read_thread(&thread.id).await.unwrap();
+        assert_eq!(detail.tool_activities[0].state, ToolActivityState::Running);
+        assert_eq!(detail.tool_activities[0].started_at_ms, Some(30_050));
+        assert_eq!(detail.tool_activities[1].state, ToolActivityState::Pending);
+        assert_eq!(detail.tool_activities[1].started_at_ms, None);
     }
 
     #[tokio::test]

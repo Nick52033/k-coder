@@ -134,6 +134,7 @@ function App() {
     lastTurn,
     activeTurnId,
     activeTurnThreadId,
+    activeTurns,
     usage,
     turnTimeline,
     turnUserMessageIds,
@@ -179,7 +180,8 @@ function App() {
     clearQueue,
     forceResetState,
   } = useWorkbenchStore();
-  const pendingQueueCount = messageQueue.filter((message) => message.status === "pending").length;
+  const currentThreadQueue = messageQueue.filter((message) => message.threadId === activeThreadId);
+  const pendingQueueCount = currentThreadQueue.filter((message) => message.status === "pending").length;
   // 普通会话列表只展示未绑定到项目的会话；绑定到项目的会话只出现在"项目"tab。
   const standaloneThreads = threads.filter((thread) => !threadProjectMap[thread.id]);
 
@@ -400,6 +402,7 @@ function App() {
   const selectedChange = changes.find((change) => change.id === selectedChangeId) ?? null;
   // 仅当正在生成的 turn 属于当前线程时才视为"忙"，避免旧线程的 turn 阻塞新对话
   const currentThreadBusy = Boolean(activeTurnId) && activeTurnThreadId === activeThreadId;
+  const anyTurnBusy = Object.keys(activeTurns).length > 0;
   const retryable = !currentThreadBusy && ["failed", "cancelled"].includes(lastTurn?.state ?? "");
   const toolActivities = turnTimeline.flatMap((item) => item.type === "tool" ? [item.activity] : []);
   const activitiesByTurn = new Map<string, typeof toolActivities>();
@@ -1420,7 +1423,7 @@ function App() {
 
             {queueExpanded && (
               <div className="queue-list">
-                {messageQueue.map((queueItem, idx) => (
+                {currentThreadQueue.map((queueItem, idx) => (
                   <div key={queueItem.id} className={cn("queue-item", `queue-item--${queueItem.status}`)}>
                     <span className="queue-item-index">{idx + 1}</span>
                     <div className="queue-item-content">
@@ -1600,7 +1603,7 @@ function App() {
             </div>
             <ApprovalModeSelector
               mode={approvalMode}
-              disabled={currentThreadBusy}
+              disabled={anyTurnBusy}
               onChange={setApprovalMode}
             />
             <ReasoningSelector
@@ -1813,10 +1816,11 @@ function stateLabel(state: string) {
 }
 
 function toolActivityDetail(activity: {
-  state: "running" | "completed" | "failed" | "cancelled";
+  state: "pending" | "running" | "completed" | "failed" | "cancelled";
   call: { name: string; arguments: Record<string, unknown> };
   result: { output: string } | null;
 }) {
+  if (activity.state === "pending") return "等待执行";
   if (activity.state === "running") return "执行中";
   if (activity.state === "failed") return activity.result?.output || "执行失败";
   if (activity.state === "cancelled") return "已取消";

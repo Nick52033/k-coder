@@ -67,7 +67,7 @@ export function ConversationTurnActivity({
     awaiting_approval: "等待确认",
     finalizing: "整理结果中",
   }[activityStatus] : null;
-  const groupedProcessTimeline = groupConsecutiveReasoning(processTimeline);
+  const groupedProcessTimeline = groupConsecutiveTimeline(processTimeline);
   const processContent = (
     <div className={streaming ? "turn-execution-live" : "turn-execution-content"}>
       {plan?.steps.length ? <ConversationPlan plan={plan} /> : null}
@@ -79,6 +79,11 @@ export function ConversationTurnActivity({
               active={streaming}
               renderText={renderText}
               key={`reasoning-group-${entry.items.map((item) => item.itemId).join("-")}`}
+            />
+          ) : entry.type === "tool_group" ? (
+            <ToolActivityGroup
+              activities={entry.activities}
+              key={`tool-group-${entry.activities.map((activity) => activity.call.id).join("-")}`}
             />
           ) : (
             <TimelineItem
@@ -92,7 +97,7 @@ export function ConversationTurnActivity({
         </div>
       ) : activities.length ? (
         <div className="turn-timeline">
-          {activities.map((activity) => <ToolActivityRow activity={activity} key={activity.call.id} />)}
+          <ToolActivityGroup activities={activities} />
         </div>
       ) : null}
     </div>
@@ -187,9 +192,10 @@ function timelineItemKey(item: TurnTimelineItem) {
 type ReasoningTimelineItem = Extract<TurnTimelineItem, { type: "reasoning" }>;
 type TimelineRenderEntry =
   | { type: "reasoning_group"; items: ReasoningTimelineItem[] }
-  | { type: "item"; item: Exclude<TurnTimelineItem, { type: "reasoning" }> };
+  | { type: "tool_group"; activities: ToolActivity[] }
+  | { type: "item"; item: Exclude<TurnTimelineItem, { type: "reasoning" | "tool" }> };
 
-function groupConsecutiveReasoning(items: TurnTimelineItem[]): TimelineRenderEntry[] {
+function groupConsecutiveTimeline(items: TurnTimelineItem[]): TimelineRenderEntry[] {
   const grouped: TimelineRenderEntry[] = [];
   for (const item of items) {
     const previous = grouped[grouped.length - 1];
@@ -197,6 +203,9 @@ function groupConsecutiveReasoning(items: TurnTimelineItem[]): TimelineRenderEnt
       if (previous?.type === "reasoning_group"
         && Boolean(previous.items[0]?.complete) === Boolean(item.complete)) previous.items.push(item);
       else grouped.push({ type: "reasoning_group", items: [item] });
+    } else if (item.type === "tool") {
+      if (previous?.type === "tool_group") previous.activities.push(item.activity);
+      else grouped.push({ type: "tool_group", activities: [item.activity] });
     } else {
       grouped.push({ type: "item", item });
     }
@@ -234,12 +243,61 @@ function ReasoningGroup({
   );
 }
 
+function ToolActivityGroup({ activities }: { activities: ToolActivity[] }) {
+  const state = toolGroupState(activities);
+  const allCommands = activities.every((activity) => activity.call.name === "run_command");
+  const count = activities.length;
+  const title = allCommands
+    ? count === 1 ? "运行了命令" : `运行了 ${count} 个命令`
+    : count === 1 ? "执行了操作" : `执行了 ${count} 个操作`;
+  const status = state === "failed"
+    ? "包含失败"
+    : state === "cancelled"
+      ? "已取消"
+      : state === "running"
+        ? "执行中"
+        : state === "pending"
+          ? "等待执行"
+          : "已完成";
+  const Icon = state === "failed"
+    ? CircleX
+    : state === "cancelled" || state === "pending"
+      ? Circle
+      : state === "running"
+        ? LoaderCircle
+        : allCommands ? SquareTerminal : Activity;
+  const expanded = state !== "completed";
+
+  return (
+    <details className={`turn-disclosure turn-tool-group turn-tool-group--${state}`} open={expanded || undefined}>
+      <summary>
+        <Icon className={state === "running" ? "turn-tool-running" : undefined} size={15} aria-hidden="true" />
+        <span className="turn-disclosure-title">{title}</span>
+        <span className="turn-disclosure-status">{status}</span>
+        <ChevronDown className="turn-disclosure-chevron" size={15} aria-hidden="true" />
+      </summary>
+      <div className="turn-tool-group-content">
+        {activities.map((activity) => <ToolActivityRow activity={activity} key={activity.call.id} />)}
+      </div>
+    </details>
+  );
+}
+
+function toolGroupState(activities: ToolActivity[]): ToolActivity["state"] {
+  if (activities.some((activity) => activity.state === "failed")) return "failed";
+  if (activities.some((activity) => activity.state === "cancelled")) return "cancelled";
+  if (activities.some((activity) => activity.state === "running")) return "running";
+  if (activities.some((activity) => activity.state === "pending")) return "pending";
+  return "completed";
+}
+
 
 function ToolActivityRow({ activity }: { activity: ToolActivity }) {
   const outputChunks = visibleOutput(activity);
   const elapsedMs = useActivityDuration(activity);
   const command = activity.call.name === "run_command" ? commandDetails(activity.call.arguments) : null;
   const fileDetails = command ? null : fileActivityDetails(activity);
+  const isPending = activity.state === "pending";
   const isRunning = activity.state === "running";
   const failed = activity.state === "failed";
   const target = failed ? "" : toolTarget(activity);
@@ -253,7 +311,7 @@ function ToolActivityRow({ activity }: { activity: ToolActivity }) {
         <CircleCheck size={15} aria-hidden="true" />
       ) : activity.state === "failed" ? (
         <CircleX size={15} aria-hidden="true" />
-      ) : activity.state === "cancelled" ? (
+      ) : activity.state === "cancelled" || isPending ? (
         <Circle size={15} aria-hidden="true" />
       ) : (
         <LoaderCircle className="turn-tool-running" size={15} aria-hidden="true" />
@@ -610,6 +668,7 @@ function positiveInteger(value: unknown) {
 }
 
 function activityStateLabel(activity: ToolActivity) {
+  if (activity.state === "pending") return "等待执行";
   if (activity.state === "running") return "执行中";
   if (activity.state === "failed") return "执行失败";
   if (activity.state === "cancelled") return "已取消";

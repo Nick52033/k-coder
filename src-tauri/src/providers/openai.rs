@@ -104,6 +104,7 @@ struct ParsedSseData {
     events: Vec<ProviderEvent>,
     tool_deltas: Vec<OpenAiToolCallDelta>,
     completion: FrameCompletion,
+    terminal_error: Option<ProviderError>,
 }
 
 #[derive(Default)]
@@ -239,6 +240,10 @@ impl Provider for OpenAiChatCompletionsProvider {
                                     Ok(parsed) => {
                                         for delta in parsed.tool_deltas { tool_calls.push(delta); }
                                         for event in parsed.events.into_iter().map(|event| redact_event(event, &secret)) { yield Ok(event); }
+                                        if let Some(error) = parsed.terminal_error {
+                                            yield Err(redact_error(error, &secret));
+                                            return;
+                                        }
                                         if parsed.completion == FrameCompletion::FinishReason {
                                             saw_finish_reason = true;
                                             match tool_calls.take() {
@@ -326,6 +331,7 @@ fn parse_sse_data(data: &str) -> Result<ParsedSseData, ProviderError> {
             events: Vec::new(),
             tool_deltas: Vec::new(),
             completion: FrameCompletion::DoneMarker,
+            terminal_error: None,
         });
     }
     let chunk: OpenAiChunk = serde_json::from_str(data).map_err(|error| {
@@ -334,11 +340,11 @@ fn parse_sse_data(data: &str) -> Result<ParsedSseData, ProviderError> {
     if let Some(error) = chunk.error {
         return Err(ProviderError::InvalidResponse(error.message));
     }
-    let completion = if chunk
+    let finish_reason = chunk
         .choices
         .iter()
-        .any(|choice| choice.finish_reason.is_some())
-    {
+        .find_map(|choice| choice.finish_reason.clone());
+    let completion = if finish_reason.is_some() {
         FrameCompletion::FinishReason
     } else {
         FrameCompletion::None
@@ -366,6 +372,14 @@ fn parse_sse_data(data: &str) -> Result<ParsedSseData, ProviderError> {
         events,
         tool_deltas,
         completion,
+        terminal_error: finish_reason
+            .as_deref()
+            .filter(|reason| !matches!(*reason, "stop" | "tool_calls" | "function_call"))
+            .map(|reason| {
+                ProviderError::InvalidResponse(format!(
+                    "Chat Completions stopped generation with finish_reason {reason}"
+                ))
+            }),
     })
 }
 
@@ -403,6 +417,23 @@ mod tests {
         assert!(matches!(
             accumulator.take(),
             Err(ProviderError::InvalidResponse(_))
+        ));
+    }
+
+    #[test]
+    fn length_finish_reason_is_not_a_successful_completion() {
+        let parsed = parse_sse_data(
+            r#"{"choices":[{"delta":{"content":"partial"},"finish_reason":"length"}],"usage":{"prompt_tokens":4,"completion_tokens":3}}"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.completion, FrameCompletion::FinishReason);
+        assert!(matches!(
+            parsed.events.last(),
+            Some(ProviderEvent::Usage { usage }) if usage.total_tokens == 7
+        ));
+        assert!(matches!(
+            parsed.terminal_error,
+            Some(ProviderError::InvalidResponse(message)) if message.contains("length")
         ));
     }
 

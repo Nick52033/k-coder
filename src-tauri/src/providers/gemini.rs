@@ -102,6 +102,7 @@ struct GeminiError {
 struct ParsedGeminiEvent {
     events: Vec<ProviderEvent>,
     completed: bool,
+    terminal_error: Option<ProviderError>,
 }
 
 #[async_trait]
@@ -182,6 +183,10 @@ impl Provider for GoogleGeminiProvider {
                                             reasoning_summary.push_str(delta);
                                         }
                                         yield Ok(redact_event(event, &secret));
+                                    }
+                                    if let Some(error) = parsed.terminal_error {
+                                        yield Err(redact_error(error, &secret));
+                                        return;
                                     }
                                     if parsed.completed {
                                         if !reasoning_summary.is_empty() {
@@ -272,29 +277,13 @@ fn parse_sse_data(data: &str, reasoning_item_id: &str) -> Result<ParsedGeminiEve
     if let Some(error) = response.error {
         return Err(ProviderError::InvalidResponse(error.message));
     }
-    if let Some(reason) = response
+    let prompt_block = response
         .prompt_feedback
         .and_then(|feedback| feedback.block_reason)
-        .filter(|reason| !reason.is_empty() && reason != "BLOCK_REASON_UNSPECIFIED")
-    {
-        return Err(ProviderError::InvalidResponse(format!(
-            "Gemini blocked the prompt: {reason}"
-        )));
-    }
+        .filter(|reason| !reason.is_empty() && reason != "BLOCK_REASON_UNSPECIFIED");
     let mut events = Vec::new();
     let candidate = response.candidates.into_iter().next();
     if let Some(candidate) = candidate.as_ref() {
-        if let Some(reason) = candidate.finish_reason.as_deref().filter(|reason| {
-            !reason.is_empty()
-                && !matches!(*reason, "FINISH_REASON_UNSPECIFIED" | "STOP" | "MAX_TOKENS")
-        }) {
-            return Err(ProviderError::InvalidResponse(
-                candidate
-                    .finish_message
-                    .clone()
-                    .unwrap_or_else(|| format!("Gemini stopped generation: {reason}")),
-            ));
-        }
         if let Some(content) = &candidate.content {
             for part in &content.parts {
                 if let Some(delta) = part.text.clone().filter(|delta| !delta.is_empty()) {
@@ -337,10 +326,32 @@ fn parse_sse_data(data: &str, reasoning_item_id: &str) -> Result<ParsedGeminiEve
             },
         });
     }
-    let completed = candidate
-        .and_then(|candidate| candidate.finish_reason)
-        .is_some_and(|reason| !reason.is_empty() && reason != "FINISH_REASON_UNSPECIFIED");
-    Ok(ParsedGeminiEvent { events, completed })
+    let finish_reason = candidate
+        .as_ref()
+        .and_then(|candidate| candidate.finish_reason.as_deref())
+        .filter(|reason| !reason.is_empty() && *reason != "FINISH_REASON_UNSPECIFIED");
+    let completed = finish_reason == Some("STOP");
+    let terminal_error = if let Some(reason) = prompt_block {
+        Some(ProviderError::InvalidResponse(format!(
+            "Gemini blocked the prompt: {reason}"
+        )))
+    } else {
+        finish_reason
+            .filter(|reason| *reason != "STOP")
+            .map(|reason| {
+                ProviderError::InvalidResponse(
+                    candidate
+                        .as_ref()
+                        .and_then(|candidate| candidate.finish_message.clone())
+                        .unwrap_or_else(|| format!("Gemini stopped generation: {reason}")),
+                )
+            })
+    };
+    Ok(ParsedGeminiEvent {
+        events,
+        completed,
+        terminal_error,
+    })
 }
 
 fn gemini_schema(mut schema: Value) -> Value {
@@ -468,5 +479,23 @@ mod tests {
             contents[0]["parts"][1]["inlineData"]["mimeType"],
             "image/png"
         );
+    }
+
+    #[test]
+    fn max_tokens_is_an_incomplete_response_with_usage() {
+        let parsed = parse_sse_data(
+            r#"{"candidates":[{"content":{"parts":[{"text":"partial"}]},"finishReason":"MAX_TOKENS"}],"usageMetadata":{"promptTokenCount":4,"candidatesTokenCount":3}}"#,
+            "reasoning",
+        )
+        .unwrap();
+        assert!(!parsed.completed);
+        assert!(matches!(
+            parsed.events.last(),
+            Some(ProviderEvent::Usage { usage }) if usage.total_tokens == 7
+        ));
+        assert!(matches!(
+            parsed.terminal_error,
+            Some(ProviderError::InvalidResponse(message)) if message.contains("MAX_TOKENS")
+        ));
     }
 }
