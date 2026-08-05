@@ -13,6 +13,8 @@ use tokio::sync::{Mutex, Notify};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+mod shell;
+
 const DEFAULT_BUFFER_BYTES: usize = 1024 * 1024;
 const MAX_BUFFER_BYTES: usize = 8 * 1024 * 1024;
 const MAX_TIMEOUT_MS: u64 = 60 * 60 * 1000;
@@ -206,13 +208,38 @@ pub fn assess_command(program: &str, args: &[String]) -> CommandAssessment {
             reason: "recognized project build or test command".into(),
         };
     }
+    let ripgrep_is_read_only = executable == "rg"
+        && !lowered.iter().any(|arg| {
+            matches!(arg.as_str(), "--pre" | "--pre-glob" | "--search-zip")
+                || arg.starts_with("--pre=")
+                || arg.starts_with("--pre-glob=")
+        });
     if matches!(
         executable.as_str(),
-        "ls" | "dir" | "pwd" | "where" | "which"
-    ) || (executable == "git"
-        && lowered
-            .first()
-            .is_some_and(|arg| matches!(arg.as_str(), "status" | "diff" | "log" | "show")))
+        "ls" | "dir"
+            | "pwd"
+            | "where"
+            | "which"
+            | "cat"
+            | "head"
+            | "tail"
+            | "echo"
+            | "printf"
+            | "get-childitem"
+            | "get-command"
+            | "get-content"
+            | "get-item"
+            | "get-location"
+            | "get-process"
+            | "measure-object"
+            | "select-string"
+            | "test-path"
+            | "write-output"
+    ) || ripgrep_is_read_only
+        || (executable == "git"
+            && lowered
+                .first()
+                .is_some_and(|arg| matches!(arg.as_str(), "status" | "diff" | "log" | "show")))
     {
         return CommandAssessment {
             risk: CommandRisk::ReadOnly,
@@ -241,6 +268,7 @@ pub struct CommandRuntime {
     sessions: Arc<Mutex<HashMap<String, Arc<Session>>>>,
     grants: Arc<RwLock<Vec<ReusableAuthorization>>>,
     recovery_dir: Option<PathBuf>,
+    default_shell: shell::DetectedShell,
 }
 
 /// Host-owned reusable authorization. It is intentionally not deserializable, so a
@@ -316,6 +344,7 @@ impl CommandRuntime {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             grants: Arc::new(RwLock::new(Vec::new())),
             recovery_dir: None,
+            default_shell: shell::default_user_shell(),
         })
     }
 
@@ -384,7 +413,38 @@ impl CommandRuntime {
     }
 
     pub fn assess(&self, request: &StartCommandRequest) -> CommandAssessment {
-        let mut assessment = assess_command(&request.program, &request.args);
+        let assessment = assess_command(&request.program, &request.args);
+        self.apply_reusable_authorization(request, assessment)
+    }
+
+    pub fn shell_request(
+        &self,
+        command: &str,
+        cwd: String,
+        timeout_ms: u64,
+    ) -> StartCommandRequest {
+        self.default_shell.request(command, cwd, timeout_ms)
+    }
+
+    pub fn default_shell_name(&self) -> &'static str {
+        self.default_shell.name()
+    }
+
+    pub fn assess_shell_command(
+        &self,
+        command: &str,
+        cwd: String,
+        timeout_ms: u64,
+    ) -> CommandAssessment {
+        let request = self.shell_request(command, cwd, timeout_ms);
+        self.apply_reusable_authorization(&request, self.default_shell.assess(command))
+    }
+
+    fn apply_reusable_authorization(
+        &self,
+        request: &StartCommandRequest,
+        mut assessment: CommandAssessment,
+    ) -> CommandAssessment {
         if assessment.requires_approval
             && self
                 .grants

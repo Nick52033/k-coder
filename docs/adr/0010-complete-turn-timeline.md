@@ -14,14 +14,14 @@ JSONL 是会话事件的事实来源，但旧的 `TurnTimelineItem` 只投影文
 1. `TurnTimelineItem` 保留 `text`、`reasoning` 和 `tool`，新增统一的有界 `event` 变体。`TimelineEventKind` 独立表示 provider context、usage、compacted、approval requested/resolved、user input requested/resolved、todo updated、change applied/undone 和 turn completed/failed/cancelled。
 2. `project_thread` 按 JSONL 事件顺序生成时间线，同时保留审批、用户输入、变更、任务清单和最后用量的领域快照。生命周期事件使用稳定的领域 ID，实时重放不会重复同一事件。
 3. `request_user_input`、`todo_write`、Provider 用量和终态事件先追加 JSONL，再发布给前端。用户输入恢复为 FIFO 队列；线程恢复会把未解决的审批和用户输入转为取消，避免展示已失效的操作卡片。
-4. `run_command` 的最终结果元数据保留有界的脱敏 stdout/stderr chunks（含 stream、cursor、text），前端优先读取该结构，旧结果继续回退到 stdout 文本。
+4. `run_command` 的最终结果元数据保留实际 shell 和有界的脱敏 stdout/stderr chunks（含 stream、cursor、text），前端优先读取该结构，旧结果继续回退到 stdout 文本；新事件展示原始 `command`，旧 `program + args` 历史继续只读兼容。
 5. 线程加载建立临时 hydration buffer。当前线程的实时事件在快照完成前暂存，应用快照后按接收顺序同步重放；非当前线程事件不能污染当前视图。消息的 `turnUserMessageIds` 将失败/取消/重试尝试锚定到原用户消息，无法锚定的孤儿 Turn 单独显示。
 6. 设置边界：Provider 上下文最多 512 KiB，单次模型响应最多 512 KiB，单 Turn 最多 24 次迭代、24 次工具调用和 1,000,000 tokens，时间线文本单项最多 2,000 字符，持久化命令输出最多 64 KiB。瞬时进展队列可以丢弃展示增量，但最终结果与审计事件不得丢失。
 7. `read_file` 的有界 `ToolResult.output` 是 Provider 历史与审计事件共享的事实。无范围参数时默认最多返回 64 KiB；`startLine/lineCount` 优先于兼容的 `offset/limit`，存在任一行范围字段时忽略冗余字节范围，显式范围最多返回 256 KiB。对话时间线只展示读取路径、范围和状态等摘要，不再提供“查看读取内容”入口；结果仍原样保留在 Provider 历史中，不重新读取当前文件。
 8. 每次 Provider 请求前都从持久化事件重建并修复工具历史。结构化 `assistant_tool_calls` 只有在调用 ID 唯一、后续结果数量一致且 `tool_call_id` 集合完全匹配时才保留；中断或崩溃遗留的缺失、重复、错配和孤立结果不得发送给 Provider。工具调用事件中的非空可见说明可以降级为普通助手文本，不能为满足协议而伪造工具结果。
 9. 时间线展示把完成状态相同且相邻的 reasoning 摘要合并为一个可折叠组，只显示一次标题和状态；组内保留各摘要事件的原始顺序，任何非 reasoning 条目或完成状态变化都会切断分组。审批请求与解决事件按请求关联的 `toolCallId` 排在对应工具活动之前，实时事件和历史恢复都遵循该展示顺序。活动 Turn 没有工具或时间线条目时，只保留状态标题，不渲染额外的空工具调用占位行。上述规则只作用于前端投影，不合并、改写或删除持久化事件。
-10. 时间线展示把相邻工具活动聚合为独立的可展开组；纯 `run_command` 组使用“运行了 N 个命令”，其他组使用“执行了 N 个操作”。全部完成的组默认折叠，Pending、Running、Failed 或 Cancelled 组保持展开，确保等待与异常状态不会被隐藏。说明、reasoning、审批、变更和其他事件都会切断工具组；展开后继续展示每个工具的原始状态、参数摘要、输出和耗时。该分组同样只改变前端展示，不改变 JSONL、Provider 历史、领域快照或 Compaction。
-11. 所有带详情的过程事件统一渲染为可展开步骤，包括 Provider 上下文、逐次用量、自动批准、审批结果、Compaction、文件变更、用户输入和任务清单生命周期。完成步骤默认只显示摘要，失败终态详情保持展开；完成 reasoning 在活动 Turn 中也收起，只有尚未完成的 reasoning 保持展开。助手阶段性说明和最终回复继续直接显示，不被步骤折叠吞入。无详情的终态摘要保持单行，避免提供没有内容的伪展开控件。
+10. 时间线展示把相邻工具活动聚合为独立的可展开组；纯 `run_command` 组按数量使用“运行了命令”或“运行了多个命令”，其他内置/MCP 工具组按数量使用“执行了操作”或“执行了多个操作”。文件变更事件独立使用“编辑了文件”，修改类明细使用“已编辑 文件名”。全部完成的组默认折叠，Pending、Running、Failed 或 Cancelled 组保持展开，确保等待与异常状态不会被隐藏。说明、reasoning、审批、变更和其他事件都会切断工具组；展开后继续展示每个工具的原始状态、参数摘要、输出和耗时。该分组同样只改变前端展示，不改变 JSONL、Provider 历史、领域快照或 Compaction。
+11. 所有带详情的过程事件统一渲染为可展开步骤，包括 Provider 上下文、逐次用量、自动批准、审批结果、Compaction、文件变更、用户输入和任务清单生命周期。完成步骤默认只显示摘要，失败终态详情保持展开；完成 reasoning 在活动 Turn 中也收起，只有尚未完成的 reasoning 保持展开。自动 Compaction 先落盘再发布带稳定事件 ID 和三项有界计数的 `context_compacted` 公共事件，使当前时间线无需刷新即可得到与历史恢复相同的步骤，同时不复制内部摘要或工具结果正文。助手阶段性说明和最终回复继续直接显示，不被步骤折叠吞入。无详情的终态摘要保持单行，避免提供没有内容的伪展开控件。
 
 ## 影响
 

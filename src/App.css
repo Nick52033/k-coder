@@ -1750,19 +1750,117 @@ button {
   display: inline-flex;
   min-width: 0;
   max-width: 240px;
-  height: 34px;
-  padding: 0 10px;
+  height: 38px;
+  padding: 3px 10px 3px 4px;
   align-items: center;
   gap: 6px;
   border: 1px solid var(--color-user-msg-border);
   border-radius: var(--radius-sm);
   color: var(--color-ink-rich);
   background: var(--color-user-msg-bg);
+  cursor: pointer;
   font-size: var(--font-size-sm);
+  text-align: left;
+  transition: background var(--transition-fast), border-color var(--transition-fast);
 }
 
-.message-image-attachment svg { flex-shrink: 0; color: var(--color-brand); }
+.message-image-attachment:hover {
+  border-color: var(--color-border-strong);
+  background: var(--color-surface-hover);
+}
+
+.message-image-attachment:focus-visible {
+  outline: 2px solid var(--color-brand);
+  outline-offset: 2px;
+}
+
+.message-image-attachment img {
+  width: 30px;
+  height: 30px;
+  flex: 0 0 auto;
+  border-radius: 4px;
+  object-fit: cover;
+  background: var(--color-surface-raised);
+}
+
 .message-image-attachment span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.image-preview-backdrop {
+  position: fixed;
+  z-index: 55;
+  inset: 0;
+  background: rgba(10, 12, 15, 0.92);
+  animation: modal-backdrop-enter var(--transition-modal);
+}
+
+.image-preview-dialog {
+  display: grid;
+  width: 100%;
+  height: 100dvh;
+  grid-template-rows: 48px minmax(0, 1fr);
+  color: #f5f7fa;
+}
+
+.image-preview-header {
+  display: flex;
+  min-width: 0;
+  padding: 0 12px 0 16px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.14);
+  background: rgba(10, 12, 15, 0.9);
+}
+
+.image-preview-header h2 {
+  min-width: 0;
+  margin: 0;
+  overflow: hidden;
+  font-size: var(--font-size-md);
+  font-weight: var(--font-weight-medium);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.image-preview-header button {
+  display: grid;
+  width: 32px;
+  height: 32px;
+  flex: 0 0 auto;
+  padding: 0;
+  place-items: center;
+  border: 0;
+  border-radius: var(--radius-sm);
+  color: inherit;
+  background: transparent;
+  cursor: pointer;
+}
+
+.image-preview-header button:hover,
+.image-preview-header button:focus-visible {
+  background: rgba(255, 255, 255, 0.12);
+}
+
+.image-preview-header button:focus-visible {
+  outline: 2px solid #ffffff;
+  outline-offset: 1px;
+}
+
+.image-preview-stage {
+  display: grid;
+  min-width: 0;
+  min-height: 0;
+  padding: 20px;
+  place-items: center;
+  overflow: hidden;
+}
+
+.image-preview-stage img {
+  display: block;
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+}
 
 .message-content {
   min-width: 0;
@@ -2957,6 +3055,7 @@ button {
   width: 100%;
   min-height: 76px;
   padding: 13px 14px;
+  font-size: var(--font-size-md);
   resize: none;
   border: 0;
   outline: 0;
@@ -3146,6 +3245,11 @@ button {
 
 .stop-button:hover {
   background: var(--color-error-text);
+}
+
+.stop-button:disabled {
+  opacity: 0.78;
+  cursor: wait;
 }
 
 /* ── Plan 模式：提问卡片 ── */
@@ -4558,7 +4662,6 @@ button {
   border: 1px solid var(--color-border-strong);
   border-radius: 7px;
   background: var(--color-surface);
-  overflow: hidden;
   transition: border-color var(--transition-fast), background-color var(--transition-fast);
 }
 

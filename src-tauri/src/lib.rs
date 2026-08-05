@@ -22,10 +22,38 @@ use tauri::Manager;
 use tauri::image::Image;
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::TrayIconBuilder;
+#[cfg(desktop)]
+use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
+
+#[cfg(desktop)]
+const SINGLE_INSTANCE_TITLE: &str = "k-Coder 已在运行";
+#[cfg(desktop)]
+const SINGLE_INSTANCE_MESSAGE: &str = "k-Coder 已在运行，已切换到现有窗口。";
+
+fn show_main_window(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
+    }
+}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let builder = tauri::Builder::default();
+
+    #[cfg(desktop)]
+    let builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+        show_main_window(app);
+        app.dialog()
+            .message(SINGLE_INSTANCE_MESSAGE)
+            .kind(MessageDialogKind::Info)
+            .title(SINGLE_INSTANCE_TITLE)
+            .show(|_| {});
+    }));
+
+    builder
+        .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
@@ -46,14 +74,17 @@ pub fn run() {
                 .tooltip("k-Coder")
                 .menu(&menu)
                 .show_menu_on_left_click(false)
-                .on_menu_event(|app, event| match event.id.as_ref() {
-                    "show" => {
-                        if let Some(window) = app.get_webview_window("main") {
-                            let _ = window.show();
-                            let _ = window.unminimize();
-                            let _ = window.set_focus();
-                        }
+                .on_tray_icon_event(move |app, event| {
+                    if let tauri::tray::TrayIconEvent::Click {
+                        button: tauri::tray::MouseButton::Left,
+                        ..
+                    } = event
+                    {
+                        show_main_window(app.app_handle());
                     }
+                })
+                .on_menu_event(move |app, event| match event.id.as_ref() {
+                    "show" => show_main_window(app),
                     "quit" => {
                         app.exit(0);
                     }
@@ -68,6 +99,18 @@ pub fn run() {
                 if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                     api.prevent_close();
                     let _ = window_clone.hide();
+                    // 发送系统通知，告诉用户窗口已最小化到托盘
+                    let app_handle = window_clone.app_handle().clone();
+                    let notification_app = app_handle.clone();
+                    let _ = app_handle.run_on_main_thread(move || {
+                        let _ = tauri_plugin_notification::NotificationExt::notification(
+                            &notification_app,
+                        )
+                        .builder()
+                        .title("k-Coder")
+                        .body("已最小化到系统托盘，右键托盘图标可退出")
+                        .show();
+                    });
                 }
             });
 
@@ -164,4 +207,18 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(all(test, desktop))]
+mod tests {
+    use super::{SINGLE_INSTANCE_MESSAGE, SINGLE_INSTANCE_TITLE};
+
+    #[test]
+    fn single_instance_notice_explains_existing_window_reuse() {
+        assert_eq!(SINGLE_INSTANCE_TITLE, "k-Coder 已在运行");
+        assert_eq!(
+            SINGLE_INSTANCE_MESSAGE,
+            "k-Coder 已在运行，已切换到现有窗口。"
+        );
+    }
 }

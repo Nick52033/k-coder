@@ -13,6 +13,7 @@
     "core:window:allow-hide",
     "dialog:allow-open",
     "opener:default",
-    "global-shortcut:default"
+    "global-shortcut:default",
+    "notification:default"
   ]
 }

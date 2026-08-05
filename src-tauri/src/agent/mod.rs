@@ -138,6 +138,7 @@ pub struct AgentRuntime {
     context_limit: usize,
     metrics: Option<RuntimeMetrics>,
     reasoning_effort: ReasoningEffort,
+    supports_vision: bool,
     logger: Option<StructuredLogger>,
 }
 
@@ -183,6 +184,7 @@ impl AgentRuntime {
             context_limit: DEFAULT_CONTEXT_LIMIT,
             metrics: None,
             reasoning_effort: ReasoningEffort::default(),
+            supports_vision: false,
             logger: None,
         }
     }
@@ -219,6 +221,11 @@ impl AgentRuntime {
 
     pub fn with_reasoning_effort(mut self, effort: ReasoningEffort) -> Self {
         self.reasoning_effort = effort;
+        self
+    }
+
+    pub fn with_vision_support(mut self, supports_vision: bool) -> Self {
+        self.supports_vision = supports_vision;
         self
     }
 
@@ -260,7 +267,7 @@ impl AgentRuntime {
         publisher: Arc<dyn EventPublisher>,
     ) -> Result<TurnOutcome, AgentRuntimeError> {
         let input = validate_input(&request.input, !attachments.is_empty())?;
-        let message = user_message(input, attachments)?;
+        let message = user_message(input, attachments, self.supports_vision)?;
         let agent_mode = request
             .agent_mode
             .as_deref()
@@ -323,7 +330,8 @@ impl AgentRuntime {
         &self,
         thread_id: &str,
     ) -> Result<CompactionSummary, AgentRuntimeError> {
-        let history = provider_history(self.repository.load(thread_id).await?);
+        let history =
+            provider_history(self.repository.load(thread_id).await?, self.supports_vision);
         let (summary, _) = context::compact(&history, self.context_limit);
         if summary.compacted_message_count > 0 {
             self.repository
@@ -464,7 +472,7 @@ impl AgentRuntime {
 
             let events = self.repository.load(&thread_id).await?;
             let last_context_usage = last_active_context_usage(&events);
-            let mut history = provider_history(events);
+            let mut history = provider_history(events, self.supports_vision);
             if context::needs_compaction(&history, self.context_limit)
                 || last_context_usage.is_some_and(|usage| {
                     context::needs_compaction_for_usage(usage.total_tokens, self.context_limit)
@@ -472,16 +480,27 @@ impl AgentRuntime {
             {
                 let (summary, compacted) = context::compact(&history, self.context_limit);
                 if summary.compacted_message_count > 0 {
+                    let compaction_event = StoredEvent::new(
+                        &thread_id,
+                        Some(turn_id.clone()),
+                        StoredEventKind::ContextCompacted {
+                            summary: summary.clone(),
+                            automatic: true,
+                        },
+                    );
+                    let item_id = compaction_event.event_id.clone();
                     self.repository
-                        .append(StoredEvent::new(
-                            &thread_id,
-                            Some(turn_id.clone()),
-                            StoredEventKind::ContextCompacted {
-                                summary,
-                                automatic: true,
-                            },
-                        ))
+                        .append(compaction_event)
                         .await?;
+                    publisher.publish(AgentEventEnvelope::new(AgentEvent::ContextCompacted {
+                        thread_id: thread_id.clone(),
+                        turn_id: turn_id.clone(),
+                        item_id,
+                        automatic: true,
+                        compacted_message_count: summary.compacted_message_count,
+                        user_constraint_count: summary.user_constraints.len(),
+                        recent_tool_result_count: summary.recent_tool_results.len(),
+                    }));
                     history = compacted;
                 }
             }
@@ -1773,12 +1792,14 @@ impl AgentRuntime {
     }
 }
 
-fn provider_history(events: Vec<StoredEvent>) -> Vec<ProviderMessage> {
+fn provider_history(events: Vec<StoredEvent>, supports_vision: bool) -> Vec<ProviderMessage> {
     let mut history = Vec::new();
     for event in events {
         let message = match event.kind {
             StoredEventKind::UserMessage { message }
-            | StoredEventKind::AssistantMessage { message } => chat_to_provider(message),
+            | StoredEventKind::AssistantMessage { message } => {
+                chat_to_provider(message, supports_vision)
+            }
             StoredEventKind::AssistantToolCalls { text, calls } => {
                 Some(ProviderMessage::AssistantToolCalls { text, calls })
             }
@@ -1985,6 +2006,7 @@ fn text_message(role: MessageRole, text: String) -> ChatMessage {
 fn user_message(
     text: String,
     attachments: Vec<ImageAttachment>,
+    supports_vision: bool,
 ) -> Result<ChatMessage, AgentRuntimeError> {
     if attachments.len() > MAX_IMAGE_COUNT {
         return Err(AgentRuntimeError::InvalidInput(format!(
@@ -1994,7 +2016,11 @@ fn user_message(
     let mut total = 0usize;
     let mut content = if text.is_empty() {
         vec![ContentBlock::Context {
-            text: "请分析用户提供的图片。".into(),
+            text: if supports_vision {
+                "请分析用户提供的图片。".into()
+            } else {
+                "请根据本地图片文字识别结果回答。".into()
+            },
         }]
     } else {
         vec![ContentBlock::Text { text }]
@@ -2017,12 +2043,17 @@ fn user_message(
                 "attached images exceed the 8 MiB total limit".into(),
             ));
         }
-        if let Some(ocr_text) = attachment
+        let ocr_text = attachment
             .ocr_text
             .as_deref()
             .map(str::trim)
-            .filter(|text| !text.is_empty())
-        {
+            .filter(|text| !text.is_empty());
+        if !supports_vision && ocr_text.is_none() {
+            return Err(AgentRuntimeError::InvalidInput(format!(
+                "the selected model does not support images and local OCR produced no text for {name}"
+            )));
+        }
+        if let Some(ocr_text) = ocr_text {
             let ocr_text = truncate_utf8(ocr_text, MAX_OCR_TEXT_BYTES);
             content.push(ContentBlock::Context {
                 text: format!("\n\n[图片文字识别: {name}]\n{ocr_text}"),
@@ -2072,13 +2103,16 @@ fn parse_image_data_url(value: &str) -> Result<(&str, &str), AgentRuntimeError> 
     Ok((media_type, encoded))
 }
 
-fn chat_to_provider(message: ChatMessage) -> Option<ProviderMessage> {
+fn chat_to_provider(message: ChatMessage, supports_vision: bool) -> Option<ProviderMessage> {
     let text = message.text();
     let images = message
         .content
         .into_iter()
         .filter_map(|block| match block {
-            ContentBlock::Image { name, data_url } => Some(ProviderImage { name, data_url }),
+            ContentBlock::Image { name, data_url } if supports_vision => {
+                Some(ProviderImage { name, data_url })
+            }
+            ContentBlock::Image { .. } => None,
             ContentBlock::Text { .. } | ContentBlock::Context { .. } => None,
         })
         .collect::<Vec<_>>();
@@ -2142,26 +2176,62 @@ mod tests {
 
     #[test]
     fn validates_and_maps_bounded_image_attachments() {
-        let message = user_message(
+        let vision_message = user_message(
+            "inspect this screenshot".into(),
+            vec![ImageAttachment {
+                name: "screen.png".into(),
+                data_url: "data:image/png;base64,iVBORw0KGgo=".into(),
+                ocr_text: None,
+            }],
+            true,
+        )
+        .unwrap();
+        assert!(matches!(
+            &vision_message.content[1],
+            ContentBlock::Image { name, .. } if name == "screen.png"
+        ));
+        assert!(matches!(
+            chat_to_provider(vision_message, true),
+            Some(ProviderMessage::UserContent { text, images })
+                if text == "inspect this screenshot" && images.len() == 1
+        ));
+
+        let ocr_message = user_message(
             "inspect this screenshot".into(),
             vec![ImageAttachment {
                 name: "screen.png".into(),
                 data_url: "data:image/png;base64,iVBORw0KGgo=".into(),
                 ocr_text: Some("compiler error E0308".into()),
             }],
+            false,
         )
         .unwrap();
         assert!(matches!(
-            &message.content[1],
+            &ocr_message.content[1],
             ContentBlock::Context { text } if text.contains("compiler error E0308")
         ));
         assert!(matches!(
-            chat_to_provider(message),
-            Some(ProviderMessage::UserContent { text, images })
+            &ocr_message.content[2],
+            ContentBlock::Image { name, .. } if name == "screen.png"
+        ));
+        assert!(matches!(
+            chat_to_provider(ocr_message, false),
+            Some(ProviderMessage::Text { role: MessageRole::User, text })
                 if text.contains("inspect this screenshot")
                     && text.contains("compiler error E0308")
-                    && images.len() == 1
         ));
+        assert!(
+            user_message(
+                "missing OCR".into(),
+                vec![ImageAttachment {
+                    name: "screen.png".into(),
+                    data_url: "data:image/png;base64,iVBORw0KGgo=".into(),
+                    ocr_text: None,
+                }],
+                false,
+            )
+            .is_err()
+        );
         assert!(
             user_message(
                 "bad image".into(),
@@ -2170,6 +2240,7 @@ mod tests {
                     data_url: "data:image/svg+xml;base64,PHN2Zy8+".into(),
                     ocr_text: None,
                 }],
+                true,
             )
             .is_err()
         );
@@ -2181,10 +2252,11 @@ mod tests {
                 data_url: "data:image/png;base64,iVBORw0KGgo=".into(),
                 ocr_text: None,
             }],
+            true,
         )
         .unwrap();
         assert!(matches!(
-            chat_to_provider(image_only),
+            chat_to_provider(image_only, true),
             Some(ProviderMessage::UserContent { text, images })
                 if text == "请分析用户提供的图片。" && images.len() == 1
         ));
@@ -3169,6 +3241,7 @@ mod tests {
             ],
         ]));
 
+        let publisher = Arc::new(RecordingPublisher::default());
         let outcome = runtime
             .with_context_limit(10_000)
             .run_turn(
@@ -3180,7 +3253,7 @@ mod tests {
                     agent_mode: None,
                 },
                 CancellationToken::new(),
-                Arc::new(RecordingPublisher::default()),
+                publisher.clone(),
             )
             .await
             .unwrap();
@@ -3198,6 +3271,21 @@ mod tests {
                         automatic: true,
                         ..
                     }
+                ))
+        );
+        assert!(
+            publisher
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| matches!(
+                    &event.event,
+                    AgentEvent::ContextCompacted {
+                        automatic: true,
+                        compacted_message_count,
+                        ..
+                    } if *compacted_message_count > 0
                 ))
         );
         let requests = provider.requests();
@@ -3219,14 +3307,17 @@ mod tests {
             }],
             compacted_message_count: 10,
         };
-        let history = provider_history(vec![StoredEvent::new(
-            "thread",
-            None,
-            StoredEventKind::ContextCompacted {
-                summary,
-                automatic: true,
-            },
-        )]);
+        let history = provider_history(
+            vec![StoredEvent::new(
+                "thread",
+                None,
+                StoredEventKind::ContextCompacted {
+                    summary,
+                    automatic: true,
+                },
+            )],
+            false,
+        );
 
         assert!(matches!(
             history.as_slice(),
@@ -3251,29 +3342,32 @@ mod tests {
                 metadata: json!({}),
             },
         ];
-        let history = provider_history(vec![
-            StoredEvent::new(
-                "thread",
-                Some("interrupted-turn".to_string()),
-                StoredEventKind::AssistantToolCalls {
-                    text: "Inspecting files".to_string(),
-                    calls,
-                },
-            ),
-            StoredEvent::new(
-                "thread",
-                Some("interrupted-turn".to_string()),
-                StoredEventKind::ToolResult {
-                    call_id: "call-a".to_string(),
-                    name: "read_file".to_string(),
-                    result: ToolResult {
-                        success: true,
-                        output: "a".to_string(),
-                        metadata: json!({}),
+        let history = provider_history(
+            vec![
+                StoredEvent::new(
+                    "thread",
+                    Some("interrupted-turn".to_string()),
+                    StoredEventKind::AssistantToolCalls {
+                        text: "Inspecting files".to_string(),
+                        calls,
                     },
-                },
-            ),
-        ]);
+                ),
+                StoredEvent::new(
+                    "thread",
+                    Some("interrupted-turn".to_string()),
+                    StoredEventKind::ToolResult {
+                        call_id: "call-a".to_string(),
+                        name: "read_file".to_string(),
+                        result: ToolResult {
+                            success: true,
+                            output: "a".to_string(),
+                            metadata: json!({}),
+                        },
+                    },
+                ),
+            ],
+            false,
+        );
 
         assert!(matches!(
             history.as_slice(),

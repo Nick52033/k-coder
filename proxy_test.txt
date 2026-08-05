@@ -1,0 +1,5 @@
+curl: (7) Failed to connect to github.com:443 over proxy 127.0.0.1 after 2050 ms: Could not connect to server
+curl: (3) URL rejected: Malformed input to a URL function
+curl: (7) Failed to connect to 127.0.0.1:7890 over proxy 127.0.0.1 after 2051 ms: Could not connect to server
+curl: (7) Failed to connect to 127.0.0.1:7890 over proxy 127.0.0.1 after 2028 ms: Could not connect to server
+curl: (7) Failed to connect to 127.0.0.1:7890 over proxy 127.0.0.1 after 2038 ms: Could not connect to server

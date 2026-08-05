@@ -8,9 +8,7 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::execution::{
-    CommandMode, CommandRuntime, CommandState, OutputStream, StartCommandRequest,
-};
+use crate::execution::{CommandRuntime, CommandState, OutputStream};
 use crate::patch::{PatchError, PatchService};
 use crate::policy::{
     AllowRegisteredTools, ExecutionWorkspacePolicy, PolicyDecision, PolicyEngine,
@@ -836,9 +834,7 @@ struct RunCommandTool {
 
 #[derive(Deserialize)]
 struct RunCommandArguments {
-    program: String,
-    #[serde(default)]
-    args: Vec<String>,
+    command: String,
     #[serde(default)]
     cwd: String,
     #[serde(default = "default_command_timeout_ms")]
@@ -852,18 +848,26 @@ fn default_command_timeout_ms() -> u64 {
 #[async_trait]
 impl ToolHandler for RunCommandTool {
     fn definition(&self) -> ToolDefinition {
+        let description = match self.runtime.default_shell_name() {
+            "powershell" => {
+                "Run a PowerShell command in the workspace and return its output. Use PowerShell syntax such as Get-Content, Get-ChildItem, Select-String, and $env:NAME. The runtime prefers pwsh and falls back to Windows PowerShell."
+            }
+            "cmd" => "Run a Command Prompt command in the workspace and return its output.",
+            _ => {
+                "Run a command in the user's default shell inside the workspace and return its output."
+            }
+        };
         ToolDefinition {
             name: "run_command".to_string(),
-            description: "Run one project build or test program using a structured executable and argument array. Do not place shell pipelines or chained commands in arguments.".to_string(),
+            description: description.to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "program": { "type": "string", "minLength": 1, "maxLength": 260 },
-                    "args": { "type": "array", "items": { "type": "string", "maxLength": 8192 }, "maxItems": 128 },
+                    "command": { "type": "string", "minLength": 1, "maxLength": 65536, "pattern": "\\S", "description": "Shell command to execute." },
                     "cwd": { "type": "string", "maxLength": 1024, "description": WORKSPACE_RELATIVE_PATH_DESCRIPTION },
                     "timeoutMs": { "type": "integer", "minimum": 1, "maximum": 3600000 }
                 },
-                "required": ["program"],
+                "required": ["command"],
                 "additionalProperties": false
             }),
         }
@@ -877,17 +881,18 @@ impl ToolHandler for RunCommandTool {
     ) -> Result<ToolResult, ToolError> {
         let arguments: RunCommandArguments = serde_json::from_value(arguments)
             .map_err(|error| ToolError::InvalidArguments(error.to_string()))?;
+        if arguments.command.trim().is_empty() {
+            return Err(ToolError::InvalidArguments(
+                "command must not be empty".to_string(),
+            ));
+        }
+        let shell = self.runtime.default_shell_name();
+        let request =
+            self.runtime
+                .shell_request(&arguments.command, arguments.cwd, arguments.timeout_ms);
         let session = self
             .runtime
-            .start(StartCommandRequest {
-                program: arguments.program,
-                args: arguments.args,
-                cwd: arguments.cwd,
-                env: HashMap::new(),
-                mode: CommandMode::Foreground,
-                timeout_ms: Some(arguments.timeout_ms),
-                buffer_bytes: None,
-            })
+            .start(request)
             .await
             .map_err(|error| ToolError::Execution(error.to_string()))?;
         let id = session.id;
@@ -961,6 +966,7 @@ impl ToolHandler for RunCommandTool {
             "startedAtMs": status.started_at_ms,
             "finishedAtMs": status.finished_at_ms,
             "durationMs": duration_ms,
+            "shell": shell,
             "outputTruncated": status.output_truncated,
             "nextCursor": output.next_cursor,
             "outputChunks": output_chunks
@@ -1277,6 +1283,29 @@ mod tests {
         assert_eq!(result, Err(ToolError::UnknownTool("shell".to_string())));
     }
 
+    #[test]
+    fn run_command_schema_exposes_the_default_shell_contract() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = CommandRuntime::new(directory.path()).unwrap();
+        let definition = RunCommandTool { runtime }.definition();
+        let validator = jsonschema::validator_for(&definition.input_schema).unwrap();
+
+        assert!(
+            validator
+                .validate(&json!({ "command": "cargo test" }))
+                .is_ok()
+        );
+        assert!(
+            validator
+                .validate(&json!({ "program": "cargo", "args": ["test"] }))
+                .is_err()
+        );
+        assert!(validator.validate(&json!({ "command": "   " })).is_err());
+        if cfg!(windows) {
+            assert!(definition.description.contains("PowerShell"));
+        }
+    }
+
     #[tokio::test]
     async fn run_command_streams_redacted_stdout_and_stderr_progress() {
         let directory = tempfile::tempdir().unwrap();
@@ -1288,17 +1317,11 @@ mod tests {
 
         #[cfg(windows)]
         let arguments = json!({
-            "program": "powershell",
-            "args": [
-                "-NoProfile",
-                "-Command",
-                "[Console]::Out.WriteLine('ready'); [Console]::Error.WriteLine('API_KEY=secret')"
-            ]
+            "command": "[Console]::Out.WriteLine('ready'); [Console]::Error.WriteLine('API_KEY=secret')"
         });
         #[cfg(not(windows))]
         let arguments = json!({
-            "program": "sh",
-            "args": ["-c", "printf 'ready\\n'; printf 'API_KEY=secret\\n' >&2"]
+            "command": "printf 'ready\\n'; printf 'API_KEY=secret\\n' >&2"
         });
 
         let result = tool
@@ -1309,6 +1332,7 @@ mod tests {
         assert!(result.metadata["startedAtMs"].as_u64().is_some());
         assert!(result.metadata["finishedAtMs"].as_u64().is_some());
         assert!(result.metadata["durationMs"].as_u64().is_some());
+        assert!(result.metadata["shell"].as_str().is_some());
         let persisted = result.metadata["outputChunks"].as_array().unwrap();
         assert!(persisted.iter().any(|chunk| {
             chunk["stream"] == "stdout"
@@ -1350,11 +1374,10 @@ mod tests {
         let tool_context = context(directory.path());
         let arguments = if cfg!(windows) {
             json!({
-                "program": "powershell",
-                "args": ["-NoProfile", "-Command", "Start-Sleep -Seconds 30"]
+                "command": "Start-Sleep -Seconds 30"
             })
         } else {
-            json!({ "program": "sleep", "args": ["30"] })
+            json!({ "command": "sleep 30" })
         };
         let task = tokio::spawn({
             let cancellation = cancellation.clone();

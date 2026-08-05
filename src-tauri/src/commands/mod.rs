@@ -201,7 +201,7 @@ fn build_system_prompt(
     let mut sections = Vec::<String>::new();
 
     // 1. identity — 固定的身份指令
-    sections.push("<identity>\n你是 k-Coder，一个专业的 AI 编码助手。你运行在用户的桌面环境中，可以读写文件、执行命令、搜索代码库。\n\n**重要**：请始终用中文回复用户。执行多步骤任务时，在第一次工具调用前和工作阶段切换时输出简短、具体的进度说明，让用户知道你正在做什么以及已确认什么。进度说明不是隐藏推理过程，不要输出私有思维链或逐步内心推演。\n</identity>".to_string());
+    sections.push("<identity>\n你是 k-Coder，一个专业的 AI 编码助手。你运行在用户的桌面环境中，可以读写文件、执行命令、搜索代码库。\n\n**重要**：请始终用中文回复用户。执行多步骤任务时，把简短、具体的进度说明自然穿插在工具调用之间：第一次调用工具前说明当前目标；完成一组探索、修改或验证工具后，在开始下一组工具前说明刚确认的事实和下一步。不要让长任务退化为连续多轮“模型调用 + 工具调用”而没有用户可见的阶段沟通，也不要为了凑频率逐条复述每个命令。进度说明只包含动作、已确认事实和下一步，不是隐藏推理过程；不要输出私有思维链或逐步内心推演。\n</identity>".to_string());
 
     // 2. workspace — 工作区信息
     // 移除 Windows 扩展路径前缀 \\?\ 避免 JSON 转义问题
@@ -1022,8 +1022,21 @@ pub async fn run_turn(
     attachments: Vec<ImageAttachment>,
 ) -> CommandResult<TurnOutcome> {
     let mut attachments = attachments;
-    enrich_image_attachments(&app, &mut attachments).await;
+    let has_image_attachments = !attachments.is_empty();
     let thread_id = request.thread_id.clone();
+    let history_has_images = state
+        .repository()
+        .read_thread(&thread_id)
+        .await
+        .map_err(|error| CommandError::new("storage", error))?
+        .messages
+        .iter()
+        .any(|message| {
+            message
+                .content
+                .iter()
+                .any(|block| matches!(block, crate::protocol::ContentBlock::Image { .. }))
+        });
     state
         .prepare_extensions(false)
         .await
@@ -1078,8 +1091,22 @@ pub async fn run_turn(
         "turn_requested",
         serde_json::json!({"threadId": thread_id}),
     );
-    let (provider, model, context_limit) = state
-        .build_provider()
+    let supports_vision = state
+        .active_model_supports_vision()
+        .map_err(|error| CommandError::new("provider_config", error))?;
+    if supports_vision {
+        for attachment in &mut attachments {
+            attachment.ocr_text = None;
+        }
+    } else if has_image_attachments {
+        enrich_image_attachments(&app, &mut attachments).await?;
+    }
+    let (provider, model, context_limit) =
+        if supports_vision && (has_image_attachments || history_has_images) {
+            state.build_vision_provider()
+        } else {
+            state.build_provider()
+        }
         .map_err(|error| CommandError::new("provider_config", error))?;
     let cancellation = state
         .begin_turn(&thread_id)
@@ -1120,6 +1147,7 @@ pub async fn run_turn(
     .with_context_limit(context_limit)
     .with_metrics(advanced.metrics.clone())
     .with_reasoning_effort(state.reasoning_effort())
+    .with_vision_support(supports_vision)
     .with_user_inputs(state.user_inputs())
     .with_logger(state.logger());
     if let Some((_, Some(remaining_tokens))) = &goal_budget {
@@ -1178,16 +1206,31 @@ pub async fn retry_turn(
         .await
         .map_err(|error| CommandError::new("storage", error))?;
     let agent_mode = retry_mode(&events);
-    let retry_input = repository
+    let thread_detail = repository
         .read_thread(&thread_id)
         .await
-        .map_err(|error| CommandError::new("storage", error))?
+        .map_err(|error| CommandError::new("storage", error))?;
+    let history_has_images = thread_detail.messages.iter().any(|message| {
+        message
+            .content
+            .iter()
+            .any(|block| matches!(block, crate::protocol::ContentBlock::Image { .. }))
+    });
+    let retry_message = thread_detail
         .messages
         .into_iter()
         .rev()
-        .find(|message| message.role == MessageRole::User)
+        .find(|message| message.role == MessageRole::User);
+    let retry_input = retry_message
+        .as_ref()
         .map(|message| message.text())
         .unwrap_or_default();
+    let retry_has_images = retry_message.as_ref().is_some_and(|message| {
+        message
+            .content
+            .iter()
+            .any(|block| matches!(block, crate::protocol::ContentBlock::Image { .. }))
+    });
     let advanced = state.advanced();
     let extension_instructions = state
         .extension_instructions(&retry_input)
@@ -1221,9 +1264,32 @@ pub async fn retry_turn(
         .map_err(|error| CommandError::new("goal", error))?
         .filter(|goal| goal.state == crate::advanced::GoalState::Active)
         .map(|goal| goal.time_budget_ms.saturating_sub(goal.elapsed_ms));
-    let (provider, model, context_limit) = state
-        .build_provider()
+    let supports_vision = state
+        .active_model_supports_vision()
         .map_err(|error| CommandError::new("provider_config", error))?;
+    if retry_has_images
+        && !supports_vision
+        && retry_message.as_ref().is_some_and(|message| {
+            !message.content.iter().any(|block| {
+                matches!(
+                    block,
+                    crate::protocol::ContentBlock::Context { text }
+                        if text.contains("[图片文字识别:")
+                )
+            })
+        })
+    {
+        return Err(CommandError::new(
+            "ocr",
+            "当前模型不支持图片，且原消息没有可用的本地 OCR 结果",
+        ));
+    }
+    let (provider, model, context_limit) = if supports_vision && history_has_images {
+        state.build_vision_provider()
+    } else {
+        state.build_provider()
+    }
+    .map_err(|error| CommandError::new("provider_config", error))?;
     let cancellation = state
         .begin_turn(&thread_id)
         .await
@@ -1246,6 +1312,7 @@ pub async fn retry_turn(
     .with_context_limit(context_limit)
     .with_metrics(advanced.metrics.clone())
     .with_reasoning_effort(state.reasoning_effort())
+    .with_vision_support(supports_vision)
     .with_user_inputs(state.user_inputs())
     .with_logger(state.logger());
     if let Some((_, Some(remaining_tokens))) = &goal_budget {
@@ -1670,30 +1737,33 @@ fn ocr_resource_dir(app: &AppHandle) -> CommandResult<std::path::PathBuf> {
     })
 }
 
-async fn enrich_image_attachments(app: &AppHandle, attachments: &mut [ImageAttachment]) {
-    let Ok(resource_dir) = ocr_resource_dir(app) else {
-        return;
-    };
+async fn enrich_image_attachments(
+    app: &AppHandle,
+    attachments: &mut [ImageAttachment],
+) -> CommandResult<()> {
+    let resource_dir = ocr_resource_dir(app)?;
     for attachment in attachments.iter_mut() {
-        if attachment
-            .ocr_text
-            .as_deref()
-            .is_some_and(|text| !text.trim().is_empty())
-        {
-            continue;
-        }
+        attachment.ocr_text = None;
         let data_url = attachment.data_url.clone();
         let resource_dir = resource_dir.clone();
         let result = tauri::async_runtime::spawn_blocking(move || {
             ocr::recognize_data_url(&data_url, &resource_dir)
         })
-        .await;
-        if let Ok(Ok(result)) = result {
-            if !result.text.trim().is_empty() {
-                attachment.ocr_text = Some(result.text);
-            }
+        .await
+        .map_err(|error| CommandError::new("ocr", error.to_string()))?
+        .map_err(|error| CommandError::new("ocr", error))?;
+        if result.text.trim().is_empty() {
+            return Err(CommandError::new(
+                "ocr",
+                format!(
+                    "当前模型不支持图片，本地 OCR 未能从 {} 识别出文字",
+                    attachment.name
+                ),
+            ));
         }
+        attachment.ocr_text = Some(result.text);
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1709,6 +1779,9 @@ mod tests {
         assert!(CRAFT_MODE_INSTRUCTIONS.contains("request_user_input"));
         assert!(CRAFT_MODE_INSTRUCTIONS.contains("暂停当前 Turn"));
         assert!(CRAFT_MODE_INSTRUCTIONS.contains("破坏性操作"));
+        assert!(CRAFT_MODE_INSTRUCTIONS.contains("apply_patch"));
+        assert!(CRAFT_MODE_INSTRUCTIONS.contains("不得用普通助手正文"));
+        assert!(CRAFT_MODE_INSTRUCTIONS.contains("unified diff"));
     }
 
     #[test]
@@ -1720,6 +1793,15 @@ mod tests {
         assert!(prompt.contains("工作区根目录使用 `.`"));
         assert!(prompt.contains("不得把上面的绝对路径传给工具"));
         assert!(prompt.contains("不得使用 `..`"));
+    }
+
+    #[test]
+    fn system_prompt_requires_interleaved_progress_without_private_reasoning() {
+        let prompt = build_system_prompt(Path::new(r"D:\code\k-coder"), "", "", "", "", &[]);
+
+        assert!(prompt.contains("自然穿插在工具调用之间"));
+        assert!(prompt.contains("刚确认的事实和下一步"));
+        assert!(prompt.contains("不要输出私有思维链"));
     }
 
     #[test]

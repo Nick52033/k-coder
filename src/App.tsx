@@ -36,7 +36,7 @@ import {
   ImageIcon,
 } from "lucide-react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { getRuntimeStatus, switchWorkspace, subscribeToAgentEvents, listSubagents, recognizeImage } from "./api/runtime";
+import { getRuntimeStatus, switchWorkspace, subscribeToAgentEvents, listSubagents } from "./api/runtime";
 import { useWorkbenchStore } from "./stores/workbenchStore";
 import { PatchReviewDialog } from "./components/PatchReviewDialog";
 import { SettingsDialog, type SettingsSection } from "./components/SettingsDialog";
@@ -49,10 +49,11 @@ import { ReasoningSelector } from "./components/ReasoningSelector";
 import { TodoList } from "./components/TodoList";
 import { ConversationTurnActivity } from "./components/ConversationActivity";
 import { MarkdownContent } from "./components/MarkdownContent";
+import { ImagePreviewDialog } from "./components/ImagePreviewDialog";
 import { cn } from "./lib/cn";
 import { open } from "@tauri-apps/plugin-dialog";
 import { readFile } from "@tauri-apps/plugin-fs";
-import type { AttachmentContent, GoalView, RuntimeStatus } from "./types/runtime";
+import type { AttachmentContent, GoalView, ImageAttachment, RuntimeStatus } from "./types/runtime";
 import "./App.css";
 import "./enhanced-animations.css"; // UI 增强动画
 import "./components/ModeSelector.css";
@@ -102,8 +103,7 @@ function App() {
   const [settingsSection, setSettingsSection] = useState<SettingsSection>("providers");
   const [selectedChangeId, setSelectedChangeId] = useState<string | null>(null);
   const [attachments, setAttachments] = useState<AttachmentContent[]>([]);
-  const ocrTasksRef = useRef(new Map<string, Promise<string>>());
-  const ocrResultsRef = useRef(new Map<string, string>());
+  const [previewImage, setPreviewImage] = useState<ImageAttachment | null>(null);
   const [threadQuery, setThreadQuery] = useState("");
   const [workbenchOpen, setWorkbenchOpen] = useState(false);
   const [agentPanelOpen, setAgentPanelOpen] = useState(false);
@@ -132,9 +132,8 @@ function App() {
     activeThreadId,
     messages,
     lastTurn,
-    activeTurnId,
-    activeTurnThreadId,
     activeTurns,
+    cancellingTurns,
     usage,
     turnTimeline,
     turnUserMessageIds,
@@ -401,7 +400,13 @@ function App() {
   const activeThread = threads.find((thread) => thread.id === activeThreadId) ?? null;
   const selectedChange = changes.find((change) => change.id === selectedChangeId) ?? null;
   // 仅当正在生成的 turn 属于当前线程时才视为"忙"，避免旧线程的 turn 阻塞新对话
-  const currentThreadBusy = Boolean(activeTurnId) && activeTurnThreadId === activeThreadId;
+  const currentThreadTurnId = activeThreadId ? activeTurns[activeThreadId] ?? null : null;
+  const currentThreadBusy = Boolean(currentThreadTurnId);
+  const currentThreadCancelling = Boolean(
+    activeThreadId
+    && currentThreadTurnId
+    && cancellingTurns[activeThreadId] === currentThreadTurnId,
+  );
   const anyTurnBusy = Object.keys(activeTurns).length > 0;
   const retryable = !currentThreadBusy && ["failed", "cancelled"].includes(lastTurn?.state ?? "");
   const toolActivities = turnTimeline.flatMap((item) => item.type === "tool" ? [item.activity] : []);
@@ -458,7 +463,7 @@ function App() {
     (message) => message.role === "assistant" && message.turnId,
   )?.turnId;
   const planTurnId = plan?.steps.length
-    ? latestPlanActivity?.turnId ?? (currentThreadBusy ? activeTurnId : latestAssistantTurnId)
+    ? latestPlanActivity?.turnId ?? (currentThreadBusy ? currentThreadTurnId : latestAssistantTurnId)
     : null;
   const orphanTurnIds = [...new Set([...activitiesByTurn.keys(), ...timelineByTurn.keys()])]
     .filter((turnId) => !representedTurnIds.has(turnId) && !groupedRetryTurnIds.has(turnId));
@@ -497,7 +502,7 @@ function App() {
             timeline={timelineByTurn.get(turnId) ?? []}
             changes={changes}
             plan={turnId === planTurnId ? plan : null}
-            streaming={turnId === activeTurnId}
+            streaming={turnId === currentThreadTurnId}
             activityStatus={turnId === activityStatus?.turnId ? activityStatus.status : null}
             renderText={renderMessageText}
           />
@@ -564,7 +569,7 @@ function App() {
                   timeline={attemptTimeline}
                   changes={changes}
                   plan={attemptPlan}
-                  streaming={turnId === activeTurnId}
+                  streaming={turnId === currentThreadTurnId}
                   activityStatus={attemptActivityStatus}
                   finalMessageId={assistantMessage?.id}
                   renderText={renderMessageText}
@@ -583,42 +588,11 @@ function App() {
     );
   }
 
-  function startAttachmentOcr(path: string, dataUrl: string) {
-    const task = recognizeImage(dataUrl)
-      .then((result) => {
-        ocrResultsRef.current.set(path, result.text);
-        setAttachments((items) => items.map((item) => item.path === path
-          ? {
-              ...item,
-              ocrStatus: "complete",
-              ocrText: result.text,
-              ocrLineCount: result.lineCount,
-              ocrDurationMs: result.durationMs,
-              ocrError: undefined,
-            }
-          : item));
-        return result.text;
-      })
-      .catch((error: unknown) => {
-        const message = typeof error === "string" ? error : error instanceof Error ? error.message : "图片文字识别失败";
-        ocrResultsRef.current.set(path, "");
-        setAttachments((items) => items.map((item) => item.path === path
-          ? { ...item, ocrStatus: "failed", ocrError: message }
-          : item));
-        return "";
-      });
-    ocrTasksRef.current.set(path, task);
-    void task.finally(() => {
-      if (ocrTasksRef.current.get(path) === task) ocrTasksRef.current.delete(path);
-    });
-  }
-
   function addImageAttachment(attachment: AttachmentContent) {
     setAttachments((items) => {
       if (items.some((item) => item.path === attachment.path)) return items;
-      return [...items, { ...attachment, ocrStatus: "processing" }];
+      return [...items, attachment];
     });
-    startAttachmentOcr(attachment.path, attachment.content);
   }
 
   async function submitMessage(event: FormEvent) {
@@ -628,22 +602,12 @@ function App() {
     const attachmentContext = attachments.filter((attachment) => attachment.kind === "document").map((attachment) =>
       `\n\n[附件: ${attachment.name}]\n${attachment.content}`,
     ).join("");
-    const imageAttachments = await Promise.all(attachments
+    const imageAttachments = attachments
       .filter((attachment) => attachment.kind === "image")
-      .map(async (attachment) => {
-        // Prefer the local result cache, then wait for an in-flight OCR task.
-        // React state can lag behind a completed promise when the user sends immediately.
-        const text = attachment.ocrText
-          || ocrResultsRef.current.get(attachment.path)
-          || await (ocrTasksRef.current.get(attachment.path) ?? Promise.resolve(""));
-        return {
-          name: attachment.name,
-          dataUrl: attachment.content,
-          ocrText: text?.trim() || undefined,
-        };
+      .map((attachment) => ({
+        name: attachment.name,
+        dataUrl: attachment.content,
       }));
-    attachments.forEach((attachment) => ocrTasksRef.current.delete(attachment.path));
-    attachments.forEach((attachment) => ocrResultsRef.current.delete(attachment.path));
     setDraft("");
     setAttachments([]);
     if (currentThreadBusy) setQueueExpanded(true);
@@ -1192,7 +1156,7 @@ function App() {
           <div>
             <h1>{activeThread?.title ?? "新会话"}</h1>
             <span className="mode-label">
-              {currentThreadBusy ? "正在生成" : usage ? `${usage.totalTokens} tokens` : "纯文本对话"}
+              {currentThreadCancelling ? "正在停止" : currentThreadBusy ? "正在生成" : usage ? `${usage.totalTokens} tokens` : "纯文本对话"}
             </span>
           </div>
         </div>
@@ -1238,10 +1202,17 @@ function App() {
                       {message.role === "user" && message.attachments?.length ? (
                         <div className="message-attachments" aria-label="图片附件">
                           {message.attachments.map((attachment, index) => (
-                            <span className="message-image-attachment" key={`${message.id}-${index}-${attachment.name}`} title={attachment.name}>
-                              <ImageIcon size={15} />
+                            <button
+                              className="message-image-attachment"
+                              type="button"
+                              key={`${message.id}-${index}-${attachment.name}`}
+                              aria-label={`查看图片 ${attachment.name}`}
+                              title={`查看 ${attachment.name}`}
+                              onClick={() => setPreviewImage(attachment)}
+                            >
+                              <img src={attachment.dataUrl} alt="" />
                               <span>{attachment.name}</span>
-                            </span>
+                            </button>
                           ))}
                         </div>
                       ) : null}
@@ -1619,12 +1590,17 @@ function App() {
             />
             <div className="composer-actions">
               {currentThreadBusy && (
-                <button className="stop-button" type="button" aria-label="停止生成" title="停止生成" onClick={() => void stopTurn()}>
-                  {lastTurn?.state === "streaming" ? (
-                    <Loader2 className="spin" size={16} />
-                  ) : (
-                    <Square size={15} fill="currentColor" />
-                  )}
+                <button
+                  className="stop-button"
+                  type="button"
+                  aria-label={currentThreadCancelling ? "正在停止" : "停止生成"}
+                  title={currentThreadCancelling ? "正在停止" : "停止生成"}
+                  disabled={currentThreadCancelling}
+                  onClick={() => void stopTurn()}
+                >
+                  {currentThreadCancelling
+                    ? <Loader2 className="spin" size={16} />
+                    : <Square size={15} fill="currentColor" />}
                 </button>
               )}
               <button
@@ -1643,6 +1619,7 @@ function App() {
 
       <WorkbenchPanel key={workspaceRevision} open={workbenchOpen} onAttach={(attachment) => setAttachments((items) => items.some((item) => item.path === attachment.path) ? items : [...items, attachment])} />
       <AgentActivityPanel open={agentPanelOpen} parentThreadId={activeThreadId} onClose={() => setAgentPanelOpen(false)} />
+      <ImagePreviewDialog image={previewImage} onClose={() => setPreviewImage(null)} />
       <aside className="activity-panel activity-panel--overlay" aria-hidden="true">
         <div className="activity-list activity-list--hidden">
           <div className="activity-row">

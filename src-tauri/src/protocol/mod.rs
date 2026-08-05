@@ -400,7 +400,7 @@ impl AgentEvent {
             Self::TurnCompleted { .. } => TurnPhase::Complete,
             Self::TurnFailed { .. } => TurnPhase::Failed,
             Self::TurnCancelled { .. } => TurnPhase::Cancelled,
-            Self::UsageUpdated { .. } => TurnPhase::Executing,
+            Self::UsageUpdated { .. } | Self::ContextCompacted { .. } => TurnPhase::Executing,
             Self::TodoUpdated { .. } => TurnPhase::Planning,
         }
     }
@@ -443,6 +443,15 @@ pub enum AgentEvent {
         thread_id: String,
         turn_id: String,
         usage: TokenUsage,
+    },
+    ContextCompacted {
+        thread_id: String,
+        turn_id: String,
+        item_id: String,
+        automatic: bool,
+        compacted_message_count: usize,
+        user_constraint_count: usize,
+        recent_tool_result_count: usize,
     },
     ToolStarted {
         thread_id: String,
@@ -713,5 +722,28 @@ mod tests {
         assert_eq!(value["callId"], "call-1");
         assert_eq!(value["stream"], "stderr");
         assert_eq!(value["cursor"], 7);
+    }
+
+    #[test]
+    fn context_compaction_event_exposes_only_bounded_summary_counts() {
+        let event = AgentEventEnvelope::new(AgentEvent::ContextCompacted {
+            thread_id: "thread-1".into(),
+            turn_id: "turn-1".into(),
+            item_id: "compaction-1".into(),
+            automatic: true,
+            compacted_message_count: 18,
+            user_constraint_count: 2,
+            recent_tool_result_count: 3,
+        });
+        let value = serde_json::to_value(event).unwrap();
+
+        assert_eq!(value["type"], "context_compacted");
+        assert_eq!(value["phase"], "executing");
+        assert_eq!(value["itemId"], "compaction-1");
+        assert_eq!(value["automatic"], true);
+        assert_eq!(value["compactedMessageCount"], 18);
+        assert_eq!(value["userConstraintCount"], 2);
+        assert_eq!(value["recentToolResultCount"], 3);
+        assert!(value.get("summary").is_none());
     }
 }

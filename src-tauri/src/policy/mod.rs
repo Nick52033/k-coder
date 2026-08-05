@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, oneshot};
 use tokio_util::sync::CancellationToken;
 
-use crate::execution::{CommandMode, CommandRuntime, StartCommandRequest};
+use crate::execution::CommandRuntime;
 use crate::protocol::{ApprovalAction, ApprovalResolution, ToolRisk, UserInputResolution};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -100,36 +100,20 @@ impl PolicyEngine for ExecutionWorkspacePolicy {
         if tool_name != "run_command" {
             return WorkspacePolicy.authorize(tool_name, arguments);
         }
-        let request = StartCommandRequest {
-            program: arguments
-                .get("program")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default()
-                .to_string(),
-            args: arguments
-                .get("args")
-                .and_then(serde_json::Value::as_array)
-                .map(|values| {
-                    values
-                        .iter()
-                        .filter_map(serde_json::Value::as_str)
-                        .map(str::to_owned)
-                        .collect()
-                })
-                .unwrap_or_default(),
-            cwd: arguments
-                .get("cwd")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default()
-                .to_string(),
-            env: HashMap::new(),
-            mode: CommandMode::Foreground,
-            timeout_ms: arguments
-                .get("timeoutMs")
-                .and_then(serde_json::Value::as_u64),
-            buffer_bytes: None,
-        };
-        let assessment = self.runtime.assess(&request);
+        let command = arguments
+            .get("command")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let cwd = arguments
+            .get("cwd")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let timeout_ms = arguments
+            .get("timeoutMs")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(120_000);
+        let assessment = self.runtime.assess_shell_command(command, cwd, timeout_ms);
         if assessment.requires_approval {
             PolicyDecision::RequireApproval {
                 reason: assessment.reason,
@@ -354,6 +338,45 @@ mod tests {
         );
         assert!(matches!(
             policy.authorize("apply_patch", &serde_json::json!({})),
+            PolicyDecision::RequireApproval { .. }
+        ));
+    }
+
+    #[test]
+    fn execution_policy_assesses_the_original_shell_script() {
+        let workspace = tempfile::tempdir().unwrap();
+        let policy = ExecutionWorkspacePolicy {
+            runtime: CommandRuntime::new(workspace.path()).unwrap(),
+        };
+
+        assert_eq!(
+            policy.authorize(
+                "run_command",
+                &serde_json::json!({ "command": "cargo test" }),
+            ),
+            PolicyDecision::Allow
+        );
+        assert_eq!(
+            policy.authorize(
+                "run_command",
+                &serde_json::json!({ "command": "Get-Content Cargo.toml" }),
+            ),
+            PolicyDecision::Allow
+        );
+        assert!(matches!(
+            policy.authorize(
+                "run_command",
+                &serde_json::json!({ "command": "Remove-Item -Recurse target" }),
+            ),
+            PolicyDecision::RequireApproval { .. }
+        ));
+        assert!(matches!(
+            policy.authorize(
+                "run_command",
+                &serde_json::json!({
+                    "command": "Get-Content Cargo.toml | Set-Content copy.toml"
+                }),
+            ),
             PolicyDecision::RequireApproval { .. }
         ));
     }

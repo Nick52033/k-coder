@@ -818,7 +818,7 @@ fn project_thread(thread_id: &str, events: &[StoredEvent]) -> Result<ThreadDetai
                     &mut turn_timeline,
                     event,
                     TimelineEventKind::ChangeApplied,
-                    format!("已应用 {} 个文件变更", change_set.files.len()),
+                    "编辑了文件",
                     Some(paths),
                 );
             }
@@ -1494,13 +1494,14 @@ mod tests {
                 },
                 TurnTimelineItem::Event {
                     kind: TimelineEventKind::ChangeApplied,
+                    title: change_title,
                     ..
                 },
                 TurnTimelineItem::Event {
                     kind: TimelineEventKind::ChangeUndone,
                     ..
                 },
-            ]
+            ] if change_title == "编辑了文件"
         ));
     }
 

@@ -78,6 +78,7 @@ interface WorkbenchState {
   activeTurnId: string | null;
   activeTurnThreadId: string | null;
   activeTurns: Record<string, string>;
+  cancellingTurns: Record<string, string>;
   messageQueue: QueuedMessage[];
   usage: TokenUsage | null;
   turnTimeline: TurnTimelineItem[];
@@ -322,8 +323,6 @@ let initializationPromise: Promise<void> | null = null;
 let hydrationSequence = 0;
 const hydrationBuffers = new Map<string, { token: number; events: AgentEvent[] }>();
 const processingQueueThreads = new Set<string>();
-const cancellationRequestedTurns = new Map<string, string>();
-
 function withoutActiveTurn(activeTurns: Record<string, string>, threadId: string) {
   if (!(threadId in activeTurns)) return activeTurns;
   const next = { ...activeTurns };
@@ -391,6 +390,7 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
   activeTurnId: null,
   activeTurnThreadId: null,
   activeTurns: {},
+  cancellingTurns: {},
   messageQueue: [],
   usage: null,
   turnTimeline: [],
@@ -529,6 +529,10 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
       const activeTurns = restoredActiveTurnId
         ? { ...get().activeTurns, [threadId]: restoredActiveTurnId }
         : withoutActiveTurn(get().activeTurns, threadId);
+      const cancellingTurns = restoredActiveTurnId
+        && get().cancellingTurns[threadId] === restoredActiveTurnId
+          ? get().cancellingTurns
+          : withoutActiveTurn(get().cancellingTurns, threadId);
 
       const pendingApprovals = detail.approvals
         .filter((approval) => !approval.resolution)
@@ -565,6 +569,7 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
         plan,
         goal,
         activeTurns,
+        cancellingTurns,
         activeTurnId: restoredActiveTurnId,
         activeTurnThreadId: restoredActiveTurnId ? threadId : null,
       });
@@ -676,6 +681,7 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
         activeTurns: state.activeTurns[queuedMessage.threadId] === outcome.turnId
           ? withoutActiveTurn(state.activeTurns, queuedMessage.threadId)
           : state.activeTurns,
+        cancellingTurns: withoutActiveTurn(state.cancellingTurns, queuedMessage.threadId),
       }));
       
       const outcomeError = outcome.error;
@@ -716,6 +722,7 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
             : msg
         ),
         activeTurns: withoutActiveTurn(state.activeTurns, failedMessage.threadId),
+        cancellingTurns: withoutActiveTurn(state.cancellingTurns, failedMessage.threadId),
         activeTurnId: state.activeThreadId === failedMessage.threadId ? null : state.activeTurnId,
         activeTurnThreadId: state.activeThreadId === failedMessage.threadId ? null : state.activeTurnThreadId,
       }));
@@ -785,6 +792,7 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
         activeTurns: state.activeTurns[threadId] === outcome.turnId
           ? withoutActiveTurn(state.activeTurns, threadId)
           : state.activeTurns,
+        cancellingTurns: withoutActiveTurn(state.cancellingTurns, threadId),
       }));
       await get().reloadThreads();
       if (get().activeThreadId === threadId) {
@@ -796,6 +804,7 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
       set((state) => ({
         error: state.activeThreadId === threadId ? errorMessage(error) : state.error,
         activeTurns: withoutActiveTurn(state.activeTurns, threadId),
+        cancellingTurns: withoutActiveTurn(state.cancellingTurns, threadId),
         activeTurnId: state.activeThreadId === threadId ? null : state.activeTurnId,
         activeTurnThreadId: state.activeThreadId === threadId ? null : state.activeTurnThreadId,
       }));
@@ -805,20 +814,34 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
   stopTurn: async (targetThreadId) => {
     const threadId = targetThreadId ?? get().activeThreadId;
     const turnId = threadId ? get().activeTurns[threadId] : null;
-    if (!threadId || !turnId || cancellationRequestedTurns.get(threadId) === turnId) return;
-    cancellationRequestedTurns.set(threadId, turnId);
+    if (!threadId || !turnId || get().cancellingTurns[threadId] === turnId) return;
+    set((state) => ({
+      cancellingTurns: { ...state.cancellingTurns, [threadId]: turnId },
+      error: state.activeThreadId === threadId ? "" : state.error,
+    }));
     try {
       const accepted = await Promise.race([
         cancelTurn(threadId),
         new Promise<"timeout">((resolve) => window.setTimeout(() => resolve("timeout"), 3_000)),
       ]);
-      if (accepted !== true) {
-        if (accepted === false) cancellationRequestedTurns.delete(threadId);
+      if (accepted === false) {
+        set((state) => ({
+          cancellingTurns: withoutActiveTurn(state.cancellingTurns, threadId),
+        }));
         if (get().activeThreadId === threadId) await get().selectThread(threadId);
+      } else if (accepted === "timeout") {
+        set((state) => ({
+          cancellingTurns: withoutActiveTurn(state.cancellingTurns, threadId),
+          error: state.activeThreadId === threadId && state.activeTurns[threadId] === turnId
+            ? "停止请求超时，Turn 仍在运行，可以重试停止"
+            : state.error,
+        }));
       }
     } catch (error) {
-      cancellationRequestedTurns.delete(threadId);
-      if (get().activeThreadId === threadId) set({ error: errorMessage(error) });
+      set((state) => ({
+        cancellingTurns: withoutActiveTurn(state.cancellingTurns, threadId),
+        error: state.activeThreadId === threadId ? errorMessage(error) : state.error,
+      }));
     }
   },
 
@@ -978,16 +1001,21 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
 
   handleAgentEvent: (event) => {
     const terminalEvent = ["turn_completed", "turn_failed", "turn_cancelled"].includes(event.type);
-    if (terminalEvent && cancellationRequestedTurns.get(event.threadId) === event.turnId) {
-      cancellationRequestedTurns.delete(event.threadId);
-    }
     if (event.type === "turn_started") {
-      set((state) => ({ activeTurns: { ...state.activeTurns, [event.threadId]: event.turnId } }));
+      set((state) => ({
+        activeTurns: { ...state.activeTurns, [event.threadId]: event.turnId },
+        cancellingTurns: state.cancellingTurns[event.threadId] === event.turnId
+          ? state.cancellingTurns
+          : withoutActiveTurn(state.cancellingTurns, event.threadId),
+      }));
     } else if (terminalEvent) {
       set((state) => ({
         activeTurns: state.activeTurns[event.threadId] === event.turnId
           ? withoutActiveTurn(state.activeTurns, event.threadId)
           : state.activeTurns,
+        cancellingTurns: state.cancellingTurns[event.threadId] === event.turnId
+          ? withoutActiveTurn(state.cancellingTurns, event.threadId)
+          : state.cancellingTurns,
       }));
     }
     const hydration = hydrationBuffers.get(event.threadId);
@@ -1100,6 +1128,18 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
         break;
       case "usage_updated":
         set({ usage: event.usage });
+        break;
+      case "context_compacted":
+        set((state) => ({
+          turnTimeline: appendTimelineEvent(
+            state.turnTimeline,
+            event.itemId,
+            event.turnId,
+            "compacted",
+            event.automatic ? "已自动压缩上下文" : "已手动压缩上下文",
+            `压缩了 ${event.compactedMessageCount} 条历史消息，保留 ${event.userConstraintCount} 项用户约束和 ${event.recentToolResultCount} 项近期工具结果`,
+          ),
+        }));
         break;
       case "tool_started":
         set((state) => {
@@ -1298,7 +1338,7 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
             `change-applied-${event.changeSet.id}`,
             event.turnId,
             "change_applied",
-            `已应用 ${event.changeSet.files.length} 个文件变更`,
+            "编辑了文件",
             event.changeSet.files.map((file) => file.path).join("、"),
           ),
         }));
@@ -1452,7 +1492,6 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
   forceResetState: async () => {
     const threadId = get().activeThreadId;
     console.log("强制重置状态...");
-    if (threadId) cancellationRequestedTurns.delete(threadId);
 
     // 尝试取消任何正在运行的 turn
     if (threadId && get().activeTurns[threadId]) {
@@ -1468,6 +1507,7 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
       activeTurnId: null,
       activeTurnThreadId: null,
       activeTurns: threadId ? withoutActiveTurn(state.activeTurns, threadId) : state.activeTurns,
+      cancellingTurns: threadId ? withoutActiveTurn(state.cancellingTurns, threadId) : state.cancellingTurns,
       pendingApproval: null,
       pendingApprovals: [],
       pendingUserInput: null,

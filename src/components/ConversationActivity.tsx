@@ -259,8 +259,8 @@ function ToolActivityGroup({ activities }: { activities: ToolActivity[] }) {
   const allCommands = activities.every((activity) => activity.call.name === "run_command");
   const count = activities.length;
   const title = allCommands
-    ? count === 1 ? "运行了命令" : `运行了 ${count} 个命令`
-    : count === 1 ? "执行了操作" : `执行了 ${count} 个操作`;
+    ? count === 1 ? "运行了命令" : "运行了多个命令"
+    : count === 1 ? "执行了操作" : "执行了多个操作";
   const status = state === "failed"
     ? "包含失败"
     : state === "cancelled"
@@ -446,6 +446,14 @@ interface CommandDetailsValue {
 }
 
 function commandDetails(argumentsValue: Record<string, unknown>): CommandDetailsValue | null {
+  const command = typeof argumentsValue.command === "string" ? argumentsValue.command.trim() : "";
+  if (command) {
+    return {
+      text: command,
+      cwd: typeof argumentsValue.cwd === "string" ? argumentsValue.cwd : "",
+      timeoutMs: typeof argumentsValue.timeoutMs === "number" ? argumentsValue.timeoutMs : null,
+    };
+  }
   const program = typeof argumentsValue.program === "string" ? argumentsValue.program.trim() : "";
   if (!program) return null;
   const args = Array.isArray(argumentsValue.args)
@@ -517,7 +525,7 @@ function shellQuote(value: string) {
 }
 
 function changeOperationLabel(operation: ChangeSet["files"][number]["operation"]) {
-  return ({ add: "新增", modify: "修改", delete: "删除", move: "移动" })[operation];
+  return ({ add: "新增", modify: "已编辑", delete: "删除", move: "移动" })[operation];
 }
 
 function useActivityDuration(activity: ToolActivity): number | null {

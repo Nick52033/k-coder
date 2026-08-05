@@ -47,7 +47,7 @@ test.beforeEach(async ({ page }) => {
       ], messageTurnIds: { "message-assistant": "turn-1" }, lastTurn: null, toolActivities: [
         { turnId: "turn-1", call: { id: "call-edit", name: "apply_patch", arguments: { patch: "*** Begin Patch\n*** Update File: src/App.css\n@@\n-old\n+new\n*** End Patch" }, metadata: {} }, state: "completed", result: { success: true, output: "applied", metadata: {} }, startedAtMs: 1000, completedAtMs: 1200, durationMs: 200 },
         { turnId: "turn-1", call: { id: "call-read", name: "read_file", arguments: { path: "src/stores/workbenchStore.ts", startLine: 42, lineCount: 1 }, metadata: {} }, state: "completed", result: { success: true, output: "export const fixture = true;\n", metadata: { path: "src/stores/workbenchStore.ts", offset: 920, bytesReturned: 29, totalBytes: 4096, startLine: 42, endLine: 42, linesReturned: 1, totalLines: 200, truncated: true } }, startedAtMs: 1210, completedAtMs: 1224, durationMs: 14 },
-        { turnId: "turn-1", call: { id: "call-test", name: "run_command", arguments: { program: "pnpm", args: ["build"], cwd: "D:\\code\\k-coder", timeoutMs: 120000 }, metadata: {} }, state: "completed", result: { success: true, output: "tests passed", metadata: { durationMs: 1530 } }, startedAtMs: 1300, completedAtMs: 2830, durationMs: 1530 },
+        { turnId: "turn-1", call: { id: "call-test", name: "run_command", arguments: { command: "pnpm build", cwd: ".", timeoutMs: 120000 }, metadata: {} }, state: "completed", result: { success: true, output: "tests passed", metadata: { durationMs: 1530, shell: "powershell" } }, startedAtMs: 1300, completedAtMs: 2830, durationMs: 1530 },
       ], turnTimeline: [
         { type: "event", itemId: "provider-context-1", turnId: "turn-1", kind: "provider_context", title: "已保留模型上下文", detail: "openai_responses · reasoning · rs_fixture" },
         { type: "event", itemId: "usage-1", turnId: "turn-1", kind: "usage", title: "模型调用 1 用量", detail: "输入 1200 · 输出 80 · 总计 1280 tokens" },
@@ -55,7 +55,7 @@ test.beforeEach(async ({ page }) => {
         { type: "tool", activity: { turnId: "turn-1", call: { id: "call-edit", name: "apply_patch", arguments: { patch: "*** Begin Patch\n*** Update File: src/App.css\n@@\n-old\n+new\n*** End Patch" }, metadata: {} }, state: "completed", result: { success: true, output: "applied", metadata: {} }, startedAtMs: 1000, completedAtMs: 1200, durationMs: 200 } },
         { type: "tool", activity: { turnId: "turn-1", call: { id: "call-read", name: "read_file", arguments: { path: "src/stores/workbenchStore.ts", startLine: 42, lineCount: 1 }, metadata: {} }, state: "completed", result: { success: true, output: "export const fixture = true;\n", metadata: { path: "src/stores/workbenchStore.ts", offset: 920, bytesReturned: 29, totalBytes: 4096, startLine: 42, endLine: 42, linesReturned: 1, totalLines: 200, truncated: true } }, startedAtMs: 1210, completedAtMs: 1224, durationMs: 14 } },
         { type: "text", id: "progress-2", turnId: "turn-1", text: "修改完成，接着运行验证。" },
-        { type: "tool", activity: { turnId: "turn-1", call: { id: "call-test", name: "run_command", arguments: { program: "pnpm", args: ["build"], cwd: "D:\\code\\k-coder", timeoutMs: 120000 }, metadata: {} }, state: "completed", result: { success: true, output: "tests passed", metadata: { durationMs: 1530 } }, startedAtMs: 1300, completedAtMs: 2830, durationMs: 1530 } },
+        { type: "tool", activity: { turnId: "turn-1", call: { id: "call-test", name: "run_command", arguments: { command: "pnpm build", cwd: ".", timeoutMs: 120000 }, metadata: {} }, state: "completed", result: { success: true, output: "tests passed", metadata: { durationMs: 1530, shell: "powershell" } }, startedAtMs: 1300, completedAtMs: 2830, durationMs: 1530 } },
         { type: "text", id: "message-assistant", turnId: "turn-1", text: "检查完成。" },
         { type: "event", itemId: "turn-completed-turn-1", turnId: "turn-1", kind: "turn_completed", title: "Turn 已完成", detail: null, durationMs: 1830 },
       ], approvals: [], changes: [] },
@@ -112,6 +112,9 @@ test.beforeEach(async ({ page }) => {
             return new Promise((resolve) => runTurnResolvers.push(resolve));
           }
           if (command === "cancel_turn") {
+            if (localStorage.getItem("kcoder_e2e_hold_cancel") === "true") {
+              return new Promise(() => undefined);
+            }
             runTurnResolvers.shift()?.({ schemaVersion: 1, threadId: "thread-1", turnId: "turn-queued", state: "cancelled", error: null });
             return true;
           }
@@ -194,6 +197,7 @@ test.beforeEach(async ({ page }) => {
 
 test("supports the primary workbench inspection flow", async ({ page }, testInfo) => {
   await page.goto("/");
+  await expect(page.getByRole("textbox", { name: "消息" })).toHaveCSS("font-size", "13px");
   await expect.poll(() => page.evaluate(() => (window as unknown as { __invocationArgs: Record<string, unknown> }).__invocationArgs.get_plan)).toEqual({ threadId: "thread-1" });
   await expect.poll(() => page.evaluate(() => (window as unknown as { __invocationArgs: Record<string, unknown> }).__invocationArgs.get_goal)).toEqual({ threadId: "thread-1" });
   await expect(page.getByRole("heading", { name: "Phase 6 workbench" })).toBeVisible();
@@ -211,7 +215,7 @@ test("supports the primary workbench inspection flow", async ({ page }, testInfo
   await expect(page.locator(".turn-event-step--usage").getByText("输入 1200 · 输出 80 · 总计 1280 tokens", { exact: true })).toBeHidden();
   await expect(page.locator(".turn-plan").getByText("检查工作区", { exact: true })).toBeVisible();
   await expect(page.getByText("我先检查相关文件并修改实现。", { exact: true })).toBeVisible();
-  const inspectionGroup = page.locator(".turn-tool-group").filter({ hasText: "执行了 2 个操作" });
+  const inspectionGroup = page.locator(".turn-tool-group").filter({ hasText: "执行了多个操作" });
   await expect(inspectionGroup).toBeVisible();
   await expect(page.locator(".turn-timeline-tool").getByText("应用补丁 src/App.css", { exact: true })).toBeHidden();
   await inspectionGroup.locator(":scope > summary").click();
@@ -424,10 +428,12 @@ test("streams thinking, safe reasoning summaries, and command output inline", as
     emit({ ...base, type: "reasoning_summary_completed", phase: "planning", itemId: "rs-live", summary: "正在检查公开事件契约。" });
     emit({ ...base, type: "reasoning_summary_delta", phase: "planning", itemId: "rs-live-2", delta: "正在核对工具输出边界。" });
     emit({ ...base, type: "reasoning_summary_completed", phase: "planning", itemId: "rs-live-2", summary: "正在核对工具输出边界。" });
-    emit({ ...base, type: "tool_started", phase: "executing", call: { id: "call-live", name: "run_command", arguments: { program: "pnpm", args: ["build"] }, metadata: {} } });
+    emit({ ...base, type: "tool_started", phase: "executing", call: { id: "call-live", name: "run_command", arguments: { command: "pnpm build" }, metadata: {} } });
     emit({ ...base, type: "tool_output_delta", phase: "executing", callId: "call-live", stream: "stdout", cursor: 0, delta: "building client\n" });
     emit({ ...base, type: "tool_output_delta", phase: "executing", callId: "call-live", stream: "stderr", cursor: 1, delta: "warning: fixture\n" });
     emit({ ...base, type: "tool_completed", phase: "executing", callId: "call-live", name: "run_command", result: { success: true, output: "building client\n", metadata: { durationMs: 1234 } } });
+    emit({ ...base, type: "context_compacted", phase: "executing", itemId: "compaction-live", automatic: true,
+      compactedMessageCount: 18, userConstraintCount: 1, recentToolResultCount: 1 });
     emit({ ...base, type: "change_applied", phase: "executing", changeSet: {
       id: "change-live", threadId: "thread-1", turnId: "turn-live", toolCallId: "call-edit-live", createdAtMs: 2,
       undone: false, files: [{ path: "src/App.tsx", destinationPath: null, operation: "modify", beforeHash: "before", afterHash: "after", beforeContent: "before\n", afterContent: "after\n", unifiedDiff: "-before\n+after\n" }],
@@ -460,15 +466,20 @@ test("streams thinking, safe reasoning summaries, and command output inline", as
   await expect(page.locator(".turn-tool-output-line--stdout").filter({ hasText: "building client" })).toBeVisible();
   await expect(page.locator(".turn-tool-output-line--stderr").filter({ hasText: "warning: fixture" })).toBeVisible();
   await expect(page.getByText("耗时 1.2s", { exact: true })).toBeVisible();
+  const compactionStep = liveExecution.locator(".turn-event-step--compacted");
+  await expect(compactionStep.getByText("已自动压缩上下文", { exact: true })).toBeVisible();
+  await expect(compactionStep.getByText("压缩了 18 条历史消息，保留 1 项用户约束和 1 项近期工具结果", { exact: true })).toBeHidden();
+  await compactionStep.locator(":scope > summary").click();
+  await expect(compactionStep.getByText("压缩了 18 条历史消息，保留 1 项用户约束和 1 项近期工具结果", { exact: true })).toBeVisible();
   await page.getByText("查看命令", { exact: true }).last().click();
   await expect(page.locator(".turn-command-details pre").last()).toContainText("pnpm build");
   const changeStep = liveExecution.locator(".turn-event-step--change_applied");
-  await expect(changeStep.getByText("已应用 1 个文件变更", { exact: true })).toBeVisible();
+  await expect(changeStep.getByText("编辑了文件", { exact: true })).toBeVisible();
   await expect(changeStep.getByText("查看变更", { exact: true })).toBeHidden();
   await changeStep.locator(":scope > summary").click();
   await page.getByText("查看变更", { exact: true }).last().click();
-  await expect(page.getByText("修改 src/App.tsx", { exact: true }).last()).toBeVisible();
-  await page.getByText("修改 src/App.tsx", { exact: true }).last().click();
+  await expect(page.getByText("已编辑 src/App.tsx", { exact: true }).last()).toBeVisible();
+  await page.getByText("已编辑 src/App.tsx", { exact: true }).last().click();
   await expect(page.locator(".turn-change-file pre").last()).toContainText("+after");
   await page.locator(".turn-tool-output").last().scrollIntoViewIfNeeded();
   await page.screenshot({ path: testInfo.outputPath("live-agent-timeline.png"), fullPage: true });
@@ -631,17 +642,27 @@ test("runs different conversations concurrently while keeping each conversation 
   await expect(page.locator(".message-queue")).toHaveCount(0);
 });
 
-test("keeps OCR text hidden while adding it to the model context", async ({ page }, testInfo) => {
+test("sends images without frontend OCR and opens the conversation preview", async ({ page }, testInfo) => {
   await page.goto("/");
   const composer = page.getByRole("textbox", { name: "消息" });
-  await composer.evaluate((element) => {
+  await composer.evaluate(async (element) => {
     const transfer = new DataTransfer();
-    transfer.items.add(new File([new Uint8Array([137, 80, 78, 71])], "ocr-fixture.png", { type: "image/png" }));
+    const canvas = document.createElement("canvas");
+    canvas.width = 320;
+    canvas.height = 180;
+    const context = canvas.getContext("2d")!;
+    context.fillStyle = "#166534";
+    context.fillRect(0, 0, canvas.width, canvas.height);
+    context.fillStyle = "#f8fafc";
+    context.font = "600 30px sans-serif";
+    context.fillText("Image preview", 56, 100);
+    const blob = await new Promise<Blob>((resolve) => canvas.toBlob((value) => resolve(value!), "image/png"));
+    transfer.items.add(new File([blob], "ocr-fixture.png", { type: "image/png" }));
     element.dispatchEvent(new ClipboardEvent("paste", { bubbles: true, clipboardData: transfer }));
   });
 
   await expect(page.getByAltText("ocr-fixture.png")).toBeVisible();
-  await expect.poll(() => page.evaluate(() => (window as unknown as { __invoked: string[] }).__invoked.filter((command) => command === "recognize_image").length)).toBe(1);
+  await expect.poll(() => page.evaluate(() => (window as unknown as { __invoked: string[] }).__invoked.filter((command) => command === "recognize_image").length)).toBe(0);
   await expect(page.getByText("hidden OCR fixture", { exact: true })).toHaveCount(0);
   await expect(page.getByText("查看识别文字", { exact: true })).toHaveCount(0);
   await expect(page.locator(".attachment-ocr-state, .attachment-ocr-details")).toHaveCount(0);
@@ -654,7 +675,14 @@ test("keeps OCR text hidden while adding it to the model context", async ({ page
   await expect(page.getByText("hidden OCR fixture", { exact: true })).toHaveCount(0);
   await expect.poll(() => page.evaluate(() => (window as unknown as { __runTurnCalls: Array<{ request?: { input?: string } }> }).__runTurnCalls[0]?.request?.input)).toBe("");
   await expect.poll(() => page.evaluate(() => (window as unknown as { __runTurnCalls: Array<{ attachments?: unknown[] }> }).__runTurnCalls[0]?.attachments?.length)).toBe(1);
-  await expect.poll(() => page.evaluate(() => (window as unknown as { __runTurnCalls: Array<{ attachments?: Array<{ ocrText?: string }> }> }).__runTurnCalls[0]?.attachments?.[0]?.ocrText)).toBe("hidden OCR fixture");
+  await expect.poll(() => page.evaluate(() => (window as unknown as { __runTurnCalls: Array<{ attachments?: Array<{ ocrText?: string }> }> }).__runTurnCalls[0]?.attachments?.[0]?.ocrText)).toBeUndefined();
+  await imageMessage.getByRole("button", { name: "查看图片 ocr-fixture.png" }).click();
+  const imagePreview = page.getByRole("dialog", { name: "ocr-fixture.png" });
+  await expect(imagePreview).toBeVisible();
+  await expect(imagePreview.locator("img")).toHaveAttribute("src", /^data:image\/png;base64,/);
+  await page.screenshot({ path: testInfo.outputPath("conversation-image-preview.png"), fullPage: true });
+  await page.keyboard.press("Escape");
+  await expect(imagePreview).toHaveCount(0);
   await page.screenshot({ path: testInfo.outputPath("image-attachment-in-user-message.png"), fullPage: true });
 
   await page.evaluate(() => localStorage.setItem("kcoder_e2e_thread_detail", JSON.stringify({
@@ -686,6 +714,9 @@ test("keeps OCR text hidden while adding it to the model context", async ({ page
   await expect(imageMessage.getByText("ocr-fixture.png", { exact: true })).toBeVisible();
   await expect(imageMessage.locator(".message-content")).toHaveCount(0);
   await expect(page.getByText("hidden OCR fixture", { exact: true })).toHaveCount(0);
+  await imageMessage.getByRole("button", { name: "查看图片 ocr-fixture.png" }).click();
+  await expect(page.getByRole("dialog", { name: "ocr-fixture.png" })).toBeVisible();
+  await page.getByRole("button", { name: "关闭图片预览" }).click();
 });
 
 test("queues concurrent approvals and drops an expired request", async ({ page }) => {
@@ -703,7 +734,7 @@ test("queues concurrent approvals and drops an expired request", async ({ page }
       toolName: "run_command",
       reason: "fixture approval",
       risk: "external",
-      arguments: { program: "powershell", args: ["-Command", `Get-Content '${file}'`] },
+      arguments: { command: `Get-Content '${file}'` },
       preview: null,
       createdAtMs: 1,
       expiresAtMs: Date.now() + 300_000,
@@ -882,9 +913,9 @@ test("completes and restores an approved edit test repair workflow", async ({ pa
 
   const readCall = call("call-read", "read_file", { path: "src/example.ts" });
   const firstPatchCall = call("call-patch-1", "apply_patch");
-  const failedTestCall = call("call-test-1", "run_command", { program: "pnpm", args: ["test"] });
+  const failedTestCall = call("call-test-1", "run_command", { command: "pnpm test" });
   const repairPatchCall = call("call-patch-2", "apply_patch");
-  const passedTestCall = call("call-test-2", "run_command", { program: "pnpm", args: ["test"] });
+  const passedTestCall = call("call-test-2", "run_command", { command: "pnpm test" });
   const firstChange = change("change-1", "call-patch-1", "before", "broken");
   const repairedChange = change("change-2", "call-patch-2", "broken", "fixed");
 
@@ -1008,12 +1039,14 @@ test("keeps a cancelled turn busy until the terminal event and then retries", as
       ...base,
       type: "tool_started",
       phase: "executing",
-      call: { id: "call-cancel", name: "run_command", arguments: { program: "pnpm", args: ["build"] }, metadata: {} },
+      call: { id: "call-cancel", name: "run_command", arguments: { command: "pnpm build" }, metadata: {} },
     });
   });
 
   await page.getByRole("button", { name: "停止生成" }).click();
-  await expect(page.getByRole("button", { name: "停止生成" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "正在停止" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "正在停止" })).toBeDisabled();
+  await expect(page.locator(".mode-label")).toHaveText("正在停止");
   await expect.poll(() => page.evaluate(() => (window as unknown as { __invoked: string[] }).__invoked.filter((command) => command === "cancel_turn").length)).toBe(1);
 
   await page.evaluate(() => {
@@ -1031,6 +1064,27 @@ test("keeps a cancelled turn busy until the terminal event and then retries", as
   await expect(page.getByRole("button", { name: "重试" })).toBeVisible();
   await page.getByRole("button", { name: "重试" }).click();
   await expect.poll(() => page.evaluate(() => (window as unknown as { __invoked: string[] }).__invoked.filter((command) => command === "retry_turn").length)).toBe(1);
+});
+
+test("allows retrying a stop request after the IPC timeout", async ({ page }) => {
+  await page.addInitScript(() => localStorage.setItem("kcoder_e2e_hold_cancel", "true"));
+  await page.goto("/");
+  await page.evaluate(() => {
+    (window as unknown as { __emitAgentEvent: (event: unknown) => void }).__emitAgentEvent({
+      schemaVersion: 1,
+      threadId: "thread-1",
+      turnId: "turn-stop-timeout",
+      type: "turn_started",
+      phase: "exploring",
+    });
+  });
+
+  await page.getByRole("button", { name: "停止生成" }).click();
+  await expect(page.getByRole("button", { name: "正在停止" })).toBeDisabled();
+  await expect(page.getByRole("alert")).toContainText("停止请求超时");
+  await expect(page.getByRole("button", { name: "停止生成" })).toBeEnabled();
+  await page.getByRole("button", { name: "停止生成" }).click();
+  await expect.poll(() => page.evaluate(() => (window as unknown as { __invoked: string[] }).__invoked.filter((command) => command === "cancel_turn").length)).toBe(2);
 });
 
 test("keeps retry attempts in one assistant reply before and after recovery", async ({ page }, testInfo) => {
@@ -1300,7 +1354,7 @@ test("switches the runtime approval mode from the composer", async ({ page }, te
         reason: "full-access mode automatically approved: fixture",
         autoApproved: true,
         risk: "external",
-        arguments: { program: "pnpm", args: ["test"] },
+        arguments: { command: "pnpm test" },
         preview: null,
         createdAtMs: 1,
         expiresAtMs: 2,

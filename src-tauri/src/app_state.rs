@@ -511,12 +511,34 @@ impl AppState {
     }
 
     pub fn build_provider(&self) -> Result<(Arc<dyn Provider>, String, usize), AppStateError> {
-        self.build_provider_for(None)
+        self.build_provider_for_capability(None, false)
     }
 
     pub fn build_provider_for(
         &self,
         provider_id: Option<&str>,
+    ) -> Result<(Arc<dyn Provider>, String, usize), AppStateError> {
+        self.build_provider_for_capability(provider_id, false)
+    }
+
+    pub fn build_vision_provider(
+        &self,
+    ) -> Result<(Arc<dyn Provider>, String, usize), AppStateError> {
+        self.build_provider_for_capability(None, true)
+    }
+
+    pub fn active_model_supports_vision(&self) -> Result<bool, AppStateError> {
+        Ok(self
+            .provider_config
+            .load()?
+            .map(|config| config.active_model().supports_vision)
+            .unwrap_or(false))
+    }
+
+    fn build_provider_for_capability(
+        &self,
+        provider_id: Option<&str>,
+        requires_vision: bool,
     ) -> Result<(Arc<dyn Provider>, String, usize), AppStateError> {
         let config = if let Some(provider_id) = provider_id {
             self.provider_config
@@ -537,30 +559,12 @@ impl AppState {
         })?;
         let model = config.model.clone();
         let context_limit = config.active_model().context_window as usize;
-        let mut target_specs = vec![(config.base_url.clone(), model.clone(), config.name.clone())];
-        for fallback in config.fallback_models() {
-            target_specs.push((
-                config.base_url.clone(),
-                fallback.id.clone(),
-                format!("{} / {}", config.name, fallback.display_name),
+        let target_specs = provider_target_specs(&config, requires_vision);
+        if target_specs.is_empty() {
+            return Err(AppStateError::ProviderNotConfigured(
+                "the active model does not support image input".to_string(),
             ));
         }
-        for endpoint in config.enabled_endpoints() {
-            target_specs.push((
-                endpoint.base_url.clone(),
-                model.clone(),
-                endpoint.name.clone(),
-            ));
-            for fallback in config.fallback_models() {
-                target_specs.push((
-                    endpoint.base_url.clone(),
-                    fallback.id.clone(),
-                    format!("{} / {}", endpoint.name, fallback.display_name),
-                ));
-            }
-        }
-        let mut seen = std::collections::HashSet::new();
-        target_specs.retain(|(base_url, model, _)| seen.insert((base_url.clone(), model.clone())));
         let mut targets = Vec::new();
         for (base_url, target_model, label) in target_specs {
             let mut target_config = config.clone();
@@ -762,6 +766,52 @@ impl AppState {
     }
 }
 
+fn provider_target_specs(
+    config: &ProviderConfig,
+    requires_vision: bool,
+) -> Vec<(String, String, String)> {
+    let active_model = config.active_model();
+    let mut candidates = vec![(
+        config.base_url.clone(),
+        active_model.id.clone(),
+        config.name.clone(),
+        active_model.supports_vision,
+    )];
+    for fallback in config.fallback_models() {
+        candidates.push((
+            config.base_url.clone(),
+            fallback.id.clone(),
+            format!("{} / {}", config.name, fallback.display_name),
+            fallback.supports_vision,
+        ));
+    }
+    for endpoint in config.enabled_endpoints() {
+        candidates.push((
+            endpoint.base_url.clone(),
+            active_model.id.clone(),
+            endpoint.name.clone(),
+            active_model.supports_vision,
+        ));
+        for fallback in config.fallback_models() {
+            candidates.push((
+                endpoint.base_url.clone(),
+                fallback.id.clone(),
+                format!("{} / {}", endpoint.name, fallback.display_name),
+                fallback.supports_vision,
+            ));
+        }
+    }
+    if requires_vision {
+        candidates.retain(|(_, _, _, supports_vision)| *supports_vision);
+    }
+    let mut seen = std::collections::HashSet::new();
+    candidates
+        .into_iter()
+        .filter(|(base_url, model, _, _)| seen.insert((base_url.clone(), model.clone())))
+        .map(|(base_url, model, label, _)| (base_url, model, label))
+        .collect()
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum AppStateError {
     #[error(transparent)]
@@ -898,6 +948,69 @@ mod tests {
             credentials.get_api_key("primary").unwrap().as_deref(),
             Some("super-secret")
         );
+        assert!(!state.active_model_supports_vision().unwrap());
+        assert!(matches!(
+            state.build_vision_provider(),
+            Err(AppStateError::ProviderNotConfigured(_))
+        ));
+    }
+
+    #[test]
+    fn vision_requests_exclude_text_only_fallback_models() {
+        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        let credentials = Arc::new(FakeCredentials::default());
+        let state = AppState::with_credentials(directory.path(), credentials)
+            .expect("state should initialize");
+
+        state
+            .save_provider_config(SaveProviderConfigRequest {
+                id: "vision".to_string(),
+                kind: ProviderKind::OpenAiCompatible,
+                transport: ProviderTransport::OpenAiChatCompletions,
+                name: "Vision provider".to_string(),
+                base_url: "https://example.com/v1".to_string(),
+                model: "vision-model".to_string(),
+                models: vec![
+                    crate::providers::ProviderModelConfig {
+                        id: "vision-model".to_string(),
+                        display_name: "Vision model".to_string(),
+                        context_window: 128_000,
+                        max_output_tokens: None,
+                        supports_vision: true,
+                        fallback: false,
+                    },
+                    crate::providers::ProviderModelConfig {
+                        id: "text-fallback".to_string(),
+                        display_name: "Text fallback".to_string(),
+                        context_window: 64_000,
+                        max_output_tokens: None,
+                        supports_vision: false,
+                        fallback: true,
+                    },
+                ],
+                endpoints: vec![crate::providers::ProviderEndpointConfig {
+                    id: "secondary".to_string(),
+                    name: "Secondary".to_string(),
+                    base_url: "https://secondary.example.com/v1".to_string(),
+                    enabled: true,
+                }],
+                api_key: Some("secret".to_string()),
+                activate: true,
+            })
+            .expect("configuration should save");
+
+        let config = state.provider_config.load().unwrap().unwrap();
+        let all_targets = provider_target_specs(&config, false);
+        let vision_targets = provider_target_specs(&config, true);
+        assert_eq!(all_targets.len(), 4);
+        assert_eq!(vision_targets.len(), 2);
+        assert!(
+            vision_targets
+                .iter()
+                .all(|(_, model, _)| model == "vision-model")
+        );
+        assert!(state.active_model_supports_vision().unwrap());
+        assert!(state.build_vision_provider().is_ok());
     }
 
     #[test]

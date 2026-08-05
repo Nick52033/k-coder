@@ -468,6 +468,14 @@ export type AgentEvent =
   | (EventBase & { type: "reasoning_summary_delta"; itemId: string; delta: string })
   | (EventBase & { type: "reasoning_summary_completed"; itemId: string; summary: string })
   | (EventBase & { type: "usage_updated"; usage: TokenUsage })
+  | (EventBase & {
+      type: "context_compacted";
+      itemId: string;
+      automatic: boolean;
+      compactedMessageCount: number;
+      userConstraintCount: number;
+      recentToolResultCount: number;
+    })
   | (EventBase & { type: "tool_started"; call: ToolCall })
   | (EventBase & {
       type: "tool_output_delta";
