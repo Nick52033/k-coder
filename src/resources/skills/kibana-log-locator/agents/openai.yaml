@@ -1,0 +1,10 @@
+interface:
+  display_name: "Kibana Log Locator"
+  short_description: "Analyze Kibana logs and trace errors back to code."
+  default_prompt: "Use $kibana-log-locator to investigate this error log and find the likely code location."
+
+dependencies:
+  tools:
+    - type: "mcp"
+      value: "Kibana"
+      description: "Kibana MCP tools for querying logs, saved searches, index patterns, and aggregations."

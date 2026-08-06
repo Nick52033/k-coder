@@ -60,7 +60,8 @@ pub fn run() {
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .setup(|app| {
             let data_root = app.path().app_data_dir()?.join("runtime-data");
-            let state = AppState::new(data_root)
+            let builtin_skills_root = app.path().resource_dir()?.join("skills");
+            let state = AppState::new_with_builtin_skills(data_root, builtin_skills_root)
                 .map_err(|error| std::io::Error::other(error.to_string()))?;
             app.manage(state);
 

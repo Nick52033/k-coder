@@ -1,0 +1,3 @@
+display_name: Sync Skill To Cursor
+short_description: Copy a Codex skill into Cursor skills, updating existing copies.
+default_prompt: 同步一个技能到 Cursor 目录

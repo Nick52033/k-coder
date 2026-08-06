@@ -76,7 +76,10 @@ test.beforeEach(async ({ page }) => {
         schemaVersion: 1,
         configPaths: ["D:\\code\\k-coder\\.k-coder\\extensions.json"],
         instructions: [{ path: "D:\\code\\k-coder\\AGENTS.md", scope: "project", priority: 200, bytes: 120 }],
-        skills: [{ name: "review", description: "Review code safely", path: "D:\\code\\k-coder\\.k-coder\\skills\\review\\SKILL.md", scope: "project", risk: "read", triggers: ["review"], enabled: true }],
+        skills: [
+          { name: "workspace-review", description: "Built-in workspace review", path: "D:\\apps\\k-coder\\resources\\skills\\workspace-review\\SKILL.md", scope: "builtin", risk: "read", triggers: ["workspace review"], enabled: true },
+          { name: "review", description: "Review code safely", path: "D:\\code\\k-coder\\.k-coder\\skills\\review\\SKILL.md", scope: "project", risk: "read", triggers: ["review"], enabled: true },
+        ],
         mcpServers: [{ id: "local", transport: "stdio", enabled: true, state: "ready", toolCount: 2, credentials: [], error: null }],
         hooks: [{ id: "guard", phase: "before", tool: "mcp__local__*", enabled: true }],
         audit: [{ timestampMs: 2, event: "extensions_ready", kind: "runtime", id: "all", success: true, detail: "extensions loaded" }],
@@ -304,6 +307,8 @@ test("supports the primary workbench inspection flow", async ({ page }, testInfo
   await expect(page.getByLabel("上下文长度 1")).toHaveValue("128000");
   await expect(page.getByLabel(/设为默认模型：GPT-4.1/)).toBeChecked();
   await page.getByRole("button", { name: /Skills/ }).click();
+  await expect(page.getByText("Built-in workspace review")).toBeVisible();
+  await expect(page.getByText("内置 · workspace review")).toBeVisible();
   await expect(page.getByText("Review code safely")).toBeVisible();
   await page.getByRole("button", { name: /MCP 与 Hooks/ }).click();
   await expect(page.getByText("local", { exact: true })).toBeVisible();

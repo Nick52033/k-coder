@@ -1,4 +1,0 @@
-interface:
-  display_name: "Code Review"
-  short_description: "Review local code changes with build and test awareness"
-  default_prompt: "Use this skill to review local uncommitted changes or a provided diff file, run .NET build validation when relevant, classify findings by P0/P1/P2/P3, and report in Chinese."

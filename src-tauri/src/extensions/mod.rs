@@ -177,6 +177,7 @@ pub struct PreparedExtensions {
 #[derive(Clone)]
 pub struct ExtensionService {
     data_root: PathBuf,
+    builtin_skills_root: Option<PathBuf>,
     projection: ProjectionDb,
     secrets: Arc<dyn McpSecretStore>,
     logger: StructuredLogger,
@@ -205,10 +206,21 @@ impl ExtensionService {
         secrets: Arc<dyn McpSecretStore>,
         logger: StructuredLogger,
     ) -> Self {
+        Self::with_builtin_skills(data_root, None, projection, secrets, logger)
+    }
+
+    pub fn with_builtin_skills(
+        data_root: PathBuf,
+        builtin_skills_root: Option<PathBuf>,
+        projection: ProjectionDb,
+        secrets: Arc<dyn McpSecretStore>,
+        logger: StructuredLogger,
+    ) -> Self {
         let audit_path = data_root.join("extension-audit.jsonl");
         let audit = load_audit(&audit_path);
         Self {
             data_root,
+            builtin_skills_root,
             projection,
             secrets,
             logger,
@@ -238,7 +250,12 @@ impl ExtensionService {
         ];
         let config = merge_configs(&config_paths)?;
         let instructions = discover_instructions(&self.data_root, &workspace)?;
-        let skills = discover_skills(&self.data_root, &workspace, &self.projection)?;
+        let skills = discover_skills(
+            self.builtin_skills_root.as_deref(),
+            &self.data_root,
+            &workspace,
+            &self.projection,
+        )?;
         let mut handlers = Vec::<Arc<dyn ToolHandler>>::new();
         let mut risks = HashMap::new();
         let mut tool_names = HashSet::new();
@@ -367,6 +384,9 @@ impl ExtensionService {
             workspace.join("AGENTS.md"),
             workspace.join(".k-coder").join("extensions.json"),
         ];
+        if let Some(root) = &self.builtin_skills_root {
+            collect_extension_files(root, &mut paths)?;
+        }
         collect_extension_files(&self.data_root.join("skills"), &mut paths)?;
         collect_extension_files(&workspace.join(".k-coder").join("skills"), &mut paths)?;
         collect_extension_files(&workspace.join(".k-coder").join("rules"), &mut paths)?;
@@ -695,14 +715,25 @@ fn discover_instructions(
 }
 
 fn discover_skills(
+    builtin_skills_root: Option<&Path>,
     data_root: &Path,
     workspace: &Path,
     projection: &ProjectionDb,
 ) -> Result<Vec<LoadedSkill>, ExtensionError> {
-    let roots = [
+    let mut roots = Vec::with_capacity(3);
+    if let Some(root) = builtin_skills_root {
+        if !root.is_dir() {
+            return Err(ExtensionError::Skill(format!(
+                "built-in Skill root {} is missing or is not a directory",
+                user_facing_path(root)
+            )));
+        }
+        roots.push((root.to_path_buf(), "builtin"));
+    }
+    roots.extend([
         (data_root.join("skills"), "global"),
         (workspace.join(".k-coder").join("skills"), "project"),
-    ];
+    ]);
     let mut selected = HashMap::<String, LoadedSkill>::new();
     for (root, scope) in roots {
         if !root.exists() {
@@ -926,6 +957,18 @@ fn collect_extension_files(root: &Path, paths: &mut Vec<PathBuf>) -> Result<(), 
 mod tests {
     use super::*;
 
+    fn write_test_skill(root: &Path, name: &str, body: &str) {
+        let directory = root.join(name);
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(
+            directory.join("SKILL.md"),
+            format!(
+                "---\nname: {name}\ndescription: Review code\ntriggers: [review]\nrisk: read\nenabled: true\n---\n{body}"
+            ),
+        )
+        .unwrap();
+    }
+
     #[test]
     fn project_instructions_override_global_and_rules_are_last() {
         let data = tempfile::tempdir().unwrap();
@@ -945,25 +988,147 @@ mod tests {
     }
 
     #[test]
-    fn validates_skill_frontmatter_and_project_override() {
+    fn builtin_global_and_project_skills_have_deterministic_precedence() {
+        let builtin = tempfile::tempdir().unwrap();
         let data = tempfile::tempdir().unwrap();
         let workspace = tempfile::tempdir().unwrap();
-        let global = data.path().join("skills/review");
-        let project = workspace.path().join(".k-coder/skills/review");
-        fs::create_dir_all(&global).unwrap();
-        fs::create_dir_all(&project).unwrap();
-        let skill = "---\nname: review\ndescription: Review code\ntriggers: [review]\nrisk: read\nenabled: true\n---\nRead carefully.";
-        fs::write(global.join("SKILL.md"), skill).unwrap();
-        fs::write(
-            project.join("SKILL.md"),
-            skill.replace("carefully", "strictly"),
+        let global_root = data.path().join("skills");
+        let project_root = workspace.path().join(".k-coder/skills");
+        write_test_skill(builtin.path(), "review", "BUILTIN-INSTRUCTIONS");
+        write_test_skill(&global_root, "review", "GLOBAL-INSTRUCTIONS");
+        write_test_skill(&project_root, "review", "PROJECT-INSTRUCTIONS");
+        let projection = ProjectionDb::memory().unwrap();
+
+        let skills = discover_skills(
+            Some(builtin.path()),
+            data.path(),
+            workspace.path(),
+            &projection,
         )
         .unwrap();
-        let projection = ProjectionDb::memory().unwrap();
-        let skills = discover_skills(data.path(), workspace.path(), &projection).unwrap();
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].scope, "project");
-        assert!(skills[0].body.contains("strictly"));
+        assert_eq!(skills[0].body, "PROJECT-INSTRUCTIONS");
+
+        fs::remove_dir_all(project_root.join("review")).unwrap();
+        let skills = discover_skills(
+            Some(builtin.path()),
+            data.path(),
+            workspace.path(),
+            &projection,
+        )
+        .unwrap();
+        assert_eq!(skills[0].scope, "global");
+        assert_eq!(skills[0].body, "GLOBAL-INSTRUCTIONS");
+
+        fs::remove_dir_all(global_root.join("review")).unwrap();
+        let skills = discover_skills(
+            Some(builtin.path()),
+            data.path(),
+            workspace.path(),
+            &projection,
+        )
+        .unwrap();
+        assert_eq!(skills[0].scope, "builtin");
+        assert_eq!(skills[0].body, "BUILTIN-INSTRUCTIONS");
+    }
+
+    #[test]
+    fn rejects_builtin_skill_that_escapes_its_resource_root() {
+        let builtin = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        write_test_skill(outside.path(), "review", "OUTSIDE-INSTRUCTIONS");
+
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(outside.path().join("review"), builtin.path().join("review"))
+            .unwrap();
+        #[cfg(windows)]
+        if std::os::windows::fs::symlink_dir(
+            outside.path().join("review"),
+            builtin.path().join("review"),
+        )
+        .is_err()
+        {
+            return;
+        }
+
+        let error = discover_skills(
+            Some(builtin.path()),
+            data.path(),
+            workspace.path(),
+            &ProjectionDb::memory().unwrap(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("escapes the Skill root"));
+    }
+
+    #[test]
+    fn missing_builtin_skill_root_fails_closed() {
+        let data = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let missing = data.path().join("missing-builtin-skills");
+
+        let error = discover_skills(
+            Some(&missing),
+            data.path(),
+            workspace.path(),
+            &ProjectionDb::memory().unwrap(),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("built-in Skill root"));
+    }
+
+    #[test]
+    fn builtin_skills_participate_in_the_extension_revision() {
+        let builtin = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let projection = ProjectionDb::memory().unwrap();
+        let logger = StructuredLogger::new(data.path()).unwrap();
+        let service = ExtensionService::with_builtin_skills(
+            data.path().into(),
+            Some(builtin.path().into()),
+            projection,
+            Arc::new(mcp::OsMcpSecretStore::new()),
+            logger,
+        );
+        let before = service.revision(workspace.path()).unwrap();
+
+        write_test_skill(builtin.path(), "review", "BUILTIN-INSTRUCTIONS");
+
+        let after = service.revision(workspace.path()).unwrap();
+        assert_ne!(before, after);
+    }
+
+    #[test]
+    fn bundled_workspace_review_skill_matches_the_runtime_contract() {
+        let builtin = Path::new(env!("CARGO_MANIFEST_DIR")).join("../src/resources/skills");
+        let data = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+
+        let skills = discover_skills(
+            Some(&builtin),
+            data.path(),
+            workspace.path(),
+            &ProjectionDb::memory().unwrap(),
+        )
+        .unwrap();
+        let skill = skills
+            .iter()
+            .find(|skill| skill.metadata.name == "workspace-review")
+            .expect("bundled workspace-review Skill");
+
+        assert_eq!(skill.scope, "builtin");
+        assert_eq!(skill.metadata.risk, ToolRisk::Read);
+        assert!(skill.enabled);
+        assert!(
+            skill
+                .body
+                .contains("does not grant additional tool permissions")
+        );
     }
 
     #[test]

@@ -1,4 +1,0 @@
-interface:
-  display_name: "Review Loop"
-  short_description: "Run review, validate, fix safe issues, and re-check"
-  default_prompt: "Use this skill to run a review-first repair loop in the current workspace: review, build or test, fix safe issues, then re-verify."

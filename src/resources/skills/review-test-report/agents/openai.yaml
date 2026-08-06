@@ -1,0 +1,4 @@
+﻿interface:
+  display_name: "测试执行报告"
+  short_description: "执行测试并输出结构化测试报告。"
+  default_prompt: "使用 $review-test-report 执行测试并生成结构化测试报告（除代码块外全部中文）。"

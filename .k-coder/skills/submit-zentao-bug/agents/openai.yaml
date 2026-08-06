@@ -1,4 +1,0 @@
-interface:
-  display_name: "提交禅道 Bug"
-  short_description: "从 AIchat 或禅道链接补全归属，预览后提交含正文截图的 Bug"
-  default_prompt: "使用 $submit-zentao-bug 从 AIchat 文档或禅道链接补全归属，预览后提交这条图文 Bug。"

@@ -1,0 +1,4 @@
+interface:
+  display_name: "第三方接口规格与代码"
+  short_description: "把 SAP Excel、中台页面/响应、curl 和 Apifox MCP 接口定义（OAS/schema/example）整理成 C# 对接规格，并按项目结构生成接口代码"
+  default_prompt: "Use $third-party-interface-spec to turn SAP Excel, iDataPlatform page details, curl input, or Apifox MCP OAS/schema/examples into a C# integration spec and implementation."

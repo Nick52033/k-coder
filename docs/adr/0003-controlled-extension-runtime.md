@@ -10,7 +10,7 @@ Skills、项目规则、Hooks 和 MCP 都会影响模型上下文或增加可执
 ## 决策
 
 1. 新增独立 `extensions` 领域模块，负责发现、严格校验、生命周期和诊断；`agent` 只接收已经编译的运行时指令和 `ToolRegistry`。
-2. 指令按“全局、项目根、项目规则”从低到高排序。Skill 使用严格 YAML frontmatter，项目同名 Skill 覆盖全局 Skill；触发后由运行时在 Provider 请求前读取正文。
+2. 指令按“全局、项目根、项目规则”从低到高排序。Skill 使用严格 YAML frontmatter，并按“应用只读资源中的内置 Skill、应用数据中的全局 Skill、工作区中的项目 Skill”从低到高发现；同名时后者覆盖前者，触发后由运行时在 Provider 请求前读取正文。内置 Skill 随应用打包和升级，不复制到可写用户目录。
 3. 非只读 Skill 默认停用，必须由宿主启用。Skill 指令永远不能扩大工具权限。
 4. MCP 使用 `mcp__<server>__<tool>` 命名空间；规范化后冲突或与内置工具重名时整个扩展加载失败。
 5. MCP 工具转换为普通 `ToolHandler`，继续经过 Schema、`PolicyEngine`、一次性审批、取消、Hook、持久化工具结果和审计流程。

@@ -1,4 +1,0 @@
-interface:
-  display_name: "Review Fix"
-  short_description: "Fix deterministic issues from a recent code review"
-  default_prompt: "Use this skill to repair concrete issues from the most recent code-review result in the current workspace, then re-run validation."

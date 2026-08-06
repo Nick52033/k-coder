@@ -60,9 +60,28 @@ impl AppState {
         Self::with_credentials(data_root, Arc::new(OsCredentialStore::new()))
     }
 
+    pub fn new_with_builtin_skills(
+        data_root: impl AsRef<Path>,
+        builtin_skills_root: impl AsRef<Path>,
+    ) -> Result<Self, AppStateError> {
+        Self::with_credentials_and_builtin_skills(
+            data_root,
+            Arc::new(OsCredentialStore::new()),
+            Some(builtin_skills_root.as_ref().to_path_buf()),
+        )
+    }
+
     pub fn with_credentials(
         data_root: impl AsRef<Path>,
         credentials: Arc<dyn CredentialStore>,
+    ) -> Result<Self, AppStateError> {
+        Self::with_credentials_and_builtin_skills(data_root, credentials, None)
+    }
+
+    fn with_credentials_and_builtin_skills(
+        data_root: impl AsRef<Path>,
+        credentials: Arc<dyn CredentialStore>,
+        builtin_skills_root: Option<PathBuf>,
     ) -> Result<Self, AppStateError> {
         let data_root = data_root.as_ref().to_path_buf();
         let fallback =
@@ -75,13 +94,32 @@ impl AppState {
             .map(PathBuf::from)
             .filter(|path| path.is_dir())
             .unwrap_or(fallback);
-        Self::with_workspace_and_credentials(data_root, workspace_root, credentials)
+        Self::with_workspace_credentials_and_builtin_skills(
+            data_root,
+            workspace_root,
+            credentials,
+            builtin_skills_root,
+        )
     }
 
     pub fn with_workspace_and_credentials(
         data_root: impl AsRef<Path>,
         workspace_root: impl AsRef<Path>,
         credentials: Arc<dyn CredentialStore>,
+    ) -> Result<Self, AppStateError> {
+        Self::with_workspace_credentials_and_builtin_skills(
+            data_root,
+            workspace_root,
+            credentials,
+            None,
+        )
+    }
+
+    fn with_workspace_credentials_and_builtin_skills(
+        data_root: impl AsRef<Path>,
+        workspace_root: impl AsRef<Path>,
+        credentials: Arc<dyn CredentialStore>,
+        builtin_skills_root: Option<PathBuf>,
     ) -> Result<Self, AppStateError> {
         let data_root = data_root.as_ref().to_path_buf();
         let workspace_root = workspace_root
@@ -111,8 +149,9 @@ impl AppState {
             .unwrap_or_default();
         let logger = StructuredLogger::new(&data_root)
             .map_err(|error| AppStateError::Logging(error.to_string()))?;
-        let extensions = ExtensionService::new(
+        let extensions = ExtensionService::with_builtin_skills(
             data_root.clone(),
+            builtin_skills_root,
             repository.projection(),
             Arc::new(OsMcpSecretStore::new()),
             logger.clone(),

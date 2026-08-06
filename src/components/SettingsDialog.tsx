@@ -1224,7 +1224,7 @@ function ExtensionsPage({ mode }: { mode: "mcp" | "skills" | "rules" }) {
       <div className="extension-section-label">Hooks</div>
       <div className="extension-list">{overview?.hooks.length ? overview.hooks.map((hook) => <div className="extension-row extension-row--compact" key={hook.id}><div className="extension-row-main"><strong>{hook.id}</strong><span>{hook.phase} · {hook.tool}</span></div><label className="extension-toggle"><input type="checkbox" checked={hook.enabled} disabled={loading} onChange={(event) => void toggle("hook", hook.id, event.target.checked)} /><span>启用</span></label></div>) : <ExtensionEmpty text="尚未配置工具 Hook" />}</div>
     </>}
-    {mode === "skills" && <div className="extension-list">{overview?.skills.length ? overview.skills.map((skill) => <div className="extension-row" key={skill.name}><div className={`skill-risk skill-risk--${skill.risk}`}>{riskText(skill.risk)}</div><div className="extension-row-main"><strong>{skill.name}</strong><span>{skill.description}</span><small>{skill.scope} · {skill.triggers.join("、")}</small></div><label className="extension-toggle"><input type="checkbox" checked={skill.enabled} disabled={loading} onChange={(event) => void toggle("skill", skill.name, event.target.checked)} /><span>启用</span></label></div>) : <ExtensionEmpty text="未发现有效的 SKILL.md" />}</div>}
+    {mode === "skills" && <div className="extension-list">{overview?.skills.length ? overview.skills.map((skill) => <div className="extension-row" key={skill.name}><div className={`skill-risk skill-risk--${skill.risk}`}>{riskText(skill.risk)}</div><div className="extension-row-main"><strong>{skill.name}</strong><span>{skill.description}</span><small>{skillScopeText(skill.scope)} · {skill.triggers.join("、")}</small></div><label className="extension-toggle"><input type="checkbox" checked={skill.enabled} disabled={loading} onChange={(event) => void toggle("skill", skill.name, event.target.checked)} /><span>启用</span></label></div>) : <ExtensionEmpty text="未发现有效的 SKILL.md" />}</div>}
     {mode === "rules" && <>
       <div className="extension-section-label">指令优先级</div>
       <div className="instruction-list">{overview?.instructions.length ? overview.instructions.map((source) => <div key={source.path}><span>{source.priority}</span><div><strong>{source.scope}</strong><small title={source.path}>{source.path}</small></div><em>{source.bytes} B</em></div>) : <ExtensionEmpty text="未发现全局或项目指令" />}</div>
@@ -1258,6 +1258,10 @@ function ExtensionEmpty({ text }: { text: string }) {
 
 function riskText(risk: "read" | "write" | "delete" | "external") {
   return risk === "read" ? "只读" : risk === "write" ? "写入" : risk === "delete" ? "删除" : "外部";
+}
+
+function skillScopeText(scope: string) {
+  return scope === "builtin" ? "内置" : scope === "global" ? "全局" : scope === "project" ? "项目" : scope;
 }
 
 function AppearancePage({
