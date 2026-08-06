@@ -157,6 +157,7 @@ pub fn run() {
             commands::workspace_state,
             commands::switch_workspace,
             commands::list_workspace_directory,
+            commands::search_workspace_files,
             commands::preview_workspace_file,
             commands::save_workspace_file,
             commands::extract_attachment,

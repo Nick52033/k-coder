@@ -13,7 +13,7 @@ import {
   LoaderCircle,
   SquareTerminal,
 } from "lucide-react";
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import type {
   AgentActivityStatus,
   ChangeSet,
@@ -44,12 +44,18 @@ export function ConversationTurnActivity({
   finalMessageId?: string;
   renderText?: (text: string) => ReactNode;
 }) {
+  const paced = usePacedTimeline(timeline, streaming);
+  const visuallyStreaming = streaming || paced.settling;
+  const visibleTimeline = visuallyStreaming && !streaming
+    ? paced.timeline.filter((item) => item.type !== "event" || !isTerminalEvent(item.kind))
+    : paced.timeline;
+
   if (!activities.length && !timeline.length && !plan?.steps.length && !activityStatus) return null;
 
-  const finalResponse = finalMessageId
-    ? timeline.find((item): item is Extract<TurnTimelineItem, { type: "text" }> => item.type === "text" && item.id === finalMessageId)
+  const finalResponse = !visuallyStreaming && finalMessageId
+    ? visibleTimeline.find((item): item is Extract<TurnTimelineItem, { type: "text" }> => item.type === "text" && item.id === finalMessageId)
     : null;
-  const processTimeline = finalResponse ? timeline.filter((item) => item !== finalResponse) : timeline;
+  const processTimeline = finalResponse ? visibleTimeline.filter((item) => item !== finalResponse) : visibleTimeline;
   const terminalEvent = [...processTimeline].reverse().find(
     (item): item is Extract<TurnTimelineItem, { type: "event" }> => item.type === "event" && isTerminalEvent(item.kind),
   );
@@ -60,73 +66,74 @@ export function ConversationTurnActivity({
   const summaryTitle = terminalEvent?.durationMs !== undefined
     ? `执行了 ${formatDuration(terminalEvent.durationMs)}`
     : "执行过程";
-  const statusLabel = activityStatus ? {
-    thinking: "思考中",
-    responding: "生成回复中",
-    running_tool: "处理工具结果中",
-    awaiting_approval: "等待确认",
-    finalizing: "整理结果中",
-  }[activityStatus] : null;
+  const statusLabel = paced.pendingTextIds.size
+    ? "生成回复中"
+    : activityStatus ? {
+      thinking: "思考中",
+      responding: "生成回复中",
+      running_tool: "处理工具结果中",
+      awaiting_approval: "等待确认",
+      finalizing: "整理结果中",
+    }[activityStatus] : visuallyStreaming ? "生成回复中" : null;
   const groupedProcessTimeline = groupConsecutiveTimeline(processTimeline);
   const processContent = (
-    <div className={streaming ? "turn-execution-live" : "turn-execution-content"}>
-      {plan?.steps.length ? <ConversationPlan plan={plan} /> : null}
-      {processTimeline.length ? (
-        <div className="turn-timeline">
-          {groupedProcessTimeline.map((entry) => entry.type === "reasoning_group" ? (
-            <ReasoningGroup
-              items={entry.items}
-              renderText={renderText}
-              key={`reasoning-group-${entry.items.map((item) => item.itemId).join("-")}`}
-            />
-          ) : entry.type === "tool_group" ? (
-            <ToolActivityGroup
-              activities={entry.activities}
-              key={`tool-group-${entry.activities.map((activity) => activity.call.id).join("-")}`}
-            />
-          ) : (
-            <TimelineItem
-              item={entry.item}
-              changes={changes}
-              renderText={renderText}
-              key={timelineItemKey(entry.item)}
-            />
-          ))}
-        </div>
-      ) : activities.length ? (
-        <div className="turn-timeline">
-          <ToolActivityGroup activities={activities} />
-        </div>
-      ) : null}
+    <div className="turn-disclosure-panel">
+      <div className={visuallyStreaming ? "turn-execution-live" : "turn-execution-content"}>
+        {plan?.steps.length ? <ConversationPlan plan={plan} /> : null}
+        {processTimeline.length ? (
+          <div className="turn-timeline">
+            {groupedProcessTimeline.map((entry) => entry.type === "reasoning_group" ? (
+              <ReasoningGroup
+                items={entry.items}
+                renderText={renderText}
+                key={`reasoning-group-${entry.items.map((item) => item.itemId).join("-")}`}
+              />
+            ) : entry.type === "tool_group" ? (
+              <ToolActivityGroup
+                activities={entry.activities}
+                key={`tool-group-${entry.activities.map((activity) => activity.call.id).join("-")}`}
+              />
+            ) : (
+              <TimelineItem
+                item={entry.item}
+                changes={changes}
+                renderText={renderText}
+                typing={entry.item.type === "text" && paced.pendingTextIds.has(entry.item.id)}
+                key={timelineItemKey(entry.item)}
+              />
+            ))}
+          </div>
+        ) : activities.length ? (
+          <div className="turn-timeline">
+            <ToolActivityGroup activities={activities} />
+          </div>
+        ) : null}
+      </div>
     </div>
   );
 
   return (
     <div className="turn-context">
-      {hasProcess && streaming ? (
-        <details className="turn-disclosure turn-execution turn-execution--live" open>
+      {hasProcess ? (
+        <details className={`turn-disclosure turn-execution${visuallyStreaming ? " turn-execution--live" : ""}`} open={visuallyStreaming || undefined}>
           <summary>
-            <LoaderCircle size={15} aria-hidden="true" />
-            <span className="turn-disclosure-title">{statusLabel}</span>
-            <span className="turn-live-status-dots" aria-hidden="true"><i /><i /><i /></span>
-          </summary>
-          {processContent}
-        </details>
-      ) : null}
-      {hasProcess && !streaming ? (
-        <details className="turn-disclosure turn-execution" open={streaming || undefined}>
-          <summary>
-            <Activity size={15} aria-hidden="true" />
-            <span className="turn-disclosure-title">{summaryTitle}</span>
-            <span className="turn-disclosure-status">{toolCount ? `${toolCount} 个操作` : "已完成"}</span>
-            <ChevronDown className="turn-disclosure-chevron" size={15} aria-hidden="true" />
+            {visuallyStreaming ? <LoaderCircle size={15} aria-hidden="true" /> : <Activity size={15} aria-hidden="true" />}
+            <span className="turn-disclosure-title">{visuallyStreaming ? statusLabel : summaryTitle}</span>
+            {visuallyStreaming ? (
+              <span className="turn-live-status-dots" aria-hidden="true"><i /><i /><i /></span>
+            ) : (
+              <>
+                <span className="turn-disclosure-status">{toolCount ? `${toolCount} 个操作` : "已完成"}</span>
+                <ChevronDown className="turn-disclosure-chevron" size={15} aria-hidden="true" />
+              </>
+            )}
           </summary>
           {processContent}
         </details>
       ) : null}
       {finalResponse ? (
         <div className="turn-final-response">
-          <TimelineItem item={finalResponse} changes={changes} renderText={renderText} />
+          <TimelineItem item={finalResponse} changes={changes} renderText={renderText} typing={false} />
         </div>
       ) : null}
     </div>
@@ -141,14 +148,16 @@ function TimelineItem({
   item,
   changes,
   renderText,
+  typing = false,
 }: {
   item: TurnTimelineItem;
   changes: ChangeSet[];
   renderText?: (text: string) => ReactNode;
+  typing?: boolean;
 }) {
   if (item.type === "text") {
     return (
-      <div className="turn-progress-text">
+      <div className={`turn-progress-text${typing ? " turn-progress-text--typing" : ""}`}>
         {renderText ? renderText(item.text) : item.text}
       </div>
     );
@@ -185,14 +194,127 @@ function TimelineItem({
           <span className="turn-disclosure-title">{item.title}</span>
           <ChevronDown className="turn-disclosure-chevron" size={15} aria-hidden="true" />
         </summary>
-        <div className="turn-event-step-content">
-          {item.detail ? <small>{item.detail}</small> : null}
-          {change ? <ChangeDetails change={change} /> : null}
+        <div className="turn-disclosure-panel">
+          <div className="turn-event-step-content">
+            {item.detail ? <small>{item.detail}</small> : null}
+            {change ? <ChangeDetails change={change} /> : null}
+          </div>
         </div>
       </details>
     );
   }
   return <ToolActivityRow activity={item.activity} />;
+}
+
+interface TextTarget {
+  key: string;
+  id: string;
+  text: string;
+}
+
+interface PacedTimeline {
+  timeline: TurnTimelineItem[];
+  settling: boolean;
+  pendingTextIds: Set<string>;
+}
+
+function usePacedTimeline(timeline: TurnTimelineItem[], streaming: boolean): PacedTimeline {
+  const targets = collectTextTargets(timeline);
+  const targetSignature = targets.map((target) => `${target.key}:${target.id}:${target.text.length}:${target.text.slice(-32)}`).join("\u0000");
+  const wasStreaming = useRef(streaming);
+  if (streaming) wasStreaming.current = true;
+
+  const [displayed, setDisplayed] = useState<Record<string, string>>(() => {
+    if (streaming) return Object.fromEntries(targets.map((target) => [target.key, ""]));
+    return Object.fromEntries(targets.map((target) => [target.key, target.text]));
+  });
+
+  useEffect(() => {
+    if (!wasStreaming.current) {
+      setDisplayed(Object.fromEntries(targets.map((target) => [target.key, target.text])));
+      return undefined;
+    }
+
+    const reducedMotion = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ?? false;
+    if (reducedMotion) {
+      setDisplayed(Object.fromEntries(targets.map((target) => [target.key, target.text])));
+      return undefined;
+    }
+
+    let timer: number | undefined;
+    const tick = () => {
+      setDisplayed((previous) => {
+        let changed = false;
+        const next = { ...previous };
+        for (const target of targets) {
+          const current = normalizeDisplayed(target.text, next[target.key] ?? "");
+          if (current.length >= target.text.length) {
+            next[target.key] = target.text;
+            continue;
+          }
+          const pending = target.text.length - current.length;
+          const step = pending > 600 ? Math.min(16, Math.ceil(pending / 80)) : pending > 192 ? 4 : pending > 64 ? 2 : 1;
+          const nextText = advanceText(target.text, current, step);
+          if (nextText !== current) {
+            next[target.key] = nextText;
+            changed = true;
+          }
+          break;
+        }
+        if (!changed && timer !== undefined) window.clearInterval(timer);
+        return changed ? next : previous;
+      });
+    };
+
+    tick();
+    timer = window.setInterval(tick, 32);
+    return () => {
+      if (timer !== undefined) window.clearInterval(timer);
+    };
+  }, [targetSignature, streaming]);
+
+  let textIndex = 0;
+  let blockedByText = false;
+  const pendingTextIds = new Set<string>();
+  const displayedTimeline = timeline.flatMap((item): TurnTimelineItem[] => {
+    if (blockedByText) return [];
+    if (item.type !== "text") return [item];
+    const target = targets[textIndex++];
+    const text = target ? normalizeDisplayed(target.text, displayed[target.key] ?? "") : item.text;
+    if (target && text !== target.text) {
+      pendingTextIds.add(item.id);
+      blockedByText = true;
+    }
+    return [text === item.text ? item : { ...item, text }];
+  });
+  const settling = !streaming && wasStreaming.current && pendingTextIds.size > 0;
+  return { timeline: displayedTimeline, settling, pendingTextIds };
+}
+
+function collectTextTargets(timeline: TurnTimelineItem[]): TextTarget[] {
+  const indexes = new Map<string, number>();
+  return timeline.flatMap((item) => {
+    if (item.type !== "text") return [];
+    const index = indexes.get(item.turnId) ?? 0;
+    indexes.set(item.turnId, index + 1);
+    return [{ key: `${item.turnId}-${index}`, id: item.id, text: item.text }];
+  });
+}
+
+function normalizeDisplayed(target: string, current: string) {
+  if (target.startsWith(current)) return current;
+  let common = 0;
+  while (common < target.length && common < current.length && target[common] === current[common]) common += 1;
+  return target.slice(0, common);
+}
+
+function advanceText(target: string, current: string, step: number) {
+  let end = Math.min(target.length, current.length + step);
+  if (end < target.length && end > 0) {
+    const code = target.charCodeAt(end - 1);
+    if (code >= 0xd800 && code <= 0xdbff) end += 1;
+  }
+  return target.slice(0, end);
 }
 
 function timelineItemKey(item: TurnTimelineItem) {
@@ -243,12 +365,14 @@ function ReasoningGroup({
         <span className="turn-disclosure-status">{status}</span>
         <ChevronDown className="turn-disclosure-chevron" size={15} aria-hidden="true" />
       </summary>
-      <div className="turn-reasoning-content">
-        {items.map((item) => (
-          <div className="turn-reasoning-segment" key={`${item.turnId}-${item.itemId}`}>
-            {renderText ? renderText(item.summary) : item.summary}
-          </div>
-        ))}
+      <div className="turn-disclosure-panel">
+        <div className="turn-reasoning-content">
+          {items.map((item) => (
+            <div className="turn-reasoning-segment" key={`${item.turnId}-${item.itemId}`}>
+              {renderText ? renderText(item.summary) : item.summary}
+            </div>
+          ))}
+        </div>
       </div>
     </details>
   );
@@ -287,8 +411,10 @@ function ToolActivityGroup({ activities }: { activities: ToolActivity[] }) {
         <span className="turn-disclosure-status">{status}</span>
         <ChevronDown className="turn-disclosure-chevron" size={15} aria-hidden="true" />
       </summary>
-      <div className="turn-tool-group-content">
-        {activities.map((activity) => <ToolActivityRow activity={activity} key={activity.call.id} />)}
+      <div className="turn-disclosure-panel">
+        <div className="turn-tool-group-content">
+          {activities.map((activity) => <ToolActivityRow activity={activity} key={activity.call.id} />)}
+        </div>
       </div>
     </details>
   );
@@ -582,17 +708,19 @@ function ConversationPlan({ plan }: { plan: PlanView }) {
         <span className="turn-disclosure-status">{completed}/{plan.steps.length}</span>
         <ChevronDown className="turn-disclosure-chevron" size={15} aria-hidden="true" />
       </summary>
-      <ol className="turn-plan-steps">
-        {plan.steps.map((step) => (
-          <li className={`turn-plan-step turn-plan-step--${step.status}`} key={step.id}>
-            <PlanStateIcon status={step.status} />
-            <span>
-              <strong>{step.step}</strong>
-              {step.detail ? <small>{step.detail}</small> : null}
-            </span>
-          </li>
-        ))}
-      </ol>
+      <div className="turn-disclosure-panel">
+        <ol className="turn-plan-steps">
+          {plan.steps.map((step) => (
+            <li className={`turn-plan-step turn-plan-step--${step.status}`} key={step.id}>
+              <PlanStateIcon status={step.status} />
+              <span>
+                <strong>{step.step}</strong>
+                {step.detail ? <small>{step.detail}</small> : null}
+              </span>
+            </li>
+          ))}
+        </ol>
+      </div>
     </details>
   );
 }

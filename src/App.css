@@ -289,6 +289,7 @@ button {
 }
 
 .workbench {
+  position: relative;
   display: grid;
   grid-template-columns: 232px minmax(0, 1fr);
   grid-template-rows: 48px minmax(0, 1fr);
@@ -1692,6 +1693,7 @@ button {
   place-items: center;
   overflow-x: hidden;
   overflow-y: auto;
+  overflow-anchor: none;
 }
 
 .message-area--populated {
@@ -1915,6 +1917,22 @@ button {
   line-height: 1.65;
   overflow-wrap: anywhere;
   white-space: normal;
+}
+
+.turn-progress-text--typing::after {
+  display: inline-block;
+  width: 1px;
+  height: 1em;
+  margin-left: 2px;
+  vertical-align: -0.12em;
+  background: currentColor;
+  content: "";
+  animation: turn-text-caret 800ms steps(1, end) infinite;
+}
+
+@keyframes turn-text-caret {
+  0%, 45% { opacity: 1; }
+  46%, 100% { opacity: 0; }
 }
 
 .turn-progress-text + .turn-progress-text {
@@ -2250,6 +2268,46 @@ button {
   border-top: 1px solid var(--color-border);
   border-bottom: 1px solid var(--color-border);
   color: var(--color-ink);
+  interpolate-size: allow-keywords;
+}
+
+/* Keep completed process steps in the DOM while their content settles out.
+   The details content track carries the height transition; opacity and pointer
+   handling close interaction without making the surrounding timeline jump. */
+.turn-disclosure-panel {
+  display: block;
+  min-width: 0;
+  min-height: 0;
+  opacity: 1;
+  visibility: visible;
+  transition: opacity 240ms ease;
+}
+
+.turn-disclosure-panel > * {
+  min-width: 0;
+  min-height: 0;
+}
+
+.turn-disclosure:not([open]) > .turn-disclosure-panel {
+  opacity: 0;
+  pointer-events: none;
+}
+
+/* Chromium/WebView2 can interpolate the intrinsic details content height.
+   This keeps the timeline in flow while an automatic collapse settles. */
+.turn-disclosure::details-content {
+  block-size: 0;
+  overflow-y: clip;
+  opacity: 0;
+  transition:
+    block-size 380ms cubic-bezier(0.16, 1, 0.3, 1),
+    opacity 240ms ease,
+    content-visibility 380ms allow-discrete;
+}
+
+.turn-disclosure[open]::details-content {
+  block-size: auto;
+  opacity: 1;
 }
 
 .turn-disclosure > summary {
@@ -2284,7 +2342,7 @@ button {
 
 .turn-disclosure-chevron {
   color: var(--color-ink-muted);
-  transition: transform 160ms ease;
+  transition: transform 320ms cubic-bezier(0.16, 1, 0.3, 1);
 }
 
 .turn-disclosure[open] .turn-disclosure-chevron { transform: rotate(180deg); }
@@ -2311,7 +2369,7 @@ button {
   flex-direction: column;
 }
 
-.turn-execution--live > .turn-execution-live {
+.turn-execution--live > .turn-disclosure-panel {
   order: 1;
 }
 
@@ -3036,6 +3094,7 @@ button {
 }
 
 .composer {
+  position: relative;
   min-width: 0;
   max-width: calc(100% - 40px);
   margin: 0 20px 20px;
@@ -3067,6 +3126,87 @@ button {
 .composer textarea:disabled {
   color: var(--color-ink-subtle);
 }
+
+.composer-suggestions {
+  position: absolute;
+  right: 10px;
+  bottom: calc(100% + 8px);
+  left: 10px;
+  z-index: 8;
+  max-height: min(360px, 48vh);
+  overflow: auto;
+  border: 1px solid var(--color-border-input);
+  border-radius: var(--radius-sm);
+  background: var(--color-surface-raised);
+  box-shadow: 0 10px 28px rgb(15 23 42 / 18%);
+}
+
+.composer-suggestions-header {
+  display: flex;
+  min-height: 30px;
+  align-items: center;
+  gap: 7px;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--color-border);
+  color: var(--color-ink-muted);
+  font-size: var(--font-size-xs);
+  font-weight: 700;
+}
+
+.composer-suggestions-header small {
+  margin-left: auto;
+  color: var(--color-ink-subtle);
+  font-weight: 500;
+}
+
+.composer-suggestion {
+  display: flex;
+  width: 100%;
+  min-height: 44px;
+  align-items: center;
+  gap: 9px;
+  padding: 7px 10px;
+  border: 0;
+  border-bottom: 1px solid var(--color-border);
+  border-radius: 0;
+  color: var(--color-ink);
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+
+.composer-suggestion:last-child { border-bottom: 0; }
+.composer-suggestion:hover,
+.composer-suggestion--active { background: var(--color-surface-hover); }
+.composer-suggestion--disabled { color: var(--color-ink-subtle); cursor: not-allowed; }
+
+.composer-suggestion-main {
+  display: flex;
+  min-width: 0;
+  flex: 1;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.composer-suggestion-main strong,
+.composer-suggestion-main small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.composer-suggestion-main strong { font-size: var(--font-size-sm); font-weight: 650; }
+.composer-suggestion-main small { color: var(--color-ink-subtle); font-size: var(--font-size-xs); }
+.composer-suggestion em { color: var(--color-warning); font-size: var(--font-size-xs); font-style: normal; }
+
+.composer-suggestions-empty {
+  padding: 14px 10px;
+  color: var(--color-ink-subtle);
+  font-size: var(--font-size-sm);
+  text-align: center;
+}
+
+.composer-suggestions-empty--error { color: var(--color-error-text); }
 
 .composer-footer {
   position: relative;
@@ -3465,7 +3605,6 @@ button {
 
 .workbench-panel--open {
   display: grid;
-  transform: translateX(0);
 }
 
 /* 桌面端：工作台必须严格限制在 grid 第 3 列轨道内，避免内部子元素的 min-content 把面板撑宽覆盖到对话区 */
@@ -3486,8 +3625,6 @@ button {
 .panel-toolbar > button, .preview-header-actions > button { display: grid; width: 27px; height: 27px; padding: 0; place-items: center; border: 0; border-radius: 4px; background: transparent; cursor: pointer; }
 .panel-toolbar > button:hover, .preview-header-actions > button:hover { background: var(--color-surface-hover); }
 .file-tree { flex: 1 1 42%; min-height: 110px; padding: 4px 0; overflow: auto; }
-.files-view--has-preview .file-tree,
-.files-view--has-preview .repository-results { flex: 0 1 140px; max-height: 20%; min-height: 72px; }
 .tree-row { display: flex; width: 100%; height: 23px; padding-right: 7px; align-items: center; gap: 4px; border: 0; color: var(--color-ink-muted); background: transparent; cursor: pointer; font-size: 12px; line-height: 1; text-align: left; letter-spacing: 0; }
 .tree-row:hover { color: var(--color-ink); background: var(--color-surface-hover); }
 .tree-row--selected { color: var(--color-item-active-text); background: var(--color-item-active-bg); }
@@ -3498,11 +3635,6 @@ button {
 .preview-header { display: flex; min-width: 0; padding: 0 7px 0 10px; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--color-border); font-size: var(--font-size-sm); }
 .preview-header > span { display: flex; min-width: 0; align-items: center; gap: 7px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .preview-header-actions { display: flex; flex: 0 0 auto; align-items: center; gap: 2px; }
-.files-view--editor-maximized > .panel-toolbar,
-.files-view--editor-maximized > .repository-search,
-.files-view--editor-maximized > .file-tree,
-.files-view--editor-maximized > .repository-results { display: none; }
-.file-preview--maximized { border-top: 0; }
 .preview-dirty { width: 7px; height: 7px; flex: 0 0 auto; border-radius: 50%; background: var(--color-brand); }
 .file-preview pre, .git-diff { min-height: 0; margin: 0; padding: 10px; overflow: auto; color: var(--color-ink); background: var(--color-surface-raised); font: 11px/1.55 var(--font-family-mono); white-space: pre; }
 .file-preview img { width: 100%; height: 100%; min-height: 0; object-fit: contain; background: var(--color-surface-raised); }
@@ -6310,10 +6442,36 @@ button {
   .turn-live-status-dots i {
     animation: none;
   }
+
+  .turn-disclosure-panel,
+  .turn-disclosure::details-content,
+  .turn-disclosure-chevron {
+    transition: none;
+  }
 }
 
 .approval-queue-position {
   margin-bottom: 8px;
   color: var(--color-ink-faint);
   font-size: var(--font-size-xs);
+}
+
+/* Plan/Ask question cards use the shared semantic palette in every theme. */
+.user-input-question-text,
+.user-input-option {
+  color: var(--color-ink);
+}
+
+.user-input-option {
+  border-color: var(--color-border-strong);
+  background: var(--color-surface);
+}
+
+.user-input-option:hover,
+.user-input-option--selected {
+  border-color: var(--color-brand);
+}
+
+.user-input-option--selected {
+  background: var(--color-surface-hover);
 }

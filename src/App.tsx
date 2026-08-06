@@ -36,7 +36,7 @@ import {
   ImageIcon,
 } from "lucide-react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { getRuntimeStatus, switchWorkspace, subscribeToAgentEvents, listSubagents } from "./api/runtime";
+import { getRuntimeStatus, switchWorkspace, subscribeToAgentEvents, listSubagents, getExtensionOverview, searchWorkspaceFiles } from "./api/runtime";
 import { useWorkbenchStore } from "./stores/workbenchStore";
 import { PatchReviewDialog } from "./components/PatchReviewDialog";
 import { SettingsDialog, type SettingsSection } from "./components/SettingsDialog";
@@ -53,7 +53,9 @@ import { ImagePreviewDialog } from "./components/ImagePreviewDialog";
 import { cn } from "./lib/cn";
 import { open } from "@tauri-apps/plugin-dialog";
 import { readFile } from "@tauri-apps/plugin-fs";
-import type { AttachmentContent, GoalView, ImageAttachment, RuntimeStatus } from "./types/runtime";
+import type { AttachmentContent, FileEntry, GoalView, ImageAttachment, RuntimeStatus } from "./types/runtime";
+import { ComposerSuggestionMenu, type ComposerSuggestion } from "./components/ComposerSuggestionMenu";
+import { findComposerTrigger, type ComposerTrigger } from "./lib/composerTrigger";
 import "./App.css";
 import "./enhanced-animations.css"; // UI 增强动画
 import "./components/ModeSelector.css";
@@ -94,10 +96,26 @@ function readStored<T>(key: string, fallback: T): T {
   }
 }
 
+function toReadableError(reason: unknown): string {
+  if (typeof reason === "string") return reason;
+  if (reason instanceof Error) return reason.message;
+  try {
+    const parsed = JSON.stringify(reason);
+    return parsed === undefined || parsed === "undefined" ? "未知错误" : parsed;
+  } catch {
+    return "未知错误";
+  }
+}
+
 function App() {
   const [runtime, setRuntime] = useState<RuntimeStatus | null>(null);
   const [runtimeError, setRuntimeError] = useState("");
   const [draft, setDraft] = useState("");
+  const [composerTrigger, setComposerTrigger] = useState<ComposerTrigger | null>(null);
+  const [composerSuggestions, setComposerSuggestions] = useState<ComposerSuggestion[]>([]);
+  const [composerSuggestionIndex, setComposerSuggestionIndex] = useState(0);
+  const [composerSuggestionsLoading, setComposerSuggestionsLoading] = useState(false);
+  const [composerSuggestionsError, setComposerSuggestionsError] = useState("");
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [logViewerOpen, setLogViewerOpen] = useState(false);
   const [settingsSection, setSettingsSection] = useState<SettingsSection>("providers");
@@ -127,6 +145,10 @@ function App() {
   const [expandedChangeSets, setExpandedChangeSets] = useState<Set<string>>(new Set());
   const [queueExpanded, setQueueExpanded] = useState(false);
   const messageAreaRef = useRef<HTMLDivElement>(null);
+  const composerRef = useRef<HTMLTextAreaElement>(null);
+  const composerSearchRequestRef = useRef(0);
+  const followLatestRef = useRef(true);
+  const scrollFrameRef = useRef<number | null>(null);
   const {
     threads,
     activeThreadId,
@@ -235,8 +257,61 @@ function App() {
 
   useEffect(() => {
     const area = messageAreaRef.current;
+    if (!area) return undefined;
+
+    const scrollToLatest = () => {
+      if (!followLatestRef.current || scrollFrameRef.current !== null) return;
+      scrollFrameRef.current = window.requestAnimationFrame(() => {
+        if (followLatestRef.current) area.scrollTop = area.scrollHeight;
+        scrollFrameRef.current = null;
+      });
+    };
+    const updateFollowState = () => {
+      const distanceFromLatest = area.scrollHeight - area.clientHeight - area.scrollTop;
+      followLatestRef.current = distanceFromLatest <= 48;
+    };
+    const handleScroll = () => {
+      const distanceFromLatest = area.scrollHeight - area.clientHeight - area.scrollTop;
+      if (distanceFromLatest <= 48) followLatestRef.current = true;
+    };
+    const handleWheel = (event: WheelEvent) => {
+      if (event.deltaY < 0) followLatestRef.current = false;
+      else updateFollowState();
+    };
+    const handlePointerDown = (event: PointerEvent) => {
+      if (event.target === area) followLatestRef.current = false;
+    };
+    const handleTouchStart = () => {
+      followLatestRef.current = false;
+    };
+
+    area.addEventListener("scroll", handleScroll, { passive: true });
+    area.addEventListener("wheel", handleWheel, { passive: true });
+    area.addEventListener("pointerdown", handlePointerDown, { passive: true });
+    area.addEventListener("touchstart", handleTouchStart, { passive: true });
+    const resizeObserver = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(scrollToLatest);
+    const messageList = area.querySelector(".message-list");
+    resizeObserver?.observe(messageList ?? area);
+    scrollToLatest();
+
+    return () => {
+      area.removeEventListener("scroll", handleScroll);
+      area.removeEventListener("wheel", handleWheel);
+      area.removeEventListener("pointerdown", handlePointerDown);
+      area.removeEventListener("touchstart", handleTouchStart);
+      resizeObserver?.disconnect();
+      if (scrollFrameRef.current !== null) {
+        window.cancelAnimationFrame(scrollFrameRef.current);
+        scrollFrameRef.current = null;
+      }
+    };
+  }, [activeThreadId, loading, messages.length]);
+
+  useEffect(() => {
+    followLatestRef.current = true;
+    const area = messageAreaRef.current;
     if (area) area.scrollTop = area.scrollHeight;
-  }, [messages]);
+  }, [activeThreadId]);
 
   useEffect(() => {
     document.documentElement.setAttribute("data-skin", "codebuddy");
@@ -329,11 +404,71 @@ function App() {
         setWorkbenchOpen(false);
         setAgentPanelOpen(false);
         setModeMenuOpen(false);
+        setComposerTrigger(null);
       }
     }
     window.addEventListener("keydown", handleShortcut);
     return () => window.removeEventListener("keydown", handleShortcut);
   }, [createThread]);
+
+  useEffect(() => {
+    const trigger = composerTrigger;
+    const requestId = ++composerSearchRequestRef.current;
+    setComposerSuggestionIndex(0);
+    setComposerSuggestionsError("");
+    if (!trigger) {
+      setComposerSuggestions([]);
+      setComposerSuggestionsLoading(false);
+      return;
+    }
+
+    setComposerSuggestionsLoading(true);
+    if (trigger.kind === "file") {
+      void searchWorkspaceFiles(trigger.query, 50)
+        .then((entries) => {
+          if (requestId !== composerSearchRequestRef.current) return;
+          const suggestions = (entries ?? [])
+            .filter((entry): entry is FileEntry => !entry.isDirectory)
+            .map((entry) => ({ kind: "file" as const, entry }));
+          setComposerSuggestions(suggestions);
+        })
+        .catch((reason: unknown) => {
+          if (requestId === composerSearchRequestRef.current) {
+            setComposerSuggestions([]);
+            setComposerSuggestionsError(toReadableError(reason));
+          }
+        })
+        .finally(() => {
+          if (requestId === composerSearchRequestRef.current) setComposerSuggestionsLoading(false);
+        });
+      return;
+    }
+
+    void getExtensionOverview(false)
+      .then((overview) => {
+        if (requestId !== composerSearchRequestRef.current) return;
+        const query = trigger.query.toLowerCase();
+        const suggestions = (overview?.skills ?? [])
+          .filter((skill) => {
+            if (!query) return true;
+            return skill.name.toLowerCase().includes(query)
+              || skill.description.toLowerCase().includes(query)
+              || skill.triggers.some((value) => value.toLowerCase().includes(query));
+          })
+          .sort((left, right) => Number(right.enabled) - Number(left.enabled) || left.name.localeCompare(right.name))
+          .map((skill) => ({ kind: "skill" as const, skill }));
+        setComposerSuggestions(suggestions);
+      })
+      .catch((reason: unknown) => {
+        if (requestId === composerSearchRequestRef.current) {
+          setComposerSuggestions([]);
+          setComposerSuggestionsError(toReadableError(reason));
+        }
+      })
+      .finally(() => {
+        if (requestId === composerSearchRequestRef.current) setComposerSuggestionsLoading(false);
+      });
+  }, [composerTrigger, workspaceRevision]);
 
   // 点击外部关闭项目菜单
   useEffect(() => {
@@ -595,6 +730,30 @@ function App() {
     });
   }
 
+  function handleComposerChange(event: React.ChangeEvent<HTMLTextAreaElement>) {
+    const value = event.currentTarget.value;
+    setDraft(value);
+    setComposerTrigger(findComposerTrigger(value, event.currentTarget.selectionStart ?? value.length));
+  }
+
+  function insertComposerSuggestion(suggestion: ComposerSuggestion) {
+    const trigger = composerTrigger;
+    if (!trigger) return;
+    const insertion = suggestion.kind === "file"
+      ? `@${suggestion.entry.path}`
+      : `/${suggestion.skill.name}`;
+    const nextDraft = `${draft.slice(0, trigger.start)}${insertion} ${draft.slice(trigger.end)}`;
+    const nextCursor = trigger.start + insertion.length + 1;
+    setDraft(nextDraft);
+    setComposerTrigger(null);
+    setComposerSuggestionIndex(0);
+    requestAnimationFrame(() => {
+      const textarea = composerRef.current;
+      textarea?.focus();
+      textarea?.setSelectionRange(nextCursor, nextCursor);
+    });
+  }
+
   async function submitMessage(event: FormEvent) {
     event.preventDefault();
     const message = draft.trim();
@@ -609,12 +768,34 @@ function App() {
         dataUrl: attachment.content,
       }));
     setDraft("");
+    setComposerTrigger(null);
     setAttachments([]);
     if (currentThreadBusy) setQueueExpanded(true);
     void sendMessage(message + attachmentContext, imageAttachments, agentMode);
   }
 
   function handleComposerKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
+    if (composerTrigger && composerSuggestions.length > 0) {
+      if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+        event.preventDefault();
+        const direction = event.key === "ArrowDown" ? 1 : -1;
+        setComposerSuggestionIndex((current) => (current + direction + composerSuggestions.length) % composerSuggestions.length);
+        return;
+      }
+      if (event.key === "Enter" || event.key === "Tab") {
+        const selected = composerSuggestions[composerSuggestionIndex];
+        if (selected && !(selected.kind === "skill" && !selected.skill.enabled)) {
+          event.preventDefault();
+          insertComposerSuggestion(selected);
+          return;
+        }
+      }
+    }
+    if (event.key === "Escape" && composerTrigger) {
+      event.preventDefault();
+      setComposerTrigger(null);
+      return;
+    }
     if (
       event.key === "Enter"
       && !event.shiftKey
@@ -1195,7 +1376,7 @@ function App() {
                   : null;
 
                 return (
-                  <Fragment key={message.id}>
+                  <Fragment key={message.role === "assistant" && message.turnId ? `assistant-turn-${message.turnId}` : message.id}>
                   <article className={cn("message", `message--${message.role}`, message.status === "streaming" && "message--streaming")}>
                     <div className="message-body">
                       <div className="message-role">{message.role === "user" ? "你" : "k-Coder"}</div>
@@ -1468,13 +1649,24 @@ function App() {
           )}
           <textarea
             aria-label="消息"
+            ref={composerRef}
             value={draft}
-            onChange={(event) => setDraft(event.target.value)}
+            onChange={handleComposerChange}
             onKeyDown={handleComposerKeyDown}
             onPaste={handlePaste}
             placeholder="输入消息，可直接粘贴或拖拽图片"
             rows={3}
           />
+          {composerTrigger && (
+            <ComposerSuggestionMenu
+              kind={composerTrigger.kind}
+              suggestions={composerSuggestions}
+              activeIndex={composerSuggestionIndex}
+              loading={composerSuggestionsLoading}
+              error={composerSuggestionsError}
+              onSelect={insertComposerSuggestion}
+            />
+          )}
           <div className="composer-footer">
             <button
               type="button"

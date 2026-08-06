@@ -34,6 +34,77 @@
 [data-theme="dark"] .file-type-icon--image { color: #c586c0; }
 [data-theme="dark"] .file-type-icon--config { color: #a7b0b8; }
 
+.file-preview-backdrop {
+  position: fixed;
+  z-index: 55;
+  top: 48px;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: clamp(12px, 3vh, 28px) clamp(12px, 3vw, 48px);
+  background: rgba(10, 12, 15, 0.6);
+}
+
+.file-preview-dialog {
+  width: min(1180px, 100%);
+  height: min(880px, 100%);
+  max-width: 1180px;
+  max-height: 100%;
+  flex: none;
+  overflow: hidden;
+  border: 1px solid var(--color-border-strong);
+  border-top: 1px solid var(--color-border-strong);
+  border-radius: 10px;
+  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.42);
+  animation: modal-enter var(--transition-modal);
+}
+
+.file-preview-dialog .preview-header {
+  min-height: 38px;
+  padding: 0 8px 0 14px;
+}
+
+.markdown-view-toggle {
+  display: flex;
+  overflow: hidden;
+  border: 1px solid var(--color-border);
+  border-radius: 5px;
+}
+
+.markdown-view-toggle button {
+  display: flex;
+  height: 24px;
+  padding: 0 9px;
+  align-items: center;
+  gap: 4px;
+  border: 0;
+  color: var(--color-ink-muted);
+  background: transparent;
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.markdown-view-toggle button:hover {
+  color: var(--color-ink);
+}
+
+.markdown-view-toggle button.active {
+  color: var(--color-item-active-text);
+  background: var(--color-item-active-bg);
+}
+
+.markdown-preview-body {
+  min-height: 0;
+  padding: 16px 22px;
+  overflow: auto;
+  background: var(--color-surface-raised);
+  font-size: 13px;
+  line-height: 1.65;
+}
+
 .git-actions {
   flex-wrap: wrap;
 }

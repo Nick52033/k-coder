@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::fmt::Write as _;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
@@ -12,6 +12,8 @@ use crate::persistence::{ProjectRecord, ProjectionDb};
 use crate::storage::now_ms;
 
 const MAX_DIRECTORY_ENTRIES: usize = 500;
+const MAX_FILE_SEARCH_ENTRIES: usize = 20_000;
+const MAX_FILE_SEARCH_RESULTS: usize = 100;
 const MAX_PREVIEW_BYTES: usize = 256 * 1024;
 const MAX_ATTACHMENT_BYTES: usize = 4 * 1024 * 1024;
 const IGNORED: &[&str] = &[".git", "node_modules", "target", "dist", "build", ".next"];
@@ -193,6 +195,112 @@ pub fn list_directory(root: &Path, relative: &str) -> Result<Vec<FileEntry>, Wor
         .collect::<Vec<_>>();
     entries.sort_by_key(|entry| (!entry.is_directory, entry.name.to_lowercase()));
     Ok(entries)
+}
+
+/// Search file names within the selected workspace for composer `@` suggestions.
+///
+/// Traversal is deliberately bounded and every discovered path is canonicalized
+/// before it is returned, so symlinks/junctions cannot turn an autocomplete
+/// request into a path disclosure outside the workspace.
+pub fn search_files(
+    root: &Path,
+    query: &str,
+    requested_limit: usize,
+) -> Result<Vec<FileEntry>, WorkbenchError> {
+    let root = canonical_workspace(root)?;
+    let query = query.trim().to_lowercase();
+    let limit = requested_limit.clamp(1, MAX_FILE_SEARCH_RESULTS);
+    let mut directories = VecDeque::from([PathBuf::new()]);
+    let mut visited = HashSet::new();
+    let mut matches = Vec::new();
+    let mut examined = 0usize;
+
+    while let Some(relative_dir) = directories.pop_front() {
+        let directory = match resolve(&root, &relative_dir.to_string_lossy(), true) {
+            Ok(path) => path,
+            Err(_) => continue,
+        };
+        if !visited.insert(directory.clone()) {
+            continue;
+        }
+        let mut entries = match std::fs::read_dir(&directory) {
+            Ok(entries) => entries.filter_map(Result::ok).collect::<Vec<_>>(),
+            Err(_) => continue,
+        };
+        entries.sort_by_key(|entry| entry.file_name().to_string_lossy().to_lowercase());
+
+        for entry in entries {
+            examined += 1;
+            if examined > MAX_FILE_SEARCH_ENTRIES {
+                break;
+            }
+            let name = entry.file_name().to_string_lossy().to_string();
+            if IGNORED.contains(&name.as_str()) {
+                continue;
+            }
+            let file_type = match entry.file_type() {
+                Ok(file_type) => file_type,
+                Err(_) => continue,
+            };
+            // Do not follow links while building a user-visible file index.
+            if file_type.is_symlink() {
+                continue;
+            }
+            let metadata = match entry.metadata() {
+                Ok(metadata) => metadata,
+                Err(_) => continue,
+            };
+            let path = match entry.path().strip_prefix(&root) {
+                Ok(path) => path.to_string_lossy().replace('\\', "/"),
+                Err(_) => continue,
+            };
+            if metadata.is_dir() {
+                directories.push_back(PathBuf::from(&path));
+                continue;
+            }
+            if !metadata.is_file() || (!query.is_empty() && !path.to_lowercase().contains(&query)) {
+                continue;
+            }
+            // Re-check the canonical target so a race or a junction cannot be
+            // surfaced even if the directory entry changed during traversal.
+            if resolve(&root, &path, false).is_err() {
+                continue;
+            }
+            matches.push(FileEntry {
+                name,
+                path,
+                is_directory: false,
+                size: Some(metadata.len()),
+                modified_at_ms: metadata
+                    .modified()
+                    .ok()
+                    .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|value| value.as_millis() as u64),
+            });
+        }
+        if examined > MAX_FILE_SEARCH_ENTRIES {
+            break;
+        }
+    }
+
+    matches.sort_by_key(|entry| {
+        let path = entry.path.to_lowercase();
+        let name = entry.name.to_lowercase();
+        let score = if !query.is_empty() && name == query {
+            0
+        } else if !query.is_empty() && name.starts_with(&query) {
+            1
+        } else if !query.is_empty() && name.contains(&query) {
+            2
+        } else if !query.is_empty() && path.starts_with(&query) {
+            3
+        } else {
+            4
+        };
+        (score, path)
+    });
+    matches.truncate(limit);
+    Ok(matches)
 }
 
 pub fn preview_file(root: &Path, relative: &str) -> Result<FilePreview, WorkbenchError> {
@@ -693,6 +801,38 @@ mod tests {
             "rust"
         );
         assert!(preview_file(root.path(), "../outside").is_err());
+    }
+
+    #[test]
+    fn searches_bounded_workspace_file_names_and_ignores_build_outputs() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("src")).unwrap();
+        std::fs::create_dir(root.path().join("dist")).unwrap();
+        std::fs::write(root.path().join("src/App.tsx"), "export {}\n").unwrap();
+        std::fs::write(root.path().join("dist/App.js"), "generated\n").unwrap();
+
+        let results = search_files(root.path(), "app", 10).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].path, "src/App.tsx");
+        assert!(results.iter().all(|entry| !entry.is_directory));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_search_does_not_follow_symlinks_outside_workspace() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.txt"), "secret\n").unwrap();
+        symlink(
+            outside.path().join("secret.txt"),
+            root.path().join("secret.txt"),
+        )
+        .unwrap();
+
+        let results = search_files(root.path(), "secret", 10).unwrap();
+        assert!(results.is_empty());
     }
 
     #[test]

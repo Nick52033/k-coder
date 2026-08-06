@@ -199,6 +199,7 @@ export function deleteMcpSecret(server: string, name: string) { return invoke<Ex
 export function getWorkspaceState() { return invoke<WorkspaceState>("workspace_state"); }
 export function switchWorkspace(path: string, trusted: boolean) { return invoke<ProjectRecord>("switch_workspace", { path, trusted }); }
 export function listWorkspaceDirectory(path = "") { return invoke<FileEntry[]>("list_workspace_directory", { path }); }
+export function searchWorkspaceFiles(query: string, limit = 50) { return invoke<FileEntry[]>("search_workspace_files", { query, limit }); }
 export function previewWorkspaceFile(path: string) { return invoke<FilePreview>("preview_workspace_file", { path }); }
 export function saveWorkspaceFile(request: SaveWorkspaceFileRequest) { return invoke<FilePreview>("save_workspace_file", { request }); }
 export function extractAttachment(path: string) { return invoke<AttachmentContent>("extract_attachment", { path }); }

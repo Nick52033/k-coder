@@ -64,6 +64,10 @@ test.beforeEach(async ({ page }) => {
         { name: "src", path: "src", isDirectory: true, size: null, modifiedAtMs: 2 },
         { name: "README.md", path: "README.md", isDirectory: false, size: 120, modifiedAtMs: 2 },
       ],
+      search_workspace_files: [
+        { name: "App.tsx", path: "src/App.tsx", isDirectory: false, size: 240, modifiedAtMs: 2 },
+        { name: "README.md", path: "README.md", isDirectory: false, size: 120, modifiedAtMs: 2 },
+      ],
       preview_workspace_file: { path: "README.md", name: "README.md", language: "markdown", content: "# k-Coder", dataUrl: null, size: 9, truncated: false, editable: true, contentHash: "hash-readme" },
       save_workspace_file: { path: "README.md", name: "README.md", language: "markdown", content: "# k-Coder\n\nEdited", dataUrl: null, size: 17, truncated: false, editable: true, contentHash: "hash-edited" },
       git_status: { isRepository: true, branch: "main", upstream: "origin/main", ahead: 0, behind: 0, files: [{ path: "src/App.tsx", indexStatus: " ", worktreeStatus: "M" }] },
@@ -248,6 +252,19 @@ test("supports the primary workbench inspection flow", async ({ page }, testInfo
   await expect(readmeRow).toHaveCSS("font-size", "12px");
   await readmeRow.click();
   await expect(readmeRow).toHaveAttribute("aria-current", "true");
+  const previewDialog = page.getByRole("dialog", { name: "预览 README.md" });
+  await expect(previewDialog).toBeVisible();
+  const previewBackdrop = page.locator(".file-preview-backdrop");
+  const viewport = page.viewportSize();
+  const backdropBox = await previewBackdrop.boundingBox();
+  const dialogBox = await previewDialog.boundingBox();
+  expect(viewport).not.toBeNull();
+  expect(backdropBox).toMatchObject({ x: 0, y: 48, width: viewport!.width, height: viewport!.height - 48 });
+  expect(dialogBox).not.toBeNull();
+  expect(Math.abs((dialogBox!.x + dialogBox!.width / 2) - (viewport!.width / 2))).toBeLessThanOrEqual(1);
+  expect(Math.abs((dialogBox!.y + dialogBox!.height / 2) - ((viewport!.height + 48) / 2))).toBeLessThanOrEqual(1);
+  await page.screenshot({ path: testInfo.outputPath("workspace-markdown-preview-centered.png"), fullPage: true });
+  await previewDialog.getByRole("button", { name: "源码", exact: true }).click();
   const editor = page.locator(".monaco-editor");
   await expect(editor).toBeVisible();
   await expect.poll(async () => {
@@ -271,10 +288,8 @@ test("supports the primary workbench inspection flow", async ({ page }, testInfo
     request: { path: "README.md", content: "# k-Coder\n\nEdited", expectedHash: "hash-readme" },
   });
   await page.screenshot({ path: testInfo.outputPath("workspace-code-editor.png"), fullPage: true });
-  await page.getByRole("button", { name: "最大化编辑器" }).click();
-  await expect(page.getByPlaceholder("搜索仓库")).toBeHidden();
-  await expect.poll(async () => (await page.locator(".code-editor").boundingBox())?.height ?? 0).toBeGreaterThan(600);
-  await page.screenshot({ path: testInfo.outputPath("workspace-code-editor-maximized.png"), fullPage: true });
+  await previewDialog.getByRole("button", { name: "关闭预览" }).click();
+  await expect(previewDialog).toHaveCount(0);
   await page.getByRole("tab", { name: "Git" }).click();
   await expect(page.getByLabel("当前分支")).toHaveValue("main");
   await page.getByRole("button", { name: "暂存 src/App.tsx" }).click();
@@ -518,6 +533,180 @@ test("renders streamed assistant markdown as structured content", async ({ page 
   await expect(liveMessage.locator(".markdown-image-placeholder")).toHaveText("远程图片");
   await liveMessage.scrollIntoViewIfNeeded();
   await page.screenshot({ path: testInfo.outputPath("assistant-markdown.png"), fullPage: true });
+});
+
+test("wakes workspace files with @ and enabled Skills with /", async ({ page }) => {
+  await page.goto("/");
+  const composer = page.getByRole("textbox", { name: "消息" });
+
+  await composer.fill("@src/");
+  await expect(page.locator(".composer-suggestions")).toBeVisible();
+  await expect(page.getByRole("option", { name: /src\/App\.tsx/ })).toBeVisible();
+  await page.getByRole("option", { name: /src\/App\.tsx/ }).click();
+  await expect(composer).toHaveValue("@src/App.tsx ");
+
+  await composer.fill("/re");
+  await expect(page.getByRole("option", { name: /\/review/ })).toBeVisible();
+  await composer.press("Enter");
+  await expect(composer).toHaveValue("/review ");
+});
+
+test("paces streamed text and preserves timeline order before tools and completion", async ({ page }) => {
+  await page.goto("/");
+  const emit = (event: Record<string, unknown>) => page.evaluate((payload) => {
+    (window as unknown as { __emitAgentEvent: (value: unknown) => void }).__emitAgentEvent(payload);
+  }, event);
+  const base = { schemaVersion: 1, threadId: "thread-1", turnId: "turn-paced" };
+  const progressText = `${"逐步展示工具前的说明内容。".repeat(18)}\n\n工具前说明终点`;
+  const finalText = `${"逐步展示收到的最终回复。".repeat(24)}\n\n流式终点`;
+
+  await emit({ ...base, type: "turn_started", phase: "exploring" });
+  await emit({ ...base, type: "text_delta", phase: "responding", delta: progressText });
+  await emit({
+    ...base,
+    type: "tool_started",
+    phase: "executing",
+    call: { id: "call-paced", name: "run_command", arguments: { command: "pnpm build" }, metadata: {} },
+  });
+  await emit({
+    ...base,
+    type: "tool_completed",
+    phase: "executing",
+    callId: "call-paced",
+    name: "run_command",
+    result: { success: true, output: "done", metadata: { durationMs: 120 } },
+  });
+
+  const liveMessage = page.locator(".message--assistant").last();
+  await expect(liveMessage.locator(".turn-progress-text--typing")).toBeVisible();
+  await expect(liveMessage.getByText("工具前说明终点", { exact: true })).toHaveCount(0);
+  await expect(liveMessage.getByText("运行了命令", { exact: true })).toHaveCount(0);
+  await expect(liveMessage.getByText("生成回复中", { exact: true })).toBeVisible();
+  await expect(liveMessage.getByText("工具前说明终点", { exact: true })).toBeVisible({ timeout: 10_000 });
+  await expect(liveMessage.getByText("运行了命令", { exact: true })).toBeVisible();
+
+  await emit({ ...base, type: "text_delta", phase: "responding", delta: finalText });
+  await expect(liveMessage.getByText("流式终点", { exact: true })).toHaveCount(0);
+
+  await emit({
+    ...base,
+    type: "turn_completed",
+    phase: "complete",
+    message: {
+      schemaVersion: 1,
+      id: "message-paced",
+      role: "assistant",
+      content: [{ type: "text", text: finalText }],
+      createdAtMs: 5,
+    },
+    usage: null,
+    startedAtMs: 1000,
+    completedAtMs: 2800,
+    durationMs: 1800,
+  });
+
+  await expect(liveMessage.locator(".turn-execution--live")).toBeVisible();
+  await expect(liveMessage.getByText("生成回复中", { exact: true })).toBeVisible();
+  await expect(liveMessage.locator(".turn-execution--live")).toHaveCount(0);
+  await expect(liveMessage.locator(".turn-final-response").getByText("流式终点", { exact: true })).toBeVisible();
+  await expect(liveMessage.getByText("执行了 1.8s", { exact: true })).toBeVisible();
+});
+
+test("settles completed tool groups with a gradual collapse", async ({ page }) => {
+  await page.goto("/");
+  const emit = (event: Record<string, unknown>) => page.evaluate((payload) => {
+    (window as unknown as { __emitAgentEvent: (value: unknown) => void }).__emitAgentEvent(payload);
+  }, event);
+  const base = { schemaVersion: 1, threadId: "thread-1", turnId: "turn-collapse" };
+
+  await emit({ ...base, type: "turn_started", phase: "exploring" });
+  await emit({
+    ...base,
+    type: "tool_started",
+    phase: "executing",
+    call: { id: "call-collapse", name: "run_command", arguments: { command: "pnpm build" }, metadata: {} },
+  });
+
+  const group = page.locator(".turn-tool-group").last();
+  await expect(group).toHaveAttribute("open", "");
+  const openHeight = await group.evaluate((element) => element.getBoundingClientRect().height);
+  expect(openHeight).toBeGreaterThan(0);
+
+  await emit({
+    ...base,
+    type: "tool_completed",
+    phase: "executing",
+    callId: "call-collapse",
+    name: "run_command",
+    result: { success: true, output: "done", metadata: { durationMs: 120 } },
+  });
+
+  await expect(group).not.toHaveAttribute("open", "");
+  const closingHeight = await group.evaluate((element) => element.getBoundingClientRect().height);
+  expect(closingHeight).toBeGreaterThan(0);
+  await page.waitForTimeout(80);
+  const settlingHeight = await group.evaluate((element) => element.getBoundingClientRect().height);
+  expect(settlingHeight).toBeGreaterThan(0);
+  expect(settlingHeight).toBeLessThan(closingHeight);
+  await expect.poll(() => group.evaluate((element) => element.getBoundingClientRect().height), { timeout: 1_000 })
+    .toBeLessThan(settlingHeight);
+});
+
+test("follows streamed growth only while the conversation remains near the latest content", async ({ page }) => {
+  await page.goto("/");
+  const area = page.locator(".message-area");
+  await area.evaluate((element) => {
+    const target = element as HTMLElement;
+    target.style.height = "220px";
+    target.style.minHeight = "220px";
+    target.style.maxHeight = "220px";
+    target.scrollTop = target.scrollHeight;
+    target.dispatchEvent(new Event("scroll"));
+  });
+  const initialTop = await area.evaluate((element) => element.scrollTop);
+  const firstChunk = Array.from(
+    { length: 70 },
+    (_, index) => `持续输出第 ${index + 1} 段内容，让对话自然向下生长。`,
+  ).join("\n\n");
+  const emit = (event: Record<string, unknown>) => page.evaluate((payload) => {
+    (window as unknown as { __emitAgentEvent: (value: unknown) => void }).__emitAgentEvent(payload);
+  }, event);
+  const base = { schemaVersion: 1, threadId: "thread-1", turnId: "turn-scroll-follow" };
+
+  await emit({ ...base, type: "turn_started", phase: "exploring" });
+  await emit({ ...base, type: "text_delta", phase: "responding", delta: firstChunk });
+  await expect.poll(() => area.evaluate((element) => element.scrollTop), { timeout: 8_000 })
+    .toBeGreaterThan(initialTop + 20);
+  await expect.poll(() => area.evaluate((element) =>
+    element.scrollHeight - element.clientHeight - element.scrollTop,
+  )).toBeLessThanOrEqual(2);
+
+  const paused = await area.evaluate((element) => {
+    const target = element as HTMLElement;
+    target.scrollTop = Math.max(0, target.scrollTop - 120);
+    target.dispatchEvent(new Event("scroll"));
+    target.dispatchEvent(new WheelEvent("wheel", { deltaY: -120 }));
+    return { top: target.scrollTop, height: target.scrollHeight };
+  });
+  await expect.poll(() => area.evaluate((element) => element.scrollHeight), { timeout: 5_000 })
+    .toBeGreaterThan(paused.height);
+  const pausedTop = await area.evaluate((element) => element.scrollTop);
+  expect(Math.abs(pausedTop - paused.top)).toBeLessThanOrEqual(2);
+  await expect.poll(() => area.evaluate((element) =>
+    element.scrollHeight - element.clientHeight - element.scrollTop,
+  )).toBeGreaterThan(48);
+
+  const resumeHeight = await area.evaluate((element) => {
+    const target = element as HTMLElement;
+    target.scrollTop = target.scrollHeight;
+    target.dispatchEvent(new Event("scroll"));
+    return target.scrollHeight;
+  });
+  await expect.poll(() => area.evaluate((element) => element.scrollHeight), { timeout: 5_000 })
+    .toBeGreaterThan(resumeHeight);
+  await expect.poll(() => area.evaluate((element) =>
+    element.scrollHeight - element.clientHeight - element.scrollTop,
+  )).toBeLessThanOrEqual(2);
 });
 
 test("queues messages during thinking and interrupts only from the queued send action", async ({ page }, testInfo) => {
@@ -1166,6 +1355,7 @@ test("keeps retry attempts in one assistant reply before and after recovery", as
 
 test("restores a pending user question after reopening the thread", async ({ page }) => {
   await page.addInitScript(() => {
+    localStorage.setItem("kcoder_theme", "dark");
     localStorage.setItem("kcoder_e2e_thread_detail", JSON.stringify({
       schemaVersion: 1,
       summary: { schemaVersion: 1, id: "thread-1", title: "Phase 6 workbench", createdAtMs: 1, updatedAtMs: 2, archived: false },
@@ -1195,6 +1385,8 @@ test("restores a pending user question after reopening the thread", async ({ pag
   });
   await page.goto("/");
   await expect(page.locator(".user-input-question-text").getByText("Choose an approach", { exact: true })).toBeVisible();
+  await expect.poll(() => page.locator(".user-input-question-text").evaluate((element) => getComputedStyle(element).color)).toBe("rgb(227, 232, 240)");
+  await expect.poll(() => page.getByRole("button", { name: "Fast", exact: true }).evaluate((element) => getComputedStyle(element).color)).toBe("rgb(227, 232, 240)");
   await page.getByRole("button", { name: "Fast", exact: true }).click();
   await page.getByRole("button", { name: "提交回答", exact: true }).click();
   await expect.poll(() => page.evaluate(() => (window as unknown as { __invoked: string[] }).__invoked.filter((command) => command === "resolve_user_input").length)).toBe(1);

@@ -2,11 +2,12 @@ import { lazy, Suspense, useEffect, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
   ArrowDownToLine, Braces, ChevronDown, ChevronRight, CircleCheck,
-  CodeXml, Database, File, FileCode2, FileCog, FileText, Folder, FolderOpen,
+  CodeXml, Database, Eye, File, FileCode2, FileCog, FileText, Folder, FolderOpen,
   GitBranch, Hash, Image, LocateFixed, Paperclip, Plus, RefreshCw, Search,
-  Maximize2, Minimize2, RotateCcw, Save, Terminal, Upload, X,
+  RotateCcw, Save, Terminal, Upload, X,
 } from "lucide-react";
 import "./WorkbenchPanel.css";
+import { MarkdownContent } from "./MarkdownContent";
 import {
   extractAttachment, getGitBranches, getGitDiff, getGitStatus, getWorkspaceState,
   listWorkspaceDirectory, openWorkspaceFile, previewWorkspaceFile, revealWorkspaceFile,
@@ -106,7 +107,7 @@ function FilesView({ onAttach }: { onAttach: (attachment: AttachmentContent) => 
   const [draft, setDraft] = useState("");
   const [saving, setSaving] = useState(false);
   const [notice, setNotice] = useState("");
-  const [editorMaximized, setEditorMaximized] = useState(false);
+  const [mdView, setMdView] = useState<"preview" | "source">("preview");
   const dirty = Boolean(preview?.editable && draft !== (preview.content ?? ""));
 
   async function select(path: string) {
@@ -116,7 +117,7 @@ function FilesView({ onAttach }: { onAttach: (attachment: AttachmentContent) => 
       const next = await previewWorkspaceFile(path);
       setPreview(next);
       setDraft(next.content ?? "");
-      setEditorMaximized(false);
+      setMdView("preview");
       setError("");
       setNotice("");
     } catch (error) {
@@ -150,7 +151,7 @@ function FilesView({ onAttach }: { onAttach: (attachment: AttachmentContent) => 
     if (dirty && !window.confirm("当前文件有未保存的修改，确定关闭？")) return;
     setPreview(null);
     setDraft("");
-    setEditorMaximized(false);
+    setMdView("preview");
     setNotice("");
     setError("");
   }
@@ -158,6 +159,15 @@ function FilesView({ onAttach }: { onAttach: (attachment: AttachmentContent) => 
   async function attach() {
     if (preview) onAttach(await extractAttachment(preview.path));
   }
+
+  useEffect(() => {
+    if (!preview) return;
+    function handleKeyDown(event: globalThis.KeyboardEvent) {
+      if (event.key === "Escape") closePreview();
+    }
+    document.addEventListener("keydown", handleKeyDown);
+    return () => document.removeEventListener("keydown", handleKeyDown);
+  });
 
   useEffect(() => {
     void getWorkspaceState()
@@ -188,8 +198,11 @@ function FilesView({ onAttach }: { onAttach: (attachment: AttachmentContent) => 
     );
   }
 
+  const isMarkdown = preview?.language === "markdown";
+  const showMarkdownPreview = Boolean(isMarkdown && mdView === "preview" && !preview?.dataUrl && preview?.content !== null);
+
   return (
-    <div className={`files-view ${preview ? "files-view--has-preview" : ""} ${editorMaximized ? "files-view--editor-maximized" : ""}`}>
+    <div className="files-view">
       <div className="panel-toolbar"><WorkspacePicker onChanged={() => setRevision((value) => value + 1)} compact /><button type="button" title="刷新" aria-label="刷新文件树" onClick={() => setRevision((value) => value + 1)}><RefreshCw size={14} /></button></div>
       <form className="repository-search" onSubmit={(event) => { event.preventDefault(); if (query.trim()) void searchRepository(query.trim()).then(setResults).catch((reason) => setError(String(reason))); }}>
         <Search size={14} />
@@ -199,9 +212,10 @@ function FilesView({ onAttach }: { onAttach: (attachment: AttachmentContent) => 
       {results.length > 0 ? <div className="repository-results">{results.map((result) => <button type="button" key={`${result.path}:${result.line}`} onClick={() => void select(result.path)}><strong>{result.path}:{result.line}</strong><span>{result.preview}</span></button>)}</div> : <div className="file-tree" key={revision}><DirectoryNode path="" depth={0} selectedPath={preview?.path ?? null} onSelect={(path) => void select(path)} /></div>}
       {error && <div className="panel-error">{error}</div>}
       {preview && (
-        <div className={`file-preview ${editorMaximized ? "file-preview--maximized" : ""}`}>
-          <div className="preview-header"><span title={preview.path}>{preview.name}{dirty && <i className="preview-dirty" title="有未保存的修改" aria-label="有未保存的修改" />}</span><div className="preview-header-actions"><button type="button" aria-label={editorMaximized ? "还原编辑器" : "最大化编辑器"} title={editorMaximized ? "还原编辑器" : "最大化编辑器"} onClick={() => setEditorMaximized((value) => !value)}>{editorMaximized ? <Minimize2 size={14} /> : <Maximize2 size={14} />}</button><button type="button" aria-label="关闭预览" onClick={closePreview}><X size={14} /></button></div></div>
-          {preview.dataUrl ? <img src={preview.dataUrl} alt={preview.name} /> : <Suspense fallback={<div className="code-editor-loading">正在载入编辑器...</div>}><CodeEditor key={preview.path} path={preview.path} language={preview.language} value={draft} readOnly={!preview.editable} onChange={setDraft} onSave={save} /></Suspense>}
+        <div className="file-preview-backdrop" onMouseDown={closePreview}>
+          <section className="file-preview file-preview-dialog" role="dialog" aria-modal="true" aria-label={`预览 ${preview.name}`} onMouseDown={(event) => event.stopPropagation()}>
+          <div className="preview-header"><span title={preview.path}>{preview.name}{dirty && <i className="preview-dirty" title="有未保存的修改" aria-label="有未保存的修改" />}</span><div className="preview-header-actions">{isMarkdown && !preview.dataUrl && (<div className="markdown-view-toggle" role="group" aria-label="Markdown 视图切换"><button className={mdView === "preview" ? "active" : ""} type="button" title="渲染预览" onClick={() => setMdView("preview")}><Eye size={13} />预览</button><button className={mdView === "source" ? "active" : ""} type="button" title="编辑源码" onClick={() => setMdView("source")}><CodeXml size={13} />源码</button></div>)}<button type="button" aria-label="关闭预览" title="关闭 (Esc)" onClick={closePreview}><X size={14} /></button></div></div>
+          {preview.dataUrl ? <img src={preview.dataUrl} alt={preview.name} /> : showMarkdownPreview ? <div className="markdown-preview-body"><MarkdownContent text={draft} /></div> : <Suspense fallback={<div className="code-editor-loading">正在载入编辑器...</div>}><CodeEditor key={preview.path} path={preview.path} language={preview.language} value={draft} readOnly={!preview.editable} onChange={setDraft} onSave={save} /></Suspense>}
           {preview.truncated && <small>文件超过 256 KiB，已截断并以只读方式打开</small>}
           {!preview.dataUrl && !preview.truncated && !preview.editable && <small>该文件不是 UTF-8 文本，仅支持查看</small>}
           {notice && <div className="preview-notice" role="status">{notice}</div>}
@@ -212,6 +226,7 @@ function FilesView({ onAttach }: { onAttach: (attachment: AttachmentContent) => 
             <button className="preview-icon-action" type="button" aria-label="使用系统编辑器打开" title="使用系统编辑器打开" onClick={() => void openWorkspaceFile(preview.path)}><Upload size={14} /></button>
             <button className="preview-icon-action" type="button" aria-label="在资源管理器中定位" title="在资源管理器中定位" onClick={() => void revealWorkspaceFile(preview.path)}><LocateFixed size={14} /></button>
           </div>
+          </section>
         </div>
       )}
     </div>

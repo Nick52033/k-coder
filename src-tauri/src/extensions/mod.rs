@@ -187,6 +187,17 @@ pub struct ExtensionService {
     audit_path: PathBuf,
 }
 
+fn skill_is_selected(lower_input: &str, skill: &LoadedSkill) -> bool {
+    let explicit_name = format!("/{}", skill.metadata.name);
+    let explicitly_invoked = lower_input
+        .split_whitespace()
+        .any(|token| token == explicit_name);
+    explicitly_invoked
+        || skill.metadata.triggers.iter().any(|trigger| {
+            !trigger.trim().is_empty() && lower_input.contains(&trigger.to_lowercase())
+        })
+}
+
 impl ExtensionService {
     pub fn new(
         data_root: PathBuf,
@@ -396,12 +407,7 @@ impl ExtensionService {
         let lower_input = input.to_lowercase();
         let selected = skills
             .iter()
-            .filter(|skill| {
-                skill.enabled
-                    && skill.metadata.triggers.iter().any(|trigger| {
-                        !trigger.trim().is_empty() && lower_input.contains(&trigger.to_lowercase())
-                    })
-            })
+            .filter(|skill| skill.enabled && skill_is_selected(&lower_input, skill))
             .take(MAX_SELECTED_SKILLS)
             .collect::<Vec<_>>();
         if !selected.is_empty() {
@@ -1056,6 +1062,8 @@ mod tests {
             .unwrap();
         assert!(instructions.contains("REVIEW-INSTRUCTIONS"));
         assert!(!instructions.contains("DEPLOY-INSTRUCTIONS"));
+        let explicit_disabled = service.runtime_instructions("/deploy now").unwrap();
+        assert!(!explicit_disabled.contains("DEPLOY-INSTRUCTIONS"));
         service.set_enabled("skill", "deploy", true).unwrap();
         service
             .prepare(workspace.path(), CancellationToken::new())
@@ -1063,7 +1071,7 @@ mod tests {
             .unwrap();
         assert!(
             service
-                .runtime_instructions("deploy now")
+                .runtime_instructions("/deploy now")
                 .unwrap()
                 .contains("DEPLOY-INSTRUCTIONS")
         );

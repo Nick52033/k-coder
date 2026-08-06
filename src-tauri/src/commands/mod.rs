@@ -837,6 +837,16 @@ pub fn list_workspace_directory(
 }
 
 #[tauri::command(rename_all = "camelCase")]
+pub fn search_workspace_files(
+    state: State<'_, AppState>,
+    query: String,
+    limit: Option<usize>,
+) -> CommandResult<Vec<FileEntry>> {
+    workbench::search_files(&state.workspace_root(), &query, limit.unwrap_or(50))
+        .map_err(|error| CommandError::new("file_search", error))
+}
+
+#[tauri::command(rename_all = "camelCase")]
 pub fn preview_workspace_file(
     state: State<'_, AppState>,
     path: String,
