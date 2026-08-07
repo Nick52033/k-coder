@@ -213,6 +213,7 @@ export interface ThreadSummary {
   createdAtMs: number;
   updatedAtMs: number;
   archived: boolean;
+  workspacePath?: string | null;
 }
 
 export interface TurnSnapshot {

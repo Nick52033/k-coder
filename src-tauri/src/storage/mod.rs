@@ -18,7 +18,7 @@ use crate::protocol::{
     TurnState, UserInputAction, UserInputRequest, UserInputResolution,
 };
 
-pub const EVENT_SCHEMA_VERSION: u32 = 4;
+pub const EVENT_SCHEMA_VERSION: u32 = 5;
 const MAX_TIMELINE_DETAIL_CHARS: usize = 2_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -55,6 +55,9 @@ impl StoredEvent {
 pub enum StoredEventKind {
     ThreadCreated {
         title: String,
+    },
+    ThreadWorkspaceBound {
+        path: String,
     },
     UserMessage {
         message: ChatMessage,
@@ -141,6 +144,7 @@ pub struct ThreadSummary {
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
     pub archived: bool,
+    pub workspace_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -270,6 +274,7 @@ pub trait ThreadRepository: Send + Sync {
 pub struct JsonlThreadRepository {
     sessions_dir: PathBuf,
     append_lock: Arc<Mutex<()>>,
+    workspace_binding_lock: Arc<Mutex<()>>,
     projection: ProjectionDb,
 }
 
@@ -280,6 +285,7 @@ impl JsonlThreadRepository {
         let repository = Self {
             sessions_dir,
             append_lock: Arc::new(Mutex::new(())),
+            workspace_binding_lock: Arc::new(Mutex::new(())),
             projection: ProjectionDb::open(data_root.as_ref())
                 .map_err(|error| StorageError::Io(error.to_string()))?,
         };
@@ -298,6 +304,39 @@ impl JsonlThreadRepository {
         ))
         .await?;
         Ok(self.read_thread(&thread_id).await?.summary)
+    }
+
+    pub async fn create_thread_in_workspace(
+        &self,
+        workspace_root: &Path,
+    ) -> Result<ThreadSummary, StorageError> {
+        let thread = self.create_thread().await?;
+        self.bind_thread_workspace(&thread.id, workspace_root).await
+    }
+
+    pub async fn bind_thread_workspace(
+        &self,
+        thread_id: &str,
+        workspace_root: &Path,
+    ) -> Result<ThreadSummary, StorageError> {
+        let _binding_guard = self.workspace_binding_lock.lock().await;
+        let detail = self.read_thread(thread_id).await?;
+        let path = workspace_root.to_string_lossy().into_owned();
+        if let Some(bound) = &detail.summary.workspace_path {
+            if bound == &path {
+                return Ok(detail.summary);
+            }
+            return Err(StorageError::InvalidData(format!(
+                "thread {thread_id} is already bound to workspace {bound}"
+            )));
+        }
+        self.append(StoredEvent::new(
+            thread_id,
+            None,
+            StoredEventKind::ThreadWorkspaceBound { path },
+        ))
+        .await?;
+        Ok(self.read_thread(thread_id).await?.summary)
     }
 
     pub async fn list_threads(&self) -> Result<Vec<ThreadSummary>, StorageError> {
@@ -523,6 +562,7 @@ fn project_thread(thread_id: &str, events: &[StoredEvent]) -> Result<ThreadDetai
     let mut turn_user_message_ids = HashMap::new();
     let mut latest_user_message_id: Option<String> = None;
     let mut archived = false;
+    let mut workspace_path = None;
     let mut last_turn = None;
     let mut tool_activities: Vec<ToolActivitySnapshot> = Vec::new();
     let mut turn_timeline: Vec<TurnTimelineItem> = Vec::new();
@@ -542,6 +582,17 @@ fn project_thread(thread_id: &str, events: &[StoredEvent]) -> Result<ThreadDetai
         }
         updated_at_ms = updated_at_ms.max(event.created_at_ms);
         match &event.kind {
+            StoredEventKind::ThreadWorkspaceBound { path } => {
+                if workspace_path
+                    .as_ref()
+                    .is_some_and(|bound: &String| bound != path)
+                {
+                    return Err(StorageError::InvalidData(
+                        "thread contains conflicting workspace bindings".into(),
+                    ));
+                }
+                workspace_path = Some(path.clone());
+            }
             StoredEventKind::UserMessage { message } => {
                 if title == "新会话" && message.role == MessageRole::User {
                     title = title_from_message(&message.visible_text());
@@ -928,6 +979,7 @@ fn project_thread(thread_id: &str, events: &[StoredEvent]) -> Result<ThreadDetai
             created_at_ms: created.1,
             updated_at_ms,
             archived,
+            workspace_path,
         },
         messages,
         message_turn_ids,
@@ -1167,6 +1219,83 @@ mod tests {
             .await
             .expect("thread should archive");
         assert!(repository.list_threads().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn persists_one_immutable_workspace_binding_per_thread() {
+        let data = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let other_workspace = tempfile::tempdir().unwrap();
+        let repository = JsonlThreadRepository::new(data.path()).unwrap();
+
+        let thread = repository
+            .create_thread_in_workspace(workspace.path())
+            .await
+            .unwrap();
+        assert_eq!(
+            thread.workspace_path.as_deref(),
+            Some(workspace.path().to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            repository.list_threads().await.unwrap()[0]
+                .workspace_path
+                .as_deref(),
+            thread.workspace_path.as_deref()
+        );
+
+        let error = repository
+            .bind_thread_workspace(&thread.id, other_workspace.path())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("already bound"));
+        assert_eq!(
+            repository
+                .read_thread(&thread.id)
+                .await
+                .unwrap()
+                .summary
+                .workspace_path,
+            thread.workspace_path
+        );
+    }
+
+    #[tokio::test]
+    async fn serializes_concurrent_workspace_binding_attempts() {
+        let data = tempfile::tempdir().unwrap();
+        let first_workspace = tempfile::tempdir().unwrap();
+        let second_workspace = tempfile::tempdir().unwrap();
+        let repository = JsonlThreadRepository::new(data.path()).unwrap();
+        let thread = repository.create_thread().await.unwrap();
+
+        let first_repository = repository.clone();
+        let first_thread_id = thread.id.clone();
+        let first_path = first_workspace.path().to_path_buf();
+        let second_repository = repository.clone();
+        let second_thread_id = thread.id.clone();
+        let second_path = second_workspace.path().to_path_buf();
+        let (first, second) = tokio::join!(
+            async move {
+                first_repository
+                    .bind_thread_workspace(&first_thread_id, &first_path)
+                    .await
+            },
+            async move {
+                second_repository
+                    .bind_thread_workspace(&second_thread_id, &second_path)
+                    .await
+            }
+        );
+
+        assert_ne!(first.is_ok(), second.is_ok());
+        let events = repository.load(&thread.id).await.unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event.kind, StoredEventKind::ThreadWorkspaceBound { .. }))
+                .count(),
+            1
+        );
+        assert!(repository.read_thread(&thread.id).await.is_ok());
     }
 
     #[tokio::test]

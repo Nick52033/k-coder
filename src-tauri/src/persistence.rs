@@ -6,7 +6,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use crate::protocol::TokenUsage;
 use crate::storage::{StoredEvent, StoredEventKind, ThreadSummary};
 
-pub const DATABASE_SCHEMA_VERSION: u32 = 2;
+pub const DATABASE_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -72,12 +72,12 @@ impl ProjectionDb {
             .map_err(|_| ProjectionError::Poisoned)?;
         let transaction = connection.transaction()?;
         transaction.execute(
-            "INSERT INTO sessions(id,title,created_at_ms,updated_at_ms,archived,event_count)
-             VALUES(?1,?2,?3,?4,?5,?6)
+            "INSERT INTO sessions(id,title,created_at_ms,updated_at_ms,archived,event_count,workspace_path)
+             VALUES(?1,?2,?3,?4,?5,?6,?7)
              ON CONFLICT(id) DO UPDATE SET title=excluded.title,updated_at_ms=excluded.updated_at_ms,
-             archived=excluded.archived,event_count=excluded.event_count",
+             archived=excluded.archived,event_count=excluded.event_count,workspace_path=excluded.workspace_path",
             params![summary.id, summary.title, summary.created_at_ms, summary.updated_at_ms,
-                summary.archived as i64, events.len() as u64],
+                summary.archived as i64, events.len() as u64, summary.workspace_path],
         )?;
         transaction.execute("DELETE FROM usage WHERE thread_id=?1", [&summary.id])?;
         for event in events {
@@ -101,7 +101,7 @@ impl ProjectionDb {
             .lock()
             .map_err(|_| ProjectionError::Poisoned)?;
         let mut statement = connection.prepare(
-            "SELECT id,title,created_at_ms,updated_at_ms,archived FROM sessions
+            "SELECT id,title,created_at_ms,updated_at_ms,archived,workspace_path FROM sessions
              WHERE archived=0 ORDER BY updated_at_ms DESC",
         )?;
         Ok(statement
@@ -113,6 +113,7 @@ impl ProjectionDb {
                     created_at_ms: row.get(2)?,
                     updated_at_ms: row.get(3)?,
                     archived: row.get::<_, i64>(4)? != 0,
+                    workspace_path: row.get(5)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?)
@@ -231,6 +232,14 @@ fn migrate(connection: &Connection) -> Result<(), rusqlite::Error> {
              COMMIT;",
         )?;
     }
+    if version < 3 {
+        connection.execute_batch(
+            "BEGIN;
+             ALTER TABLE sessions ADD COLUMN workspace_path TEXT;
+             INSERT INTO schema_migrations(version,applied_at) VALUES(3,datetime('now'));
+             COMMIT;",
+        )?;
+    }
     Ok(())
 }
 
@@ -252,5 +261,16 @@ mod tests {
             })
             .unwrap();
         assert_eq!(version, DATABASE_SCHEMA_VERSION);
+        let columns = db
+            .connection
+            .lock()
+            .unwrap()
+            .prepare("PRAGMA table_info(sessions)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(columns.iter().any(|column| column == "workspace_path"));
     }
 }

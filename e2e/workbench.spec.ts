@@ -13,6 +13,7 @@ test.beforeEach(async ({ page }) => {
     let providerCatalog: { schemaVersion: number; activeProviderId: string | null; providers: Array<typeof openAiProvider> } = { schemaVersion: 1, activeProviderId: "openai", providers: [openAiProvider, ziccProvider, pendingProvider] };
     let approvalMode: "ask" | "full_access" = "ask";
     let reasoningEffort: "off" | "minimal" | "low" | "medium" | "high" | "x_high" = "medium";
+    let workspaceState = { current: { id: "project-1", name: "k-coder", path: "D:\\code\\k-coder", trusted: true, lastOpenedAtMs: 2 }, recent: [] as Array<{ id: string; name: string; path: string; trusted: boolean; lastOpenedAtMs: number }> };
     const runTurnCalls: unknown[] = [];
     const runTurnResolvers: Array<(value: unknown) => void> = [];
     const invocationArgs: Record<string, unknown> = {};
@@ -112,6 +113,33 @@ test.beforeEach(async ({ page }) => {
               agentEventCallbackId = args.handler;
             }
             return 1;
+          }
+          if (command === "workspace_state") {
+            const forcedPath = localStorage.getItem("kcoder_e2e_workspace_path");
+            if (forcedPath) {
+              workspaceState = {
+                ...workspaceState,
+                current: {
+                  ...workspaceState.current,
+                  name: forcedPath.split(/[/\\]/).filter(Boolean).pop() ?? forcedPath,
+                  path: forcedPath,
+                },
+              };
+            }
+            return workspaceState;
+          }
+          if (command === "switch_workspace") {
+            const path = String(args?.path ?? "");
+            const current = {
+              id: `project-${path}`,
+              name: path.split(/[/\\]/).filter(Boolean).pop() ?? path,
+              path,
+              trusted: Boolean(args?.trusted),
+              lastOpenedAtMs: Date.now(),
+            };
+            workspaceState = { current, recent: [current, ...workspaceState.recent] };
+            localStorage.setItem("kcoder_e2e_workspace_path", path);
+            return current;
           }
           if (command === "get_provider_catalog") return providerCatalog;
           if (command === "run_turn") {
@@ -1700,4 +1728,36 @@ test("hides project-bound sessions from the plain conversation list", async ({ p
   await projectList.getByRole("button", { name: "展开项目" }).click();
   await expect(projectList.getByText("Phase 6 workbench", { exact: true })).toBeVisible();
   await page.screenshot({ path: testInfo.outputPath("project-session-list.png"), fullPage: true });
+});
+
+test("switches to the project workspace before creating a project session", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name === "narrow", "窄屏隐藏项目侧边栏");
+  await page.addInitScript(() => {
+    localStorage.setItem("kcoder_thread_project_map", JSON.stringify({ "thread-1": "D:\\code\\k-coder" }));
+    localStorage.setItem("kcoder_known_projects", JSON.stringify(["D:\\code\\k-coder"]));
+    localStorage.setItem("kcoder_e2e_workspace_path", "D:\\code\\codex");
+  });
+  await page.goto("/");
+
+  await expect.poll(() => page.evaluate(() =>
+    (window as unknown as { __invocationArgs: Record<string, unknown> }).__invocationArgs.switch_workspace
+  )).toEqual({ path: "D:\\code\\k-coder", trusted: true });
+
+  await page.evaluate(() => {
+    localStorage.setItem("kcoder_e2e_workspace_path", "D:\\code\\codex");
+    (window as unknown as { __invoked: string[] }).__invoked.length = 0;
+  });
+  await page.getByRole("tab", { name: "项目" }).click();
+  const project = page.locator(".project-group").filter({ hasText: "k-coder" });
+  await project.getByRole("button", { name: "在项目中新建会话" }).click();
+
+  await expect.poll(() => page.evaluate(() =>
+    (window as unknown as { __invoked: string[] }).__invoked
+  )).toContain("create_thread");
+  const calls = await page.evaluate(() => (window as unknown as { __invoked: string[] }).__invoked);
+  expect(calls.indexOf("switch_workspace")).toBeGreaterThanOrEqual(0);
+  expect(calls.indexOf("create_thread")).toBeGreaterThan(calls.indexOf("switch_workspace"));
+  await expect.poll(() => page.evaluate(() =>
+    (window as unknown as { __invocationArgs: Record<string, unknown> }).__invocationArgs.switch_workspace
+  )).toEqual({ path: "D:\\code\\k-coder", trusted: true });
 });

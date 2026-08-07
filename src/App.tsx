@@ -36,7 +36,7 @@ import {
   ImageIcon,
 } from "lucide-react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { getRuntimeStatus, switchWorkspace, subscribeToAgentEvents, listSubagents, getExtensionOverview, searchWorkspaceFiles } from "./api/runtime";
+import { getRuntimeStatus, getWorkspaceState, switchWorkspace, subscribeToAgentEvents, listSubagents, getExtensionOverview, searchWorkspaceFiles } from "./api/runtime";
 import { useWorkbenchStore } from "./stores/workbenchStore";
 import { PatchReviewDialog } from "./components/PatchReviewDialog";
 import { SettingsDialog, type SettingsSection } from "./components/SettingsDialog";
@@ -96,6 +96,18 @@ function readStored<T>(key: string, fallback: T): T {
   }
 }
 
+function workspacePathsEqual(left: string, right: string): boolean {
+  const normalize = (value: string) => value
+    .replace(/^\\\\\?\\/, "")
+    .replace(/\\/g, "/")
+    .replace(/\/$/, "");
+  const normalizedLeft = normalize(left);
+  const normalizedRight = normalize(right);
+  return navigator.userAgent.includes("Windows")
+    ? normalizedLeft.toLowerCase() === normalizedRight.toLowerCase()
+    : normalizedLeft === normalizedRight;
+}
+
 function toReadableError(reason: unknown): string {
   if (typeof reason === "string") return reason;
   if (reason instanceof Error) return reason.message;
@@ -132,6 +144,8 @@ function App() {
   const [subagentThreadIds, setSubagentThreadIds] = useState<Set<string>>(new Set());
   const [sideView, setSideView] = useState<"conversations" | "projects">("conversations");
   const [workspacePath, setWorkspacePath] = useState("");
+  const [workspaceSwitching, setWorkspaceSwitching] = useState(false);
+  const [workspaceError, setWorkspaceError] = useState("");
   const [threadProjectMap, setThreadProjectMap] = useState<Record<string, string>>(() => readThreadProjectMap());
   const [expandedProjects, setExpandedProjects] = useState<Set<string>>(new Set());
   const [projectMenuOpen, setProjectMenuOpen] = useState<string | null>(null);
@@ -149,6 +163,7 @@ function App() {
   const composerSearchRequestRef = useRef(0);
   const followLatestRef = useRef(true);
   const scrollFrameRef = useRef<number | null>(null);
+  const workspaceOperationCountRef = useRef(0);
   const {
     threads,
     activeThreadId,
@@ -216,6 +231,8 @@ function App() {
         if (disposed) stopListening();
         else unlisten = stopListening;
         await initialize();
+        const workspace = await getWorkspaceState();
+        if (!disposed) setWorkspacePath(workspace.current.path);
 
         // Fetch all subagents to mark their threads
         const subagents = await listSubagents();
@@ -323,12 +340,48 @@ function App() {
     try { localStorage.setItem(THREAD_PROJECT_KEY, JSON.stringify(map)); } catch { /* noop */ }
   };
 
+  const ensureProjectWorkspace = async (projectPath: string) => {
+    workspaceOperationCountRef.current += 1;
+    setWorkspaceSwitching(true);
+    try {
+      const state = await getWorkspaceState();
+      if (workspacePathsEqual(state.current.path, projectPath)) {
+        setWorkspacePath(state.current.path);
+        setWorkspaceError("");
+        return state.current.path;
+      }
+      const project = await switchWorkspace(projectPath, true);
+      setWorkspacePath(project.path);
+      setWorkspaceRevision((value) => value + 1);
+      setWorkspaceError("");
+      return project.path;
+    } catch (reason) {
+      const message = `无法切换到会话所属工作区：${toReadableError(reason)}`;
+      setWorkspaceError(message);
+      throw new Error(message);
+    } finally {
+      workspaceOperationCountRef.current -= 1;
+      if (workspaceOperationCountRef.current === 0) setWorkspaceSwitching(false);
+    }
+  };
+
+  const selectSessionThread = async (thread: (typeof threads)[number]) => {
+    const targetWorkspace = threadProjectMap[thread.id] ?? thread.workspacePath;
+    try {
+      if (targetWorkspace) await ensureProjectWorkspace(targetWorkspace);
+      await selectThread(thread.id);
+    } catch {
+      // ensureProjectWorkspace already exposes a user-visible error and keeps the current thread selected.
+    }
+  };
+
   // 在指定项目（路径）下创建一个新会话。
   // "会话"tab 调用时不传项目路径，会话保持"未分类"；"项目"tab 调用时传入项目路径，
   // store 创建线程后立即把 threadId 关联到该项目，避免被自动绑定到当前工作区。
   const createSessionUnderProject = async (projectPath: string | null) => {
     let newThreadId: string;
     try {
+      if (projectPath) await ensureProjectWorkspace(projectPath);
       newThreadId = await createThread();
     } catch {
       return;
@@ -533,6 +586,13 @@ function App() {
   };
 
   const activeThread = threads.find((thread) => thread.id === activeThreadId) ?? null;
+  const activeThreadWorkspacePath = activeThread
+    ? threadProjectMap[activeThread.id] ?? activeThread.workspacePath
+    : null;
+  useEffect(() => {
+    if (!activeThreadWorkspacePath) return;
+    void ensureProjectWorkspace(activeThreadWorkspacePath).catch(() => undefined);
+  }, [activeThreadId, activeThreadWorkspacePath]);
   const selectedChange = changes.find((change) => change.id === selectedChangeId) ?? null;
   // 仅当正在生成的 turn 属于当前线程时才视为"忙"，避免旧线程的 turn 阻塞新对话
   const currentThreadTurnId = activeThreadId ? activeTurns[activeThreadId] ?? null : null;
@@ -758,6 +818,13 @@ function App() {
     event.preventDefault();
     const message = draft.trim();
     if (!message && attachments.length === 0) return;
+    if (activeThreadWorkspacePath) {
+      try {
+        await ensureProjectWorkspace(activeThreadWorkspacePath);
+      } catch {
+        return;
+      }
+    }
     const attachmentContext = attachments.filter((attachment) => attachment.kind === "document").map((attachment) =>
       `\n\n[附件: ${attachment.name}]\n${attachment.content}`,
     ).join("");
@@ -1134,7 +1201,7 @@ function App() {
                 const isSubagentThread = subagentThreadIds.has(thread.id);
                 return (
                   <div className={cn("thread-item", thread.id === activeThreadId && "thread-item--active")} key={thread.id}>
-                    <button className="thread-item-main" type="button" onClick={() => void selectThread(thread.id)}>
+                    <button className="thread-item-main" type="button" onClick={() => void selectSessionThread(thread)}>
                       <MessageSquare size={15} />
                       <span>{thread.title}</span>
                       {isSubagentThread && (
@@ -1279,7 +1346,7 @@ function App() {
                               const isSubagentThread = subagentThreadIds.has(thread.id);
                               return (
                                 <div className={cn("thread-item thread-item--child", thread.id === activeThreadId && "thread-item--active")} key={thread.id}>
-                                  <button className="thread-item-main" type="button" onClick={() => void selectThread(thread.id)}>
+                                  <button className="thread-item-main" type="button" onClick={() => void selectSessionThread(thread)}>
                                     <MessageSquare size={14} />
                                     <span>{thread.title}</span>
                                     {isSubagentThread && (
@@ -1532,10 +1599,10 @@ function App() {
           )}
         </div>
 
-        {error && (
+        {(workspaceError || error) && (
           <div className="error-banner" role="alert">
             <CircleAlert size={16} />
-            <span>{error}</span>
+            <span>{workspaceError || error}</span>
             <div style={{ display: 'flex', gap: '4px', alignItems: 'center' }}>
               {currentThreadBusy && (
                 <button
@@ -1556,7 +1623,7 @@ function App() {
                   重置
                 </button>
               )}
-              <button type="button" aria-label="关闭错误" title="关闭" onClick={clearError}><X size={15} /></button>
+              <button type="button" aria-label="关闭错误" title="关闭" onClick={() => { setWorkspaceError(""); clearError(); }}><X size={15} /></button>
             </div>
           </div>
         )}
@@ -1800,7 +1867,7 @@ function App() {
                 type="submit"
                 aria-label="发送消息"
                 title="发送消息"
-                disabled={!draft.trim() && attachments.length === 0}
+                disabled={workspaceSwitching || (!draft.trim() && attachments.length === 0)}
               >
                 <ArrowUp size={18} strokeWidth={2.2} />
               </button>

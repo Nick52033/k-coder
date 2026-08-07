@@ -648,14 +648,55 @@ impl AppState {
     }
 
     pub async fn begin_turn(&self, thread_id: &str) -> Result<CancellationToken, AppStateError> {
+        let workspace = self.workspace_root();
+        self.begin_turn_in_workspace(thread_id, &workspace).await
+    }
+
+    pub async fn begin_turn_in_workspace(
+        &self,
+        thread_id: &str,
+        expected_workspace: &Path,
+    ) -> Result<CancellationToken, AppStateError> {
         let _recovery_guard = self.recovery_lock.lock().await;
         let mut active_turns = self.active_turns.lock().await;
         if active_turns.contains_key(thread_id) {
             return Err(AppStateError::TurnAlreadyActive(thread_id.to_string()));
         }
+        let current_workspace = self.workspace_root();
+        if current_workspace != expected_workspace {
+            return Err(AppStateError::ThreadWorkspaceMismatch {
+                thread_id: thread_id.to_string(),
+                expected: expected_workspace.to_path_buf(),
+                actual: current_workspace,
+            });
+        }
         let cancellation = CancellationToken::new();
         active_turns.insert(thread_id.to_string(), cancellation.clone());
         Ok(cancellation)
+    }
+
+    pub async fn ensure_thread_workspace(&self, thread_id: &str) -> Result<PathBuf, AppStateError> {
+        let current_workspace = self.workspace_root();
+        let detail = self.repository.read_thread(thread_id).await?;
+        let Some(bound_path) = detail.summary.workspace_path else {
+            self.repository
+                .bind_thread_workspace(thread_id, &current_workspace)
+                .await?;
+            return Ok(current_workspace);
+        };
+        let bound_workspace = PathBuf::from(&bound_path).canonicalize().map_err(|error| {
+            AppStateError::Workspace(format!(
+                "bound workspace {bound_path} cannot be resolved: {error}"
+            ))
+        })?;
+        if bound_workspace != current_workspace {
+            return Err(AppStateError::ThreadWorkspaceMismatch {
+                thread_id: thread_id.to_string(),
+                expected: bound_workspace,
+                actual: current_workspace,
+            });
+        }
+        Ok(current_workspace)
     }
 
     pub async fn finish_turn(&self, thread_id: &str) {
@@ -877,6 +918,14 @@ pub enum AppStateError {
     ProviderNotConfigured(String),
     #[error("a turn is already active for thread {0}")]
     TurnAlreadyActive(String),
+    #[error(
+        "thread {thread_id} belongs to workspace {expected}, but the active workspace is {actual}"
+    )]
+    ThreadWorkspaceMismatch {
+        thread_id: String,
+        expected: PathBuf,
+        actual: PathBuf,
+    },
     #[error("stop active turns and subagents before changing the approval mode")]
     ApprovalModeBusy,
     #[error("approval mode lock poisoned")]
@@ -1225,6 +1274,45 @@ mod tests {
                 .as_deref(),
             Some(switched.to_string_lossy().as_ref())
         );
+    }
+
+    #[tokio::test]
+    async fn binds_legacy_threads_and_rejects_a_different_active_workspace() {
+        let data = tempfile::tempdir().unwrap();
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let state = AppState::with_workspace_and_credentials(
+            data.path(),
+            first.path(),
+            Arc::new(FakeCredentials::default()),
+        )
+        .unwrap();
+        let thread = state.repository().create_thread().await.unwrap();
+
+        let bound = state.ensure_thread_workspace(&thread.id).await.unwrap();
+        assert_eq!(bound, first.path().canonicalize().unwrap());
+        assert_eq!(
+            state
+                .repository()
+                .read_thread(&thread.id)
+                .await
+                .unwrap()
+                .summary
+                .workspace_path
+                .as_deref(),
+            Some(bound.to_string_lossy().as_ref())
+        );
+
+        state.switch_workspace(second.path()).await.unwrap();
+        assert!(matches!(
+            state.ensure_thread_workspace(&thread.id).await,
+            Err(AppStateError::ThreadWorkspaceMismatch { .. })
+        ));
+        assert!(matches!(
+            state.begin_turn_in_workspace(&thread.id, &bound).await,
+            Err(AppStateError::ThreadWorkspaceMismatch { .. })
+        ));
+        assert!(!state.is_turn_active(&thread.id).await);
     }
 
     #[tokio::test]

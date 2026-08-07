@@ -677,9 +677,10 @@ pub fn delete_provider_api_key(
 
 #[tauri::command]
 pub async fn create_thread(state: State<'_, AppState>) -> CommandResult<ThreadSummary> {
+    let workspace_root = state.workspace_root();
     state
         .repository()
-        .create_thread()
+        .create_thread_in_workspace(&workspace_root)
         .await
         .map_err(|error| CommandError::new("storage", error))
 }
@@ -1000,13 +1001,17 @@ pub async fn compact_thread(
             "stop the active turn before compacting",
         ));
     }
+    let workspace_root = state
+        .ensure_thread_workspace(&thread_id)
+        .await
+        .map_err(|error| CommandError::new("workspace_mismatch", error))?;
     let context_limit = state
         .provider_context_limit()
         .map_err(|error| CommandError::new("provider_config", error))?;
     let runtime = AgentRuntime::with_tools_and_approvals(
         state.runtime_repository(),
         state.tool_registry(),
-        state.workspace_root(),
+        workspace_root,
         state.approvals(),
     )
     .with_context_limit(context_limit);
@@ -1034,6 +1039,10 @@ pub async fn run_turn(
     let mut attachments = attachments;
     let has_image_attachments = !attachments.is_empty();
     let thread_id = request.thread_id.clone();
+    let workspace_root = state
+        .ensure_thread_workspace(&thread_id)
+        .await
+        .map_err(|error| CommandError::new("workspace_mismatch", error))?;
     let history_has_images = state
         .repository()
         .read_thread(&thread_id)
@@ -1078,7 +1087,7 @@ pub async fn run_turn(
     // 分层拼接 system prompt（identity/workspace/mode/tools/memory/context/extension）
     let tool_names = base_tools.definition_names();
     let runtime_instructions = build_system_prompt(
-        &state.workspace_root(),
+        &workspace_root,
         &extension_instructions,
         &advanced_instructions,
         &memory_instructions,
@@ -1119,7 +1128,7 @@ pub async fn run_turn(
         }
         .map_err(|error| CommandError::new("provider_config", error))?;
     let cancellation = state
-        .begin_turn(&thread_id)
+        .begin_turn_in_workspace(&thread_id, &workspace_root)
         .await
         .map_err(|error| CommandError::new("turn_active", error))?;
     let goal_timeout = goal_timeout_ms.map(|timeout_ms| {
@@ -1149,7 +1158,7 @@ pub async fn run_turn(
     let mut runtime = AgentRuntime::with_tools_and_approvals(
         state.runtime_repository(),
         tools,
-        state.workspace_root(),
+        workspace_root,
         state.approvals(),
     )
     .with_approval_mode(state.approval_mode())
@@ -1206,6 +1215,10 @@ pub async fn retry_turn(
     state: State<'_, AppState>,
     thread_id: String,
 ) -> CommandResult<TurnOutcome> {
+    let workspace_root = state
+        .ensure_thread_workspace(&thread_id)
+        .await
+        .map_err(|error| CommandError::new("workspace_mismatch", error))?;
     state
         .prepare_extensions(false)
         .await
@@ -1257,7 +1270,7 @@ pub async fn retry_turn(
         .map_err(|error| CommandError::new("agent_mode", error))?;
     let tool_names = base_tools.definition_names();
     let runtime_instructions = build_system_prompt(
-        &state.workspace_root(),
+        &workspace_root,
         &extension_instructions,
         &advanced_instructions,
         &memory_instructions,
@@ -1301,7 +1314,7 @@ pub async fn retry_turn(
     }
     .map_err(|error| CommandError::new("provider_config", error))?;
     let cancellation = state
-        .begin_turn(&thread_id)
+        .begin_turn_in_workspace(&thread_id, &workspace_root)
         .await
         .map_err(|error| CommandError::new("turn_active", error))?;
     let goal_timeout = goal_timeout_ms.map(|timeout_ms| {
@@ -1314,7 +1327,7 @@ pub async fn retry_turn(
     let mut runtime = AgentRuntime::with_tools_and_approvals(
         state.runtime_repository(),
         base_tools,
-        state.workspace_root(),
+        workspace_root,
         state.approvals(),
     )
     .with_approval_mode(state.approval_mode())
