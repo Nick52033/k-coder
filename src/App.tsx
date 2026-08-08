@@ -3,13 +3,16 @@ import {
   Activity,
   ArrowUp,
   ChevronRight,
+  Check,
   CircleAlert,
   Bot,
   Code2,
+  Copy,
   FileDiff,
   Folder,
   FolderPlus,
   Hammer,
+  History,
   PanelRightOpen,
   PanelRightClose,
   Loader2,
@@ -36,7 +39,7 @@ import {
   ImageIcon,
 } from "lucide-react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { getRuntimeStatus, getWorkspaceState, switchWorkspace, subscribeToAgentEvents, listSubagents, getExtensionOverview, searchWorkspaceFiles } from "./api/runtime";
+import { getRuntimeStatus, getWorkspaceState, switchWorkspace, subscribeToAgentEvents, subscribeToMailboxEvents, listSubagents, getExtensionOverview, searchWorkspaceFiles } from "./api/runtime";
 import { useWorkbenchStore } from "./stores/workbenchStore";
 import { PatchReviewDialog } from "./components/PatchReviewDialog";
 import { SettingsDialog, type SettingsSection } from "./components/SettingsDialog";
@@ -187,12 +190,15 @@ function App() {
     plan,
     goal,
     todos,
+    historyNextCursor,
+    historyLoading,
     loading,
     error,
     messageQueue,
     initialize,
     createThread,
     selectThread,
+    loadOlderHistory,
     sendMessage,
     retryLastTurn,
     stopTurn,
@@ -205,6 +211,7 @@ function App() {
     setApprovalMode,
     setReasoningEffort,
     handleAgentEvent,
+    handleMailboxChanged,
     clearError,
     searchThreadHistory,
     renameConversation,
@@ -223,13 +230,22 @@ function App() {
 
   useEffect(() => {
     let disposed = false;
-    let unlisten: (() => void) | undefined;
+    let unlistenAgent: (() => void) | undefined;
+    let unlistenMailbox: (() => void) | undefined;
 
     async function connect() {
       try {
-        const stopListening = await subscribeToAgentEvents(handleAgentEvent);
-        if (disposed) stopListening();
-        else unlisten = stopListening;
+        const [stopAgentEvents, stopMailboxEvents] = await Promise.all([
+          subscribeToAgentEvents(handleAgentEvent),
+          subscribeToMailboxEvents(handleMailboxChanged),
+        ]);
+        if (disposed) {
+          stopAgentEvents();
+          stopMailboxEvents();
+        } else {
+          unlistenAgent = stopAgentEvents;
+          unlistenMailbox = stopMailboxEvents;
+        }
         await initialize();
         const workspace = await getWorkspaceState();
         if (!disposed) setWorkspacePath(workspace.current.path);
@@ -254,23 +270,22 @@ function App() {
         if (!disposed) setRuntimeError(String(reason));
       });
 
-    // 添加紧急状态重置快捷键 Ctrl+Shift+R
+    // Ctrl+Shift+R 精确停止当前 Turn，并从运行时重新同步状态。
     function handleEmergencyReset(event: globalThis.KeyboardEvent) {
       if ((event.ctrlKey || event.metaKey) && event.shiftKey && event.key.toLowerCase() === "r") {
         event.preventDefault();
-        // 使用新的 forceResetState 函数
         void forceResetState();
-        console.log("紧急状态已重置");
       }
     }
     window.addEventListener("keydown", handleEmergencyReset);
 
     return () => {
       disposed = true;
-      unlisten?.();
+      unlistenAgent?.();
+      unlistenMailbox?.();
       window.removeEventListener("keydown", handleEmergencyReset);
     };
-  }, [handleAgentEvent, initialize, forceResetState]);
+  }, [handleAgentEvent, handleMailboxChanged, initialize, forceResetState]);
 
   useEffect(() => {
     const area = messageAreaRef.current;
@@ -877,6 +892,10 @@ function App() {
   function getFriendlyToolDescription(toolName: string, args: Record<string, unknown>): string {
     switch (toolName) {
       case "run_command":
+        const command = typeof args.command === "string" ? args.command.trim() : "";
+        if (command) {
+          return `执行命令: ${command.length > 120 ? `${command.slice(0, 117)}...` : command}`;
+        }
         const cmdArgs = args.args as string[] | undefined;
         if (cmdArgs && cmdArgs.length > 0) {
           // 提取实际的命令
@@ -1040,7 +1059,6 @@ function App() {
     setWorkbenchOpen(false);
     setAgentPanelOpen(false);
     setSettingsSection("providers");
-    setSideView("conversations");
     setSettingsOpen(true);
   }
 
@@ -1414,6 +1432,18 @@ function App() {
             <div className="empty-thread"><Activity className="spin" size={24} /><p>正在读取会话</p></div>
           ) : hasConversationContent ? (
             <div className="message-list">
+              {historyNextCursor && (
+                <div className="conversation-history-loader">
+                  <button
+                    type="button"
+                    onClick={() => void loadOlderHistory()}
+                    disabled={historyLoading}
+                  >
+                    {historyLoading ? <Loader2 className="spin" size={14} /> : <History size={14} />}
+                    <span>{historyLoading ? "正在读取" : "加载更早记录"}</span>
+                  </button>
+                </div>
+              )}
               {/* 任务清单 */}
               {activeThreadId && todos.get(activeThreadId) && (
                 <TodoList todos={todos.get(activeThreadId)!} />
@@ -1446,7 +1476,12 @@ function App() {
                   <Fragment key={message.role === "assistant" && message.turnId ? `assistant-turn-${message.turnId}` : message.id}>
                   <article className={cn("message", `message--${message.role}`, message.status === "streaming" && "message--streaming")}>
                     <div className="message-body">
-                      <div className="message-role">{message.role === "user" ? "你" : "k-Coder"}</div>
+                      <div className="message-role">
+                        {message.role === "user" ? "你" : "k-Coder"}
+                        {message.role === "user" && message.text ? (
+                          <CopyMessageButton text={message.text} />
+                        ) : null}
+                      </div>
                       {message.role === "user" && message.attachments?.length ? (
                         <div className="message-attachments" aria-label="图片附件">
                           {message.attachments.map((attachment, index) => (
@@ -1607,8 +1642,8 @@ function App() {
               {currentThreadBusy && (
                 <button
                   type="button"
-                  aria-label="强制重置"
-                  title="强制重置卡住的状态"
+                  aria-label="恢复运行状态"
+                  title="精确停止当前任务并重新同步状态"
                   onClick={() => void forceResetState()}
                   style={{
                     padding: '2px 6px',
@@ -1620,7 +1655,7 @@ function App() {
                     whiteSpace: 'nowrap'
                   }}
                 >
-                  重置
+                  恢复
                 </button>
               )}
               <button type="button" aria-label="关闭错误" title="关闭" onClick={() => { setWorkspaceError(""); clearError(); }}><X size={15} /></button>
@@ -1646,7 +1681,11 @@ function App() {
                   <div key={queueItem.id} className={cn("queue-item", `queue-item--${queueItem.status}`)}>
                     <span className="queue-item-index">{idx + 1}</span>
                     <div className="queue-item-content">
-                      <span className="queue-item-text">{queueItem.input.slice(0, 50)}{queueItem.input.length > 50 ? "..." : ""}</span>
+                      <span className="queue-item-text">
+                        {queueItem.kind === "retry"
+                          ? "重试上一轮"
+                          : <>{queueItem.input.slice(0, 50)}{queueItem.input.length > 50 ? "..." : ""}</>}
+                      </span>
                       <span className="queue-item-status">
                         {queueItem.status === "pending" && "等待中"}
                         {queueItem.status === "processing" && "处理中..."}
@@ -1656,17 +1695,19 @@ function App() {
                     </div>
                     {queueItem.status === "pending" && (
                       <div className="queue-item-actions">
+                        {queueItem.kind === "message" && (
+                          <button
+                            type="button"
+                            aria-label={`加入当前对话 ${queueItem.input || "图片消息"}`}
+                            title="加入当前对话"
+                            onClick={() => void sendQueuedMessageNow(queueItem.id)}
+                          >
+                            <ArrowUp size={16} strokeWidth={2.2} />
+                          </button>
+                        )}
                         <button
                           type="button"
-                          aria-label={`立即发送 ${queueItem.input || "图片消息"}`}
-                          title="立即发送并打断当前对话"
-                          onClick={() => void sendQueuedMessageNow(queueItem.id)}
-                        >
-                          <ArrowUp size={16} strokeWidth={2.2} />
-                        </button>
-                        <button
-                          type="button"
-                          aria-label={`删除队列消息 ${queueItem.input || "图片消息"}`}
+                          aria-label={`删除队列消息 ${queueItem.kind === "retry" ? "重试上一轮" : queueItem.input || "图片消息"}`}
                           title="从队列删除"
                           onClick={() => removeQueuedMessage(queueItem.id)}
                         >
@@ -2147,6 +2188,32 @@ function UserInputCard({ request, onResolve }: {
 
 function renderMessageText(text: string): React.ReactNode {
   return <MarkdownContent text={text} />;
+}
+
+function CopyMessageButton({ text }: { text: string }) {
+  const [copied, setCopied] = useState(false);
+
+  async function copyMessage() {
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1_500);
+    } catch {
+      setCopied(false);
+    }
+  }
+
+  return (
+    <button
+      type="button"
+      className="message-copy-button"
+      title={copied ? "已复制" : "复制消息"}
+      aria-label={copied ? "已复制" : "复制消息"}
+      onClick={() => void copyMessage()}
+    >
+      {copied ? <Check size={14} aria-hidden="true" /> : <Copy size={14} aria-hidden="true" />}
+    </button>
+  );
 }
 
 export default App;

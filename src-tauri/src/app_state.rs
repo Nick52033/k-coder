@@ -6,8 +6,11 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
 use crate::advanced::AdvancedServices;
+use crate::agent::mailbox::{MailboxTurn, QueuedTurnSteerError, ThreadMailbox, TurnControl};
+use crate::agent::thread_operation::{ThreadOperationGate, ThreadOperationGuard};
 use crate::execution::{CommandRuntime, ExecutionError, NativePtyRuntime};
 use crate::extensions::mcp::OsMcpSecretStore;
 use crate::extensions::{ExtensionError, ExtensionOverview, ExtensionService};
@@ -17,8 +20,9 @@ use crate::patch::{PatchError, PatchService};
 use crate::persistence::ProjectionDb;
 use crate::policy::{ApprovalManager, UserInputManager};
 use crate::protocol::{
-    ApprovalAction, ApprovalMode, ApprovalResolution, ChangeSet, ReasoningEffort, TurnState,
-    UserInputAction, UserInputResolution,
+    AgentItemStatus, AgentItemType, ApprovalAction, ApprovalMode, ApprovalResolution, ChangeSet,
+    HistorySortDirection, ReasoningEffort, ThreadHistorySnapshot, ThreadItemsPage, ThreadTurnsPage,
+    TurnItemsView, TurnState, UserInputAction, UserInputResolution,
 };
 use crate::providers::{
     AnthropicMessagesProvider, CredentialError, CredentialStore, FallbackProvider, FallbackTarget,
@@ -47,12 +51,21 @@ pub struct AppState {
     command_runtime: RwLock<CommandRuntime>,
     pty_runtime: RwLock<NativePtyRuntime>,
     logger: StructuredLogger,
-    active_turns: Mutex<HashMap<String, CancellationToken>>,
+    active_turns: Mutex<HashMap<String, ActiveTurn>>,
+    thread_mailbox: ThreadMailbox,
+    thread_operations: ThreadOperationGate,
     recovery_lock: Mutex<()>,
     extensions: ExtensionService,
     extension_workspace: Mutex<Option<(PathBuf, u64)>>,
     subagents: MultiAgentCoordinator,
     advanced: AdvancedServices,
+}
+
+#[derive(Debug)]
+struct ActiveTurn {
+    turn_id: String,
+    cancellation: CancellationToken,
+    control: Arc<TurnControl>,
 }
 
 impl AppState {
@@ -182,6 +195,8 @@ impl AppState {
             pty_runtime: RwLock::new(pty_runtime),
             logger,
             active_turns: Mutex::new(HashMap::new()),
+            thread_mailbox: ThreadMailbox::default(),
+            thread_operations: ThreadOperationGate::default(),
             recovery_lock: Mutex::new(()),
             extensions,
             extension_workspace: Mutex::new(None),
@@ -200,6 +215,37 @@ impl AppState {
 
     pub fn runtime_repository(&self) -> Arc<dyn ThreadRepository> {
         self.repository.clone()
+    }
+
+    pub fn thread_mailbox(&self) -> &ThreadMailbox {
+        &self.thread_mailbox
+    }
+
+    pub async fn enqueue_thread_turn(&self, item: MailboxTurn) -> bool {
+        let thread_id = item.handle.thread_id.clone();
+        let _operation_guard = self.thread_operations.lock(&thread_id).await;
+        self.thread_mailbox.enqueue(item).await
+    }
+
+    pub async fn next_thread_turn(
+        &self,
+        thread_id: &str,
+    ) -> Option<(MailboxTurn, ThreadOperationGuard)> {
+        let operation_guard = self.thread_operations.lock(thread_id).await;
+        self.thread_mailbox
+            .next(thread_id)
+            .await
+            .map(|item| (item, operation_guard))
+    }
+
+    pub async fn remove_queued_turn(&self, thread_id: &str, turn_id: &str) -> bool {
+        let _operation_guard = self.thread_operations.lock(thread_id).await;
+        self.thread_mailbox.remove(thread_id, turn_id).await
+    }
+
+    pub async fn clear_thread_mailbox(&self, thread_id: &str) -> usize {
+        let _operation_guard = self.thread_operations.lock(thread_id).await;
+        self.thread_mailbox.clear(thread_id).await
     }
 
     pub fn workspace_root(&self) -> PathBuf {
@@ -657,6 +703,39 @@ impl AppState {
         thread_id: &str,
         expected_workspace: &Path,
     ) -> Result<CancellationToken, AppStateError> {
+        let (cancellation, _) = self
+            .begin_turn_with_id_in_workspace(
+                thread_id,
+                &Uuid::new_v4().to_string(),
+                expected_workspace,
+            )
+            .await?;
+        Ok(cancellation)
+    }
+
+    pub async fn begin_turn_with_id_in_workspace(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        expected_workspace: &Path,
+    ) -> Result<(CancellationToken, Arc<TurnControl>), AppStateError> {
+        let operation_guard = self.thread_operations.lock(thread_id).await;
+        self.begin_turn_with_id_in_workspace_locked(
+            thread_id,
+            turn_id,
+            expected_workspace,
+            &operation_guard,
+        )
+        .await
+    }
+
+    pub async fn begin_turn_with_id_in_workspace_locked(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        expected_workspace: &Path,
+        _operation_guard: &ThreadOperationGuard,
+    ) -> Result<(CancellationToken, Arc<TurnControl>), AppStateError> {
         let _recovery_guard = self.recovery_lock.lock().await;
         let mut active_turns = self.active_turns.lock().await;
         if active_turns.contains_key(thread_id) {
@@ -671,8 +750,69 @@ impl AppState {
             });
         }
         let cancellation = CancellationToken::new();
-        active_turns.insert(thread_id.to_string(), cancellation.clone());
-        Ok(cancellation)
+        let control = TurnControl::new();
+        active_turns.insert(
+            thread_id.to_string(),
+            ActiveTurn {
+                turn_id: turn_id.to_string(),
+                cancellation: cancellation.clone(),
+                control: control.clone(),
+            },
+        );
+        Ok((cancellation, control))
+    }
+
+    pub async fn fork_thread(
+        &self,
+        thread_id: &str,
+        last_turn_id: Option<&str>,
+    ) -> Result<crate::storage::ThreadSummary, AppStateError> {
+        let _operation_guard = self.thread_operations.lock(thread_id).await;
+        if self.active_turns.lock().await.contains_key(thread_id) {
+            return Err(AppStateError::ThreadOperationBusy(thread_id.to_string()));
+        }
+        if !self
+            .thread_mailbox
+            .snapshot(thread_id, None)
+            .await
+            .pending
+            .is_empty()
+        {
+            return Err(AppStateError::ThreadMailboxNotEmpty(thread_id.to_string()));
+        }
+        Ok(self.repository.fork_thread(thread_id, last_turn_id).await?)
+    }
+
+    pub async fn rollback_thread(
+        &self,
+        thread_id: &str,
+        num_turns: u32,
+    ) -> Result<ThreadHistorySnapshot, AppStateError> {
+        let _operation_guard = self.thread_operations.lock(thread_id).await;
+        if self.active_turns.lock().await.contains_key(thread_id) {
+            return Err(AppStateError::ThreadOperationBusy(thread_id.to_string()));
+        }
+        if !self
+            .thread_mailbox
+            .snapshot(thread_id, None)
+            .await
+            .pending
+            .is_empty()
+        {
+            return Err(AppStateError::ThreadMailboxNotEmpty(thread_id.to_string()));
+        }
+        Ok(self
+            .repository
+            .rollback_thread(thread_id, num_turns)
+            .await?)
+    }
+
+    pub async fn resume_thread_history(
+        &self,
+        thread_id: &str,
+    ) -> Result<ThreadHistorySnapshot, AppStateError> {
+        let _operation_guard = self.thread_operations.lock(thread_id).await;
+        self.read_thread_history(thread_id).await
     }
 
     pub async fn ensure_thread_workspace(&self, thread_id: &str) -> Result<PathBuf, AppStateError> {
@@ -700,13 +840,16 @@ impl AppState {
     }
 
     pub async fn finish_turn(&self, thread_id: &str) {
-        self.active_turns.lock().await.remove(thread_id);
+        if let Some(active) = self.active_turns.lock().await.remove(thread_id) {
+            active.control.close();
+        }
     }
 
     pub async fn cancel_turn(&self, thread_id: &str) -> bool {
         let active_turns = self.active_turns.lock().await;
-        if let Some(cancellation) = active_turns.get(thread_id) {
-            cancellation.cancel();
+        if let Some(active) = active_turns.get(thread_id) {
+            active.control.close();
+            active.cancellation.cancel();
             self.subagents.cancel_for_parent(thread_id);
             true
         } else {
@@ -716,6 +859,96 @@ impl AppState {
 
     pub async fn is_turn_active(&self, thread_id: &str) -> bool {
         self.active_turns.lock().await.contains_key(thread_id)
+    }
+
+    pub async fn active_turn_id(&self, thread_id: &str) -> Option<String> {
+        self.active_turns
+            .lock()
+            .await
+            .get(thread_id)
+            .map(|active| active.turn_id.clone())
+    }
+
+    pub async fn steer_turn(
+        &self,
+        thread_id: &str,
+        expected_turn_id: &str,
+        message: crate::protocol::ChatMessage,
+    ) -> Result<String, AppStateError> {
+        let active_turns = self.active_turns.lock().await;
+        let active = active_turns
+            .get(thread_id)
+            .ok_or_else(|| AppStateError::NoActiveTurn(thread_id.to_string()))?;
+        if active.turn_id != expected_turn_id {
+            return Err(AppStateError::ExpectedTurnMismatch {
+                expected: expected_turn_id.to_string(),
+                actual: active.turn_id.clone(),
+            });
+        }
+        active
+            .control
+            .steer(message)
+            .map_err(|_| AppStateError::NoActiveTurn(thread_id.to_string()))?;
+        Ok(active.turn_id.clone())
+    }
+
+    pub async fn steer_queued_message(
+        &self,
+        thread_id: &str,
+        expected_turn_id: &str,
+        queued_turn_id: &str,
+        message: crate::protocol::ChatMessage,
+    ) -> Result<String, AppStateError> {
+        // Keep the active Turn stable through mailbox acceptance. Mailbox code
+        // never acquires active_turns, so this is the single lock order.
+        let active_turns = self.active_turns.lock().await;
+        let active = active_turns
+            .get(thread_id)
+            .ok_or_else(|| AppStateError::NoActiveTurn(thread_id.to_string()))?;
+        if active.turn_id != expected_turn_id {
+            return Err(AppStateError::ExpectedTurnMismatch {
+                expected: expected_turn_id.to_string(),
+                actual: active.turn_id.clone(),
+            });
+        }
+        self.thread_mailbox
+            .steer_message(thread_id, queued_turn_id, active.control.as_ref(), message)
+            .await
+            .map_err(|error| match error {
+                QueuedTurnSteerError::NotFound => AppStateError::QueuedTurnNotFound {
+                    thread_id: thread_id.to_string(),
+                    turn_id: queued_turn_id.to_string(),
+                },
+                QueuedTurnSteerError::NotMessage => AppStateError::QueuedTurnNotMessage {
+                    thread_id: thread_id.to_string(),
+                    turn_id: queued_turn_id.to_string(),
+                },
+                QueuedTurnSteerError::TurnClosed => {
+                    AppStateError::NoActiveTurn(thread_id.to_string())
+                }
+            })?;
+        Ok(active.turn_id.clone())
+    }
+
+    pub async fn interrupt_turn(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+    ) -> Result<(), AppStateError> {
+        let active_turns = self.active_turns.lock().await;
+        let active = active_turns
+            .get(thread_id)
+            .ok_or_else(|| AppStateError::NoActiveTurn(thread_id.to_string()))?;
+        if active.turn_id != turn_id {
+            return Err(AppStateError::ExpectedTurnMismatch {
+                expected: turn_id.to_string(),
+                actual: active.turn_id.clone(),
+            });
+        }
+        active.control.close();
+        active.cancellation.cancel();
+        self.subagents.cancel_for_parent(thread_id);
+        Ok(())
     }
 
     pub async fn read_thread(
@@ -778,6 +1011,20 @@ impl AppState {
                 ))
                 .await?;
         }
+        let events = self.repository.load(thread_id).await?;
+        for (item_id, item_type) in active_turn_items(&events, &last_turn.turn_id) {
+            self.repository
+                .append(StoredEvent::new(
+                    thread_id,
+                    Some(last_turn.turn_id.clone()),
+                    StoredEventKind::ItemCompleted {
+                        item_id,
+                        item_type,
+                        status: AgentItemStatus::Cancelled,
+                    },
+                ))
+                .await?;
+        }
         self.repository
             .append(StoredEvent::new(
                 thread_id,
@@ -786,6 +1033,44 @@ impl AppState {
             ))
             .await?;
         Ok(self.repository.read_thread(thread_id).await?)
+    }
+
+    pub async fn read_thread_history(
+        &self,
+        thread_id: &str,
+    ) -> Result<ThreadHistorySnapshot, AppStateError> {
+        self.read_thread(thread_id).await?;
+        Ok(self.repository.read_thread_history(thread_id).await?)
+    }
+
+    pub async fn list_thread_turns(
+        &self,
+        thread_id: &str,
+        cursor: Option<&str>,
+        limit: Option<u32>,
+        sort_direction: HistorySortDirection,
+        items_view: TurnItemsView,
+    ) -> Result<ThreadTurnsPage, AppStateError> {
+        self.read_thread(thread_id).await?;
+        Ok(self
+            .repository
+            .list_thread_turns(thread_id, cursor, limit, sort_direction, items_view)
+            .await?)
+    }
+
+    pub async fn list_thread_items(
+        &self,
+        thread_id: &str,
+        turn_id: Option<&str>,
+        cursor: Option<&str>,
+        limit: Option<u32>,
+        sort_direction: HistorySortDirection,
+    ) -> Result<ThreadItemsPage, AppStateError> {
+        self.read_thread(thread_id).await?;
+        Ok(self
+            .repository
+            .list_thread_items(thread_id, turn_id, cursor, limit, sort_direction)
+            .await?)
     }
 
     pub async fn undo_change(
@@ -844,6 +1129,28 @@ impl AppState {
         }
         Ok(undone_change)
     }
+}
+
+fn active_turn_items(events: &[StoredEvent], turn_id: &str) -> Vec<(String, AgentItemType)> {
+    let mut active = Vec::<(String, AgentItemType)>::new();
+    for event in events {
+        if event.turn_id.as_deref() != Some(turn_id) {
+            continue;
+        }
+        match &event.kind {
+            StoredEventKind::ItemStarted { item_id, item_type } => {
+                let item = (item_id.clone(), *item_type);
+                if !active.contains(&item) {
+                    active.push(item);
+                }
+            }
+            StoredEventKind::ItemCompleted {
+                item_id, item_type, ..
+            } => active.retain(|active_item| active_item != &(item_id.clone(), *item_type)),
+            _ => {}
+        }
+    }
+    active
 }
 
 fn provider_target_specs(
@@ -918,6 +1225,18 @@ pub enum AppStateError {
     ProviderNotConfigured(String),
     #[error("a turn is already active for thread {0}")]
     TurnAlreadyActive(String),
+    #[error("no active turn for thread {0}")]
+    NoActiveTurn(String),
+    #[error("expected active turn id {expected}, but found {actual}")]
+    ExpectedTurnMismatch { expected: String, actual: String },
+    #[error("queued turn {turn_id} was not found for thread {thread_id}")]
+    QueuedTurnNotFound { thread_id: String, turn_id: String },
+    #[error("queued turn {turn_id} for thread {thread_id} is not a message")]
+    QueuedTurnNotMessage { thread_id: String, turn_id: String },
+    #[error("thread operation conflicts with an active turn for {0}")]
+    ThreadOperationBusy(String),
+    #[error("thread mailbox is not empty for {0}")]
+    ThreadMailboxNotEmpty(String),
     #[error(
         "thread {thread_id} belongs to workspace {expected}, but the active workspace is {actual}"
     )]
@@ -954,6 +1273,7 @@ mod tests {
     use std::sync::Mutex as StdMutex;
 
     use super::*;
+    use crate::agent::mailbox::{MailboxTurn, MailboxTurnKind};
     use crate::policy::PolicyDecision;
     use crate::protocol::{
         ApprovalRequest, ExpectedFileHash, ToolRisk, UserInputQuestion, UserInputRequest,
@@ -1189,6 +1509,237 @@ mod tests {
         assert!(state.cancel_turn("thread").await);
         state.finish_turn("thread").await;
         state.finish_turn("other-thread").await;
+    }
+
+    #[tokio::test]
+    async fn lifecycle_operations_wait_for_dequeued_turn_registration() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = Arc::new(
+            AppState::with_credentials(directory.path(), Arc::new(FakeCredentials::default()))
+                .unwrap(),
+        );
+        state
+            .enqueue_thread_turn(MailboxTurn {
+                handle: crate::protocol::TurnHandle {
+                    schema_version: crate::protocol::PROTOCOL_VERSION,
+                    thread_id: "thread".into(),
+                    turn_id: "turn-dequeued".into(),
+                    state: TurnState::Queued,
+                },
+                kind: MailboxTurnKind::Retry,
+                started: None,
+            })
+            .await;
+        let (_, operation_guard) = state
+            .next_thread_turn("thread")
+            .await
+            .expect("queued turn should be dequeued with the operation gate held");
+
+        let fork_state = state.clone();
+        let fork = tokio::spawn(async move { fork_state.fork_thread("thread", None).await });
+        tokio::task::yield_now().await;
+        assert!(!fork.is_finished());
+
+        let workspace = state.workspace_root();
+        state
+            .begin_turn_with_id_in_workspace_locked(
+                "thread",
+                "turn-dequeued",
+                &workspace,
+                &operation_guard,
+            )
+            .await
+            .unwrap();
+        drop(operation_guard);
+
+        assert!(matches!(
+            fork.await.unwrap(),
+            Err(AppStateError::ThreadOperationBusy(thread_id)) if thread_id == "thread"
+        ));
+        state.finish_turn("thread").await;
+    }
+
+    #[tokio::test]
+    async fn lifecycle_operations_reject_pending_mailbox_turns() {
+        let directory = tempfile::tempdir().unwrap();
+        let state =
+            AppState::with_credentials(directory.path(), Arc::new(FakeCredentials::default()))
+                .unwrap();
+        let thread = state.repository().create_thread().await.unwrap();
+        state
+            .enqueue_thread_turn(MailboxTurn {
+                handle: crate::protocol::TurnHandle {
+                    schema_version: crate::protocol::PROTOCOL_VERSION,
+                    thread_id: thread.id.clone(),
+                    turn_id: "turn-pending".into(),
+                    state: TurnState::Queued,
+                },
+                kind: MailboxTurnKind::Retry,
+                started: None,
+            })
+            .await;
+
+        assert!(matches!(
+            state.fork_thread(&thread.id, None).await,
+            Err(AppStateError::ThreadMailboxNotEmpty(thread_id)) if thread_id == thread.id
+        ));
+        assert!(matches!(
+            state.rollback_thread(&thread.id, 1).await,
+            Err(AppStateError::ThreadMailboxNotEmpty(thread_id)) if thread_id == thread.id
+        ));
+    }
+
+    #[tokio::test]
+    async fn steer_and_interrupt_require_the_exact_active_turn_id() {
+        let directory = tempfile::tempdir().unwrap();
+        let state =
+            AppState::with_credentials(directory.path(), Arc::new(FakeCredentials::default()))
+                .unwrap();
+        let workspace = state.workspace_root();
+        let (_, control) = state
+            .begin_turn_with_id_in_workspace("thread", "turn-current", &workspace)
+            .await
+            .unwrap();
+        let message = crate::protocol::ChatMessage {
+            schema_version: crate::protocol::PROTOCOL_VERSION,
+            id: "steer-message".into(),
+            role: crate::protocol::MessageRole::User,
+            content: Vec::new(),
+            created_at_ms: 1,
+        };
+
+        assert!(matches!(
+            state
+                .steer_turn("thread", "turn-stale", message.clone())
+                .await,
+            Err(AppStateError::ExpectedTurnMismatch { .. })
+        ));
+        assert_eq!(
+            state
+                .steer_turn("thread", "turn-current", message.clone())
+                .await
+                .unwrap(),
+            "turn-current"
+        );
+        assert_eq!(control.take_pending(), vec![message]);
+        assert!(matches!(
+            state.interrupt_turn("thread", "turn-stale").await,
+            Err(AppStateError::ExpectedTurnMismatch { .. })
+        ));
+        state
+            .interrupt_turn("thread", "turn-current")
+            .await
+            .unwrap();
+        assert!(state.cancel_turn("thread").await);
+        state.finish_turn("thread").await;
+        assert!(matches!(
+            state.interrupt_turn("thread", "turn-current").await,
+            Err(AppStateError::NoActiveTurn(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn queued_steer_consumes_only_the_matching_message() {
+        let directory = tempfile::tempdir().unwrap();
+        let state =
+            AppState::with_credentials(directory.path(), Arc::new(FakeCredentials::default()))
+                .unwrap();
+        let workspace = state.workspace_root();
+        let (_, control) = state
+            .begin_turn_with_id_in_workspace("thread", "turn-current", &workspace)
+            .await
+            .unwrap();
+        for (turn_id, kind) in [
+            (
+                "queued-message",
+                MailboxTurnKind::Message {
+                    request: crate::agent::RunTurnRequest {
+                        thread_id: "thread".into(),
+                        input: "queued input".into(),
+                        agent_mode: None,
+                    },
+                    attachments: Vec::new(),
+                },
+            ),
+            ("queued-retry", MailboxTurnKind::Retry),
+        ] {
+            state
+                .thread_mailbox()
+                .enqueue(MailboxTurn {
+                    handle: crate::protocol::TurnHandle {
+                        schema_version: crate::protocol::PROTOCOL_VERSION,
+                        thread_id: "thread".into(),
+                        turn_id: turn_id.into(),
+                        state: TurnState::Queued,
+                    },
+                    kind,
+                    started: None,
+                })
+                .await;
+        }
+        let message = crate::protocol::ChatMessage {
+            schema_version: crate::protocol::PROTOCOL_VERSION,
+            id: "steered-message".into(),
+            role: crate::protocol::MessageRole::User,
+            content: Vec::new(),
+            created_at_ms: 1,
+        };
+
+        let stale_result = state
+            .steer_queued_message("thread", "turn-stale", "queued-message", message.clone())
+            .await;
+        assert!(matches!(
+            stale_result,
+            Err(AppStateError::ExpectedTurnMismatch { .. })
+        ));
+        assert_eq!(
+            state
+                .thread_mailbox()
+                .snapshot("thread", Some("turn-current".into()))
+                .await
+                .pending
+                .len(),
+            2
+        );
+        let accepted_turn = state
+            .steer_queued_message("thread", "turn-current", "queued-message", message.clone())
+            .await
+            .unwrap();
+        assert_eq!(accepted_turn, "turn-current");
+        assert_eq!(control.take_pending(), vec![message]);
+        let snapshot = state
+            .thread_mailbox()
+            .snapshot("thread", Some("turn-current".into()))
+            .await;
+        assert_eq!(snapshot.pending.len(), 1);
+        assert_eq!(snapshot.pending[0].turn_id, "queued-retry");
+        assert!(matches!(
+            state
+                .steer_queued_message(
+                    "thread",
+                    "turn-current",
+                    "queued-retry",
+                    crate::protocol::ChatMessage {
+                        schema_version: crate::protocol::PROTOCOL_VERSION,
+                        id: "invalid-retry-steer".into(),
+                        role: crate::protocol::MessageRole::User,
+                        content: Vec::new(),
+                        created_at_ms: 2,
+                    },
+                )
+                .await,
+            Err(AppStateError::QueuedTurnNotMessage { .. })
+        ));
+        assert_eq!(
+            state
+                .thread_mailbox()
+                .snapshot("thread", Some("turn-current".into()))
+                .await
+                .pending
+                .len(),
+            1
+        );
+        state.finish_turn("thread").await;
     }
 
     #[tokio::test]
@@ -1456,6 +2007,10 @@ mod tests {
         };
         for kind in [
             StoredEventKind::TurnStarted,
+            StoredEventKind::ItemStarted {
+                item_id: request.id.clone(),
+                item_type: AgentItemType::Approval,
+            },
             StoredEventKind::ApprovalRequested {
                 request: request.clone(),
             },
@@ -1465,6 +2020,10 @@ mod tests {
                     tool_call_id: "call-2".to_string(),
                     ..request.clone()
                 },
+            },
+            StoredEventKind::ItemStarted {
+                item_id: "interrupted-input".to_string(),
+                item_type: AgentItemType::UserInput,
             },
             StoredEventKind::UserInputRequested {
                 request: UserInputRequest {
@@ -1479,6 +2038,10 @@ mod tests {
                     created_at_ms: 1,
                     expires_at_ms: 2,
                 },
+            },
+            StoredEventKind::ItemStarted {
+                item_id: "interrupted-compaction".to_string(),
+                item_type: AgentItemType::ContextCompaction,
             },
         ] {
             state
@@ -1504,7 +2067,30 @@ mod tests {
                 .as_ref()
                 .is_some_and(|resolution| resolution.action == UserInputAction::Cancelled)
         );
-        let event_count = state.repository().load(&thread.id).await.unwrap().len();
+        let events = state.repository().load(&thread.id).await.unwrap();
+        for (item_id, item_type) in [
+            ("interrupted-approval", AgentItemType::Approval),
+            ("interrupted-input", AgentItemType::UserInput),
+            ("interrupted-compaction", AgentItemType::ContextCompaction),
+        ] {
+            assert!(events.iter().any(|event| matches!(
+                &event.kind,
+                StoredEventKind::ItemCompleted {
+                    item_id: completed_item_id,
+                    item_type: completed_item_type,
+                    status: AgentItemStatus::Cancelled,
+                } if completed_item_id == item_id && completed_item_type == &item_type
+            )));
+        }
+        assert!(!events.iter().any(|event| matches!(
+            &event.kind,
+            StoredEventKind::ItemCompleted {
+                item_id,
+                item_type: AgentItemType::Approval,
+                ..
+            } if item_id == "interrupted-approval-2"
+        )));
+        let event_count = events.len();
         let detail = state.read_thread(&thread.id).await.unwrap();
         assert_eq!(detail.last_turn.unwrap().state, TurnState::Cancelled);
         assert_eq!(

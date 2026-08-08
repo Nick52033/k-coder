@@ -1,3 +1,4 @@
+import { fileURLToPath } from "node:url";
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 
@@ -7,6 +8,15 @@ const host = process.env.TAURI_DEV_HOST;
 // https://vite.dev/config/
 export default defineConfig(async () => ({
   plugins: [react()],
+  resolve: {
+    alias: {
+      // monaco-editor 的 package exports 会把 CSS 等子路径错误拼接 `.js`，
+      // 深路径别名绕过 exports，直接映射到 ESM 文件。
+      "monaco-editor/esm/vs": fileURLToPath(
+        new URL("./node_modules/monaco-editor/esm/vs", import.meta.url),
+      ),
+    },
+  },
   build: {
     rollupOptions: {
       output: {

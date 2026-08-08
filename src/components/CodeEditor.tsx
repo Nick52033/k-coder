@@ -1,27 +1,8 @@
 import { useEffect, useRef } from "react";
-import Editor, { loader, type OnMount } from "@monaco-editor/react";
-import * as monaco from "monaco-editor";
-import CssWorker from "monaco-editor/language/css/css.worker?worker";
-import EditorWorker from "monaco-editor/editor/editor.worker?worker";
-import HtmlWorker from "monaco-editor/language/html/html.worker?worker";
-import JsonWorker from "monaco-editor/language/json/json.worker?worker";
-import TypeScriptWorker from "monaco-editor/language/typescript/ts.worker?worker";
+import Editor, { DiffEditor, loader, type DiffOnMount, type OnMount } from "@monaco-editor/react";
+import { monaco } from "./monaco/setup";
 
 loader.config({ monaco });
-
-const monacoGlobal = globalThis as typeof globalThis & {
-  MonacoEnvironment?: { getWorker: (moduleId: string, label: string) => Worker };
-};
-
-monacoGlobal.MonacoEnvironment = {
-  getWorker(_moduleId, label) {
-    if (label === "json") return new JsonWorker();
-    if (label === "css" || label === "scss" || label === "less") return new CssWorker();
-    if (label === "html" || label === "handlebars" || label === "razor") return new HtmlWorker();
-    if (label === "typescript" || label === "javascript") return new TypeScriptWorker();
-    return new EditorWorker();
-  },
-};
 
 interface CodeEditorProps {
   path: string;
@@ -103,6 +84,82 @@ export function CodeEditor({
           scrollBeyondLastLine: false,
           smoothScrolling: true,
           tabSize: 2,
+          wordWrap: "off",
+        }}
+      />
+    </div>
+  );
+}
+
+interface CodeDiffEditorProps {
+  path: string;
+  originalModelPath: string;
+  modifiedModelPath: string;
+  language: string;
+  originalValue: string;
+  modifiedValue: string;
+}
+
+export function CodeDiffEditor({
+  path,
+  originalModelPath,
+  modifiedModelPath,
+  language,
+  originalValue,
+  modifiedValue,
+}: CodeDiffEditorProps) {
+  const mount: DiffOnMount = (editor, api) => {
+    editor.getOriginalEditor().getModel()?.setEOL(
+      originalValue.includes("\r\n")
+        ? api.editor.EndOfLineSequence.CRLF
+        : api.editor.EndOfLineSequence.LF,
+    );
+    editor.getModifiedEditor().getModel()?.setEOL(
+      modifiedValue.includes("\r\n")
+        ? api.editor.EndOfLineSequence.CRLF
+        : api.editor.EndOfLineSequence.LF,
+    );
+  };
+  const theme = document.documentElement.dataset.theme === "dark" ? "vs-dark" : "vs";
+
+  return (
+    <div className="code-diff-editor" data-language={language}>
+      <DiffEditor
+        originalModelPath={originalModelPath}
+        modifiedModelPath={modifiedModelPath}
+        originalLanguage={language || "plaintext"}
+        modifiedLanguage={language || "plaintext"}
+        original={originalValue}
+        modified={modifiedValue}
+        theme={theme}
+        loading={<div className="code-editor-loading">正在载入编辑器...</div>}
+        onMount={mount}
+        options={{
+          automaticLayout: true,
+          contextmenu: true,
+          diffAlgorithm: "advanced",
+          enableSplitViewResizing: false,
+          fontFamily: "var(--font-family-mono)",
+          fontLigatures: false,
+          fontSize: 12,
+          glyphMargin: false,
+          lineDecorationsWidth: 8,
+          lineHeight: 19,
+          lineNumbers: "on",
+          lineNumbersMinChars: 3,
+          minimap: { enabled: false },
+          modifiedAriaLabel: `修改后 ${path}`,
+          originalAriaLabel: `修改前 ${path}`,
+          originalEditable: false,
+          padding: { top: 7, bottom: 7 },
+          readOnly: true,
+          renderIndicators: true,
+          renderLineHighlight: "all",
+          renderMarginRevertIcon: false,
+          renderSideBySide: false,
+          roundedSelection: false,
+          scrollBeyondLastLine: false,
+          smoothScrolling: true,
           wordWrap: "off",
         }}
       />

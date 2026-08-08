@@ -238,6 +238,78 @@ export interface ThreadDetail {
   lastUsage: TokenUsage | null;
 }
 
+export type HistorySortDirection = "asc" | "desc";
+export type TurnItemsView = "not_loaded" | "summary" | "full";
+export type AgentMessagePhase = "commentary" | "final_answer";
+
+interface ThreadItemBase {
+  schemaVersion: number;
+  id: string;
+  turnId: string | null;
+  status: AgentItemStatus | null;
+  startedAtMs: number | null;
+  completedAtMs: number | null;
+  timelineItems: TurnTimelineItem[];
+}
+
+export type ThreadItem = ThreadItemBase & (
+  | { type: "user_message"; message: ChatMessage }
+  | { type: "agent_message"; message: ChatMessage; phase: AgentMessagePhase }
+  | { type: "reasoning"; summary: string }
+  | { type: "tool"; activity: ToolActivity }
+  | { type: "approval"; approval: ApprovalSnapshot }
+  | { type: "user_input"; userInput: UserInputSnapshot }
+  | { type: "change"; changeSet: ChangeSet }
+  | {
+      type: "context_compaction";
+      automatic: boolean;
+      compactedMessageCount: number;
+      userConstraintCount: number;
+      recentToolResultCount: number;
+    }
+  | { type: "event" }
+);
+
+export interface ThreadTurn {
+  schemaVersion: number;
+  id: string;
+  userMessageId: string | null;
+  state: TurnState;
+  error: string | null;
+  startedAtMs: number | null;
+  completedAtMs: number | null;
+  durationMs: number | null;
+  itemsView: TurnItemsView;
+  items: ThreadItem[];
+}
+
+export interface ThreadTurnsPage {
+  data: ThreadTurn[];
+  nextCursor: string | null;
+  backwardsCursor: string | null;
+}
+
+export interface ThreadItemEntry {
+  turnId: string | null;
+  item: ThreadItem;
+}
+
+export interface ThreadItemsPage {
+  data: ThreadItemEntry[];
+  nextCursor: string | null;
+  backwardsCursor: string | null;
+}
+
+export interface ThreadHistorySnapshot {
+  schemaVersion: number;
+  summary: ThreadSummary;
+  lastTurn: TurnSnapshot | null;
+  todos: TodoItem[];
+  lastUsage: TokenUsage | null;
+  turns: ThreadTurnsPage;
+  unscopedItems: ThreadItem[];
+}
+
 export type FileOperation = "add" | "modify" | "delete" | "move";
 export type ToolRisk = "read" | "write" | "delete" | "external";
 export type ApprovalMode = "ask" | "full_access";
@@ -447,6 +519,39 @@ export interface TurnOutcome {
   durationMs: number;
 }
 
+export interface TurnHandle {
+  schemaVersion: number;
+  threadId: string;
+  turnId: string;
+  state: TurnState;
+}
+
+export interface QueuedTurn {
+  schemaVersion: number;
+  turnId: string;
+  threadId: string;
+  kind: "message" | "retry";
+  input: string;
+  agentMode: string | null;
+  attachments: ImageAttachment[];
+}
+
+export interface ThreadMailboxSnapshot {
+  schemaVersion: number;
+  threadId: string;
+  revision: number;
+  activeTurnId: string | null;
+  pending: QueuedTurn[];
+}
+
+export interface ThreadMailboxChanged {
+  schemaVersion: number;
+  threadId: string;
+  revision: number;
+}
+
+export interface TurnSteerResponse { schemaVersion: number; threadId: string; turnId: string; }
+
 interface EventBase {
   schemaVersion: number;
   threadId: string;
@@ -462,10 +567,24 @@ export interface TodoItem {
   activeForm: string;
 }
 
+export type AgentItemType =
+  | "agent_message"
+  | "reasoning"
+  | "tool"
+  | "approval"
+  | "change"
+  | "context_compaction"
+  | "user_input";
+export type AgentItemStatus = "completed" | "failed" | "cancelled";
+
 export type AgentEvent =
-  | (EventBase & { type: "turn_started" })
+  | (EventBase & { type: "turn_started"; userMessage: ChatMessage | null })
+  | (EventBase & { type: "turn_steered"; message: ChatMessage })
+  | (EventBase & { type: "turn_rejected"; message: string })
+  | (EventBase & { type: "item_started"; itemId: string; itemType: AgentItemType })
+  | (EventBase & { type: "item_completed"; itemId: string; itemType: AgentItemType; status: AgentItemStatus })
   | (EventBase & { type: "activity_status_changed"; status: AgentActivityStatus })
-  | (EventBase & { type: "text_delta"; delta: string })
+  | (EventBase & { type: "text_delta"; itemId: string; delta: string })
   | (EventBase & { type: "reasoning_summary_delta"; itemId: string; delta: string })
   | (EventBase & { type: "reasoning_summary_completed"; itemId: string; summary: string })
   | (EventBase & { type: "usage_updated"; usage: TokenUsage })

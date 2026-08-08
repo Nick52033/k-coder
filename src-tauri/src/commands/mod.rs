@@ -1,9 +1,11 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 
 use futures_util::StreamExt;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
+use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
 use crate::advanced::{
     BrowserArtifact, BrowserAuditEvent, BrowserSettings, CreateGoalRequest, DocumentContent,
@@ -11,8 +13,10 @@ use crate::advanced::{
     MemoryView, MetricsSnapshot, PlanUpdateRequest, PlanView, RepositorySearchIndex, SearchResult,
     extract_document, run_recorded_evaluation,
 };
-use crate::agent::{AgentRuntime, EventPublisher, RunTurnRequest, TurnOutcome};
-use crate::app_state::AppState;
+use crate::agent::mailbox::{MailboxTurn, MailboxTurnKind, QueuedTurnSteerError};
+use crate::agent::thread_operation::ThreadOperationGuard;
+use crate::agent::{AgentRuntime, EventPublisher, RunTurnRequest, TurnOutcome, build_user_message};
+use crate::app_state::{AppState, AppStateError};
 use crate::context::CompactionSummary;
 use crate::execution::{
     CommandSessionView, OutputPage, PtyOutputPage, PtySessionView, StartCommandRequest,
@@ -28,8 +32,11 @@ use crate::ocr::{self, OcrResult};
 use crate::persistence::{ProjectRecord, UsageSummary};
 use crate::protocol::{
     AgentEvent, AgentEventEnvelope, AgentMode, ApprovalMode, ApprovalResolution, ChangeSet,
-    ImageAttachment, MessageRole, PROTOCOL_VERSION, PatchPreview, ReasoningEffort, RuntimeStatus,
-    TokenUsage, UserInputResolution,
+    HistorySortDirection, ImageAttachment, MessageRole, PROTOCOL_VERSION, PatchPreview,
+    QueuedTurnSteerRequest, ReasoningEffort, RuntimeStatus, ThreadForkRequest,
+    ThreadHistorySnapshot, ThreadItemsPage, ThreadMailboxChanged, ThreadMailboxSnapshot,
+    ThreadRollbackRequest, ThreadTurnsPage, TokenUsage, TurnHandle, TurnItemsView, TurnState,
+    TurnSteerRequest, TurnSteerResponse, UserInputResolution,
 };
 use crate::providers::{
     ProviderConfigView, ProviderEvent, ProviderMessage, ProviderRequest, SaveProviderConfigRequest,
@@ -51,6 +58,23 @@ const CRAFT_MODE_INSTRUCTIONS: &str = include_str!("../../templates/craft_mode.m
 
 const AGENT_EVENT_NAME: &str = "agent-event";
 const SUBAGENT_EVENT_NAME: &str = "subagent-event";
+const THREAD_MAILBOX_CHANGED_EVENT_NAME: &str = "thread-mailbox-changed";
+
+async fn emit_mailbox_changed(app: &AppHandle, state: &AppState, thread_id: &str) {
+    let revision = state.thread_mailbox().revision(thread_id).await;
+    emit_mailbox_revision(app, thread_id, revision);
+}
+
+fn emit_mailbox_revision(app: &AppHandle, thread_id: &str, revision: u64) {
+    let _ = app.emit(
+        THREAD_MAILBOX_CHANGED_EVENT_NAME,
+        ThreadMailboxChanged {
+            schema_version: PROTOCOL_VERSION,
+            thread_id: thread_id.to_string(),
+            revision,
+        },
+    );
+}
 
 fn instructions_for_mode(mode: AgentMode) -> &'static str {
     match mode {
@@ -112,7 +136,7 @@ fn retry_mode(events: &[StoredEvent]) -> AgentMode {
         .unwrap_or_default()
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CommandError {
     code: &'static str,
@@ -141,6 +165,55 @@ struct TauriEventPublisher {
 impl EventPublisher for TauriEventPublisher {
     fn publish(&self, event: AgentEventEnvelope) {
         let _ = self.app.emit(AGENT_EVENT_NAME, event);
+    }
+}
+
+struct TurnStartPublisher {
+    delegate: Arc<dyn EventPublisher>,
+    thread_id: String,
+    turn_id: String,
+    signal: StdMutex<Option<oneshot::Sender<Result<(), String>>>>,
+}
+
+impl TurnStartPublisher {
+    fn new(
+        delegate: Arc<dyn EventPublisher>,
+        thread_id: String,
+        turn_id: String,
+        signal: oneshot::Sender<Result<(), String>>,
+    ) -> Self {
+        Self {
+            delegate,
+            thread_id,
+            turn_id,
+            signal: StdMutex::new(Some(signal)),
+        }
+    }
+
+    fn report_error(&self, error: CommandError) {
+        if let Some(signal) = self.signal.lock().unwrap().take() {
+            let message = error.message;
+            if signal.send(Err(message.clone())).is_err() {
+                self.delegate
+                    .publish(AgentEventEnvelope::new(AgentEvent::TurnRejected {
+                        thread_id: self.thread_id.clone(),
+                        turn_id: self.turn_id.clone(),
+                        message,
+                    }));
+            }
+        }
+    }
+}
+
+impl EventPublisher for TurnStartPublisher {
+    fn publish(&self, event: AgentEventEnvelope) {
+        let started = matches!(&event.event, AgentEvent::TurnStarted { .. });
+        self.delegate.publish(event);
+        if started {
+            if let Some(signal) = self.signal.lock().unwrap().take() {
+                let _ = signal.send(Ok(()));
+            }
+        }
     }
 }
 
@@ -976,6 +1049,59 @@ pub async fn read_thread(
 }
 
 #[tauri::command(rename_all = "camelCase")]
+pub async fn read_thread_history(
+    state: State<'_, AppState>,
+    thread_id: String,
+) -> CommandResult<ThreadHistorySnapshot> {
+    state
+        .read_thread_history(&thread_id)
+        .await
+        .map_err(|error| CommandError::new("storage", error))
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn list_thread_turns(
+    state: State<'_, AppState>,
+    thread_id: String,
+    cursor: Option<String>,
+    limit: Option<u32>,
+    sort_direction: Option<HistorySortDirection>,
+    items_view: Option<TurnItemsView>,
+) -> CommandResult<ThreadTurnsPage> {
+    state
+        .list_thread_turns(
+            &thread_id,
+            cursor.as_deref(),
+            limit,
+            sort_direction.unwrap_or_default(),
+            items_view.unwrap_or(TurnItemsView::Summary),
+        )
+        .await
+        .map_err(|error| CommandError::new("storage", error))
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn list_thread_items(
+    state: State<'_, AppState>,
+    thread_id: String,
+    turn_id: Option<String>,
+    cursor: Option<String>,
+    limit: Option<u32>,
+    sort_direction: Option<HistorySortDirection>,
+) -> CommandResult<ThreadItemsPage> {
+    state
+        .list_thread_items(
+            &thread_id,
+            turn_id.as_deref(),
+            cursor.as_deref(),
+            limit,
+            sort_direction.unwrap_or(HistorySortDirection::Asc),
+        )
+        .await
+        .map_err(|error| CommandError::new("storage", error))
+}
+
+#[tauri::command(rename_all = "camelCase")]
 pub async fn archive_thread(state: State<'_, AppState>, thread_id: String) -> CommandResult<()> {
     if state.is_turn_active(&thread_id).await {
         return Err(CommandError::new(
@@ -1035,6 +1161,415 @@ pub async fn run_turn(
     state: State<'_, AppState>,
     request: RunTurnRequest,
     attachments: Vec<ImageAttachment>,
+) -> CommandResult<TurnOutcome> {
+    let publisher: Arc<dyn EventPublisher> = Arc::new(TauriEventPublisher { app: app.clone() });
+    execute_turn(
+        app,
+        state.inner(),
+        request,
+        attachments,
+        None,
+        None,
+        publisher,
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn turn_start(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    request: RunTurnRequest,
+    attachments: Vec<ImageAttachment>,
+) -> CommandResult<TurnHandle> {
+    let turn_id = Uuid::new_v4().to_string();
+    let thread_id = request.thread_id.clone();
+    let (signal, started) = oneshot::channel();
+    let handle = TurnHandle {
+        schema_version: PROTOCOL_VERSION,
+        thread_id: thread_id.clone(),
+        turn_id: turn_id.clone(),
+        state: TurnState::Queued,
+    };
+    let should_start = state
+        .enqueue_thread_turn(MailboxTurn {
+            handle: handle.clone(),
+            kind: MailboxTurnKind::Message {
+                request,
+                attachments,
+            },
+            started: Some(signal),
+        })
+        .await;
+    emit_mailbox_changed(&app, state.inner(), &thread_id).await;
+
+    if !should_start {
+        return Ok(handle);
+    }
+
+    tauri::async_runtime::spawn(drain_thread_mailbox(app, thread_id));
+    started
+        .await
+        .map_err(|_| CommandError::internal("turn start task ended before initialization"))?
+        .map_err(|error| CommandError::new("turn_start", error))?;
+
+    Ok(TurnHandle {
+        state: TurnState::Streaming,
+        ..handle
+    })
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn turn_retry(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    thread_id: String,
+) -> CommandResult<TurnHandle> {
+    let turn_id = Uuid::new_v4().to_string();
+    let (signal, started) = oneshot::channel();
+    let handle = TurnHandle {
+        schema_version: PROTOCOL_VERSION,
+        thread_id: thread_id.clone(),
+        turn_id,
+        state: TurnState::Queued,
+    };
+    let should_start = state
+        .enqueue_thread_turn(MailboxTurn {
+            handle: handle.clone(),
+            kind: MailboxTurnKind::Retry,
+            started: Some(signal),
+        })
+        .await;
+    emit_mailbox_changed(&app, state.inner(), &thread_id).await;
+
+    if !should_start {
+        return Ok(handle);
+    }
+
+    tauri::async_runtime::spawn(drain_thread_mailbox(app, thread_id));
+    started
+        .await
+        .map_err(|_| CommandError::internal("turn retry task ended before initialization"))?
+        .map_err(|error| CommandError::new("turn_retry", error))?;
+
+    Ok(TurnHandle {
+        state: TurnState::Streaming,
+        ..handle
+    })
+}
+
+async fn drain_thread_mailbox(app: AppHandle, thread_id: String) {
+    loop {
+        let (item, revision) = {
+            let state = app.state::<AppState>();
+            let item = state.next_thread_turn(&thread_id).await;
+            let revision = state.thread_mailbox().revision(&thread_id).await;
+            (item, revision)
+        };
+        emit_mailbox_revision(&app, &thread_id, revision);
+        let Some((item, operation_guard)) = item else {
+            return;
+        };
+        let MailboxTurn {
+            handle,
+            kind,
+            started,
+        } = item;
+        let delegate: Arc<dyn EventPublisher> = Arc::new(TauriEventPublisher { app: app.clone() });
+        let publisher = Arc::new(match started {
+            Some(signal) => TurnStartPublisher::new(
+                delegate,
+                handle.thread_id.clone(),
+                handle.turn_id.clone(),
+                signal,
+            ),
+            None => unreachable!("mailbox turns always carry a start signal"),
+        });
+        let state = app.state::<AppState>();
+        let result = match kind {
+            MailboxTurnKind::Message {
+                request,
+                attachments,
+            } => {
+                execute_turn(
+                    app.clone(),
+                    state.inner(),
+                    request,
+                    attachments,
+                    Some(handle.turn_id),
+                    Some(operation_guard),
+                    publisher.clone(),
+                )
+                .await
+            }
+            MailboxTurnKind::Retry => {
+                execute_retry(
+                    state.inner(),
+                    handle.thread_id,
+                    Some(handle.turn_id),
+                    Some(operation_guard),
+                    publisher.clone(),
+                )
+                .await
+            }
+        };
+        match result {
+            Ok(_) => publisher.report_error(CommandError::internal(
+                "turn completed before publishing turn_started",
+            )),
+            Err(error) => publisher.report_error(error),
+        }
+    }
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn read_thread_mailbox(
+    state: State<'_, AppState>,
+    thread_id: String,
+) -> CommandResult<ThreadMailboxSnapshot> {
+    state
+        .repository()
+        .read_thread(&thread_id)
+        .await
+        .map_err(|error| CommandError::new("storage", error))?;
+    let active_turn_id = state.active_turn_id(&thread_id).await;
+    Ok(state
+        .thread_mailbox()
+        .snapshot(&thread_id, active_turn_id)
+        .await)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn remove_queued_turn(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    thread_id: String,
+    turn_id: String,
+) -> CommandResult<bool> {
+    let removed = state.remove_queued_turn(&thread_id, &turn_id).await;
+    if removed {
+        emit_mailbox_changed(&app, state.inner(), &thread_id).await;
+    }
+    Ok(removed)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn clear_thread_mailbox(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    thread_id: String,
+) -> CommandResult<usize> {
+    let removed = state.clear_thread_mailbox(&thread_id).await;
+    if removed > 0 {
+        emit_mailbox_changed(&app, state.inner(), &thread_id).await;
+    }
+    Ok(removed)
+}
+
+#[tauri::command]
+pub async fn turn_steer(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    request: TurnSteerRequest,
+) -> CommandResult<TurnSteerResponse> {
+    if request.expected_turn_id.trim().is_empty() {
+        return Err(CommandError::new(
+            "invalid_request",
+            "expectedTurnId must not be empty",
+        ));
+    }
+    let active_turn_id = state
+        .active_turn_id(&request.thread_id)
+        .await
+        .ok_or_else(|| CommandError::new("no_active_turn", "no active turn to steer"))?;
+    if active_turn_id != request.expected_turn_id {
+        return Err(CommandError::new(
+            "turn_mismatch",
+            format!(
+                "expected active turn id {}, but found {}",
+                request.expected_turn_id, active_turn_id
+            ),
+        ));
+    }
+
+    let message =
+        prepare_steer_message(&app, state.inner(), &request.input, request.attachments).await?;
+    let turn_id = state
+        .steer_turn(&request.thread_id, &request.expected_turn_id, message)
+        .await
+        .map_err(|error| CommandError::new("turn_steer", error))?;
+    Ok(TurnSteerResponse {
+        schema_version: PROTOCOL_VERSION,
+        thread_id: request.thread_id,
+        turn_id,
+    })
+}
+
+#[tauri::command]
+pub async fn turn_steer_queued(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    request: QueuedTurnSteerRequest,
+) -> CommandResult<TurnSteerResponse> {
+    if request.expected_turn_id.trim().is_empty() || request.queued_turn_id.trim().is_empty() {
+        return Err(CommandError::new(
+            "invalid_request",
+            "expectedTurnId and queuedTurnId must not be empty",
+        ));
+    }
+    let active_turn_id = state
+        .active_turn_id(&request.thread_id)
+        .await
+        .ok_or_else(|| CommandError::new("no_active_turn", "no active turn to steer"))?;
+    if active_turn_id != request.expected_turn_id {
+        return Err(CommandError::new(
+            "turn_mismatch",
+            format!(
+                "expected active turn id {}, but found {}",
+                request.expected_turn_id, active_turn_id
+            ),
+        ));
+    }
+    let pending = state
+        .thread_mailbox()
+        .pending_message(&request.thread_id, &request.queued_turn_id)
+        .await
+        .map_err(|error| match error {
+            QueuedTurnSteerError::NotFound => CommandError::new(
+                "queued_turn_not_found",
+                format!("queued turn {} was not found", request.queued_turn_id),
+            ),
+            QueuedTurnSteerError::NotMessage => CommandError::new(
+                "queued_turn_not_message",
+                format!("queued turn {} is not a message", request.queued_turn_id),
+            ),
+            QueuedTurnSteerError::TurnClosed => {
+                CommandError::new("no_active_turn", "active turn no longer accepts input")
+            }
+        })?;
+    let message = prepare_steer_message(
+        &app,
+        state.inner(),
+        &pending.request.input,
+        pending.attachments,
+    )
+    .await?;
+    let turn_id = state
+        .steer_queued_message(
+            &request.thread_id,
+            &request.expected_turn_id,
+            &request.queued_turn_id,
+            message,
+        )
+        .await
+        .map_err(map_queued_steer_error)?;
+    emit_mailbox_changed(&app, state.inner(), &request.thread_id).await;
+    Ok(TurnSteerResponse {
+        schema_version: PROTOCOL_VERSION,
+        thread_id: request.thread_id,
+        turn_id,
+    })
+}
+
+async fn prepare_steer_message(
+    app: &AppHandle,
+    state: &AppState,
+    input: &str,
+    mut attachments: Vec<ImageAttachment>,
+) -> CommandResult<crate::protocol::ChatMessage> {
+    let supports_vision = state
+        .active_model_supports_vision()
+        .map_err(|error| CommandError::new("provider_config", error))?;
+    if supports_vision {
+        for attachment in &mut attachments {
+            attachment.ocr_text = None;
+        }
+    } else if !attachments.is_empty() {
+        enrich_image_attachments(app, &mut attachments).await?;
+    }
+    build_user_message(input, attachments, supports_vision)
+        .map_err(|error| CommandError::new("invalid_request", error))
+}
+
+fn map_queued_steer_error(error: AppStateError) -> CommandError {
+    let code = match &error {
+        AppStateError::NoActiveTurn(_) => "no_active_turn",
+        AppStateError::ExpectedTurnMismatch { .. } => "turn_mismatch",
+        AppStateError::QueuedTurnNotFound { .. } => "queued_turn_not_found",
+        AppStateError::QueuedTurnNotMessage { .. } => "queued_turn_not_message",
+        _ => "turn_steer_queued",
+    };
+    CommandError::new(code, error)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn turn_interrupt(
+    state: State<'_, AppState>,
+    thread_id: String,
+    turn_id: String,
+) -> CommandResult<()> {
+    if turn_id.trim().is_empty() {
+        return Err(CommandError::new(
+            "invalid_request",
+            "turnId must not be empty",
+        ));
+    }
+    state
+        .interrupt_turn(&thread_id, &turn_id)
+        .await
+        .map_err(|error| CommandError::new("turn_interrupt", error))
+}
+
+#[tauri::command]
+pub async fn thread_fork(
+    state: State<'_, AppState>,
+    request: ThreadForkRequest,
+) -> CommandResult<ThreadSummary> {
+    state
+        .fork_thread(&request.thread_id, request.last_turn_id.as_deref())
+        .await
+        .map_err(map_thread_operation_error)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn thread_resume(
+    state: State<'_, AppState>,
+    thread_id: String,
+) -> CommandResult<ThreadHistorySnapshot> {
+    state
+        .resume_thread_history(&thread_id)
+        .await
+        .map_err(|error| CommandError::new("thread_resume", error))
+}
+
+#[tauri::command]
+pub async fn thread_rollback(
+    state: State<'_, AppState>,
+    request: ThreadRollbackRequest,
+) -> CommandResult<ThreadHistorySnapshot> {
+    state
+        .rollback_thread(&request.thread_id, request.num_turns)
+        .await
+        .map_err(map_thread_operation_error)
+}
+
+fn map_thread_operation_error(error: AppStateError) -> CommandError {
+    let code = match &error {
+        AppStateError::ThreadOperationBusy(_) => "turn_active",
+        AppStateError::ThreadMailboxNotEmpty(_) => "mailbox_not_empty",
+        _ => "thread_operation",
+    };
+    CommandError::new(code, error)
+}
+
+async fn execute_turn(
+    app: AppHandle,
+    state: &AppState,
+    request: RunTurnRequest,
+    attachments: Vec<ImageAttachment>,
+    assigned_turn_id: Option<String>,
+    operation_guard: Option<ThreadOperationGuard>,
+    publisher: Arc<dyn EventPublisher>,
 ) -> CommandResult<TurnOutcome> {
     let mut attachments = attachments;
     let has_image_attachments = !attachments.is_empty();
@@ -1127,10 +1662,27 @@ pub async fn run_turn(
             state.build_provider()
         }
         .map_err(|error| CommandError::new("provider_config", error))?;
-    let cancellation = state
-        .begin_turn_in_workspace(&thread_id, &workspace_root)
-        .await
-        .map_err(|error| CommandError::new("turn_active", error))?;
+    let turn_id = assigned_turn_id.unwrap_or_else(|| Uuid::new_v4().to_string());
+    let begin_result = match operation_guard.as_ref() {
+        Some(operation_guard) => {
+            state
+                .begin_turn_with_id_in_workspace_locked(
+                    &thread_id,
+                    &turn_id,
+                    &workspace_root,
+                    operation_guard,
+                )
+                .await
+        }
+        None => {
+            state
+                .begin_turn_with_id_in_workspace(&thread_id, &turn_id, &workspace_root)
+                .await
+        }
+    };
+    let (cancellation, control) =
+        begin_result.map_err(|error| CommandError::new("turn_active", error))?;
+    drop(operation_guard);
     let goal_timeout = goal_timeout_ms.map(|timeout_ms| {
         let cancellation = cancellation.clone();
         tokio::spawn(async move {
@@ -1152,9 +1704,16 @@ pub async fn run_turn(
         thread_id.clone(),
         cancellation.child_token(),
     );
-    let tools = base_tools
-        .with_additional_handlers(agent_handlers, agent_risks)
-        .map_err(|error| CommandError::new("multi_agent", error))?;
+    let tools = match base_tools.with_additional_handlers(agent_handlers, agent_risks) {
+        Ok(tools) => tools,
+        Err(error) => {
+            if let Some(timeout) = goal_timeout {
+                timeout.abort();
+            }
+            state.finish_turn(&thread_id).await;
+            return Err(CommandError::new("multi_agent", error));
+        }
+    };
     let mut runtime = AgentRuntime::with_tools_and_approvals(
         state.runtime_repository(),
         tools,
@@ -1172,15 +1731,16 @@ pub async fn run_turn(
     if let Some((_, Some(remaining_tokens))) = &goal_budget {
         runtime = runtime.with_token_budget(*remaining_tokens);
     }
-    let publisher: Arc<dyn EventPublisher> = Arc::new(TauriEventPublisher { app });
     let started = std::time::Instant::now();
     let result = runtime
-        .run_turn_with_attachments(
+        .run_turn_with_attachments_id_and_control(
             provider,
             model,
             request,
             attachments,
+            turn_id,
             cancellation,
+            control,
             publisher,
         )
         .await;
@@ -1214,6 +1774,17 @@ pub async fn retry_turn(
     app: AppHandle,
     state: State<'_, AppState>,
     thread_id: String,
+) -> CommandResult<TurnOutcome> {
+    let publisher: Arc<dyn EventPublisher> = Arc::new(TauriEventPublisher { app: app.clone() });
+    execute_retry(state.inner(), thread_id, None, None, publisher).await
+}
+
+async fn execute_retry(
+    state: &AppState,
+    thread_id: String,
+    assigned_turn_id: Option<String>,
+    operation_guard: Option<ThreadOperationGuard>,
+    publisher: Arc<dyn EventPublisher>,
 ) -> CommandResult<TurnOutcome> {
     let workspace_root = state
         .ensure_thread_workspace(&thread_id)
@@ -1313,10 +1884,27 @@ pub async fn retry_turn(
         state.build_provider()
     }
     .map_err(|error| CommandError::new("provider_config", error))?;
-    let cancellation = state
-        .begin_turn_in_workspace(&thread_id, &workspace_root)
-        .await
-        .map_err(|error| CommandError::new("turn_active", error))?;
+    let turn_id = assigned_turn_id.unwrap_or_else(|| Uuid::new_v4().to_string());
+    let begin_result = match operation_guard.as_ref() {
+        Some(operation_guard) => {
+            state
+                .begin_turn_with_id_in_workspace_locked(
+                    &thread_id,
+                    &turn_id,
+                    &workspace_root,
+                    operation_guard,
+                )
+                .await
+        }
+        None => {
+            state
+                .begin_turn_with_id_in_workspace(&thread_id, &turn_id, &workspace_root)
+                .await
+        }
+    };
+    let (cancellation, control) =
+        begin_result.map_err(|error| CommandError::new("turn_active", error))?;
+    drop(operation_guard);
     let goal_timeout = goal_timeout_ms.map(|timeout_ms| {
         let cancellation = cancellation.clone();
         tokio::spawn(async move {
@@ -1341,15 +1929,16 @@ pub async fn retry_turn(
     if let Some((_, Some(remaining_tokens))) = &goal_budget {
         runtime = runtime.with_token_budget(*remaining_tokens);
     }
-    let publisher: Arc<dyn EventPublisher> = Arc::new(TauriEventPublisher { app });
     let started = std::time::Instant::now();
     let result = runtime
-        .retry_turn(
+        .retry_turn_with_id_and_control(
             provider,
             model,
             thread_id.clone(),
             agent_mode,
+            turn_id,
             cancellation,
+            control,
             publisher,
         )
         .await;
@@ -1792,10 +2381,84 @@ async fn enrich_image_attachments(
 #[cfg(test)]
 mod tests {
     use std::path::Path;
+    use std::sync::{Arc, Mutex};
 
-    use super::{CRAFT_MODE_INSTRUCTIONS, build_system_prompt, retry_mode};
-    use crate::protocol::AgentMode;
+    use super::{
+        CRAFT_MODE_INSTRUCTIONS, CommandError, TurnStartPublisher, build_system_prompt, retry_mode,
+    };
+    use crate::agent::EventPublisher;
+    use crate::protocol::{AgentEvent, AgentEventEnvelope, AgentMode};
     use crate::storage::{StoredEvent, StoredEventKind};
+
+    #[derive(Default)]
+    struct RecordingPublisher {
+        events: Mutex<Vec<AgentEventEnvelope>>,
+    }
+
+    impl EventPublisher for RecordingPublisher {
+        fn publish(&self, event: AgentEventEnvelope) {
+            self.events.lock().unwrap().push(event);
+        }
+    }
+
+    #[tokio::test]
+    async fn async_start_acknowledges_only_after_turn_started_is_published() {
+        let delegate = Arc::new(RecordingPublisher::default());
+        let (signal, mut started) = tokio::sync::oneshot::channel();
+        let publisher =
+            TurnStartPublisher::new(delegate.clone(), "thread-1".into(), "turn-1".into(), signal);
+        publisher.publish(AgentEventEnvelope::new(AgentEvent::ActivityStatusChanged {
+            thread_id: "thread-1".into(),
+            turn_id: "turn-1".into(),
+            status: crate::protocol::AgentActivityStatus::Thinking,
+        }));
+        assert!(started.try_recv().is_err());
+
+        publisher.publish(AgentEventEnvelope::new(AgentEvent::TurnStarted {
+            thread_id: "thread-1".into(),
+            turn_id: "turn-1".into(),
+            user_message: None,
+        }));
+
+        assert!(started.await.unwrap().is_ok());
+        assert_eq!(delegate.events.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn async_start_returns_pre_start_errors_through_the_handshake() {
+        let delegate = Arc::new(RecordingPublisher::default());
+        let (signal, started) = tokio::sync::oneshot::channel();
+        let publisher =
+            TurnStartPublisher::new(delegate, "thread-1".into(), "turn-1".into(), signal);
+
+        publisher.report_error(CommandError::new("turn_active", "already running"));
+
+        let error = started.await.unwrap().unwrap_err();
+        assert_eq!(error, "already running");
+    }
+
+    #[test]
+    fn queued_start_failure_is_published_when_the_caller_no_longer_waits() {
+        let delegate = Arc::new(RecordingPublisher::default());
+        let (signal, started) = tokio::sync::oneshot::channel();
+        drop(started);
+        let publisher = TurnStartPublisher::new(
+            delegate.clone(),
+            "thread-1".into(),
+            "turn-queued".into(),
+            signal,
+        );
+
+        publisher.report_error(CommandError::new("provider_config", "missing provider"));
+
+        assert!(matches!(
+            delegate.events.lock().unwrap().as_slice(),
+            [AgentEventEnvelope {
+                event: AgentEvent::TurnRejected { turn_id, message, .. },
+                ..
+            }] if turn_id == "turn-queued" && message == "missing provider"
+        ));
+    }
 
     #[test]
     fn craft_mode_can_proactively_clarify_ambiguous_behavior() {
@@ -1847,6 +2510,7 @@ mod tests {
                 Some("turn-plan".into()),
                 StoredEventKind::TurnFailed {
                     message: "failed".into(),
+                    error: None,
                 },
             ),
         ];

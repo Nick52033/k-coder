@@ -12,6 +12,7 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 
+use crate::execution::hide_console_window;
 use crate::protocol::{ToolDefinition, ToolResult, ToolRisk};
 use crate::tools::{ToolContext, ToolError, ToolHandler};
 
@@ -475,6 +476,7 @@ impl StdioClient {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
             .kill_on_drop(true);
+        hide_console_window(&mut process);
         let mut child = process
             .spawn()
             .map_err(|error| McpError::Transport(format!("{server} failed to start: {error}")))?;

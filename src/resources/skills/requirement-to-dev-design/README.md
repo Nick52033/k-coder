@@ -49,7 +49,7 @@ https://alidocs.dingtalk.com/i/nodes/{需求nodeId}
 | `references/user-guide.md` | **使用指南（推荐阅读）** |
 | `references/dingtalk-config.md` | 默认钉钉 nodeId |
 | `references/fmea-guide.md` | 2.10 故障分析 |
-| `templates/详细设计模板.md` | 离线模板 |
+| `templates/detailed-design-template.md` | 离线模板 |
 
 ---
 

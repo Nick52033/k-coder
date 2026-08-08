@@ -1,19 +1,20 @@
 import {
   Activity,
   Brain,
+  Check,
   ChevronDown,
   Circle,
   CircleCheck,
   CircleDot,
   CircleX,
   Clock3,
-  FileDiff,
+  Copy,
   FileText,
   ListChecks,
   LoaderCircle,
   SquareTerminal,
 } from "lucide-react";
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { lazy, Suspense, useEffect, useRef, useState, type ReactNode } from "react";
 import type {
   AgentActivityStatus,
   ChangeSet,
@@ -24,6 +25,9 @@ import type {
   TimelineEventKind,
   TurnTimelineItem,
 } from "../types/runtime";
+
+const ReadOnlyCodeEditor = lazy(() => import("./CodeEditor").then((module) => ({ default: module.CodeEditor })));
+const ChangeCodeDiffEditor = lazy(() => import("./CodeEditor").then((module) => ({ default: module.CodeDiffEditor })));
 
 export function ConversationTurnActivity({
   activities,
@@ -61,11 +65,32 @@ export function ConversationTurnActivity({
   );
   const processItems = processTimeline.filter((item) => item !== terminalEvent);
   const hasItems = Boolean(plan?.steps.length || activities.length || processItems.length);
-  const hasProcess = hasItems || Boolean(activityStatus);
+  const hasProcess = hasItems || Boolean(activityStatus) || terminalEvent?.kind === "turn_failed" || terminalEvent?.kind === "turn_cancelled";
   const toolCount = processTimeline.filter((item) => item.type === "tool").length || activities.length;
   const summaryTitle = terminalEvent?.durationMs !== undefined
-    ? `执行了 ${formatDuration(terminalEvent.durationMs)}`
-    : "执行过程";
+    ? terminalEvent.kind === "turn_cancelled"
+      ? "已停止"
+      : terminalEvent.kind === "turn_failed"
+        ? "执行失败"
+        : `执行了 ${formatDuration(terminalEvent.durationMs)}`
+    : terminalEvent?.kind === "turn_cancelled"
+      ? "已停止"
+      : terminalEvent?.kind === "turn_failed"
+        ? "执行失败"
+        : "执行过程";
+  const autoCollapse = !visuallyStreaming && terminalEvent?.kind === "turn_completed";
+  const SummaryIcon = visuallyStreaming
+    ? LoaderCircle
+    : terminalEvent?.kind === "turn_cancelled"
+      ? Circle
+      : terminalEvent?.kind === "turn_failed"
+        ? CircleX
+        : Activity;
+  const summaryStatus = terminalEvent?.kind === "turn_completed"
+    ? (toolCount ? `${toolCount} 个操作` : "已完成")
+    : terminalEvent?.durationMs !== undefined
+      ? `耗时 ${formatDuration(terminalEvent.durationMs)}`
+      : toolCount ? `${toolCount} 个操作` : "处理中";
   const statusLabel = paced.pendingTextIds.size
     ? "生成回复中"
     : activityStatus ? {
@@ -79,18 +104,20 @@ export function ConversationTurnActivity({
   const processContent = (
     <div className="turn-disclosure-panel">
       <div className={visuallyStreaming ? "turn-execution-live" : "turn-execution-content"}>
-        {plan?.steps.length ? <ConversationPlan plan={plan} /> : null}
+        {plan?.steps.length ? <ConversationPlan plan={plan} allowAutoCollapse={autoCollapse} /> : null}
         {processTimeline.length ? (
           <div className="turn-timeline">
             {groupedProcessTimeline.map((entry) => entry.type === "reasoning_group" ? (
               <ReasoningGroup
                 items={entry.items}
                 renderText={renderText}
+                allowAutoCollapse={autoCollapse}
                 key={`reasoning-group-${entry.items.map((item) => item.itemId).join("-")}`}
               />
             ) : entry.type === "tool_group" ? (
               <ToolActivityGroup
                 activities={entry.activities}
+                allowAutoCollapse={autoCollapse}
                 key={`tool-group-${entry.activities.map((activity) => activity.call.id).join("-")}`}
               />
             ) : (
@@ -98,6 +125,7 @@ export function ConversationTurnActivity({
                 item={entry.item}
                 changes={changes}
                 renderText={renderText}
+                allowAutoCollapse={autoCollapse}
                 typing={entry.item.type === "text" && paced.pendingTextIds.has(entry.item.id)}
                 key={timelineItemKey(entry.item)}
               />
@@ -105,7 +133,7 @@ export function ConversationTurnActivity({
           </div>
         ) : activities.length ? (
           <div className="turn-timeline">
-            <ToolActivityGroup activities={activities} />
+            <ToolActivityGroup activities={activities} allowAutoCollapse={autoCollapse} />
           </div>
         ) : null}
       </div>
@@ -115,15 +143,18 @@ export function ConversationTurnActivity({
   return (
     <div className="turn-context">
       {hasProcess ? (
-        <details className={`turn-disclosure turn-execution${visuallyStreaming ? " turn-execution--live" : ""}`} open={visuallyStreaming || undefined}>
+        <details
+          className={`turn-disclosure turn-execution${visuallyStreaming ? " turn-execution--live" : ""}${terminalEvent?.kind === "turn_cancelled" ? " turn-execution--cancelled" : terminalEvent?.kind === "turn_failed" ? " turn-execution--failed" : ""}`}
+          open={!autoCollapse || undefined}
+        >
           <summary>
-            {visuallyStreaming ? <LoaderCircle size={15} aria-hidden="true" /> : <Activity size={15} aria-hidden="true" />}
+            <SummaryIcon size={15} aria-hidden="true" className={visuallyStreaming ? "turn-tool-running" : undefined} />
             <span className="turn-disclosure-title">{visuallyStreaming ? statusLabel : summaryTitle}</span>
             {visuallyStreaming ? (
               <span className="turn-live-status-dots" aria-hidden="true"><i /><i /><i /></span>
             ) : (
               <>
-                <span className="turn-disclosure-status">{toolCount ? `${toolCount} 个操作` : "已完成"}</span>
+                <span className="turn-disclosure-status">{summaryStatus}</span>
                 <ChevronDown className="turn-disclosure-chevron" size={15} aria-hidden="true" />
               </>
             )}
@@ -133,7 +164,7 @@ export function ConversationTurnActivity({
       ) : null}
       {finalResponse ? (
         <div className="turn-final-response">
-          <TimelineItem item={finalResponse} changes={changes} renderText={renderText} typing={false} />
+          <TimelineItem item={finalResponse} changes={changes} renderText={renderText} allowAutoCollapse={autoCollapse} typing={false} />
         </div>
       ) : null}
     </div>
@@ -148,11 +179,13 @@ function TimelineItem({
   item,
   changes,
   renderText,
+  allowAutoCollapse,
   typing = false,
 }: {
   item: TurnTimelineItem;
   changes: ChangeSet[];
   renderText?: (text: string) => ReactNode;
+  allowAutoCollapse: boolean;
   typing?: boolean;
 }) {
   if (item.type === "text") {
@@ -163,47 +196,70 @@ function TimelineItem({
     );
   }
   if (item.type === "reasoning") {
-    return <ReasoningGroup items={[item]} renderText={renderText} />;
+    return <ReasoningGroup items={[item]} renderText={renderText} allowAutoCollapse={allowAutoCollapse} />;
   }
   if (item.type === "event") {
-    const Icon = item.kind === "turn_completed"
-      ? CircleCheck
-      : item.kind === "turn_failed"
-        ? CircleX
-        : item.kind === "turn_cancelled"
-          ? Circle
-          : CircleDot;
-    const change = item.kind === "change_applied" ? findChange(item, changes) : null;
-    const hasDetails = Boolean(item.detail || change);
-    const expanded = item.kind === "turn_failed";
-    if (!hasDetails) {
-      return (
-        <div className={`turn-timeline-event turn-timeline-event--${item.kind}`}>
-          <Icon size={15} aria-hidden="true" />
-          <span><strong>{item.title}</strong></span>
-        </div>
-      );
-    }
-    return (
-      <details
-        className={`turn-disclosure turn-timeline-event turn-event-step turn-event-step--${item.kind} turn-timeline-event--${item.kind}`}
-        open={expanded || undefined}
-      >
-        <summary>
-          <Icon size={15} aria-hidden="true" />
-          <span className="turn-disclosure-title">{item.title}</span>
-          <ChevronDown className="turn-disclosure-chevron" size={15} aria-hidden="true" />
-        </summary>
-        <div className="turn-disclosure-panel">
-          <div className="turn-event-step-content">
-            {item.detail ? <small>{item.detail}</small> : null}
-            {change ? <ChangeDetails change={change} /> : null}
-          </div>
-        </div>
-      </details>
-    );
+    return <TimelineEventRow item={item} changes={changes} allowAutoCollapse={allowAutoCollapse} />;
   }
   return <ToolActivityRow activity={item.activity} />;
+}
+
+function TimelineEventRow({
+  item,
+  changes,
+  allowAutoCollapse,
+}: {
+  item: Extract<TurnTimelineItem, { type: "event" }>;
+  changes: ChangeSet[];
+  allowAutoCollapse: boolean;
+}) {
+  const Icon = item.kind === "turn_completed"
+    ? CircleCheck
+    : item.kind === "turn_failed"
+      ? CircleX
+      : item.kind === "turn_cancelled"
+        ? Circle
+        : CircleDot;
+  const change = item.kind === "change_applied" ? findChange(item, changes) : null;
+  const hasDetails = Boolean(item.detail || change);
+  const expanded = !allowAutoCollapse || item.kind === "turn_failed";
+  const [open, setOpen] = useState(expanded);
+  if (!hasDetails) {
+    return (
+      <div className={`turn-timeline-event turn-timeline-event--${item.kind}`}>
+        <Icon size={15} aria-hidden="true" />
+        <span><strong>{item.title}</strong></span>
+      </div>
+    );
+  }
+  return (
+    <details
+      className={`turn-disclosure turn-timeline-event turn-event-step turn-event-step--${item.kind} turn-timeline-event--${item.kind}`}
+      open={expanded || undefined}
+      onToggle={(event) => setOpen(event.currentTarget.open)}
+    >
+      <summary>
+        <Icon size={15} aria-hidden="true" />
+        <span className="turn-disclosure-title">{item.title}</span>
+        <ChevronDown className="turn-disclosure-chevron" size={15} aria-hidden="true" />
+      </summary>
+      <div className="turn-disclosure-panel">
+        <div className="turn-event-step-content">
+          {change ? (
+            open ? (
+              <div className="turn-change-files">
+                {change.files.map((file) => (
+                  <ChangeFileView changeId={change.id} file={file} key={`${change.id}-${file.path}`} />
+                ))}
+              </div>
+            ) : null
+          ) : item.detail ? (
+            <small>{item.detail}</small>
+          ) : null}
+        </div>
+      </div>
+    </details>
+  );
 }
 
 interface TextTarget {
@@ -351,14 +407,16 @@ function groupConsecutiveTimeline(items: TurnTimelineItem[]): TimelineRenderEntr
 function ReasoningGroup({
   items,
   renderText,
+  allowAutoCollapse,
 }: {
   items: ReasoningTimelineItem[];
   renderText?: (text: string) => ReactNode;
+  allowAutoCollapse: boolean;
 }) {
   const complete = items.every((item) => item.complete);
   const status = complete && items.length > 1 ? `${items.length} 段` : complete ? "已完成" : "生成中";
   return (
-    <details className="turn-disclosure turn-reasoning" open={!complete || undefined}>
+    <details className="turn-disclosure turn-reasoning" open={allowAutoCollapse ? (!complete || undefined) : true}>
       <summary>
         <Brain size={15} aria-hidden="true" />
         <span className="turn-disclosure-title">思考内容</span>
@@ -378,7 +436,7 @@ function ReasoningGroup({
   );
 }
 
-function ToolActivityGroup({ activities }: { activities: ToolActivity[] }) {
+function ToolActivityGroup({ activities, allowAutoCollapse }: { activities: ToolActivity[]; allowAutoCollapse: boolean }) {
   const state = toolGroupState(activities);
   const allCommands = activities.every((activity) => activity.call.name === "run_command");
   const count = activities.length;
@@ -404,7 +462,7 @@ function ToolActivityGroup({ activities }: { activities: ToolActivity[] }) {
   const expanded = state !== "completed";
 
   return (
-    <details className={`turn-disclosure turn-tool-group turn-tool-group--${state}`} open={expanded || undefined}>
+    <details className={`turn-disclosure turn-tool-group turn-tool-group--${state}`} open={allowAutoCollapse ? (expanded || undefined) : true}>
       <summary>
         <Icon className={state === "running" ? "turn-tool-running" : undefined} size={15} aria-hidden="true" />
         <span className="turn-disclosure-title">{title}</span>
@@ -413,7 +471,7 @@ function ToolActivityGroup({ activities }: { activities: ToolActivity[] }) {
       </summary>
       <div className="turn-disclosure-panel">
         <div className="turn-tool-group-content">
-          {activities.map((activity) => <ToolActivityRow activity={activity} key={activity.call.id} />)}
+          {activities.map((activity) => <ToolActivityRow activity={activity} keepDetailsExpanded={!allowAutoCollapse} key={activity.call.id} />)}
         </div>
       </div>
     </details>
@@ -429,10 +487,10 @@ function toolGroupState(activities: ToolActivity[]): ToolActivity["state"] {
 }
 
 
-function ToolActivityRow({ activity }: { activity: ToolActivity }) {
+function ToolActivityRow({ activity, keepDetailsExpanded = false }: { activity: ToolActivity; keepDetailsExpanded?: boolean }) {
   const outputChunks = visibleOutput(activity);
   const elapsedMs = useActivityDuration(activity);
-  const command = activity.call.name === "run_command" ? commandDetails(activity.call.arguments) : null;
+  const command = activity.call.name === "run_command" ? commandDetails(activity) : null;
   const fileDetails = command ? null : fileActivityDetails(activity);
   const isPending = activity.state === "pending";
   const isRunning = activity.state === "running";
@@ -463,7 +521,7 @@ function ToolActivityRow({ activity }: { activity: ToolActivity }) {
       {command ? <CommandDetails command={command} /> : null}
       {fileDetails ? <FileActivityDetails details={fileDetails} /> : null}
       {outputChunks.length ? (
-        <details className="turn-tool-output" open={isRunning || undefined}>
+        <details className="turn-tool-output" open={keepDetailsExpanded || isRunning || activity.state === "failed" || activity.state === "cancelled" || undefined}>
           <summary>
             <SquareTerminal size={14} aria-hidden="true" />
             <span>命令输出</span>
@@ -481,79 +539,156 @@ function ToolActivityRow({ activity }: { activity: ToolActivity }) {
 }
 
 interface FileActivityDetailsValue {
+  id: string;
   kind: "patch" | "write";
   label: string;
+  path: string;
   content: string;
   meta: string;
   truncated: boolean;
 }
 
 function FileActivityDetails({ details }: { details: FileActivityDetailsValue }) {
+  const [open, setOpen] = useState(false);
+
   return (
-    <details className="turn-tool-details">
+    <details className="turn-tool-details turn-tool-details--file" onToggle={(event) => setOpen(event.currentTarget.open)}>
       <summary>
         <FileText size={14} aria-hidden="true" />
         <span>{details.label}</span>
         <ChevronDown size={14} aria-hidden="true" />
       </summary>
-      <div className="turn-command-details">
-        <pre>{details.content}</pre>
+      {open ? <div className="turn-command-editor-shell">
+        <div className="turn-command-editor-header">
+          <span><FileText size={13} aria-hidden="true" />{details.path || "Patch"}</span>
+          <small>只读</small>
+        </div>
+        <Suspense fallback={<div className="turn-command-editor-loading">正在载入编辑器...</div>}>
+          <div className="turn-file-editor-frame" style={{ height: `${fileDetailEditorHeight(details.content)}px` }}>
+            <ReadOnlyCodeEditor
+              path={details.path || "Patch"}
+              modelPath={`k-coder-file-operation://detail/${encodeURIComponent(details.id)}`}
+              language={details.kind === "patch" ? "diff" : fileLanguage(details.path)}
+              value={details.content}
+              readOnly
+            />
+          </div>
+        </Suspense>
         {details.meta || details.truncated ? (
-          <small>
+          <small className="turn-command-editor-meta">
             {details.meta}
             {details.meta && details.truncated ? " · " : ""}
             {details.truncated ? "内容过长，仅显示前 64 KiB" : ""}
           </small>
         ) : null}
-      </div>
+      </div> : null}
     </details>
   );
 }
 
 function CommandDetails({ command }: { command: CommandDetailsValue }) {
+  const [open, setOpen] = useState(false);
+
   return (
-    <details className="turn-tool-details">
+    <details className="turn-tool-details turn-tool-details--command" onToggle={(event) => setOpen(event.currentTarget.open)}>
       <summary>
         <SquareTerminal size={14} aria-hidden="true" />
         <span>查看命令</span>
         <ChevronDown size={14} aria-hidden="true" />
       </summary>
-      <div className="turn-command-details">
-        <pre>{command.text}</pre>
+      {open ? <div className="turn-command-editor-shell">
+        <div className="turn-command-editor-header">
+          <span><SquareTerminal size={13} aria-hidden="true" />{command.shellLabel}</span>
+          <small>只读</small>
+        </div>
+        <Suspense fallback={<div className="turn-command-editor-loading">正在载入编辑器...</div>}>
+          <div className="turn-command-editor-frame" style={{ height: `${commandEditorHeight(command.text)}px` }}>
+            <ReadOnlyCodeEditor
+              path={`命令 ${command.id}`}
+              modelPath={`k-coder-command://${encodeURIComponent(command.id)}.${commandFileExtension(command.language)}`}
+              language={command.language}
+              value={command.text}
+              readOnly
+            />
+          </div>
+        </Suspense>
         {command.cwd || command.timeoutMs ? (
-          <small>
+          <small className="turn-command-editor-meta">
             {command.cwd ? `工作目录：${command.cwd}` : ""}
             {command.cwd && command.timeoutMs ? " · " : ""}
             {command.timeoutMs ? `超时：${formatDuration(command.timeoutMs)}` : ""}
           </small>
         ) : null}
-      </div>
+      </div> : null}
     </details>
   );
 }
 
-function ChangeDetails({ change }: { change: ChangeSet | null }) {
-  if (!change) return null;
+function ChangeFileView({ changeId, file }: { changeId: string; file: ChangeSet["files"][number] }) {
+  const [copied, setCopied] = useState(false);
+  const stats = changeLineStats(file.unifiedDiff);
+  const displayPath = file.operation === "move" && file.destinationPath
+    ? `${file.path} -> ${file.destinationPath}`
+    : file.path;
+  const languagePath = file.destinationPath || file.path;
+  const hasSnapshots = (file.operation === "add" || file.beforeContent !== null)
+    && (file.operation === "delete" || file.afterContent !== null);
+  const modelRoot = `k-coder-change://snapshot/${encodeURIComponent(changeId)}/${encodeURIComponent(languagePath)}`;
+
+  async function copyDiff() {
+    try {
+      await navigator.clipboard.writeText(file.unifiedDiff);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1_500);
+    } catch {
+      setCopied(false);
+    }
+  }
+
   return (
-    <details className="turn-change-details">
-      <summary>
-        <FileDiff size={14} aria-hidden="true" />
-        <span>查看变更</span>
-        <small>{change.files.length} 个文件</small>
-        <ChevronDown size={14} aria-hidden="true" />
-      </summary>
-      <div className="turn-change-files">
-        {change.files.map((file) => (
-          <details className="turn-change-file" key={`${change.id}-${file.path}`}>
-            <summary>
-              <span>{changeOperationLabel(file.operation)} {file.path}</span>
-              <ChevronDown size={13} aria-hidden="true" />
-            </summary>
-            <pre>{file.unifiedDiff || "没有可显示的 Diff"}</pre>
-          </details>
-        ))}
+    <div className="turn-change-file">
+      <div className="turn-change-editor-shell">
+        <div className="turn-change-editor-header">
+          <span className="turn-change-editor-path" title={displayPath}>
+            {changeOperationLabel(file.operation)} {displayPath}
+          </span>
+          <span className="turn-change-editor-stats" aria-label={`新增 ${stats.added} 行，删除 ${stats.deleted} 行`}>
+            <i>+{stats.added}</i><i>-{stats.deleted}</i>
+          </span>
+          <button
+            type="button"
+            className="turn-change-copy"
+            title={copied ? "已复制 Diff" : "复制 Diff"}
+            aria-label={copied ? "已复制 Diff" : "复制 Diff"}
+            onClick={() => void copyDiff()}
+          >
+            {copied ? <Check size={14} aria-hidden="true" /> : <Copy size={14} aria-hidden="true" />}
+          </button>
+        </div>
+        <Suspense fallback={<div className="turn-command-editor-loading">正在载入编辑器...</div>}>
+          <div className="turn-change-editor-frame" style={{ height: `${changeEditorHeight(file)}px` }}>
+            {hasSnapshots ? (
+              <ChangeCodeDiffEditor
+                path={displayPath}
+                originalModelPath={`${modelRoot}?side=original`}
+                modifiedModelPath={`${modelRoot}?side=modified`}
+                language={fileLanguage(languagePath)}
+                originalValue={file.beforeContent ?? ""}
+                modifiedValue={file.afterContent ?? ""}
+              />
+            ) : (
+              <ReadOnlyCodeEditor
+                path={`${displayPath} Diff`}
+                modelPath={`${modelRoot}?side=unified`}
+                language="diff"
+                value={file.unifiedDiff || "没有可显示的 Diff"}
+                readOnly
+              />
+            )}
+          </div>
+        </Suspense>
       </div>
-    </details>
+    </div>
   );
 }
 
@@ -566,18 +701,26 @@ function findChange(item: Extract<TurnTimelineItem, { type: "event" }>, changes:
 }
 
 interface CommandDetailsValue {
+  id: string;
   text: string;
   cwd: string;
   timeoutMs: number | null;
+  language: "powershell" | "bat" | "shell";
+  shellLabel: string;
 }
 
-function commandDetails(argumentsValue: Record<string, unknown>): CommandDetailsValue | null {
+function commandDetails(activity: ToolActivity): CommandDetailsValue | null {
+  const argumentsValue = activity.call.arguments;
+  const shell = typeof activity.result?.metadata.shell === "string" ? activity.result.metadata.shell : "";
   const command = typeof argumentsValue.command === "string" ? argumentsValue.command.trim() : "";
   if (command) {
     return {
+      id: `${activity.turnId}-${activity.call.id}`,
       text: command,
       cwd: typeof argumentsValue.cwd === "string" ? argumentsValue.cwd : "",
       timeoutMs: typeof argumentsValue.timeoutMs === "number" ? argumentsValue.timeoutMs : null,
+      language: commandLanguage(shell),
+      shellLabel: shellLabel(shell),
     };
   }
   const program = typeof argumentsValue.program === "string" ? argumentsValue.program.trim() : "";
@@ -587,10 +730,99 @@ function commandDetails(argumentsValue: Record<string, unknown>): CommandDetails
     : [];
   const text = [program, ...args].map(shellQuote).join(" ");
   return {
+    id: `${activity.turnId}-${activity.call.id}`,
     text,
     cwd: typeof argumentsValue.cwd === "string" ? argumentsValue.cwd : "",
     timeoutMs: typeof argumentsValue.timeoutMs === "number" ? argumentsValue.timeoutMs : null,
+    language: commandLanguage(shell),
+    shellLabel: shellLabel(shell),
   };
+}
+
+function commandLanguage(shell: string): CommandDetailsValue["language"] {
+  const value = shell.toLowerCase();
+  if (value.includes("cmd")) return "bat";
+  if (value.includes("powershell") || value.includes("pwsh") || (typeof navigator !== "undefined" && /windows/i.test(navigator.userAgent))) {
+    return "powershell";
+  }
+  return "shell";
+}
+
+function shellLabel(shell: string) {
+  const value = shell.toLowerCase();
+  if (value.includes("cmd")) return "命令提示符 · CMD";
+  if (value.includes("powershell") || value.includes("pwsh") || (typeof navigator !== "undefined" && /windows/i.test(navigator.userAgent))) return "PowerShell";
+  if (value.includes("zsh")) return "Zsh";
+  if (value.includes("bash")) return "Bash";
+  if (value.includes("sh")) return "Shell";
+  return "Shell 命令";
+}
+
+function commandEditorHeight(command: string) {
+  const lineCount = Math.max(1, command.split(/\r?\n/).length);
+  return Math.min(260, Math.max(84, lineCount * 19 + 14));
+}
+
+function commandFileExtension(language: CommandDetailsValue["language"]) {
+  if (language === "bat") return "cmd";
+  if (language === "shell") return "sh";
+  return "ps1";
+}
+
+function fileDetailEditorHeight(content: string) {
+  const lines = Math.max(1, content.split(/\r?\n/).length);
+  return Math.min(320, Math.max(100, lines * 19 + 14));
+}
+
+function changeLineStats(diff: string) {
+  let added = 0;
+  let deleted = 0;
+  for (const line of diff.split(/\r?\n/)) {
+    if (line.startsWith("+") && !line.startsWith("+++")) added += 1;
+    if (line.startsWith("-") && !line.startsWith("---")) deleted += 1;
+  }
+  return { added, deleted };
+}
+
+function changeEditorHeight(file: ChangeSet["files"][number]) {
+  const stats = changeLineStats(file.unifiedDiff);
+  const originalLines = lineCount(file.beforeContent);
+  const modifiedLines = lineCount(file.afterContent);
+  const visibleLines = Math.max(originalLines, modifiedLines, stats.added + stats.deleted + 3);
+  return Math.min(360, Math.max(120, visibleLines * 19 + 14));
+}
+
+function lineCount(value: string | null) {
+  return value === null ? 0 : Math.max(1, value.split(/\r?\n/).length);
+}
+
+function fileLanguage(path: string) {
+  const name = path.toLowerCase().split(/[\\/]/).pop() ?? "";
+  const extension = name.includes(".") ? name.slice(name.lastIndexOf(".") + 1) : "";
+  if (["ts", "tsx"].includes(extension)) return "typescript";
+  if (["js", "jsx", "mjs", "cjs"].includes(extension)) return "javascript";
+  if (extension === "json" || name === "package-lock.json") return "json";
+  if (["css", "scss", "less"].includes(extension)) return extension;
+  if (["html", "htm"].includes(extension)) return "html";
+  if (["xml", "svg"].includes(extension)) return "xml";
+  if (["md", "mdx"].includes(extension)) return "markdown";
+  if (["yaml", "yml"].includes(extension)) return "yaml";
+  if (["sh", "bash", "zsh"].includes(extension)) return "shell";
+  if (extension === "ps1") return "powershell";
+  if (["bat", "cmd"].includes(extension)) return "bat";
+  if (extension === "py") return "python";
+  if (extension === "rs") return "rust";
+  if (extension === "toml" || name === "cargo.lock") return "toml";
+  if (extension === "sql") return "sql";
+  if (["c", "h"].includes(extension)) return "c";
+  if (["cc", "cpp", "cxx", "hpp"].includes(extension)) return "cpp";
+  if (extension === "cs") return "csharp";
+  if (extension === "java") return "java";
+  if (extension === "go") return "go";
+  if (extension === "php") return "php";
+  if (extension === "rb") return "ruby";
+  if (extension === "dockerfile" || name === "dockerfile") return "dockerfile";
+  return "plaintext";
 }
 
 function fileActivityDetails(activity: ToolActivity): FileActivityDetailsValue | null {
@@ -620,8 +852,10 @@ function fileActivityDetails(activity: ToolActivity): FileActivityDetailsValue |
   content = bounded.content;
   truncated = bounded.truncated;
   return {
+    id: `${activity.turnId}-${activity.call.id}`,
     kind,
     label,
+    path,
     content,
     meta,
     truncated,
@@ -696,12 +930,12 @@ function visibleOutput(activity: ToolActivity): ToolOutputDelta[] {
   return [];
 }
 
-function ConversationPlan({ plan }: { plan: PlanView }) {
+function ConversationPlan({ plan, allowAutoCollapse }: { plan: PlanView; allowAutoCollapse: boolean }) {
   const completed = plan.steps.filter((step) => step.status === "completed" || step.status === "skipped").length;
   const active = plan.steps.some((step) => step.status === "in_progress");
 
   return (
-    <details className="turn-disclosure turn-plan" open={active || undefined}>
+    <details className="turn-disclosure turn-plan" open={allowAutoCollapse ? (active || undefined) : true}>
       <summary>
         <ListChecks size={15} aria-hidden="true" />
         <span className="turn-disclosure-title">计划</span>
@@ -794,7 +1028,7 @@ function toolTarget(activity: ToolActivity) {
     return truncate(`写入 ${args.path}`, 120);
   }
   if (activity.call.name === "run_command") {
-    const command = commandDetails(args);
+    const command = commandDetails(activity);
     if (command) return truncate(`执行 ${command.text}`, 120);
   }
   if (activity.call.name === "apply_patch" && typeof args.patch === "string") {

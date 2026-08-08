@@ -1,25 +1,42 @@
-use std::collections::HashMap;
-use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::collections::{HashMap, HashSet};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[cfg(test)]
+use std::fs::OpenOptions;
+#[cfg(test)]
+use std::io::Write;
+
 use async_trait::async_trait;
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::context::CompactionSummary;
-use crate::persistence::ProjectionDb;
+use crate::persistence::{
+    HistoryIndexItem, HistoryIndexMetadata, HistoryIndexOrder, HistoryIndexTurn, ProjectionDb,
+};
 use crate::protocol::{
-    AgentMode, ApprovalAction, ApprovalRequest, ApprovalResolution, ApprovalSnapshot, ChangeSet,
-    ChatMessage, MessageRole, PROTOCOL_VERSION, TodoItem, TokenUsage, ToolCall, ToolResult,
-    TurnState, UserInputAction, UserInputRequest, UserInputResolution,
+    AgentItemStatus, AgentItemType, AgentMessagePhase, AgentMode, ApprovalAction, ApprovalRequest,
+    ApprovalResolution, ApprovalSnapshot, ChangeSet, ChatMessage, ContentBlock,
+    HistorySortDirection, MessageRole, PROTOCOL_VERSION, ThreadHistorySnapshot, ThreadItem,
+    ThreadItemEntry, ThreadItemPayload, ThreadItemsPage, ThreadTurn, ThreadTurnsPage, TodoItem,
+    TokenUsage, ToolCall, ToolResult, TurnError, TurnItemsView, TurnState, UserInputAction,
+    UserInputRequest, UserInputResolution,
 };
 
-pub const EVENT_SCHEMA_VERSION: u32 = 5;
+mod writer;
+
+use writer::ThreadWriters;
+
+pub const EVENT_SCHEMA_VERSION: u32 = 8;
 const MAX_TIMELINE_DETAIL_CHARS: usize = 2_000;
+pub const DEFAULT_THREAD_HISTORY_PAGE_SIZE: u32 = 50;
+pub const MAX_THREAD_HISTORY_PAGE_SIZE: u32 = 100;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -59,6 +76,14 @@ pub enum StoredEventKind {
     ThreadWorkspaceBound {
         path: String,
     },
+    ThreadForked {
+        source_thread_id: String,
+        last_turn_id: Option<String>,
+    },
+    ThreadRolledBack {
+        retained_event_id: Option<String>,
+        num_turns: u32,
+    },
     UserMessage {
         message: ChatMessage,
     },
@@ -66,10 +91,21 @@ pub enum StoredEventKind {
         mode: AgentMode,
     },
     TurnStarted,
+    ItemStarted {
+        item_id: String,
+        item_type: AgentItemType,
+    },
+    ItemCompleted {
+        item_id: String,
+        item_type: AgentItemType,
+        status: AgentItemStatus,
+    },
     AssistantMessage {
         message: ChatMessage,
     },
     AssistantToolCalls {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        item_id: Option<String>,
         #[serde(default)]
         text: String,
         calls: Vec<ToolCall>,
@@ -126,6 +162,8 @@ pub enum StoredEventKind {
     },
     TurnFailed {
         message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<TurnError>,
     },
     TurnCancelled,
     ThreadArchived,
@@ -152,7 +190,7 @@ pub struct ThreadSummary {
 pub struct TurnSnapshot {
     pub turn_id: String,
     pub state: TurnState,
-    pub error: Option<String>,
+    pub error: Option<TurnError>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -273,8 +311,9 @@ pub trait ThreadRepository: Send + Sync {
 #[derive(Debug, Clone)]
 pub struct JsonlThreadRepository {
     sessions_dir: PathBuf,
-    append_lock: Arc<Mutex<()>>,
+    writers: Arc<ThreadWriters>,
     workspace_binding_lock: Arc<Mutex<()>>,
+    history_index_lock: Arc<Mutex<()>>,
     projection: ProjectionDb,
 }
 
@@ -284,8 +323,9 @@ impl JsonlThreadRepository {
         fs::create_dir_all(&sessions_dir).map_err(|error| StorageError::Io(error.to_string()))?;
         let repository = Self {
             sessions_dir,
-            append_lock: Arc::new(Mutex::new(())),
+            writers: Arc::new(ThreadWriters::new()),
             workspace_binding_lock: Arc::new(Mutex::new(())),
+            history_index_lock: Arc::new(Mutex::new(())),
             projection: ProjectionDb::open(data_root.as_ref())
                 .map_err(|error| StorageError::Io(error.to_string()))?,
         };
@@ -350,6 +390,73 @@ impl JsonlThreadRepository {
         project_thread(thread_id, &events)
     }
 
+    pub async fn read_thread_history(
+        &self,
+        thread_id: &str,
+    ) -> Result<ThreadHistorySnapshot, StorageError> {
+        self.ensure_history_index(thread_id).await?;
+        let metadata = self
+            .projection
+            .history_metadata(thread_id)
+            .map_err(projection_error)?
+            .ok_or_else(|| StorageError::NotFound(thread_id.to_string()))?;
+        let turns = paginate_indexed_turns(
+            &self.projection,
+            thread_id,
+            None,
+            Some(DEFAULT_THREAD_HISTORY_PAGE_SIZE),
+            HistorySortDirection::Desc,
+            TurnItemsView::Full,
+        )?;
+        Ok(ThreadHistorySnapshot {
+            schema_version: PROTOCOL_VERSION,
+            summary: metadata.summary,
+            last_turn: metadata.last_turn,
+            todos: metadata.todos,
+            last_usage: metadata.last_usage,
+            turns,
+            unscoped_items: metadata.unscoped_items,
+        })
+    }
+
+    pub async fn list_thread_turns(
+        &self,
+        thread_id: &str,
+        cursor: Option<&str>,
+        limit: Option<u32>,
+        sort_direction: HistorySortDirection,
+        items_view: TurnItemsView,
+    ) -> Result<ThreadTurnsPage, StorageError> {
+        self.ensure_history_index(thread_id).await?;
+        paginate_indexed_turns(
+            &self.projection,
+            thread_id,
+            cursor,
+            limit,
+            sort_direction,
+            items_view,
+        )
+    }
+
+    pub async fn list_thread_items(
+        &self,
+        thread_id: &str,
+        turn_id: Option<&str>,
+        cursor: Option<&str>,
+        limit: Option<u32>,
+        sort_direction: HistorySortDirection,
+    ) -> Result<ThreadItemsPage, StorageError> {
+        self.ensure_history_index(thread_id).await?;
+        paginate_indexed_items(
+            &self.projection,
+            thread_id,
+            turn_id,
+            cursor,
+            limit,
+            sort_direction,
+        )
+    }
+
     pub async fn archive_thread(&self, thread_id: &str) -> Result<(), StorageError> {
         let detail = self.read_thread(thread_id).await?;
         if !detail.summary.archived {
@@ -384,6 +491,114 @@ impl JsonlThreadRepository {
         ))
         .await?;
         Ok(self.read_thread(thread_id).await?.summary)
+    }
+
+    pub async fn fork_thread(
+        &self,
+        source_thread_id: &str,
+        last_turn_id: Option<&str>,
+    ) -> Result<ThreadSummary, StorageError> {
+        let source = self.read_thread(source_thread_id).await?;
+        // Fork from the effective append-only view. Raw events may contain turns
+        // hidden by an earlier rollback marker and must not be resurrected.
+        let events = apply_history_rewrites(self.load(source_thread_id).await?)?;
+        let through = match last_turn_id {
+            Some(turn_id) => {
+                events
+                    .iter()
+                    .position(|event| {
+                        event.turn_id.as_deref() == Some(turn_id) && is_terminal_event(&event.kind)
+                    })
+                    .ok_or_else(|| {
+                        StorageError::InvalidData(format!(
+                            "last turn {turn_id} was not found or is not complete"
+                        ))
+                    })?
+                    + 1
+            }
+            None => events.len(),
+        };
+        let destination = match source.summary.workspace_path.as_deref() {
+            Some(path) => self.create_thread_in_workspace(Path::new(path)).await?,
+            None => self.create_thread().await?,
+        };
+        self.append(StoredEvent::new(
+            &destination.id,
+            None,
+            StoredEventKind::ThreadForked {
+                source_thread_id: source_thread_id.to_string(),
+                last_turn_id: last_turn_id.map(str::to_string),
+            },
+        ))
+        .await?;
+
+        for source_event in events.into_iter().take(through) {
+            if !is_fork_history_event(&source_event.kind) {
+                continue;
+            }
+            let mut event = source_event;
+            event.schema_version = EVENT_SCHEMA_VERSION;
+            event.event_id = Uuid::new_v4().to_string();
+            event.thread_id = destination.id.clone();
+            match &mut event.kind {
+                StoredEventKind::ApprovalRequested { request } => {
+                    request.thread_id = destination.id.clone();
+                }
+                StoredEventKind::UserInputRequested { request } => {
+                    request.thread_id = destination.id.clone();
+                }
+                _ => {}
+            }
+            self.append(event).await?;
+        }
+        self.rename_thread(&destination.id, format!("{} (分支)", source.summary.title))
+            .await
+    }
+
+    pub async fn rollback_thread(
+        &self,
+        thread_id: &str,
+        num_turns: u32,
+    ) -> Result<ThreadHistorySnapshot, StorageError> {
+        if num_turns == 0 {
+            return Err(StorageError::InvalidData(
+                "numTurns must be at least 1".to_string(),
+            ));
+        }
+        // Rollback is defined over the current visible history, not over raw
+        // terminal events that may already have been hidden by a prior rollback.
+        let events = apply_history_rewrites(self.load(thread_id).await?)?;
+        let terminals = events
+            .iter()
+            .enumerate()
+            .filter(|(_, event)| is_terminal_event(&event.kind))
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        if terminals.is_empty() {
+            return Err(StorageError::InvalidData(
+                "thread has no completed turns to roll back".to_string(),
+            ));
+        }
+        let keep_count = terminals.len().saturating_sub(num_turns as usize);
+        let retained_event_id = if keep_count > 0 {
+            Some(events[terminals[keep_count - 1]].event_id.clone())
+        } else {
+            events
+                .iter()
+                .take_while(|event| !is_history_event(&event.kind))
+                .last()
+                .map(|event| event.event_id.clone())
+        };
+        self.append(StoredEvent::new(
+            thread_id,
+            None,
+            StoredEventKind::ThreadRolledBack {
+                retained_event_id,
+                num_turns,
+            },
+        ))
+        .await?;
+        self.read_thread_history(thread_id).await
     }
 
     pub async fn delete_thread(&self, thread_id: &str) -> Result<(), StorageError> {
@@ -427,6 +642,64 @@ impl JsonlThreadRepository {
         }
         matches.sort_by_key(|summary| std::cmp::Reverse(summary.updated_at_ms));
         Ok(matches)
+    }
+
+    async fn ensure_history_index(&self, thread_id: &str) -> Result<(), StorageError> {
+        if self
+            .projection
+            .history_index_is_current(thread_id)
+            .map_err(projection_error)?
+        {
+            return Ok(());
+        }
+        let _guard = self.history_index_lock.lock().await;
+        if self
+            .projection
+            .history_index_is_current(thread_id)
+            .map_err(projection_error)?
+        {
+            return Ok(());
+        }
+
+        let events = self.load(thread_id).await?;
+        let detail = project_thread(thread_id, &events)?;
+        let history = project_thread_history(thread_id, &events, &detail)?;
+        let metadata = HistoryIndexMetadata {
+            summary: detail.summary.clone(),
+            last_turn: detail.last_turn.clone(),
+            todos: detail.todos.clone(),
+            last_usage: detail.last_usage,
+            unscoped_items: history
+                .items
+                .iter()
+                .rev()
+                .filter(|item| item.item.turn_id.is_none())
+                .take(MAX_THREAD_HISTORY_PAGE_SIZE as usize)
+                .map(|item| item.item.clone())
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect(),
+        };
+        let turns = history
+            .turns
+            .iter()
+            .map(|turn| HistoryIndexTurn {
+                order: history_index_order(turn.order),
+                turn: turn.turn.clone(),
+            })
+            .collect::<Vec<_>>();
+        let items = history
+            .items
+            .iter()
+            .map(|item| HistoryIndexItem {
+                order: history_index_order(item.order),
+                item: item.item.clone(),
+            })
+            .collect::<Vec<_>>();
+        self.projection
+            .replace_history_index(thread_id, events.len() as u64, &metadata, &turns, &items)
+            .map_err(projection_error)
     }
 
     fn session_path(&self, thread_id: &str) -> Result<PathBuf, StorageError> {
@@ -477,26 +750,19 @@ impl ThreadRepository for JsonlThreadRepository {
         let path = self.session_path(&event.thread_id)?;
         let line = serde_json::to_vec(&event)
             .map_err(|error| StorageError::InvalidData(error.to_string()))?;
-        let _guard = self.append_lock.lock().await;
-
-        tokio::task::spawn_blocking(move || {
-            let mut file = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(path)
-                .map_err(|error| StorageError::Io(error.to_string()))?;
-            file.write_all(&line)
-                .and_then(|_| file.write_all(b"\n"))
-                .and_then(|_| file.sync_data())
-                .map_err(|error| StorageError::Io(error.to_string()))
-        })
-        .await
-        .map_err(|error| StorageError::Io(error.to_string()))??;
-        let events = self.load(&event.thread_id).await?;
-        let detail = project_thread(&event.thread_id, &events)?;
-        self.projection
-            .replace_thread(&detail.summary, &events)
-            .map_err(|error| StorageError::Io(error.to_string()))?;
+        let _append_guard = self.writers.lock_thread(&event.thread_id).await;
+        self.writers.append(&event.thread_id, path, line).await?;
+        if matches!(&event.kind, StoredEventKind::ThreadRolledBack { .. }) {
+            let events = self.load(&event.thread_id).await?;
+            let detail = project_thread(&event.thread_id, &events)?;
+            self.projection
+                .replace_thread(&detail.summary, &events)
+                .map_err(projection_error)?;
+        } else {
+            self.projection
+                .append_event(&event)
+                .map_err(projection_error)?;
+        }
         Ok(())
     }
 
@@ -544,7 +810,85 @@ fn load_path(path: &Path) -> Result<Vec<StoredEvent>, StorageError> {
             Err(error) => return Err(StorageError::InvalidData(error.to_string())),
         }
     }
-    Ok(events)
+    apply_history_rewrites(events)
+}
+
+fn apply_history_rewrites(events: Vec<StoredEvent>) -> Result<Vec<StoredEvent>, StorageError> {
+    let mut effective = Vec::with_capacity(events.len());
+    for event in events {
+        let StoredEventKind::ThreadRolledBack {
+            retained_event_id, ..
+        } = &event.kind
+        else {
+            effective.push(event);
+            continue;
+        };
+
+        let cutoff = match retained_event_id {
+            Some(event_id) => {
+                effective
+                    .iter()
+                    .position(|candidate| candidate.event_id == *event_id)
+                    .ok_or_else(|| {
+                        StorageError::InvalidData(format!(
+                            "rollback retained event {event_id} is missing"
+                        ))
+                    })?
+                    + 1
+            }
+            None => 0,
+        };
+        let metadata = effective
+            .drain(cutoff..)
+            .filter(|candidate| is_thread_metadata(&candidate.kind))
+            .collect::<Vec<_>>();
+        effective.extend(metadata);
+        effective.push(event);
+    }
+    Ok(effective)
+}
+
+fn is_terminal_event(kind: &StoredEventKind) -> bool {
+    matches!(
+        kind,
+        StoredEventKind::TurnCompleted { .. }
+            | StoredEventKind::TurnFailed { .. }
+            | StoredEventKind::TurnCancelled
+    )
+}
+
+fn is_thread_metadata(kind: &StoredEventKind) -> bool {
+    matches!(
+        kind,
+        StoredEventKind::ThreadCreated { .. }
+            | StoredEventKind::ThreadWorkspaceBound { .. }
+            | StoredEventKind::ThreadForked { .. }
+            | StoredEventKind::ThreadRolledBack { .. }
+            | StoredEventKind::ThreadArchived
+            | StoredEventKind::ThreadRenamed { .. }
+            | StoredEventKind::ThreadDeleted
+    )
+}
+
+fn is_history_event(kind: &StoredEventKind) -> bool {
+    !is_thread_metadata(kind)
+}
+
+fn is_fork_history_event(kind: &StoredEventKind) -> bool {
+    !is_thread_metadata(kind)
+        && !matches!(
+            kind,
+            StoredEventKind::ChangeApplied { .. }
+                | StoredEventKind::ChangeUndone { .. }
+                | StoredEventKind::ItemStarted {
+                    item_type: AgentItemType::Change,
+                    ..
+                }
+                | StoredEventKind::ItemCompleted {
+                    item_type: AgentItemType::Change,
+                    ..
+                }
+        )
 }
 
 fn project_thread(thread_id: &str, events: &[StoredEvent]) -> Result<ThreadDetail, StorageError> {
@@ -582,6 +926,25 @@ fn project_thread(thread_id: &str, events: &[StoredEvent]) -> Result<ThreadDetai
         }
         updated_at_ms = updated_at_ms.max(event.created_at_ms);
         match &event.kind {
+            StoredEventKind::ItemStarted { .. } => {}
+            StoredEventKind::ItemCompleted {
+                item_id,
+                item_type: AgentItemType::Tool,
+                status,
+            } => {
+                finish_tool_activity(
+                    &mut tool_activities,
+                    &mut turn_timeline,
+                    item_id,
+                    event,
+                    match status {
+                        AgentItemStatus::Completed => ToolActivityState::Completed,
+                        AgentItemStatus::Failed => ToolActivityState::Failed,
+                        AgentItemStatus::Cancelled => ToolActivityState::Cancelled,
+                    },
+                );
+            }
+            StoredEventKind::ItemCompleted { .. } => {}
             StoredEventKind::ThreadWorkspaceBound { path } => {
                 if workspace_path
                     .as_ref()
@@ -593,6 +956,7 @@ fn project_thread(thread_id: &str, events: &[StoredEvent]) -> Result<ThreadDetai
                 }
                 workspace_path = Some(path.clone());
             }
+            StoredEventKind::ThreadForked { .. } | StoredEventKind::ThreadRolledBack { .. } => {}
             StoredEventKind::UserMessage { message } => {
                 if title == "新会话" && message.role == MessageRole::User {
                     title = title_from_message(&message.visible_text());
@@ -621,11 +985,15 @@ fn project_thread(thread_id: &str, events: &[StoredEvent]) -> Result<ThreadDetai
                 }
                 messages.push(message.clone());
             }
-            StoredEventKind::AssistantToolCalls { text, calls } => {
+            StoredEventKind::AssistantToolCalls {
+                item_id,
+                text,
+                calls,
+            } => {
                 if let Some(turn_id) = &event.turn_id {
                     if !text.is_empty() {
                         turn_timeline.push(TurnTimelineItem::Text {
-                            id: event.event_id.clone(),
+                            id: item_id.clone().unwrap_or_else(|| event.event_id.clone()),
                             turn_id: turn_id.clone(),
                             text: text.clone(),
                         });
@@ -924,7 +1292,7 @@ fn project_thread(thread_id: &str, events: &[StoredEvent]) -> Result<ThreadDetai
                 );
                 update_turn(&mut last_turn, event, TurnState::Completed, None)
             }
-            StoredEventKind::TurnFailed { message } => {
+            StoredEventKind::TurnFailed { message, error } => {
                 finish_running_tool_activities(
                     &mut tool_activities,
                     &mut turn_timeline,
@@ -943,7 +1311,11 @@ fn project_thread(thread_id: &str, events: &[StoredEvent]) -> Result<ThreadDetai
                     &mut last_turn,
                     event,
                     TurnState::Failed,
-                    Some(message.clone()),
+                    Some(
+                        error
+                            .clone()
+                            .unwrap_or_else(|| TurnError::legacy(message.clone())),
+                    ),
                 )
             }
             StoredEventKind::TurnCancelled => {
@@ -993,6 +1365,1050 @@ fn project_thread(thread_id: &str, events: &[StoredEvent]) -> Result<ThreadDetai
         todos,
         last_usage,
     })
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "camelCase")]
+struct HistoryOrder {
+    event_index: u64,
+    item_index: u32,
+}
+
+#[derive(Debug, Clone)]
+struct ProjectedHistory {
+    turns: Vec<ProjectedTurn>,
+    items: Vec<ProjectedItem>,
+}
+
+#[derive(Debug, Clone)]
+struct ProjectedTurn {
+    order: HistoryOrder,
+    turn: ThreadTurn,
+}
+
+#[derive(Debug, Clone)]
+struct ProjectedItem {
+    order: HistoryOrder,
+    item: ThreadItem,
+}
+
+#[derive(Debug, Clone)]
+struct ItemLifecycleSnapshot {
+    turn_id: Option<String>,
+    item_id: String,
+    item_type: AgentItemType,
+    started_at_ms: Option<u64>,
+    completed_at_ms: Option<u64>,
+    status: Option<AgentItemStatus>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum HistoryCursorResource {
+    Turns,
+    Items,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct HistoryCursor {
+    version: u32,
+    thread_id: String,
+    resource: HistoryCursorResource,
+    anchor_id: String,
+    order: HistoryOrder,
+    inclusive: bool,
+    filter_turn_id: Option<String>,
+}
+
+fn project_thread_history(
+    thread_id: &str,
+    events: &[StoredEvent],
+    detail: &ThreadDetail,
+) -> Result<ProjectedHistory, StorageError> {
+    let lifecycles = project_item_lifecycles(events);
+    let mut turns = project_turn_metadata(events, detail);
+    let mut items = Vec::<ProjectedItem>::new();
+    let mut inserted_user_messages = HashSet::<String>::new();
+    let mut grouped_approvals = HashSet::<String>::new();
+    let mut grouped_user_inputs = HashSet::<String>::new();
+
+    for (event_index, event) in events.iter().enumerate() {
+        if event.thread_id != thread_id {
+            return Err(StorageError::InvalidData(
+                "event thread ID does not match its session file".to_string(),
+            ));
+        }
+        let mut item_index = 0u32;
+        let mut next_order = || {
+            let order = HistoryOrder {
+                event_index: event_index as u64,
+                item_index,
+            };
+            item_index = item_index.saturating_add(1);
+            order
+        };
+
+        match &event.kind {
+            StoredEventKind::UserMessage { message } => {
+                if !inserted_user_messages.insert(message.id.clone()) {
+                    continue;
+                }
+                let turn_id = event.turn_id.clone().or_else(|| {
+                    turns
+                        .iter()
+                        .find(|turn| turn.turn.user_message_id.as_deref() == Some(&message.id))
+                        .map(|turn| turn.turn.id.clone())
+                });
+                let item = ThreadItem {
+                    schema_version: PROTOCOL_VERSION,
+                    id: message.id.clone(),
+                    turn_id,
+                    status: Some(AgentItemStatus::Completed),
+                    started_at_ms: Some(message.created_at_ms),
+                    completed_at_ms: Some(message.created_at_ms),
+                    timeline_items: Vec::new(),
+                    payload: ThreadItemPayload::UserMessage {
+                        message: message.clone(),
+                    },
+                };
+                push_history_item(&mut turns, &mut items, next_order(), item);
+            }
+            StoredEventKind::AssistantMessage { message } => {
+                let Some(turn_id) = event.turn_id.as_deref() else {
+                    continue;
+                };
+                let timeline_items = find_timeline_text(detail, turn_id, &message.id)
+                    .into_iter()
+                    .collect();
+                let item = history_item(
+                    &lifecycles,
+                    event,
+                    message.id.clone(),
+                    Some(AgentItemType::AgentMessage),
+                    Some(AgentItemStatus::Completed),
+                    ThreadItemPayload::AgentMessage {
+                        message: message.clone(),
+                        phase: AgentMessagePhase::FinalAnswer,
+                    },
+                    timeline_items,
+                );
+                push_history_item(&mut turns, &mut items, next_order(), item);
+            }
+            StoredEventKind::AssistantToolCalls {
+                item_id,
+                text,
+                calls,
+            } => {
+                let Some(turn_id) = event.turn_id.as_deref() else {
+                    continue;
+                };
+                if !text.is_empty() {
+                    let item_id = item_id.clone().unwrap_or_else(|| event.event_id.clone());
+                    let message = ChatMessage {
+                        schema_version: PROTOCOL_VERSION,
+                        id: item_id.clone(),
+                        role: MessageRole::Assistant,
+                        content: vec![ContentBlock::Text { text: text.clone() }],
+                        created_at_ms: event.created_at_ms,
+                    };
+                    let timeline_items = find_timeline_text(detail, turn_id, &item_id)
+                        .into_iter()
+                        .collect();
+                    let item = history_item(
+                        &lifecycles,
+                        event,
+                        item_id,
+                        Some(AgentItemType::AgentMessage),
+                        Some(AgentItemStatus::Completed),
+                        ThreadItemPayload::AgentMessage {
+                            message,
+                            phase: AgentMessagePhase::Commentary,
+                        },
+                        timeline_items,
+                    );
+                    push_history_item(&mut turns, &mut items, next_order(), item);
+                }
+                for call in calls {
+                    let Some(activity) = detail
+                        .tool_activities
+                        .iter()
+                        .find(|activity| activity.turn_id == turn_id && activity.call.id == call.id)
+                        .cloned()
+                    else {
+                        continue;
+                    };
+                    let fallback_status = tool_item_status(&activity.state);
+                    let timeline_items = find_timeline_tool(detail, turn_id, &call.id)
+                        .into_iter()
+                        .collect();
+                    let mut item = history_item(
+                        &lifecycles,
+                        event,
+                        call.id.clone(),
+                        Some(AgentItemType::Tool),
+                        fallback_status,
+                        ThreadItemPayload::Tool {
+                            activity: activity.clone(),
+                        },
+                        timeline_items,
+                    );
+                    if !has_completed_lifecycle(
+                        &lifecycles,
+                        event.turn_id.as_deref(),
+                        &call.id,
+                        AgentItemType::Tool,
+                    ) {
+                        item.completed_at_ms = activity.completed_at_ms;
+                    }
+                    push_history_item(&mut turns, &mut items, next_order(), item);
+                }
+            }
+            StoredEventKind::ReasoningSummary { item_id, summary } => {
+                let Some(turn_id) = event.turn_id.as_deref() else {
+                    continue;
+                };
+                let timeline_items = find_timeline_reasoning(detail, turn_id, item_id)
+                    .into_iter()
+                    .collect();
+                let item = history_item(
+                    &lifecycles,
+                    event,
+                    item_id.clone(),
+                    Some(AgentItemType::Reasoning),
+                    Some(AgentItemStatus::Completed),
+                    ThreadItemPayload::Reasoning {
+                        summary: summary.clone(),
+                    },
+                    timeline_items,
+                );
+                push_history_item(&mut turns, &mut items, next_order(), item);
+            }
+            StoredEventKind::ApprovalRequested { request } => {
+                grouped_approvals.insert(request.id.clone());
+                let Some(approval) = detail
+                    .approvals
+                    .iter()
+                    .find(|approval| approval.request.id == request.id)
+                    .cloned()
+                else {
+                    continue;
+                };
+                let timeline_items = approval_timeline_items(detail, &request.id);
+                let fallback_status =
+                    approval
+                        .resolution
+                        .as_ref()
+                        .map(|resolution| match resolution.action {
+                            ApprovalAction::Approved => AgentItemStatus::Completed,
+                            ApprovalAction::Rejected | ApprovalAction::TimedOut => {
+                                AgentItemStatus::Failed
+                            }
+                            ApprovalAction::Cancelled => AgentItemStatus::Cancelled,
+                        });
+                let mut item = history_item(
+                    &lifecycles,
+                    event,
+                    request.id.clone(),
+                    Some(AgentItemType::Approval),
+                    fallback_status,
+                    ThreadItemPayload::Approval { approval },
+                    timeline_items,
+                );
+                if !has_completed_lifecycle(
+                    &lifecycles,
+                    event.turn_id.as_deref(),
+                    &request.id,
+                    AgentItemType::Approval,
+                ) {
+                    item.completed_at_ms =
+                        events.iter().find_map(|candidate| match &candidate.kind {
+                            StoredEventKind::ApprovalResolved { request_id, .. }
+                                if request_id == &request.id =>
+                            {
+                                Some(candidate.created_at_ms)
+                            }
+                            _ => None,
+                        });
+                }
+                push_history_item(&mut turns, &mut items, next_order(), item);
+            }
+            StoredEventKind::ApprovalResolved { request_id, .. } => {
+                if !grouped_approvals.contains(request_id) {
+                    push_generic_event_item(&mut turns, &mut items, detail, event, next_order());
+                }
+            }
+            StoredEventKind::UserInputRequested { request } => {
+                grouped_user_inputs.insert(request.id.clone());
+                let Some(user_input) = detail
+                    .user_inputs
+                    .iter()
+                    .find(|input| input.request.id == request.id)
+                    .cloned()
+                else {
+                    continue;
+                };
+                let timeline_items = user_input_timeline_items(detail, &request.id);
+                let fallback_status =
+                    user_input
+                        .resolution
+                        .as_ref()
+                        .map(|resolution| match resolution.action {
+                            UserInputAction::Answered => AgentItemStatus::Completed,
+                            UserInputAction::Skipped => AgentItemStatus::Failed,
+                            UserInputAction::Cancelled => AgentItemStatus::Cancelled,
+                        });
+                let mut item = history_item(
+                    &lifecycles,
+                    event,
+                    request.id.clone(),
+                    Some(AgentItemType::UserInput),
+                    fallback_status,
+                    ThreadItemPayload::UserInput { user_input },
+                    timeline_items,
+                );
+                if !has_completed_lifecycle(
+                    &lifecycles,
+                    event.turn_id.as_deref(),
+                    &request.id,
+                    AgentItemType::UserInput,
+                ) {
+                    item.completed_at_ms =
+                        events.iter().find_map(|candidate| match &candidate.kind {
+                            StoredEventKind::UserInputResolved { request_id, .. }
+                                if request_id == &request.id =>
+                            {
+                                Some(candidate.created_at_ms)
+                            }
+                            _ => None,
+                        });
+                }
+                push_history_item(&mut turns, &mut items, next_order(), item);
+            }
+            StoredEventKind::UserInputResolved { request_id, .. } => {
+                if !grouped_user_inputs.contains(request_id) {
+                    push_generic_event_item(&mut turns, &mut items, detail, event, next_order());
+                }
+            }
+            StoredEventKind::ChangeApplied { change_set } => {
+                let change_set = detail
+                    .changes
+                    .iter()
+                    .find(|change| change.id == change_set.id)
+                    .cloned()
+                    .unwrap_or_else(|| change_set.clone());
+                let timeline_items = find_timeline_event(detail, event).into_iter().collect();
+                let item = history_item(
+                    &lifecycles,
+                    event,
+                    change_set.id.clone(),
+                    Some(AgentItemType::Change),
+                    Some(AgentItemStatus::Completed),
+                    ThreadItemPayload::Change { change_set },
+                    timeline_items,
+                );
+                push_history_item(&mut turns, &mut items, next_order(), item);
+            }
+            StoredEventKind::ContextCompacted { summary, automatic } => {
+                let timeline_items = find_timeline_event(detail, event).into_iter().collect();
+                let item = history_item(
+                    &lifecycles,
+                    event,
+                    event.event_id.clone(),
+                    Some(AgentItemType::ContextCompaction),
+                    Some(AgentItemStatus::Completed),
+                    ThreadItemPayload::ContextCompaction {
+                        automatic: *automatic,
+                        compacted_message_count: summary.compacted_message_count,
+                        user_constraint_count: summary.user_constraints.len(),
+                        recent_tool_result_count: summary.recent_tool_results.len(),
+                    },
+                    timeline_items,
+                );
+                push_history_item(&mut turns, &mut items, next_order(), item);
+            }
+            StoredEventKind::ProviderContext { .. }
+            | StoredEventKind::ProviderCallUsage { .. }
+            | StoredEventKind::TodoUpdated { .. }
+            | StoredEventKind::ChangeUndone { .. }
+            | StoredEventKind::TurnCompleted { .. }
+            | StoredEventKind::TurnFailed { .. }
+            | StoredEventKind::TurnCancelled => {
+                push_generic_event_item(&mut turns, &mut items, detail, event, next_order());
+            }
+            StoredEventKind::ThreadCreated { .. }
+            | StoredEventKind::ThreadWorkspaceBound { .. }
+            | StoredEventKind::ThreadForked { .. }
+            | StoredEventKind::ThreadRolledBack { .. }
+            | StoredEventKind::TurnStarted
+            | StoredEventKind::TurnModeSelected { .. }
+            | StoredEventKind::ItemStarted { .. }
+            | StoredEventKind::ItemCompleted { .. }
+            | StoredEventKind::ToolStarted { .. }
+            | StoredEventKind::ToolResult { .. }
+            | StoredEventKind::ThreadArchived
+            | StoredEventKind::ThreadRenamed { .. }
+            | StoredEventKind::ThreadDeleted => {}
+        }
+    }
+
+    items.sort_by_key(|item| item.order);
+    for turn in &mut turns {
+        turn.turn
+            .items
+            .sort_by_key(|item| turn_item_display_order(detail, &items, item));
+    }
+
+    Ok(ProjectedHistory { turns, items })
+}
+
+fn project_item_lifecycles(events: &[StoredEvent]) -> Vec<ItemLifecycleSnapshot> {
+    let mut lifecycles = Vec::<ItemLifecycleSnapshot>::new();
+    for event in events {
+        match &event.kind {
+            StoredEventKind::ItemStarted { item_id, item_type } => {
+                if let Some(lifecycle) = lifecycles.iter_mut().rev().find(|lifecycle| {
+                    lifecycle.turn_id == event.turn_id
+                        && lifecycle.item_id == *item_id
+                        && lifecycle.item_type == *item_type
+                }) {
+                    lifecycle.started_at_ms.get_or_insert(event.created_at_ms);
+                } else {
+                    lifecycles.push(ItemLifecycleSnapshot {
+                        turn_id: event.turn_id.clone(),
+                        item_id: item_id.clone(),
+                        item_type: *item_type,
+                        started_at_ms: Some(event.created_at_ms),
+                        completed_at_ms: None,
+                        status: None,
+                    });
+                }
+            }
+            StoredEventKind::ItemCompleted {
+                item_id,
+                item_type,
+                status,
+            } => {
+                if let Some(lifecycle) = lifecycles.iter_mut().rev().find(|lifecycle| {
+                    lifecycle.turn_id == event.turn_id
+                        && lifecycle.item_id == *item_id
+                        && lifecycle.item_type == *item_type
+                }) {
+                    lifecycle.completed_at_ms = Some(event.created_at_ms);
+                    lifecycle.status = Some(*status);
+                } else {
+                    lifecycles.push(ItemLifecycleSnapshot {
+                        turn_id: event.turn_id.clone(),
+                        item_id: item_id.clone(),
+                        item_type: *item_type,
+                        started_at_ms: None,
+                        completed_at_ms: Some(event.created_at_ms),
+                        status: Some(*status),
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    lifecycles
+}
+
+fn has_completed_lifecycle(
+    lifecycles: &[ItemLifecycleSnapshot],
+    turn_id: Option<&str>,
+    item_id: &str,
+    item_type: AgentItemType,
+) -> bool {
+    lifecycles.iter().any(|lifecycle| {
+        lifecycle.turn_id.as_deref() == turn_id
+            && lifecycle.item_id == item_id
+            && lifecycle.item_type == item_type
+            && lifecycle.completed_at_ms.is_some()
+    })
+}
+
+fn turn_item_display_order(
+    detail: &ThreadDetail,
+    items: &[ProjectedItem],
+    item: &ThreadItem,
+) -> (u8, u64, u32) {
+    if matches!(&item.payload, ThreadItemPayload::UserMessage { .. }) {
+        let order = projected_item_order(items, item);
+        return (0, order.event_index, order.item_index);
+    }
+    if let ThreadItemPayload::Approval { approval } = &item.payload
+        && let Some(index) = detail.turn_timeline.iter().position(|candidate| {
+            matches!(candidate, TurnTimelineItem::Tool { activity }
+                if activity.turn_id == approval.request.turn_id
+                    && activity.call.id == approval.request.tool_call_id)
+        })
+    {
+        return (1, (index as u64).saturating_mul(2).saturating_sub(1), 0);
+    }
+    if let Some(index) = item
+        .timeline_items
+        .iter()
+        .filter_map(|timeline_item| {
+            detail.turn_timeline.iter().position(|candidate| {
+                timeline_item_id(candidate) == timeline_item_id(timeline_item)
+                    && timeline_item_turn_id(candidate) == timeline_item_turn_id(timeline_item)
+            })
+        })
+        .min()
+    {
+        return (1, (index as u64).saturating_mul(2), 0);
+    }
+    let order = projected_item_order(items, item);
+    (2, order.event_index, order.item_index)
+}
+
+fn projected_item_order(items: &[ProjectedItem], item: &ThreadItem) -> HistoryOrder {
+    items
+        .iter()
+        .find(|projected| projected.item.id == item.id && projected.item.turn_id == item.turn_id)
+        .map(|projected| projected.order)
+        .unwrap_or(HistoryOrder {
+            event_index: u64::MAX,
+            item_index: u32::MAX,
+        })
+}
+
+fn timeline_item_turn_id(item: &TurnTimelineItem) -> &str {
+    match item {
+        TurnTimelineItem::Text { turn_id, .. }
+        | TurnTimelineItem::Reasoning { turn_id, .. }
+        | TurnTimelineItem::Event { turn_id, .. } => turn_id,
+        TurnTimelineItem::Tool { activity } => &activity.turn_id,
+    }
+}
+
+fn project_turn_metadata(events: &[StoredEvent], detail: &ThreadDetail) -> Vec<ProjectedTurn> {
+    let mut turns = Vec::<ProjectedTurn>::new();
+    for (event_index, event) in events.iter().enumerate() {
+        let Some(turn_id) = event.turn_id.as_deref() else {
+            continue;
+        };
+        if !turns.iter().any(|turn| turn.turn.id == turn_id) {
+            turns.push(ProjectedTurn {
+                order: HistoryOrder {
+                    event_index: event_index as u64,
+                    item_index: 0,
+                },
+                turn: ThreadTurn {
+                    schema_version: PROTOCOL_VERSION,
+                    id: turn_id.to_string(),
+                    user_message_id: detail.turn_user_message_ids.get(turn_id).cloned(),
+                    state: TurnState::Streaming,
+                    error: None,
+                    started_at_ms: Some(event.created_at_ms),
+                    completed_at_ms: None,
+                    duration_ms: None,
+                    items_view: TurnItemsView::Full,
+                    items: Vec::new(),
+                },
+            });
+        }
+        let Some(turn) = turns.iter_mut().find(|turn| turn.turn.id == turn_id) else {
+            continue;
+        };
+        match &event.kind {
+            StoredEventKind::TurnStarted => {
+                turn.turn.state = TurnState::Streaming;
+                turn.turn.started_at_ms = Some(event.created_at_ms);
+            }
+            StoredEventKind::ToolStarted { .. } => turn.turn.state = TurnState::RunningTool,
+            StoredEventKind::ToolResult { .. }
+            | StoredEventKind::ApprovalResolved { .. }
+            | StoredEventKind::UserInputResolved { .. } => {
+                turn.turn.state = TurnState::Streaming;
+            }
+            StoredEventKind::ApprovalRequested { request } if !request.auto_approved => {
+                turn.turn.state = TurnState::AwaitingApproval;
+            }
+            StoredEventKind::UserInputRequested { .. } => {
+                turn.turn.state = TurnState::AwaitingApproval;
+            }
+            StoredEventKind::TurnCompleted { .. } => {
+                finish_thread_turn(&mut turn.turn, event, TurnState::Completed, None);
+            }
+            StoredEventKind::TurnFailed { message, error } => {
+                finish_thread_turn(
+                    &mut turn.turn,
+                    event,
+                    TurnState::Failed,
+                    Some(
+                        error
+                            .clone()
+                            .unwrap_or_else(|| TurnError::legacy(message.clone())),
+                    ),
+                );
+            }
+            StoredEventKind::TurnCancelled => {
+                finish_thread_turn(&mut turn.turn, event, TurnState::Cancelled, None);
+            }
+            _ => {}
+        }
+    }
+    turns
+}
+
+fn finish_thread_turn(
+    turn: &mut ThreadTurn,
+    event: &StoredEvent,
+    state: TurnState,
+    error: Option<TurnError>,
+) {
+    turn.state = state;
+    turn.error = error;
+    turn.completed_at_ms = Some(event.created_at_ms);
+    turn.duration_ms = turn
+        .started_at_ms
+        .map(|started| event.created_at_ms.saturating_sub(started));
+}
+
+fn history_item(
+    lifecycles: &[ItemLifecycleSnapshot],
+    event: &StoredEvent,
+    item_id: String,
+    item_type: Option<AgentItemType>,
+    fallback_status: Option<AgentItemStatus>,
+    payload: ThreadItemPayload,
+    timeline_items: Vec<TurnTimelineItem>,
+) -> ThreadItem {
+    let lifecycle = item_type.and_then(|item_type| {
+        lifecycles.iter().rev().find(|lifecycle| {
+            lifecycle.turn_id == event.turn_id
+                && lifecycle.item_id == item_id
+                && lifecycle.item_type == item_type
+        })
+    });
+    let status = lifecycle
+        .and_then(|lifecycle| lifecycle.status)
+        .or(fallback_status);
+    ThreadItem {
+        schema_version: PROTOCOL_VERSION,
+        id: item_id,
+        turn_id: event.turn_id.clone(),
+        status,
+        started_at_ms: lifecycle
+            .and_then(|lifecycle| lifecycle.started_at_ms)
+            .or(Some(event.created_at_ms)),
+        completed_at_ms: lifecycle
+            .and_then(|lifecycle| lifecycle.completed_at_ms)
+            .or_else(|| status.map(|_| event.created_at_ms)),
+        timeline_items,
+        payload,
+    }
+}
+
+fn push_history_item(
+    turns: &mut [ProjectedTurn],
+    items: &mut Vec<ProjectedItem>,
+    order: HistoryOrder,
+    item: ThreadItem,
+) {
+    if let Some(turn_id) = item.turn_id.as_deref()
+        && let Some(turn) = turns.iter_mut().find(|turn| turn.turn.id == turn_id)
+    {
+        turn.turn.items.push(item.clone());
+    }
+    items.push(ProjectedItem { order, item });
+}
+
+fn push_generic_event_item(
+    turns: &mut [ProjectedTurn],
+    items: &mut Vec<ProjectedItem>,
+    detail: &ThreadDetail,
+    event: &StoredEvent,
+    order: HistoryOrder,
+) {
+    let Some(timeline_item) = find_timeline_event(detail, event) else {
+        return;
+    };
+    let item_id = timeline_item_id(&timeline_item).to_string();
+    let item = ThreadItem {
+        schema_version: PROTOCOL_VERSION,
+        id: item_id,
+        turn_id: event.turn_id.clone(),
+        status: None,
+        started_at_ms: Some(event.created_at_ms),
+        completed_at_ms: Some(event.created_at_ms),
+        timeline_items: vec![timeline_item],
+        payload: ThreadItemPayload::Event,
+    };
+    push_history_item(turns, items, order, item);
+}
+
+fn find_timeline_text(
+    detail: &ThreadDetail,
+    turn_id: &str,
+    item_id: &str,
+) -> Option<TurnTimelineItem> {
+    detail.turn_timeline.iter().find_map(|item| match item {
+        TurnTimelineItem::Text {
+            id,
+            turn_id: item_turn_id,
+            ..
+        } if id == item_id && item_turn_id == turn_id => Some(item.clone()),
+        _ => None,
+    })
+}
+
+fn find_timeline_reasoning(
+    detail: &ThreadDetail,
+    turn_id: &str,
+    item_id: &str,
+) -> Option<TurnTimelineItem> {
+    detail.turn_timeline.iter().find_map(|item| match item {
+        TurnTimelineItem::Reasoning {
+            item_id: reasoning_id,
+            turn_id: item_turn_id,
+            ..
+        } if reasoning_id == item_id && item_turn_id == turn_id => Some(item.clone()),
+        _ => None,
+    })
+}
+
+fn find_timeline_tool(
+    detail: &ThreadDetail,
+    turn_id: &str,
+    call_id: &str,
+) -> Option<TurnTimelineItem> {
+    detail.turn_timeline.iter().find_map(|item| match item {
+        TurnTimelineItem::Tool { activity }
+            if activity.turn_id == turn_id && activity.call.id == call_id =>
+        {
+            Some(item.clone())
+        }
+        _ => None,
+    })
+}
+
+fn approval_timeline_items(detail: &ThreadDetail, request_id: &str) -> Vec<TurnTimelineItem> {
+    let requested_id = format!("approval-requested-{request_id}");
+    let resolved_id = format!("approval-resolved-{request_id}");
+    detail
+        .turn_timeline
+        .iter()
+        .filter(|item| {
+            matches!(
+                item,
+                TurnTimelineItem::Event { item_id, .. }
+                    if item_id == &requested_id || item_id == &resolved_id
+            )
+        })
+        .cloned()
+        .collect()
+}
+
+fn user_input_timeline_items(detail: &ThreadDetail, request_id: &str) -> Vec<TurnTimelineItem> {
+    let requested_id = format!("user-input-requested-{request_id}");
+    let resolved_id = format!("user-input-resolved-{request_id}");
+    detail
+        .turn_timeline
+        .iter()
+        .filter(|item| {
+            matches!(
+                item,
+                TurnTimelineItem::Event { item_id, .. }
+                    if item_id == &requested_id || item_id == &resolved_id
+            )
+        })
+        .cloned()
+        .collect()
+}
+
+fn find_timeline_event(detail: &ThreadDetail, event: &StoredEvent) -> Option<TurnTimelineItem> {
+    let item_id = timeline_event_id(event)?;
+    detail.turn_timeline.iter().find_map(|item| match item {
+        TurnTimelineItem::Event {
+            item_id: timeline_id,
+            ..
+        } if timeline_id == &item_id => Some(item.clone()),
+        _ => None,
+    })
+}
+
+fn timeline_event_id(event: &StoredEvent) -> Option<String> {
+    let turn_id = event.turn_id.as_deref()?;
+    Some(match &event.kind {
+        StoredEventKind::ApprovalRequested { request } => {
+            format!("approval-requested-{}", request.id)
+        }
+        StoredEventKind::ApprovalResolved { request_id, .. } => {
+            format!("approval-resolved-{request_id}")
+        }
+        StoredEventKind::UserInputRequested { request } => {
+            format!("user-input-requested-{}", request.id)
+        }
+        StoredEventKind::UserInputResolved { request_id, .. } => {
+            format!("user-input-resolved-{request_id}")
+        }
+        StoredEventKind::ChangeApplied { change_set } => {
+            format!("change-applied-{}", change_set.id)
+        }
+        StoredEventKind::ChangeUndone { change_id } => format!("change-undone-{change_id}"),
+        StoredEventKind::TurnCompleted { .. } => format!("turn-completed-{turn_id}"),
+        StoredEventKind::TurnFailed { .. } => format!("turn-failed-{turn_id}"),
+        StoredEventKind::TurnCancelled => format!("turn-cancelled-{turn_id}"),
+        StoredEventKind::ProviderContext { .. }
+        | StoredEventKind::ProviderCallUsage { .. }
+        | StoredEventKind::ContextCompacted { .. }
+        | StoredEventKind::TodoUpdated { .. } => event.event_id.clone(),
+        _ => return None,
+    })
+}
+
+fn timeline_item_id(item: &TurnTimelineItem) -> &str {
+    match item {
+        TurnTimelineItem::Text { id, .. } => id,
+        TurnTimelineItem::Reasoning { item_id, .. } | TurnTimelineItem::Event { item_id, .. } => {
+            item_id
+        }
+        TurnTimelineItem::Tool { activity } => &activity.call.id,
+    }
+}
+
+fn tool_item_status(state: &ToolActivityState) -> Option<AgentItemStatus> {
+    match state {
+        ToolActivityState::Completed => Some(AgentItemStatus::Completed),
+        ToolActivityState::Failed => Some(AgentItemStatus::Failed),
+        ToolActivityState::Cancelled => Some(AgentItemStatus::Cancelled),
+        ToolActivityState::Pending | ToolActivityState::Running => None,
+    }
+}
+
+fn projection_error(error: crate::persistence::ProjectionError) -> StorageError {
+    StorageError::Io(error.to_string())
+}
+
+fn history_index_order(order: HistoryOrder) -> HistoryIndexOrder {
+    HistoryIndexOrder {
+        event_index: order.event_index,
+        item_index: order.item_index,
+    }
+}
+
+fn projected_history_order(order: HistoryIndexOrder) -> HistoryOrder {
+    HistoryOrder {
+        event_index: order.event_index,
+        item_index: order.item_index,
+    }
+}
+
+fn paginate_indexed_turns(
+    projection: &ProjectionDb,
+    thread_id: &str,
+    cursor: Option<&str>,
+    limit: Option<u32>,
+    sort_direction: HistorySortDirection,
+    items_view: TurnItemsView,
+) -> Result<ThreadTurnsPage, StorageError> {
+    let limit = history_page_limit(limit)?;
+    let cursor = decode_history_cursor(cursor, thread_id, HistoryCursorResource::Turns, None)?;
+    if let Some(cursor) = &cursor
+        && !projection
+            .history_turn_exists(
+                thread_id,
+                history_index_order(cursor.order),
+                &cursor.anchor_id,
+            )
+            .map_err(projection_error)?
+    {
+        return Err(invalid_history_cursor());
+    }
+    let mut candidates = projection
+        .history_turn_page(
+            thread_id,
+            cursor
+                .as_ref()
+                .map(|cursor| (history_index_order(cursor.order), cursor.inclusive)),
+            limit + 1,
+            sort_direction,
+        )
+        .map_err(projection_error)?;
+    let has_more = candidates.len() > limit;
+    candidates.truncate(limit);
+    let data = candidates
+        .iter()
+        .map(|turn| turn_with_items_view(&turn.turn, items_view))
+        .collect::<Vec<_>>();
+    let next_cursor = if has_more {
+        candidates.last().map(|turn| {
+            encode_history_cursor(HistoryCursor {
+                version: 1,
+                thread_id: thread_id.to_string(),
+                resource: HistoryCursorResource::Turns,
+                anchor_id: turn.turn.id.clone(),
+                order: projected_history_order(turn.order),
+                inclusive: false,
+                filter_turn_id: None,
+            })
+        })
+    } else {
+        None
+    };
+    let backwards_cursor = candidates.first().map(|turn| {
+        encode_history_cursor(HistoryCursor {
+            version: 1,
+            thread_id: thread_id.to_string(),
+            resource: HistoryCursorResource::Turns,
+            anchor_id: turn.turn.id.clone(),
+            order: projected_history_order(turn.order),
+            inclusive: true,
+            filter_turn_id: None,
+        })
+    });
+    Ok(ThreadTurnsPage {
+        data,
+        next_cursor,
+        backwards_cursor,
+    })
+}
+
+fn paginate_indexed_items(
+    projection: &ProjectionDb,
+    thread_id: &str,
+    turn_id: Option<&str>,
+    cursor: Option<&str>,
+    limit: Option<u32>,
+    sort_direction: HistorySortDirection,
+) -> Result<ThreadItemsPage, StorageError> {
+    if let Some(turn_id) = turn_id
+        && !projection
+            .history_has_turn(thread_id, turn_id)
+            .map_err(projection_error)?
+    {
+        return Err(StorageError::NotFound(format!(
+            "turn {turn_id} in thread {thread_id}"
+        )));
+    }
+    let limit = history_page_limit(limit)?;
+    let cursor = decode_history_cursor(cursor, thread_id, HistoryCursorResource::Items, turn_id)?;
+    if let Some(cursor) = &cursor
+        && !projection
+            .history_item_exists(
+                thread_id,
+                history_index_order(cursor.order),
+                &cursor.anchor_id,
+                turn_id,
+            )
+            .map_err(projection_error)?
+    {
+        return Err(invalid_history_cursor());
+    }
+    let mut candidates = projection
+        .history_item_page(
+            thread_id,
+            turn_id,
+            cursor
+                .as_ref()
+                .map(|cursor| (history_index_order(cursor.order), cursor.inclusive)),
+            limit + 1,
+            sort_direction,
+        )
+        .map_err(projection_error)?;
+    let has_more = candidates.len() > limit;
+    candidates.truncate(limit);
+    let data = candidates
+        .iter()
+        .map(|item| ThreadItemEntry {
+            turn_id: item.item.turn_id.clone(),
+            item: item.item.clone(),
+        })
+        .collect::<Vec<_>>();
+    let next_cursor = if has_more {
+        candidates.last().map(|item| {
+            encode_history_cursor(HistoryCursor {
+                version: 1,
+                thread_id: thread_id.to_string(),
+                resource: HistoryCursorResource::Items,
+                anchor_id: item.item.id.clone(),
+                order: projected_history_order(item.order),
+                inclusive: false,
+                filter_turn_id: turn_id.map(str::to_string),
+            })
+        })
+    } else {
+        None
+    };
+    let backwards_cursor = candidates.first().map(|item| {
+        encode_history_cursor(HistoryCursor {
+            version: 1,
+            thread_id: thread_id.to_string(),
+            resource: HistoryCursorResource::Items,
+            anchor_id: item.item.id.clone(),
+            order: projected_history_order(item.order),
+            inclusive: true,
+            filter_turn_id: turn_id.map(str::to_string),
+        })
+    });
+    Ok(ThreadItemsPage {
+        data,
+        next_cursor,
+        backwards_cursor,
+    })
+}
+
+fn turn_with_items_view(turn: &ThreadTurn, items_view: TurnItemsView) -> ThreadTurn {
+    let mut turn = turn.clone();
+    turn.items_view = items_view;
+    match items_view {
+        TurnItemsView::NotLoaded => turn.items.clear(),
+        TurnItemsView::Summary => turn.items.retain(|item| {
+            matches!(&item.payload, ThreadItemPayload::UserMessage { .. })
+                || matches!(
+                    &item.payload,
+                    ThreadItemPayload::AgentMessage {
+                        phase: AgentMessagePhase::FinalAnswer,
+                        ..
+                    }
+                )
+        }),
+        TurnItemsView::Full => {}
+    }
+    turn
+}
+
+fn history_page_limit(limit: Option<u32>) -> Result<usize, StorageError> {
+    let limit = limit.unwrap_or(DEFAULT_THREAD_HISTORY_PAGE_SIZE);
+    if !(1..=MAX_THREAD_HISTORY_PAGE_SIZE).contains(&limit) {
+        return Err(StorageError::InvalidData(format!(
+            "history page limit must be between 1 and {MAX_THREAD_HISTORY_PAGE_SIZE}"
+        )));
+    }
+    Ok(limit as usize)
+}
+
+fn encode_history_cursor(cursor: HistoryCursor) -> String {
+    URL_SAFE_NO_PAD.encode(serde_json::to_vec(&cursor).expect("history cursor should serialize"))
+}
+
+fn decode_history_cursor(
+    cursor: Option<&str>,
+    thread_id: &str,
+    resource: HistoryCursorResource,
+    filter_turn_id: Option<&str>,
+) -> Result<Option<HistoryCursor>, StorageError> {
+    let Some(cursor) = cursor else {
+        return Ok(None);
+    };
+    let decoded = URL_SAFE_NO_PAD
+        .decode(cursor)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<HistoryCursor>(&bytes).ok())
+        .filter(|cursor| {
+            cursor.version == 1
+                && cursor.thread_id == thread_id
+                && cursor.resource == resource
+                && cursor.filter_turn_id.as_deref() == filter_turn_id
+        })
+        .ok_or_else(invalid_history_cursor)?;
+    Ok(Some(decoded))
+}
+
+fn invalid_history_cursor() -> StorageError {
+    StorageError::InvalidData("invalid or stale thread history cursor".to_string())
 }
 
 fn push_timeline_event(
@@ -1106,6 +2522,42 @@ fn add_token_usage(left: TokenUsage, right: TokenUsage) -> TokenUsage {
     }
 }
 
+fn finish_tool_activity(
+    tool_activities: &mut [ToolActivitySnapshot],
+    turn_timeline: &mut [TurnTimelineItem],
+    call_id: &str,
+    event: &StoredEvent,
+    terminal_state: ToolActivityState,
+) {
+    let belongs_to_turn = |activity: &ToolActivitySnapshot| {
+        activity.call.id == call_id
+            && event
+                .turn_id
+                .as_deref()
+                .is_some_and(|turn_id| activity.turn_id == turn_id)
+    };
+    let finish = |activity: &mut ToolActivitySnapshot| {
+        activity.state = terminal_state.clone();
+        activity.completed_at_ms = Some(event.created_at_ms);
+        activity.duration_ms = activity
+            .started_at_ms
+            .map(|started| event.created_at_ms.saturating_sub(started));
+    };
+
+    if let Some(activity) = tool_activities
+        .iter_mut()
+        .rev()
+        .find(|activity| belongs_to_turn(activity))
+    {
+        finish(activity);
+    }
+    if let Some(TurnTimelineItem::Tool { activity }) = turn_timeline.iter_mut().rev().find(
+        |item| matches!(item, TurnTimelineItem::Tool { activity } if belongs_to_turn(activity)),
+    ) {
+        finish(activity);
+    }
+}
+
 fn approval_action_label(action: ApprovalAction) -> &'static str {
     match action {
         ApprovalAction::Approved => "已批准",
@@ -1127,7 +2579,7 @@ fn update_turn(
     last_turn: &mut Option<TurnSnapshot>,
     event: &StoredEvent,
     state: TurnState,
-    error: Option<String>,
+    error: Option<TurnError>,
 ) {
     if let Some(turn_id) = &event.turn_id {
         *last_turn = Some(TurnSnapshot {
@@ -1138,7 +2590,7 @@ fn update_turn(
     }
 }
 
-fn title_from_message(message: &str) -> String {
+pub(crate) fn title_from_message(message: &str) -> String {
     let message = message
         .split("\n\n[图片文字识别:")
         .next()
@@ -1182,6 +2634,18 @@ mod tests {
         }
     }
 
+    async fn append_at(
+        repository: &JsonlThreadRepository,
+        thread_id: &str,
+        turn_id: Option<&str>,
+        created_at_ms: u64,
+        kind: StoredEventKind,
+    ) {
+        let mut event = StoredEvent::new(thread_id, turn_id.map(str::to_string), kind);
+        event.created_at_ms = created_at_ms;
+        repository.append(event).await.unwrap();
+    }
+
     #[tokio::test]
     async fn creates_projects_and_archives_a_thread() {
         let directory = tempfile::tempdir().expect("temporary directory should be created");
@@ -1219,6 +2683,98 @@ mod tests {
             .await
             .expect("thread should archive");
         assert!(repository.list_threads().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn concurrent_appends_keep_jsonl_and_incremental_projection_in_the_same_order() {
+        let directory = tempfile::tempdir().unwrap();
+        let repository = JsonlThreadRepository::new(directory.path()).unwrap();
+        let thread = repository.create_thread().await.unwrap();
+        let mut appends = Vec::new();
+        for index in 0..24 {
+            let repository = repository.clone();
+            let thread_id = thread.id.clone();
+            appends.push(tokio::spawn(async move {
+                repository
+                    .append(StoredEvent::new(
+                        thread_id,
+                        None,
+                        StoredEventKind::ThreadRenamed {
+                            title: format!("title-{index}"),
+                        },
+                    ))
+                    .await
+                    .unwrap();
+            }));
+        }
+        for append in appends {
+            append.await.unwrap();
+        }
+
+        let events = repository.load(&thread.id).await.unwrap();
+        let jsonl_ids = events
+            .iter()
+            .map(|event| event.event_id.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            repository
+                .projection()
+                .indexed_event_ids(&thread.id)
+                .unwrap(),
+            jsonl_ids
+        );
+        assert_eq!(
+            repository.list_threads().await.unwrap()[0].title,
+            repository
+                .read_thread(&thread.id)
+                .await
+                .unwrap()
+                .summary
+                .title
+        );
+    }
+
+    #[tokio::test]
+    async fn history_index_is_invalidated_by_append_and_rebuilt_on_demand() {
+        let directory = tempfile::tempdir().unwrap();
+        let repository = JsonlThreadRepository::new(directory.path()).unwrap();
+        let thread = repository.create_thread().await.unwrap();
+        repository.read_thread_history(&thread.id).await.unwrap();
+        assert!(
+            repository
+                .projection()
+                .history_index_is_current(&thread.id)
+                .unwrap()
+        );
+
+        repository
+            .append(StoredEvent::new(
+                &thread.id,
+                None,
+                StoredEventKind::UserMessage {
+                    message: message(MessageRole::User, "indexed lazily"),
+                },
+            ))
+            .await
+            .unwrap();
+        assert!(
+            !repository
+                .projection()
+                .history_index_is_current(&thread.id)
+                .unwrap()
+        );
+
+        let page = repository
+            .list_thread_items(&thread.id, None, None, Some(10), HistorySortDirection::Asc)
+            .await
+            .unwrap();
+        assert_eq!(page.data.len(), 1);
+        assert!(
+            repository
+                .projection()
+                .history_index_is_current(&thread.id)
+                .unwrap()
+        );
     }
 
     #[tokio::test]
@@ -1381,6 +2937,7 @@ mod tests {
                 &thread.id,
                 Some("turn-timeline".into()),
                 StoredEventKind::AssistantToolCalls {
+                    item_id: Some("agent-message-progress".into()),
                     text: "我先读取说明文件。".into(),
                     calls: vec![call.clone()],
                 },
@@ -1418,7 +2975,8 @@ mod tests {
         assert_eq!(detail.turn_timeline.len(), 3);
         assert!(matches!(
             &detail.turn_timeline[0],
-            TurnTimelineItem::Text { text, .. } if text == "我先读取说明文件。"
+            TurnTimelineItem::Text { id, text, .. }
+                if id == "agent-message-progress" && text == "我先读取说明文件。"
         ));
         assert!(matches!(
             &detail.turn_timeline[1],
@@ -1467,8 +3025,11 @@ mod tests {
         .unwrap();
         assert!(matches!(
             event,
-            StoredEventKind::AssistantToolCalls { text, calls }
-                if text.is_empty() && calls.is_empty()
+            StoredEventKind::AssistantToolCalls {
+                item_id: None,
+                text,
+                calls,
+            } if text.is_empty() && calls.is_empty()
         ));
     }
 
@@ -1712,6 +3273,7 @@ mod tests {
         for (index, kind) in [
             StoredEventKind::TurnStarted,
             StoredEventKind::AssistantToolCalls {
+                item_id: None,
                 text: String::new(),
                 calls,
             },
@@ -1770,6 +3332,7 @@ mod tests {
         for (index, kind) in [
             StoredEventKind::TurnStarted,
             StoredEventKind::AssistantToolCalls {
+                item_id: None,
                 text: String::new(),
                 calls,
             },
@@ -1790,6 +3353,311 @@ mod tests {
         assert_eq!(detail.tool_activities[0].started_at_ms, Some(30_050));
         assert_eq!(detail.tool_activities[1].state, ToolActivityState::Pending);
         assert_eq!(detail.tool_activities[1].started_at_ms, None);
+    }
+
+    #[tokio::test]
+    async fn projects_one_thread_item_history_without_rewriting_legacy_events() {
+        let directory = tempfile::tempdir().unwrap();
+        let repository = JsonlThreadRepository::new(directory.path()).unwrap();
+        let thread = repository.create_thread().await.unwrap();
+        let turn_id = "turn-legacy-history";
+        let base = now_ms() + 100;
+        let user = message(MessageRole::User, "inspect history");
+        let assistant = message(MessageRole::Assistant, "history is consistent");
+        let call = ToolCall {
+            id: "call-history".into(),
+            name: "read_file".into(),
+            arguments: serde_json::json!({ "path": "README.md" }),
+            metadata: serde_json::json!({}),
+        };
+        let approval = ApprovalRequest {
+            id: "approval-history".into(),
+            thread_id: thread.id.clone(),
+            turn_id: turn_id.into(),
+            tool_call_id: call.id.clone(),
+            tool_name: call.name.clone(),
+            reason: "legacy approval".into(),
+            auto_approved: false,
+            risk: ToolRisk::Read,
+            arguments: call.arguments.clone(),
+            preview: None,
+            created_at_ms: base + 30,
+            expires_at_ms: base + 60_000,
+        };
+        let resolution = ApprovalResolution {
+            action: ApprovalAction::Approved,
+            patch: None,
+            selected_paths: Vec::new(),
+            expected_hashes: Vec::new(),
+        };
+
+        for (offset, kind) in [
+            StoredEventKind::UserMessage { message: user },
+            StoredEventKind::AssistantToolCalls {
+                item_id: Some("commentary-history".into()),
+                text: "checking the file".into(),
+                calls: vec![call.clone()],
+            },
+            StoredEventKind::ApprovalRequested {
+                request: approval.clone(),
+            },
+            StoredEventKind::ApprovalResolved {
+                request_id: approval.id.clone(),
+                resolution,
+            },
+            StoredEventKind::ToolStarted {
+                call_id: call.id.clone(),
+            },
+            StoredEventKind::ToolResult {
+                call_id: call.id.clone(),
+                name: call.name.clone(),
+                result: ToolResult {
+                    success: true,
+                    output: "read".into(),
+                    metadata: serde_json::json!({}),
+                },
+            },
+            StoredEventKind::AssistantMessage { message: assistant },
+            StoredEventKind::TurnCompleted { usage: None },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            append_at(
+                &repository,
+                &thread.id,
+                Some(turn_id),
+                base + offset as u64 * 10,
+                kind,
+            )
+            .await;
+        }
+
+        let event_count = repository.load(&thread.id).await.unwrap().len();
+        let history = repository.read_thread_history(&thread.id).await.unwrap();
+        assert_eq!(
+            repository.load(&thread.id).await.unwrap().len(),
+            event_count
+        );
+        assert_eq!(history.turns.data.len(), 1);
+        let turn = &history.turns.data[0];
+        assert_eq!(turn.id, turn_id);
+        assert_eq!(turn.state, TurnState::Completed);
+        assert_eq!(turn.items_view, TurnItemsView::Full);
+        assert!(
+            matches!(
+                &turn.items[..],
+                [
+                    ThreadItem { payload: ThreadItemPayload::UserMessage { .. }, .. },
+                    ThreadItem { payload: ThreadItemPayload::AgentMessage { phase: AgentMessagePhase::Commentary, .. }, .. },
+                    ThreadItem { payload: ThreadItemPayload::Approval { .. }, completed_at_ms: Some(completed), .. },
+                    ThreadItem { payload: ThreadItemPayload::Tool { .. }, completed_at_ms: Some(tool_completed), .. },
+                    ThreadItem { payload: ThreadItemPayload::AgentMessage { phase: AgentMessagePhase::FinalAnswer, .. }, .. },
+                    ThreadItem { payload: ThreadItemPayload::Event, .. },
+                ] if *completed == base + 30 && *tool_completed == base + 50
+            ),
+            "{:#?}",
+            turn.items
+        );
+        let timeline = turn
+            .items
+            .iter()
+            .flat_map(|item| item.timeline_items.iter())
+            .map(timeline_item_id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            timeline,
+            vec![
+                "commentary-history",
+                "approval-requested-approval-history",
+                "approval-resolved-approval-history",
+                "call-history",
+                turn.items[4].id.as_str(),
+                "turn-completed-turn-legacy-history",
+            ]
+        );
+        let json = serde_json::to_value(history).unwrap();
+        assert_eq!(json["turns"]["data"][0]["itemsView"], "full");
+        assert_eq!(json["turns"]["data"][0]["items"][2]["type"], "approval");
+    }
+
+    #[tokio::test]
+    async fn paginates_thread_turns_and_items_with_bound_query_cursors() {
+        let directory = tempfile::tempdir().unwrap();
+        let repository = JsonlThreadRepository::new(directory.path()).unwrap();
+        let thread = repository.create_thread().await.unwrap();
+        let base = now_ms() + 100;
+
+        for index in 1..=4u64 {
+            let turn_id = format!("turn-{index}");
+            append_at(
+                &repository,
+                &thread.id,
+                None,
+                base + index * 100,
+                StoredEventKind::UserMessage {
+                    message: message(MessageRole::User, &format!("question {index}")),
+                },
+            )
+            .await;
+            append_at(
+                &repository,
+                &thread.id,
+                Some(&turn_id),
+                base + index * 100 + 10,
+                StoredEventKind::TurnStarted,
+            )
+            .await;
+            append_at(
+                &repository,
+                &thread.id,
+                Some(&turn_id),
+                base + index * 100 + 20,
+                StoredEventKind::AssistantMessage {
+                    message: message(MessageRole::Assistant, &format!("answer {index}")),
+                },
+            )
+            .await;
+            append_at(
+                &repository,
+                &thread.id,
+                Some(&turn_id),
+                base + index * 100 + 30,
+                StoredEventKind::TurnCompleted { usage: None },
+            )
+            .await;
+        }
+
+        let first = repository
+            .list_thread_turns(
+                &thread.id,
+                None,
+                Some(2),
+                HistorySortDirection::Desc,
+                TurnItemsView::Summary,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            first
+                .data
+                .iter()
+                .map(|turn| turn.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["turn-4", "turn-3"]
+        );
+        assert!(first.data.iter().all(|turn| {
+            turn.items_view == TurnItemsView::Summary
+                && turn.items.len() == 2
+                && turn.items.iter().all(|item| {
+                    matches!(
+                        &item.payload,
+                        ThreadItemPayload::UserMessage { .. }
+                            | ThreadItemPayload::AgentMessage {
+                                phase: AgentMessagePhase::FinalAnswer,
+                                ..
+                            }
+                    )
+                })
+        }));
+        let second = repository
+            .list_thread_turns(
+                &thread.id,
+                first.next_cursor.as_deref(),
+                Some(2),
+                HistorySortDirection::Desc,
+                TurnItemsView::NotLoaded,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            second
+                .data
+                .iter()
+                .map(|turn| turn.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["turn-2", "turn-1"]
+        );
+        assert!(second.data.iter().all(|turn| turn.items.is_empty()));
+
+        append_at(
+            &repository,
+            &thread.id,
+            Some("turn-5"),
+            base + 510,
+            StoredEventKind::TurnStarted,
+        )
+        .await;
+        let newer = repository
+            .list_thread_turns(
+                &thread.id,
+                first.backwards_cursor.as_deref(),
+                Some(10),
+                HistorySortDirection::Asc,
+                TurnItemsView::NotLoaded,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            newer
+                .data
+                .iter()
+                .map(|turn| turn.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["turn-4", "turn-5"]
+        );
+
+        let turn_items = repository
+            .list_thread_items(
+                &thread.id,
+                Some("turn-1"),
+                None,
+                Some(1),
+                HistorySortDirection::Asc,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            turn_items.data[0].item.payload,
+            ThreadItemPayload::UserMessage { .. }
+        ));
+        assert!(turn_items.next_cursor.is_some());
+        assert!(matches!(
+            repository
+                .list_thread_items(
+                    &thread.id,
+                    Some("turn-2"),
+                    turn_items.next_cursor.as_deref(),
+                    Some(1),
+                    HistorySortDirection::Asc,
+                )
+                .await,
+            Err(StorageError::InvalidData(_))
+        ));
+        assert!(matches!(
+            repository
+                .list_thread_items(
+                    &thread.id,
+                    None,
+                    first.next_cursor.as_deref(),
+                    Some(1),
+                    HistorySortDirection::Asc,
+                )
+                .await,
+            Err(StorageError::InvalidData(_))
+        ));
+        assert!(matches!(
+            repository
+                .list_thread_turns(
+                    &thread.id,
+                    None,
+                    Some(101),
+                    HistorySortDirection::Desc,
+                    TurnItemsView::Full,
+                )
+                .await,
+            Err(StorageError::InvalidData(_))
+        ));
     }
 
     #[tokio::test]
@@ -1823,5 +3691,154 @@ mod tests {
         fs::remove_file(directory.path().join("k-coder.db")).unwrap();
         let rebuilt = JsonlThreadRepository::new(directory.path()).unwrap();
         assert_eq!(rebuilt.list_threads().await.unwrap()[0].id, thread_id);
+    }
+
+    #[tokio::test]
+    async fn rollback_truncates_effective_history_and_keeps_an_audit_marker() {
+        let directory = tempfile::tempdir().unwrap();
+        let repository = JsonlThreadRepository::new(directory.path()).unwrap();
+        let thread = repository.create_thread().await.unwrap();
+        let base = now_ms() + 100;
+
+        for index in 1..=2u64 {
+            let turn_id = format!("turn-{index}");
+            append_at(
+                &repository,
+                &thread.id,
+                None,
+                base + index * 100,
+                StoredEventKind::UserMessage {
+                    message: message(MessageRole::User, &format!("question {index}")),
+                },
+            )
+            .await;
+            append_at(
+                &repository,
+                &thread.id,
+                Some(&turn_id),
+                base + index * 100 + 10,
+                StoredEventKind::TurnStarted,
+            )
+            .await;
+            append_at(
+                &repository,
+                &thread.id,
+                Some(&turn_id),
+                base + index * 100 + 20,
+                StoredEventKind::AssistantMessage {
+                    message: message(MessageRole::Assistant, &format!("answer {index}")),
+                },
+            )
+            .await;
+            append_at(
+                &repository,
+                &thread.id,
+                Some(&turn_id),
+                base + index * 100 + 30,
+                StoredEventKind::TurnCompleted { usage: None },
+            )
+            .await;
+        }
+
+        let rolled_back = repository.rollback_thread(&thread.id, 1).await.unwrap();
+        assert_eq!(rolled_back.turns.data.len(), 1);
+        assert_eq!(rolled_back.turns.data[0].id, "turn-1");
+        assert_eq!(rolled_back.summary.title, "question 1");
+        assert!(
+            repository
+                .load(&thread.id)
+                .await
+                .unwrap()
+                .iter()
+                .any(|event| {
+                    matches!(
+                        event.kind,
+                        StoredEventKind::ThreadRolledBack { num_turns: 1, .. }
+                    )
+                })
+        );
+
+        let rolled_back_again = repository.rollback_thread(&thread.id, 1).await.unwrap();
+        assert!(rolled_back_again.turns.data.is_empty());
+
+        drop(repository);
+        let restored = JsonlThreadRepository::new(directory.path()).unwrap();
+        assert!(
+            restored
+                .read_thread_history(&thread.id)
+                .await
+                .unwrap()
+                .turns
+                .data
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn fork_copies_only_the_selected_completed_history() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let repository = JsonlThreadRepository::new(directory.path()).unwrap();
+        let thread = repository
+            .create_thread_in_workspace(workspace.path())
+            .await
+            .unwrap();
+        for index in 1..=2u64 {
+            let turn_id = format!("turn-{index}");
+            for kind in [
+                StoredEventKind::UserMessage {
+                    message: message(MessageRole::User, &format!("question {index}")),
+                },
+                StoredEventKind::TurnStarted,
+                StoredEventKind::AssistantMessage {
+                    message: message(MessageRole::Assistant, &format!("answer {index}")),
+                },
+                StoredEventKind::TurnCompleted { usage: None },
+            ] {
+                repository
+                    .append(StoredEvent::new(
+                        &thread.id,
+                        (!matches!(kind, StoredEventKind::UserMessage { .. }))
+                            .then_some(turn_id.clone()),
+                        kind,
+                    ))
+                    .await
+                    .unwrap();
+            }
+        }
+
+        let fork = repository
+            .fork_thread(&thread.id, Some("turn-1"))
+            .await
+            .unwrap();
+        assert_ne!(fork.id, thread.id);
+        assert_eq!(fork.workspace_path, thread.workspace_path);
+        assert!(fork.title.ends_with("(分支)"));
+        let history = repository.read_thread_history(&fork.id).await.unwrap();
+        assert_eq!(history.turns.data.len(), 1);
+        assert_eq!(history.turns.data[0].id, "turn-1");
+        assert!(
+            repository
+                .load(&fork.id)
+                .await
+                .unwrap()
+                .iter()
+                .any(|event| {
+                    matches!(
+                        &event.kind,
+                        StoredEventKind::ThreadForked { source_thread_id, .. }
+                            if source_thread_id == &thread.id
+                    )
+                })
+        );
+
+        repository.rollback_thread(&thread.id, 1).await.unwrap();
+        let fork_after_rollback = repository.fork_thread(&thread.id, None).await.unwrap();
+        let forked_history = repository
+            .read_thread_history(&fork_after_rollback.id)
+            .await
+            .unwrap();
+        assert_eq!(forked_history.turns.data.len(), 1);
+        assert_eq!(forked_history.turns.data[0].id, "turn-1");
     }
 }

@@ -1,6 +1,225 @@
 use serde::{Deserialize, Serialize};
 
+use crate::storage::{
+    ThreadSummary, ToolActivitySnapshot, TurnSnapshot, TurnTimelineItem, UserInputSnapshot,
+};
+
 pub const PROTOCOL_VERSION: u32 = 1;
+pub const AGENT_EVENT_SCHEMA_VERSION: u32 = 4;
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HistorySortDirection {
+    Asc,
+    #[default]
+    Desc,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnItemsView {
+    NotLoaded,
+    Summary,
+    #[default]
+    Full,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentMessagePhase {
+    Commentary,
+    FinalAnswer,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(
+    tag = "type",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
+pub enum ThreadItemPayload {
+    UserMessage {
+        message: ChatMessage,
+    },
+    AgentMessage {
+        message: ChatMessage,
+        phase: AgentMessagePhase,
+    },
+    Reasoning {
+        summary: String,
+    },
+    Tool {
+        activity: ToolActivitySnapshot,
+    },
+    Approval {
+        approval: ApprovalSnapshot,
+    },
+    UserInput {
+        user_input: UserInputSnapshot,
+    },
+    Change {
+        change_set: ChangeSet,
+    },
+    ContextCompaction {
+        automatic: bool,
+        compacted_message_count: usize,
+        user_constraint_count: usize,
+        recent_tool_result_count: usize,
+    },
+    Event,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadItem {
+    pub schema_version: u32,
+    pub id: String,
+    pub turn_id: Option<String>,
+    pub status: Option<AgentItemStatus>,
+    pub started_at_ms: Option<u64>,
+    pub completed_at_ms: Option<u64>,
+    pub timeline_items: Vec<TurnTimelineItem>,
+    #[serde(flatten)]
+    pub payload: ThreadItemPayload,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadTurn {
+    pub schema_version: u32,
+    pub id: String,
+    pub user_message_id: Option<String>,
+    pub state: TurnState,
+    pub error: Option<TurnError>,
+    pub started_at_ms: Option<u64>,
+    pub completed_at_ms: Option<u64>,
+    pub duration_ms: Option<u64>,
+    pub items_view: TurnItemsView,
+    pub items: Vec<ThreadItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnHandle {
+    pub schema_version: u32,
+    pub thread_id: String,
+    pub turn_id: String,
+    pub state: TurnState,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum QueuedTurnKind {
+    #[default]
+    Message,
+    Retry,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct QueuedTurn {
+    pub schema_version: u32,
+    pub turn_id: String,
+    pub thread_id: String,
+    #[serde(default)]
+    pub kind: QueuedTurnKind,
+    pub input: String,
+    pub agent_mode: Option<String>,
+    pub attachments: Vec<ImageAttachment>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadMailboxSnapshot {
+    pub schema_version: u32,
+    pub thread_id: String,
+    pub revision: u64,
+    pub active_turn_id: Option<String>,
+    pub pending: Vec<QueuedTurn>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadMailboxChanged {
+    pub schema_version: u32,
+    pub thread_id: String,
+    pub revision: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnSteerRequest {
+    pub thread_id: String,
+    pub expected_turn_id: String,
+    pub input: String,
+    #[serde(default)]
+    pub attachments: Vec<ImageAttachment>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct QueuedTurnSteerRequest {
+    pub thread_id: String,
+    pub expected_turn_id: String,
+    pub queued_turn_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnSteerResponse {
+    pub schema_version: u32,
+    pub thread_id: String,
+    pub turn_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadForkRequest {
+    pub thread_id: String,
+    pub last_turn_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadRollbackRequest {
+    pub thread_id: String,
+    pub num_turns: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadTurnsPage {
+    pub data: Vec<ThreadTurn>,
+    pub next_cursor: Option<String>,
+    pub backwards_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadItemEntry {
+    pub turn_id: Option<String>,
+    pub item: ThreadItem,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadItemsPage {
+    pub data: Vec<ThreadItemEntry>,
+    pub next_cursor: Option<String>,
+    pub backwards_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadHistorySnapshot {
+    pub schema_version: u32,
+    pub summary: ThreadSummary,
+    pub last_turn: Option<TurnSnapshot>,
+    pub todos: Vec<TodoItem>,
+    pub last_usage: Option<TokenUsage>,
+    pub turns: ThreadTurnsPage,
+    pub unscoped_items: Vec<ThreadItem>,
+}
 
 /// 应用层的推理强度，Provider 适配器负责映射到兼容字段。
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -289,6 +508,76 @@ pub struct TokenUsage {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+pub enum TurnErrorCategory {
+    Provider,
+    Authentication,
+    Policy,
+    Tool,
+    Storage,
+    Protocol,
+    Runtime,
+    Legacy,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TurnError {
+    pub code: String,
+    pub message: String,
+    pub retryable: bool,
+    pub category: TurnErrorCategory,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<serde_json::Value>,
+}
+
+impl TurnError {
+    pub fn legacy(message: String) -> Self {
+        Self {
+            code: "legacy_failure".to_string(),
+            message,
+            retryable: true,
+            category: TurnErrorCategory::Legacy,
+            details: None,
+        }
+    }
+
+    pub fn classify(message: String) -> Self {
+        let normalized = message.to_ascii_lowercase();
+        let (code, retryable, category) = if normalized.contains("token_budget_exceeded")
+            || normalized.contains("response_limit")
+        {
+            ("limit_exceeded", false, TurnErrorCategory::Runtime)
+        } else if normalized.contains("api key") || normalized.contains("authentication") {
+            (
+                "authentication_failed",
+                false,
+                TurnErrorCategory::Authentication,
+            )
+        } else if normalized.contains("rate limit") || normalized.contains("status 429") {
+            ("rate_limited", true, TurnErrorCategory::Provider)
+        } else if normalized.contains("approval") || normalized.contains("permission") {
+            ("policy_denied", false, TurnErrorCategory::Policy)
+        } else if normalized.contains("storage") || normalized.contains("jsonl") {
+            ("storage_failure", true, TurnErrorCategory::Storage)
+        } else if normalized.contains("invalid input") || normalized.contains("invalid json") {
+            ("invalid_input", false, TurnErrorCategory::Protocol)
+        } else if normalized.contains("provider") {
+            ("provider_failure", true, TurnErrorCategory::Provider)
+        } else {
+            ("runtime_failure", true, TurnErrorCategory::Runtime)
+        };
+        Self {
+            code: code.to_string(),
+            message,
+            retryable,
+            category,
+            details: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum TurnState {
     Queued,
     Streaming,
@@ -307,6 +596,27 @@ pub enum AgentActivityStatus {
     RunningTool,
     AwaitingApproval,
     Finalizing,
+}
+
+/// Codex 式 Thread Item 的公开类别。事件先统一生命周期，再逐步扩展每类 Item 的增量载荷。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentItemType {
+    AgentMessage,
+    Reasoning,
+    Tool,
+    Approval,
+    Change,
+    ContextCompaction,
+    UserInput,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentItemStatus {
+    Completed,
+    Failed,
+    Cancelled,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -355,7 +665,7 @@ impl AgentEventEnvelope {
     pub fn new(event: AgentEvent) -> Self {
         let phase = event.default_phase();
         Self {
-            schema_version: PROTOCOL_VERSION,
+            schema_version: AGENT_EVENT_SCHEMA_VERSION,
             phase,
             event,
         }
@@ -364,7 +674,7 @@ impl AgentEventEnvelope {
     /// 用指定 phase 构造 envelope（用于覆盖默认推断）。
     pub fn with_phase(event: AgentEvent, phase: TurnPhase) -> Self {
         Self {
-            schema_version: PROTOCOL_VERSION,
+            schema_version: AGENT_EVENT_SCHEMA_VERSION,
             phase,
             event,
         }
@@ -376,6 +686,8 @@ impl AgentEvent {
     fn default_phase(&self) -> TurnPhase {
         match self {
             Self::TurnStarted { .. } => TurnPhase::Exploring,
+            Self::TurnSteered { .. } => TurnPhase::Exploring,
+            Self::TurnRejected { .. } => TurnPhase::Failed,
             Self::ActivityStatusChanged { status, .. } => match status {
                 AgentActivityStatus::Thinking => TurnPhase::Exploring,
                 AgentActivityStatus::Responding | AgentActivityStatus::Finalizing => {
@@ -384,6 +696,16 @@ impl AgentEvent {
                 AgentActivityStatus::RunningTool => TurnPhase::Executing,
                 AgentActivityStatus::AwaitingApproval => TurnPhase::AwaitingInput,
             },
+            Self::ItemStarted { item_type, .. } | Self::ItemCompleted { item_type, .. } => {
+                match item_type {
+                    AgentItemType::Tool | AgentItemType::Approval | AgentItemType::Change => {
+                        TurnPhase::Executing
+                    }
+                    AgentItemType::ContextCompaction => TurnPhase::Executing,
+                    AgentItemType::UserInput => TurnPhase::AwaitingInput,
+                    AgentItemType::AgentMessage | AgentItemType::Reasoning => TurnPhase::Planning,
+                }
+            }
             Self::TextDelta { .. } => TurnPhase::Planning,
             Self::ReasoningSummaryDelta { .. } | Self::ReasoningSummaryCompleted { .. } => {
                 TurnPhase::Planning
@@ -416,6 +738,30 @@ pub enum AgentEvent {
     TurnStarted {
         thread_id: String,
         turn_id: String,
+        user_message: Option<ChatMessage>,
+    },
+    TurnSteered {
+        thread_id: String,
+        turn_id: String,
+        message: ChatMessage,
+    },
+    TurnRejected {
+        thread_id: String,
+        turn_id: String,
+        message: String,
+    },
+    ItemStarted {
+        thread_id: String,
+        turn_id: String,
+        item_id: String,
+        item_type: AgentItemType,
+    },
+    ItemCompleted {
+        thread_id: String,
+        turn_id: String,
+        item_id: String,
+        item_type: AgentItemType,
+        status: AgentItemStatus,
     },
     ActivityStatusChanged {
         thread_id: String,
@@ -425,6 +771,7 @@ pub enum AgentEvent {
     TextDelta {
         thread_id: String,
         turn_id: String,
+        item_id: String,
         delta: String,
     },
     ReasoningSummaryDelta {
@@ -686,6 +1033,24 @@ mod tests {
     }
 
     #[test]
+    fn turn_handle_uses_the_public_async_start_contract() {
+        let handle = TurnHandle {
+            schema_version: PROTOCOL_VERSION,
+            thread_id: "thread-1".into(),
+            turn_id: "turn-1".into(),
+            state: TurnState::Streaming,
+        };
+
+        let value = serde_json::to_value(handle).expect("turn handle should serialize");
+
+        assert_eq!(value["schemaVersion"], PROTOCOL_VERSION);
+        assert_eq!(value["threadId"], "thread-1");
+        assert_eq!(value["turnId"], "turn-1");
+        assert_eq!(value["state"], "streaming");
+        assert!(value.get("error").is_none());
+    }
+
+    #[test]
     fn agent_event_envelope_is_versioned_and_flattened() {
         let event = AgentEventEnvelope::new(AgentEvent::TurnCancelled {
             thread_id: "thread-1".to_string(),
@@ -697,12 +1062,38 @@ mod tests {
 
         let value = serde_json::to_value(event).expect("agent event should serialize");
 
-        assert_eq!(value["schemaVersion"], PROTOCOL_VERSION);
+        assert_eq!(value["schemaVersion"], AGENT_EVENT_SCHEMA_VERSION);
         assert_eq!(value["type"], "turn_cancelled");
         assert_eq!(value["threadId"], "thread-1");
         assert_eq!(value["startedAtMs"], 10);
         assert_eq!(value["completedAtMs"], 25);
         assert_eq!(value["durationMs"], 15);
+    }
+
+    #[test]
+    fn assistant_item_lifecycle_uses_a_stable_public_identity() {
+        let started = serde_json::to_value(AgentEventEnvelope::new(AgentEvent::ItemStarted {
+            thread_id: "thread-1".into(),
+            turn_id: "turn-1".into(),
+            item_id: "message-1".into(),
+            item_type: AgentItemType::AgentMessage,
+        }))
+        .unwrap();
+        let completed = serde_json::to_value(AgentEventEnvelope::new(AgentEvent::ItemCompleted {
+            thread_id: "thread-1".into(),
+            turn_id: "turn-1".into(),
+            item_id: "message-1".into(),
+            item_type: AgentItemType::AgentMessage,
+            status: AgentItemStatus::Completed,
+        }))
+        .unwrap();
+
+        assert_eq!(started["type"], "item_started");
+        assert_eq!(started["itemId"], "message-1");
+        assert_eq!(started["itemType"], "agent_message");
+        assert_eq!(completed["type"], "item_completed");
+        assert_eq!(completed["itemId"], started["itemId"]);
+        assert_eq!(completed["status"], "completed");
     }
 
     #[test]
@@ -722,6 +1113,22 @@ mod tests {
         assert_eq!(value["callId"], "call-1");
         assert_eq!(value["stream"], "stderr");
         assert_eq!(value["cursor"], 7);
+    }
+
+    #[test]
+    fn assistant_text_delta_exposes_the_stable_item_id() {
+        let event = AgentEventEnvelope::new(AgentEvent::TextDelta {
+            thread_id: "thread-1".into(),
+            turn_id: "turn-1".into(),
+            item_id: "agent-message-1".into(),
+            delta: "hello".into(),
+        });
+        let value = serde_json::to_value(event).unwrap();
+
+        assert_eq!(value["schemaVersion"], AGENT_EVENT_SCHEMA_VERSION);
+        assert_eq!(value["type"], "text_delta");
+        assert_eq!(value["itemId"], "agent-message-1");
+        assert_eq!(value["delta"], "hello");
     }
 
     #[test]
@@ -745,5 +1152,67 @@ mod tests {
         assert_eq!(value["userConstraintCount"], 2);
         assert_eq!(value["recentToolResultCount"], 3);
         assert!(value.get("summary").is_none());
+    }
+
+    #[test]
+    fn mailbox_and_thread_control_requests_use_camel_case_contracts() {
+        let steer = serde_json::to_value(TurnSteerRequest {
+            thread_id: "thread-1".into(),
+            expected_turn_id: "turn-1".into(),
+            input: "adjust".into(),
+            attachments: Vec::new(),
+        })
+        .unwrap();
+        let queued_steer = serde_json::to_value(QueuedTurnSteerRequest {
+            thread_id: "thread-1".into(),
+            expected_turn_id: "turn-1".into(),
+            queued_turn_id: "turn-2".into(),
+        })
+        .unwrap();
+        let fork = serde_json::to_value(ThreadForkRequest {
+            thread_id: "thread-1".into(),
+            last_turn_id: Some("turn-1".into()),
+        })
+        .unwrap();
+        let rollback = serde_json::to_value(ThreadRollbackRequest {
+            thread_id: "thread-1".into(),
+            num_turns: 2,
+        })
+        .unwrap();
+        let mailbox = serde_json::to_value(ThreadMailboxSnapshot {
+            schema_version: PROTOCOL_VERSION,
+            thread_id: "thread-1".into(),
+            revision: 7,
+            active_turn_id: Some("turn-1".into()),
+            pending: vec![QueuedTurn {
+                schema_version: PROTOCOL_VERSION,
+                turn_id: "turn-2".into(),
+                thread_id: "thread-1".into(),
+                kind: QueuedTurnKind::Message,
+                input: "next".into(),
+                agent_mode: None,
+                attachments: Vec::new(),
+            }],
+        })
+        .unwrap();
+        let steer_response = serde_json::to_value(TurnSteerResponse {
+            schema_version: PROTOCOL_VERSION,
+            thread_id: "thread-1".into(),
+            turn_id: "turn-1".into(),
+        })
+        .unwrap();
+
+        assert_eq!(steer["expectedTurnId"], "turn-1");
+        assert_eq!(queued_steer["expectedTurnId"], "turn-1");
+        assert_eq!(queued_steer["queuedTurnId"], "turn-2");
+        assert_eq!(fork["lastTurnId"], "turn-1");
+        assert_eq!(rollback["numTurns"], 2);
+        assert_eq!(mailbox["schemaVersion"], PROTOCOL_VERSION);
+        assert_eq!(mailbox["revision"], 7);
+        assert_eq!(mailbox["pending"][0]["schemaVersion"], PROTOCOL_VERSION);
+        assert_eq!(mailbox["pending"][0]["kind"], "message");
+        assert_eq!(mailbox["activeTurnId"], "turn-1");
+        assert_eq!(steer_response["schemaVersion"], PROTOCOL_VERSION);
+        assert_eq!(steer_response["threadId"], "thread-1");
     }
 }

@@ -41,7 +41,7 @@ enabled: true
 | **钉钉输出目录 folderId** | **`outputFolderId`** | **`3xRN9bGQyw4Jbo6OQa6N8zXPADKnorv6`** |
 | 仅本地不写钉钉 | `skipDingtalkWrite` | `false` |
 | 变更记录修改人 | `defaultAuthor` | 空（用当前用户） |
-| 离线模板 | — | 本 skill `templates/详细设计模板.md` |
+| 离线模板 | — | 本 skill `templates/detailed-design-template.md` |
 
 模板 URL（默认）：https://alidocs.dingtalk.com/i/nodes/qnYMoO1rWxDlAnXpc3AwgNEnW47Z3je9  
 输出目录 URL（默认）：https://alidocs.dingtalk.com/i/nodes/3xRN9bGQyw4Jbo6OQa6N8zXPADKnorv6  
@@ -179,7 +179,7 @@ arguments: { "nodeId": "<需求URL或nodeId>", "format": "markdown" }
 
 | 模式 | 方式 |
 |------|------|
-| **默认** | 读 `templates/详细设计模板.md` |
+| **默认** | 读 `templates/detailed-design-template.md` |
 | 同步钉钉最新 | MCP `get_document_content(nodeId=qnYMoO1rWxDlAnXpc3AwgNEnW47Z3je9)` |
 
 **结构约束**：
@@ -264,7 +264,7 @@ arguments: { "folderId": "<开发提测文档或需求分组子文件夹 nodeId>
 
 **禁止**将「详细设计模板 1.7.2」以模板名称留存在开发提测文档目录：
 - `copy_document` 仅为中间步骤，复制后**必须立即** `rename_document` 为 `{设计主题}开发设计`
-- **禁止**用 `create_document` / 本地 `templates/详细设计模板.md` 整篇上传到开发提测文档
+- **禁止**用 `create_document` / 本地 `templates/detailed-design-template.md` 整篇上传到开发提测文档
 - 生成完成后 `list_nodes` 清理名称匹配 `详细设计模板` 的误留副本（`delete_document`）
 
 按顺序执行：

@@ -834,8 +834,18 @@ pub(crate) fn configure_process_group(command: &mut Command) {
 #[cfg(windows)]
 pub(crate) fn configure_process_group(command: &mut Command) {
     const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-    command.creation_flags(CREATE_NEW_PROCESS_GROUP);
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    command.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
 }
+
+#[cfg(windows)]
+pub(crate) fn hide_console_window(command: &mut Command) {
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    command.creation_flags(CREATE_NO_WINDOW);
+}
+
+#[cfg(unix)]
+pub(crate) fn hide_console_window(_command: &mut Command) {}
 
 #[cfg(unix)]
 pub(crate) async fn terminate_tree(pid: u32) {
@@ -846,13 +856,14 @@ pub(crate) async fn terminate_tree(pid: u32) {
 
 #[cfg(windows)]
 pub(crate) async fn terminate_tree(pid: u32) {
-    let _ = Command::new("taskkill")
+    let mut command = Command::new("taskkill");
+    command
         .args(["/PID", &pid.to_string(), "/T", "/F"])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .await;
+        .stderr(Stdio::null());
+    hide_console_window(&mut command);
+    let _ = command.status().await;
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

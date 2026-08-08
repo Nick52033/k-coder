@@ -429,14 +429,18 @@ pub fn extract_attachment(
 pub fn open_external(root: &Path, relative: &str, reveal: bool) -> Result<(), WorkbenchError> {
     let path = resolve(root, relative, false)?;
     #[cfg(target_os = "windows")]
-    let status = if reveal {
-        Command::new("explorer")
-            .arg(format!("/select,{}", path.display()))
-            .status()
-    } else {
-        Command::new("cmd")
-            .args(["/C", "start", "", &path.to_string_lossy()])
-            .status()
+    let status = {
+        let mut command = if reveal {
+            let mut command = Command::new("explorer");
+            command.arg(format!("/select,{}", path.display()));
+            command
+        } else {
+            let mut command = Command::new("cmd");
+            command.args(["/C", "start", "", &path.to_string_lossy()]);
+            command
+        };
+        hide_console_window(&mut command);
+        command.status()
     };
     #[cfg(target_os = "macos")]
     let status = if reveal {
@@ -678,10 +682,21 @@ pub fn git_action(
     }
 }
 
+#[cfg(target_os = "windows")]
+fn hide_console_window(command: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    command.creation_flags(CREATE_NO_WINDOW);
+}
+
 fn git(root: &Path, args: &[&str]) -> Result<String, WorkbenchError> {
-    let output = Command::new("git")
+    let mut command = Command::new("git");
+    command
         .args(["--literal-pathspecs", "-C", &root.to_string_lossy()])
-        .args(args)
+        .args(args);
+    #[cfg(target_os = "windows")]
+    hide_console_window(&mut command);
+    let output = command
         .output()
         .map_err(|error| WorkbenchError::Git(error.to_string()))?;
     if !output.status.success() {

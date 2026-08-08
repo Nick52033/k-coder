@@ -1,7 +1,6 @@
 import { create } from "zustand";
 import {
   archiveThread as archiveThreadCommand,
-  cancelTurn,
   createThread as createThreadCommand,
   errorMessage,
   getProviderCatalog,
@@ -10,14 +9,21 @@ import {
   activateProvider as activateProviderCommand,
   deleteProvider as deleteProviderCommand,
   listThreads,
+  listThreadTurns,
   readThread,
+  readThreadHistory,
   searchThreads,
   renameThread,
   deleteThread,
   resolveApproval,
   resolveUserInput,
   retryTurn,
-  runTurn,
+  startTurn,
+  readThreadMailbox,
+  removeQueuedTurn,
+  clearThreadMailbox,
+  steerQueuedTurn,
+  interruptTurn,
   saveProviderConfig,
   setApprovalMode as setApprovalModeCommand,
   setReasoningEffort as setReasoningEffortCommand,
@@ -43,6 +49,8 @@ import type {
   ProviderConfigView,
   SaveProviderConfigRequest,
   ThreadSummary,
+  ThreadItem,
+  ThreadTurn,
   ToolActivity,
   ToolResult,
   ToolOutputStream,
@@ -55,13 +63,21 @@ import type {
   PlanView,
   UserInputRequest,
   UserInputResolution,
+  UserInputSnapshot,
   TodoItem,
+  ThreadMailboxChanged,
 } from "../types/runtime";
+import {
+  reduceAgentEvent,
+  reduceTurnLifecycle,
+  type ReducerHelpers,
+} from "./reducers/agentEventReducer";
 
 interface QueuedMessage {
   id: string;
   messageId: string;
   threadId: string;
+  kind: "message" | "retry";
   input: string;
   attachments: ImageAttachment[];
   agentMode?: string;
@@ -79,6 +95,7 @@ interface WorkbenchState {
   activeTurnThreadId: string | null;
   activeTurns: Record<string, string>;
   cancellingTurns: Record<string, string>;
+  mailboxRevisions: Record<string, number>;
   messageQueue: QueuedMessage[];
   usage: TokenUsage | null;
   turnTimeline: TurnTimelineItem[];
@@ -97,6 +114,8 @@ interface WorkbenchState {
   plan: PlanView | null;
   goal: GoalView | null;
   todos: Map<string, TodoItem[]>; // key: threadId
+  historyNextCursor: string | null;
+  historyLoading: boolean;
   loading: boolean;
   error: string;
   initialize: () => Promise<void>;
@@ -106,9 +125,10 @@ interface WorkbenchState {
   deleteConversation: (threadId: string) => Promise<void>;
   createThread: () => Promise<string>;
   selectThread: (threadId: string) => Promise<void>;
+  loadOlderHistory: () => Promise<void>;
   archiveActiveThread: () => Promise<void>;
   sendMessage: (input: string, attachments?: ImageAttachment[], agentMode?: string) => Promise<void>;
-  processQueue: () => Promise<void>;
+  processQueue: (threadId?: string, minimumRevision?: number) => Promise<void>;
   sendQueuedMessageNow: (messageId: string) => Promise<void>;
   removeQueuedMessage: (messageId: string) => void;
   clearQueue: () => void;
@@ -126,6 +146,7 @@ interface WorkbenchState {
   resolvePendingUserInput: (resolution: UserInputResolution) => Promise<boolean>;
   undoAppliedChange: (changeId: string) => Promise<boolean>;
   handleAgentEvent: (event: AgentEvent) => void;
+  handleMailboxChanged: (event: ThreadMailboxChanged) => void;
   clearError: () => void;
   forceResetState: () => Promise<void>;
 }
@@ -147,7 +168,6 @@ function toConversationMessage(message: ChatMessage, turnId?: string): Conversat
 }
 
 const MAX_LIVE_TOOL_OUTPUT_CHARS = 64 * 1024;
-const MAX_REASONING_SUMMARY_CHARS = 64 * 1024;
 
 function appendToolOutput(
   activity: ToolActivity,
@@ -274,6 +294,84 @@ function normalizeApprovalTimeline(timeline: TurnTimelineItem[], approvals: Appr
   return normalized;
 }
 
+interface ProjectedThreadHistory {
+  messages: ConversationMessage[];
+  turnTimeline: TurnTimelineItem[];
+  turnUserMessageIds: Record<string, string>;
+  approvals: ApprovalSnapshot[];
+  userInputs: UserInputSnapshot[];
+  changes: ChangeSet[];
+}
+
+function projectHistoryTurns(turns: ThreadTurn[], unscopedItems: ThreadItem[] = []): ProjectedThreadHistory {
+  const projected: ProjectedThreadHistory = {
+    messages: [],
+    turnTimeline: [],
+    turnUserMessageIds: {},
+    approvals: [],
+    userInputs: [],
+    changes: [],
+  };
+  const messageIds = new Set<string>();
+  const timelineIds = new Set<string>();
+  const approvalIds = new Set<string>();
+  const userInputIds = new Set<string>();
+  const changeIds = new Set<string>();
+
+  const projectItem = (item: ThreadItem, turnId?: string) => {
+    if (item.type === "user_message" && !messageIds.has(item.message.id)) {
+      messageIds.add(item.message.id);
+      projected.messages.push(toConversationMessage(item.message));
+    } else if (item.type === "agent_message" && item.phase === "final_answer" && !messageIds.has(item.message.id)) {
+      messageIds.add(item.message.id);
+      projected.messages.push(toConversationMessage(item.message, turnId ?? item.turnId ?? undefined));
+    } else if (item.type === "approval" && !approvalIds.has(item.approval.request.id)) {
+      approvalIds.add(item.approval.request.id);
+      projected.approvals.push(item.approval);
+    } else if (item.type === "user_input" && !userInputIds.has(item.userInput.request.id)) {
+      userInputIds.add(item.userInput.request.id);
+      projected.userInputs.push(item.userInput);
+    } else if (item.type === "change" && !changeIds.has(item.changeSet.id)) {
+      changeIds.add(item.changeSet.id);
+      projected.changes.push(item.changeSet);
+    }
+
+    for (const timelineItem of item.timelineItems) {
+      const key = timelineItemKey(timelineItem);
+      if (timelineIds.has(key)) continue;
+      timelineIds.add(key);
+      projected.turnTimeline.push(timelineItem);
+    }
+  };
+
+  for (const turn of turns) {
+    if (turn.userMessageId) projected.turnUserMessageIds[turn.id] = turn.userMessageId;
+    for (const item of turn.items) {
+      projectItem(item, turn.id);
+    }
+  }
+  for (const item of unscopedItems) projectItem(item);
+  projected.messages.sort((left, right) => left.createdAtMs - right.createdAtMs);
+  return projected;
+}
+
+function timelineItemKey(item: TurnTimelineItem) {
+  if (item.type === "text") return `text:${item.turnId}:${item.id}`;
+  if (item.type === "reasoning") return `reasoning:${item.turnId}:${item.itemId}`;
+  if (item.type === "tool") return `tool:${item.activity.turnId}:${item.activity.call.id}`;
+  return `event:${item.turnId}:${item.itemId}`;
+}
+
+function prependUnique<T>(older: T[], current: T[], key: (item: T) => string) {
+  const seen = new Set<string>();
+  return [...older, ...current].filter((item) => {
+    const value = key(item);
+    if (seen.has(value)) return false;
+    seen.add(value);
+    return true;
+  });
+}
+
 function finishRunningTools(
   timeline: TurnTimelineItem[],
   turnId: string,
@@ -322,7 +420,35 @@ function moveTimelineItemAfterRequest(timeline: TurnTimelineItem[], itemId: stri
 let initializationPromise: Promise<void> | null = null;
 let hydrationSequence = 0;
 const hydrationBuffers = new Map<string, { token: number; events: AgentEvent[] }>();
-const processingQueueThreads = new Set<string>();
+const terminalTurnIds = new Set<string>();
+
+function mailboxMessages(threadId: string, pending: Array<{
+  turnId: string;
+  kind?: "message" | "retry";
+  input: string;
+  attachments: ImageAttachment[];
+  agentMode: string | null;
+}>): QueuedMessage[] {
+  return pending.map((item) => ({
+    id: item.turnId,
+    messageId: item.turnId,
+    threadId,
+    kind: item.kind ?? "message",
+    input: item.input,
+    attachments: item.attachments,
+    agentMode: item.agentMode ?? undefined,
+    status: "pending",
+    turnId: item.turnId,
+  }));
+}
+
+function rememberTerminalTurn(turnId: string) {
+  terminalTurnIds.add(turnId);
+  if (terminalTurnIds.size > 200) {
+    const oldest = terminalTurnIds.values().next().value;
+    if (oldest) terminalTurnIds.delete(oldest);
+  }
+}
 function withoutActiveTurn(activeTurns: Record<string, string>, threadId: string) {
   if (!(threadId in activeTurns)) return activeTurns;
   const next = { ...activeTurns };
@@ -391,6 +517,7 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
   activeTurnThreadId: null,
   activeTurns: {},
   cancellingTurns: {},
+  mailboxRevisions: {},
   messageQueue: [],
   usage: null,
   turnTimeline: [],
@@ -409,6 +536,8 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
   plan: null,
   goal: null,
   todos: new Map(),
+  historyNextCursor: null,
+  historyLoading: false,
   loading: true,
   error: "",
 
@@ -490,6 +619,8 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
         changes: [],
         plan: null,
         goal: null,
+        historyNextCursor: null,
+        historyLoading: false,
         error: "",
       }));
       return thread.id;
@@ -502,30 +633,51 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
   selectThread: async (threadId) => {
     const token = ++hydrationSequence;
     hydrationBuffers.set(threadId, { token, events: [] });
-    set({
-      activeThreadId: threadId,
-      loading: true,
-      error: "",
-      usage: null,
-      activityStatus: null,
-      pendingApproval: null,
-      pendingApprovals: [],
-      pendingUserInput: null,
-      pendingUserInputs: [],
+    set((state) => {
+      const todos = new Map(state.todos);
+      todos.delete(threadId);
+      return {
+        activeThreadId: threadId,
+        loading: true,
+        error: "",
+        messages: [],
+        lastTurn: null,
+        activeTurnId: null,
+        activeTurnThreadId: null,
+        usage: null,
+        turnTimeline: [],
+        turnUserMessageIds: {},
+        activityStatus: null,
+        pendingApproval: null,
+        pendingApprovals: [],
+        pendingUserInput: null,
+        pendingUserInputs: [],
+        changes: [],
+        todos,
+        plan: null,
+        goal: null,
+        historyNextCursor: null,
+        historyLoading: false,
+        messageQueue: state.messageQueue.filter((message) => message.threadId !== threadId),
+      };
     });
     try {
-      const [detail, plan, goal] = await Promise.all([
-        readThread(threadId),
+      const [history, plan, goal, mailbox] = await Promise.all([
+        readThreadHistory(threadId).catch(() => null),
         getPlan(threadId),
         getGoal(threadId),
+        readThreadMailbox(threadId).catch(() => null),
       ]);
+      const detail = history ? null : await readThread(threadId);
       if (get().activeThreadId !== threadId) return;
       const hydration = hydrationBuffers.get(threadId);
       if (!hydration || hydration.token !== token) return;
-      const restoredActiveTurnId = detail.lastTurn
-        && ["queued", "streaming", "running_tool", "awaiting_approval"].includes(detail.lastTurn.state)
-        ? detail.lastTurn.turnId
-        : null;
+      const lastTurn = history ? history.lastTurn : detail!.lastTurn;
+      const summary = history ? history.summary : detail!.summary;
+      const restoredActiveTurnId = mailbox?.activeTurnId ?? (lastTurn
+        && ["queued", "streaming", "running_tool", "awaiting_approval"].includes(lastTurn.state)
+        ? lastTurn.turnId
+        : null);
       const activeTurns = restoredActiveTurnId
         ? { ...get().activeTurns, [threadId]: restoredActiveTurnId }
         : withoutActiveTurn(get().activeTurns, threadId);
@@ -534,44 +686,60 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
           ? get().cancellingTurns
           : withoutActiveTurn(get().cancellingTurns, threadId);
 
-      const pendingApprovals = detail.approvals
+      const projected = history
+        ? projectHistoryTurns([...history.turns.data].reverse(), history.unscopedItems)
+        : null;
+      const approvals = projected?.approvals ?? detail!.approvals;
+      const userInputs = projected?.userInputs ?? detail!.userInputs ?? [];
+      const pendingApprovals = approvals
         .filter((approval) => !approval.resolution)
         .map((approval) => approval.request);
-      const pendingUserInputs = (detail.userInputs ?? [])
+      const pendingUserInputs = userInputs
         .filter((input) => !input.resolution)
         .map((input) => input.request);
       const todos = new Map(get().todos);
-      todos.set(threadId, detail.todos ?? []);
+      todos.set(threadId, history ? history.todos : detail!.todos ?? []);
       hydrationBuffers.delete(threadId);
-      const restoredTimeline = detail.turnTimeline?.length
-        ? normalizeApprovalTimeline(detail.turnTimeline, detail.approvals)
-        : detail.toolActivities.map((activity) => ({ type: "tool" as const, activity }));
-      const terminalTimeline = detail.lastTurn?.state === "cancelled"
-        ? finishRunningTools(restoredTimeline, detail.lastTurn.turnId, "cancelled", detail.summary.updatedAtMs)
-        : detail.lastTurn?.state === "failed" || detail.lastTurn?.state === "completed"
-          ? finishRunningTools(restoredTimeline, detail.lastTurn.turnId, "failed", detail.summary.updatedAtMs)
+      const restoredTimeline = projected?.turnTimeline ?? (detail!.turnTimeline?.length
+        ? normalizeApprovalTimeline(detail!.turnTimeline, detail!.approvals)
+        : detail!.toolActivities.map((activity) => ({ type: "tool" as const, activity })));
+      const terminalTimeline = history
+        ? restoredTimeline
+        : lastTurn?.state === "cancelled"
+        ? finishRunningTools(restoredTimeline, lastTurn.turnId, "cancelled", summary.updatedAtMs)
+        : lastTurn?.state === "failed" || lastTurn?.state === "completed"
+          ? finishRunningTools(restoredTimeline, lastTurn.turnId, "failed", summary.updatedAtMs)
           : restoredTimeline;
       set({
-        messages: detail.messages.map((message) =>
-          toConversationMessage(message, detail.messageTurnIds?.[message.id]),
+        messages: projected?.messages ?? detail!.messages.map((message) =>
+          toConversationMessage(message, detail!.messageTurnIds?.[message.id]),
         ),
-        lastTurn: detail.lastTurn,
+        lastTurn,
         turnTimeline: terminalTimeline,
-        turnUserMessageIds: detail.turnUserMessageIds ?? {},
+        turnUserMessageIds: projected?.turnUserMessageIds ?? detail!.turnUserMessageIds ?? {},
         activityStatus: restoredActiveTurnId
-          ? { turnId: detail.lastTurn!.turnId, status: statusForTurnState(detail.lastTurn!.state) ?? "thinking" }
+          ? { turnId: lastTurn!.turnId, status: statusForTurnState(lastTurn!.state) ?? "thinking" }
           : null,
         ...approvalQueueState(pendingApprovals),
         ...userInputQueueState(pendingUserInputs),
-        changes: detail.changes,
+        changes: projected?.changes ?? detail!.changes,
         todos,
-        usage: detail.lastUsage ?? null,
+        usage: history ? history.lastUsage : detail!.lastUsage ?? null,
+        historyNextCursor: history?.turns.nextCursor ?? null,
         plan,
         goal,
         activeTurns,
         cancellingTurns,
+        mailboxRevisions: {
+          ...get().mailboxRevisions,
+          [threadId]: mailbox?.revision ?? 0,
+        },
         activeTurnId: restoredActiveTurnId,
         activeTurnThreadId: restoredActiveTurnId ? threadId : null,
+        messageQueue: [
+          ...get().messageQueue.filter((message) => message.threadId !== threadId),
+          ...mailboxMessages(threadId, mailbox?.pending ?? []),
+        ],
       });
       for (const event of hydration.events) get().handleAgentEvent(event);
     } catch (error) {
@@ -579,6 +747,33 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
     } finally {
       if (hydrationBuffers.get(threadId)?.token === token) hydrationBuffers.delete(threadId);
       if (get().activeThreadId === threadId) set({ loading: false });
+    }
+  },
+
+  loadOlderHistory: async () => {
+    const { activeThreadId: threadId, historyNextCursor: cursor, historyLoading } = get();
+    if (!threadId || !cursor || historyLoading) return;
+    set({ historyLoading: true, error: "" });
+    try {
+      const page = await listThreadTurns(threadId, {
+        cursor,
+        limit: 50,
+        sortDirection: "desc",
+        itemsView: "full",
+      });
+      if (get().activeThreadId !== threadId) return;
+      const older = projectHistoryTurns([...page.data].reverse());
+      set((state) => ({
+        messages: prependUnique(older.messages, state.messages, (message) => message.id),
+        turnTimeline: prependUnique(older.turnTimeline, state.turnTimeline, timelineItemKey),
+        turnUserMessageIds: { ...older.turnUserMessageIds, ...state.turnUserMessageIds },
+        changes: prependUnique(older.changes, state.changes, (change) => change.id),
+        historyNextCursor: page.nextCursor,
+      }));
+    } catch (error) {
+      set({ error: errorMessage(error) });
+    } finally {
+      if (get().activeThreadId === threadId) set({ historyLoading: false });
     }
   },
 
@@ -600,186 +795,100 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
   },
 
   sendMessage: async (input, attachments = [], agentMode) => {
-    const { activeThreadId: threadId, activeTurns } = get();
+    const { activeThreadId: threadId } = get();
     const text = input.trim();
     if (!threadId || (!text && attachments.length === 0)) return;
-    const shouldQueueOnly = Boolean(activeTurns[threadId] || processingQueueThreads.has(threadId));
-
-    // 创建队列项
-    const queuedMessage: QueuedMessage = {
-      id: `queue-${crypto.randomUUID()}`,
-      messageId: `pending-${crypto.randomUUID()}`,
-      threadId,
-      input: text,
-      attachments,
-      agentMode,
-      status: "pending",
-    };
-
-    // 添加到队列
-    set((state) => ({
-      messageQueue: [...state.messageQueue, queuedMessage],
-      error: "",
-    }));
-
-    if (shouldQueueOnly) return;
-
-    void get().processQueue();
-  },
-
-  processQueue: async () => {
-    let nextMessage: QueuedMessage | undefined;
+    set({ error: "" });
     try {
-      const { messageQueue, activeTurns } = get();
-      nextMessage = messageQueue.find((message) => message.status === "pending"
-        && !activeTurns[message.threadId]
-        && !processingQueueThreads.has(message.threadId));
-      if (!nextMessage) return;
-      const queuedMessage = nextMessage;
-      processingQueueThreads.add(queuedMessage.threadId);
-
-      console.log("[Queue] 开始处理消息:", queuedMessage.id);
-      set((state) => ({
-        messageQueue: state.messageQueue.map(msg =>
-          msg.id === queuedMessage.id ? { ...msg, status: "processing" as const } : msg
-        ),
-        messages: state.activeThreadId !== queuedMessage.threadId
-          ? state.messages
-          : state.messages.some((message) => message.id === queuedMessage.messageId)
-          ? state.messages
-          : [
-              ...state.messages,
-              {
-                id: queuedMessage.messageId,
-                role: "user" as const,
-                text: queuedMessage.input,
-                attachments: queuedMessage.attachments.map(({ name, dataUrl }) => ({ name, dataUrl })),
-                createdAtMs: Date.now(),
-              },
-            ],
-      }));
-
-      const outcome = await runTurn(
-        queuedMessage.threadId,
-        queuedMessage.input,
-        queuedMessage.attachments,
-        queuedMessage.agentMode
-      );
-
-      console.log("[Queue] Turn 完成:", outcome.turnId);
-
-      // 标记为完成并清理
-      set((state) => ({
-        messageQueue: state.messageQueue.map(msg =>
-          msg.id === queuedMessage.id
-            ? { ...msg, status: "completed" as const, turnId: outcome.turnId }
-            : msg
-        ).filter(
-          // 立即清理已完成的消息，只保留最近3条
-          (msg, idx, arr) => msg.status !== "completed" || idx >= arr.length - 3
-        ),
-        activeTurns: state.activeTurns[queuedMessage.threadId] === outcome.turnId
-          ? withoutActiveTurn(state.activeTurns, queuedMessage.threadId)
-          : state.activeTurns,
-        cancellingTurns: withoutActiveTurn(state.cancellingTurns, queuedMessage.threadId),
-      }));
-      
-      const outcomeError = outcome.error;
-
-      // 重新加载线程，但不要重新设置 activeTurnId
-      await get().reloadThreads();
-      if (get().activeThreadId === queuedMessage.threadId) {
-        await get().selectThread(queuedMessage.threadId);
-      }
-
-      if (outcomeError) {
-        if (get().activeThreadId === queuedMessage.threadId) set({ error: outcomeError });
-        // 如果有错误，标记为失败
+      const handle = await startTurn(threadId, text, attachments, agentMode);
+      if (handle.state === "queued") {
+        await get().processQueue();
+      } else if (!terminalTurnIds.has(handle.turnId)) {
         set((state) => ({
-          messageQueue: state.messageQueue.map(msg =>
-            msg.id === queuedMessage.id
-              ? { ...msg, status: "failed" as const, error: outcomeError ?? undefined }
-              : msg
-          ),
+          activeTurns: { ...state.activeTurns, [threadId]: handle.turnId },
+          cancellingTurns: withoutActiveTurn(state.cancellingTurns, threadId),
         }));
       }
-
     } catch (error) {
-      console.error("[Queue] 处理消息失败:", error);
-
-      if (!nextMessage) {
-        set({ error: errorMessage(error) });
-        return;
-      }
-      const failedMessage = nextMessage;
-      const errorMsg = errorMessage(error);
-
-      // 标记为失败
-      set((state) => ({
-        messageQueue: state.messageQueue.map(msg =>
-          msg.id === failedMessage.id
-            ? { ...msg, status: "failed" as const, error: errorMsg }
-            : msg
-        ),
-        activeTurns: withoutActiveTurn(state.activeTurns, failedMessage.threadId),
-        cancellingTurns: withoutActiveTurn(state.cancellingTurns, failedMessage.threadId),
-        activeTurnId: state.activeThreadId === failedMessage.threadId ? null : state.activeTurnId,
-        activeTurnThreadId: state.activeThreadId === failedMessage.threadId ? null : state.activeTurnThreadId,
-      }));
-
-      if (get().activeThreadId === failedMessage.threadId) {
-        await get().selectThread(failedMessage.threadId);
-      }
-
-      // selectThread 会清除 error，所以在之后重新设置
-      if (get().activeThreadId === failedMessage.threadId) set({ error: errorMsg });
-    } finally {
-      if (nextMessage) {
-        processingQueueThreads.delete(nextMessage.threadId);
-        setTimeout(() => get().processQueue(), 0);
-      }
+      set({ error: errorMessage(error) });
     }
+  },
+
+  processQueue: async (targetThreadId, minimumRevision = 0) => {
+    const threadId = targetThreadId ?? get().activeThreadId;
+    if (!threadId) return;
+    try {
+      const mailbox = await readThreadMailbox(threadId);
+      set((state) => {
+        const expectedRevision = Math.max(
+          minimumRevision,
+          state.mailboxRevisions[threadId] ?? 0,
+        );
+        if (mailbox.revision < expectedRevision) return {};
+        return {
+          mailboxRevisions: {
+            ...state.mailboxRevisions,
+            [threadId]: mailbox.revision,
+          },
+          messageQueue: [
+            ...state.messageQueue.filter((message) => message.threadId !== threadId),
+            ...mailboxMessages(threadId, mailbox.pending),
+          ],
+        };
+      });
+    } catch (error) {
+      set({ error: errorMessage(error) });
+    }
+  },
+
+  handleMailboxChanged: (event) => {
+    const knownRevision = get().mailboxRevisions[event.threadId] ?? 0;
+    if (event.revision <= knownRevision) return;
+    set((state) => ({
+      mailboxRevisions: {
+        ...state.mailboxRevisions,
+        [event.threadId]: event.revision,
+      },
+    }));
+    void get().processQueue(event.threadId, event.revision);
   },
 
   sendQueuedMessageNow: async (messageId) => {
     const queuedMessage = get().messageQueue.find((message) =>
       message.id === messageId && message.status === "pending"
     );
-    if (!queuedMessage) return;
-
-    set((state) => {
-      const target = state.messageQueue.find((message) => message.id === messageId);
-      if (!target) return state;
-      const messageQueue = state.messageQueue.filter((message) => message.id !== messageId);
-      const firstPendingIndex = messageQueue.findIndex((message) =>
-        message.threadId === target.threadId && message.status === "pending"
-      );
-      messageQueue.splice(firstPendingIndex < 0 ? messageQueue.length : firstPendingIndex, 0, target);
-      return { messageQueue };
-    });
+    if (!queuedMessage || queuedMessage.kind !== "message") return;
 
     const activeTurnId = get().activeTurns[queuedMessage.threadId];
     if (activeTurnId) {
-      await get().stopTurn(queuedMessage.threadId);
-      return;
+      try {
+        await steerQueuedTurn(
+          queuedMessage.threadId,
+          activeTurnId,
+          queuedMessage.turnId ?? queuedMessage.id,
+        );
+        await get().processQueue();
+      } catch (error) {
+        set({ error: errorMessage(error) });
+        await get().processQueue();
+      }
     }
-    void get().processQueue();
   },
 
   removeQueuedMessage: (messageId) => {
-    set((state) => ({
-      messageQueue: state.messageQueue.filter((message) =>
-        message.id !== messageId || message.status !== "pending"
-      ),
-    }));
+    const queued = get().messageQueue.find((message) => message.id === messageId);
+    if (!queued) return;
+    void removeQueuedTurn(queued.threadId, queued.turnId ?? queued.id)
+      .then(() => get().processQueue())
+      .catch((error) => set({ error: errorMessage(error) }));
   },
 
   clearQueue: () => {
-    set((state) => ({
-      messageQueue: state.messageQueue.filter((message) =>
-        message.threadId !== state.activeThreadId || message.status !== "pending"
-      ),
-    }));
+    const threadId = get().activeThreadId;
+    if (!threadId) return;
+    void clearThreadMailbox(threadId)
+      .then(() => get().processQueue())
+      .catch((error) => set({ error: errorMessage(error) }));
   },
 
   retryLastTurn: async () => {
@@ -787,27 +896,17 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
     if (!threadId || get().activeTurns[threadId]) return;
     set({ error: "", usage: null });
     try {
-      const outcome = await retryTurn(threadId);
-      set((state) => ({
-        activeTurns: state.activeTurns[threadId] === outcome.turnId
-          ? withoutActiveTurn(state.activeTurns, threadId)
-          : state.activeTurns,
-        cancellingTurns: withoutActiveTurn(state.cancellingTurns, threadId),
-      }));
-      await get().reloadThreads();
-      if (get().activeThreadId === threadId) {
-        await get().selectThread(threadId);
-        if (outcome.error) set({ error: outcome.error });
+      const handle = await retryTurn(threadId);
+      if (handle.state === "queued") {
+        await get().processQueue();
+      } else if (!terminalTurnIds.has(handle.turnId)) {
+        set((state) => ({
+          activeTurns: { ...state.activeTurns, [threadId]: handle.turnId },
+          cancellingTurns: withoutActiveTurn(state.cancellingTurns, threadId),
+        }));
       }
     } catch (error) {
-      // 确保错误发生时清除 activeTurnId，防止界面卡住
-      set((state) => ({
-        error: state.activeThreadId === threadId ? errorMessage(error) : state.error,
-        activeTurns: withoutActiveTurn(state.activeTurns, threadId),
-        cancellingTurns: withoutActiveTurn(state.cancellingTurns, threadId),
-        activeTurnId: state.activeThreadId === threadId ? null : state.activeTurnId,
-        activeTurnThreadId: state.activeThreadId === threadId ? null : state.activeTurnThreadId,
-      }));
+      set({ error: errorMessage(error) });
     }
   },
 
@@ -821,15 +920,10 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
     }));
     try {
       const accepted = await Promise.race([
-        cancelTurn(threadId),
+        interruptTurn(threadId, turnId).then(() => "accepted" as const),
         new Promise<"timeout">((resolve) => window.setTimeout(() => resolve("timeout"), 3_000)),
       ]);
-      if (accepted === false) {
-        set((state) => ({
-          cancellingTurns: withoutActiveTurn(state.cancellingTurns, threadId),
-        }));
-        if (get().activeThreadId === threadId) await get().selectThread(threadId);
-      } else if (accepted === "timeout") {
+      if (accepted === "timeout") {
         set((state) => ({
           cancellingTurns: withoutActiveTurn(state.cancellingTurns, threadId),
           error: state.activeThreadId === threadId && state.activeTurns[threadId] === turnId
@@ -1002,21 +1096,16 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
   handleAgentEvent: (event) => {
     const terminalEvent = ["turn_completed", "turn_failed", "turn_cancelled"].includes(event.type);
     if (event.type === "turn_started") {
-      set((state) => ({
-        activeTurns: { ...state.activeTurns, [event.threadId]: event.turnId },
-        cancellingTurns: state.cancellingTurns[event.threadId] === event.turnId
-          ? state.cancellingTurns
-          : withoutActiveTurn(state.cancellingTurns, event.threadId),
-      }));
+      terminalTurnIds.delete(event.turnId);
     } else if (terminalEvent) {
-      set((state) => ({
-        activeTurns: state.activeTurns[event.threadId] === event.turnId
-          ? withoutActiveTurn(state.activeTurns, event.threadId)
-          : state.activeTurns,
-        cancellingTurns: state.cancellingTurns[event.threadId] === event.turnId
-          ? withoutActiveTurn(state.cancellingTurns, event.threadId)
-          : state.cancellingTurns,
-      }));
+      rememberTerminalTurn(event.turnId);
+    }
+    const lifecyclePatch = reduceTurnLifecycle(event, {
+      activeTurns: get().activeTurns,
+      cancellingTurns: get().cancellingTurns,
+    });
+    if (lifecyclePatch) {
+      set(lifecyclePatch);
     }
     const hydration = hydrationBuffers.get(event.threadId);
     if (hydration) {
@@ -1031,459 +1120,36 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
       return;
     }
 
-    switch (event.type) {
-      case "turn_started":
-        set((state) => {
-          const latestUserMessage = [...state.messages].reverse().find((message) => message.role === "user");
-          return {
-            activeTurnId: event.turnId,
-            activeTurnThreadId: event.threadId,
-            lastTurn: { turnId: event.turnId, state: "streaming", error: null },
-            pendingApproval: null,
-            pendingApprovals: [],
-            activityStatus: { turnId: event.turnId, status: "thinking" },
-            turnUserMessageIds: state.turnUserMessageIds[event.turnId] || !latestUserMessage
-              ? state.turnUserMessageIds
-              : { ...state.turnUserMessageIds, [event.turnId]: latestUserMessage.id },
-            messages: state.messages.some((message) => message.turnId === event.turnId)
-              ? state.messages
-              : [...state.messages, {
-                id: `turn-${event.turnId}`,
-                role: "assistant",
-                text: "",
-                createdAtMs: Date.now(),
-                turnId: event.turnId,
-                status: "streaming",
-              }],
-          };
-        });
-        break;
-      case "activity_status_changed":
-        set({ activityStatus: { turnId: event.turnId, status: event.status } });
-        break;
-      case "text_delta":
-        set((state) => {
-          const lastItem = state.turnTimeline[state.turnTimeline.length - 1];
-          const turnTimeline = lastItem?.type === "text" && lastItem.turnId === event.turnId
-            ? state.turnTimeline.map((item, index) => index === state.turnTimeline.length - 1
-              ? { ...lastItem, text: lastItem.text + event.delta }
-              : item)
-            : [...state.turnTimeline, {
-                type: "text" as const,
-                id: `stream-${event.turnId}-${crypto.randomUUID()}`,
-                turnId: event.turnId,
-                text: event.delta,
-              }];
-          return {
-            activityStatus: { turnId: event.turnId, status: "responding" },
-            turnTimeline,
-          };
-        });
-        break;
-      case "reasoning_summary_delta":
-        set((state) => {
-          const existing = state.turnTimeline.findIndex((item) =>
-            item.type === "reasoning" && item.turnId === event.turnId && item.itemId === event.itemId,
-          );
-          if (existing >= 0) {
-            return {
-              turnTimeline: state.turnTimeline.map((item, index) => index === existing && item.type === "reasoning"
-                ? { ...item, summary: (item.summary + event.delta).slice(0, MAX_REASONING_SUMMARY_CHARS), complete: false }
-                : item),
-            };
-          }
-          return {
-            turnTimeline: [...state.turnTimeline, {
-              type: "reasoning" as const,
-              itemId: event.itemId,
-              turnId: event.turnId,
-              summary: event.delta.slice(0, MAX_REASONING_SUMMARY_CHARS),
-              complete: false,
-            }],
-          };
-        });
-        break;
-      case "reasoning_summary_completed":
-        set((state) => {
-          const summary = event.summary.slice(0, MAX_REASONING_SUMMARY_CHARS);
-          const exists = state.turnTimeline.some((item) =>
-            item.type === "reasoning" && item.turnId === event.turnId && item.itemId === event.itemId,
-          );
-          return {
-            turnTimeline: exists
-              ? state.turnTimeline.map((item) => item.type === "reasoning"
-                  && item.turnId === event.turnId
-                  && item.itemId === event.itemId
-                ? { ...item, summary, complete: true }
-                : item)
-              : [...state.turnTimeline, {
-                  type: "reasoning" as const,
-                  itemId: event.itemId,
-                  turnId: event.turnId,
-                  summary,
-                  complete: true,
-                }],
-          };
-        });
-        break;
-      case "usage_updated":
-        set({ usage: event.usage });
-        break;
-      case "context_compacted":
-        set((state) => ({
-          turnTimeline: appendTimelineEvent(
-            state.turnTimeline,
-            event.itemId,
-            event.turnId,
-            "compacted",
-            event.automatic ? "已自动压缩上下文" : "已手动压缩上下文",
-            `压缩了 ${event.compactedMessageCount} 条历史消息，保留 ${event.userConstraintCount} 项用户约束和 ${event.recentToolResultCount} 项近期工具结果`,
-          ),
-        }));
-        break;
-      case "tool_started":
-        set((state) => {
-          const startedAtMs = Date.now();
-          const activity: ToolActivity = {
-            turnId: event.turnId,
-            call: event.call,
-            state: "running",
-            result: null,
-            startedAtMs,
-          };
-          const hasExisting = state.turnTimeline.some((item) => item.type === "tool"
-            && item.activity.turnId === event.turnId
-            && item.activity.call.id === event.call.id);
-          return {
-            lastTurn: { turnId: event.turnId, state: "running_tool", error: null },
-            activityStatus: { turnId: event.turnId, status: "running_tool" },
-            turnTimeline: hasExisting
-              ? state.turnTimeline.map((item) => item.type === "tool"
-                && item.activity.turnId === event.turnId
-                && item.activity.call.id === event.call.id
-                ? {
-                    ...item,
-                    activity: {
-                      ...item.activity,
-                      call: event.call,
-                      state: "running",
-                      result: null,
-                      startedAtMs: item.activity.startedAtMs ?? startedAtMs,
-                      completedAtMs: undefined,
-                      durationMs: undefined,
-                    },
-                  }
-                : item)
-              : [...state.turnTimeline, { type: "tool", activity }],
-          };
-        });
-        break;
-      case "tool_output_delta":
-        set((state) => ({
-          turnTimeline: state.turnTimeline.map((item) => item.type === "tool"
-            ? { ...item, activity: appendToolOutput(
-                item.activity,
-                event.turnId,
-                event.callId,
-                event.stream,
-                event.cursor,
-                event.delta,
-              ) }
-            : item),
-        }));
-        break;
-      case "tool_completed":
-        set((state) => {
-          const completedAtMs = Date.now();
-          return {
-            lastTurn: { turnId: event.turnId, state: "streaming", error: null },
-            activityStatus: { turnId: event.turnId, status: "thinking" },
-            turnTimeline: state.turnTimeline.map((item) =>
-              item.type === "tool"
-                && item.activity.turnId === event.turnId
-                && item.activity.call.id === event.callId
-                ? {
-                    ...item,
-                    activity: {
-                      ...item.activity,
-                      state: event.result.success ? "completed" : "failed",
-                      result: event.result,
-                      completedAtMs,
-                      durationMs: resultDurationMs(event.result)
-                        ?? (item.activity.startedAtMs
-                          ? Math.max(0, completedAtMs - item.activity.startedAtMs)
-                          : undefined),
-                    },
-                  }
-                : item,
-            ),
-          };
-        });
-        if (event.name === "update_plan") {
-          void getPlan(event.threadId)
-            .then((updatedPlan) => {
-              if (get().activeThreadId === event.threadId) set({ plan: updatedPlan });
-            })
-            .catch(() => undefined);
-        }
-        break;
-      case "approval_requested":
-        set((state) => {
-          if (event.request.autoApproved) {
-            return {
-              turnTimeline: insertApprovalRequestEvent(
-                state.turnTimeline,
-                `approval-requested-${event.request.id}`,
-                event.turnId,
-                "approval_requested",
-                "已自动批准操作",
-                `${event.request.toolName} · ${event.request.reason}`,
-                event.request.toolCallId,
-              ),
-            };
-          }
-          const queue = enqueueApproval(state.pendingApprovals, event.request);
-          return {
-            ...approvalQueueState(queue),
-            activityStatus: { turnId: event.turnId, status: "awaiting_approval" },
-            lastTurn: { turnId: event.turnId, state: "awaiting_approval", error: null },
-            turnTimeline: insertApprovalRequestEvent(
-              state.turnTimeline,
-              `approval-requested-${event.request.id}`,
-              event.turnId,
-              "approval_requested",
-              "已请求操作确认",
-              `${event.request.toolName} · ${event.request.reason}`,
-              event.request.toolCallId,
-            ),
-          };
-        });
-        break;
-      case "approval_resolved":
-        set((state) => {
-          const queue = removeApproval(state.pendingApprovals, event.requestId);
-          return {
-            ...approvalQueueState(queue),
-            lastTurn: {
-              turnId: event.turnId,
-              state: queue.length ? "awaiting_approval" : "streaming",
-              error: null,
-            },
-            activityStatus: {
-              turnId: event.turnId,
-              status: queue.length ? "awaiting_approval" : "thinking",
-            },
-            turnTimeline: insertApprovalResolutionEvent(
-              state.turnTimeline,
-              `approval-resolved-${event.requestId}`,
-              event.turnId,
-              "approval_resolved",
-              "操作确认已处理",
-              event.resolution.action,
-              event.requestId,
-            ),
-          };
-        });
-        break;
-      case "user_input_requested":
-        set((state) => {
-          const queue = enqueueUserInput(state.pendingUserInputs, event.request);
-          return {
-            ...userInputQueueState(queue),
-            activityStatus: { turnId: event.turnId, status: "awaiting_approval" },
-            lastTurn: { turnId: event.turnId, state: "awaiting_approval", error: null },
-            turnTimeline: appendTimelineEvent(
-              state.turnTimeline,
-              `user-input-requested-${event.request.id}`,
-              event.turnId,
-              "user_input_requested",
-              "已请求用户输入",
-              event.request.questions.map((question) => question.question).join("；"),
-            ),
-          };
-        });
-        break;
-      case "user_input_resolved":
-        set((state) => {
-          const queue = removeUserInput(state.pendingUserInputs, event.requestId);
-          return {
-            ...userInputQueueState(queue),
-            lastTurn: {
-              turnId: event.turnId,
-              state: queue.length ? "awaiting_approval" : "streaming",
-              error: null,
-            },
-            activityStatus: {
-              turnId: event.turnId,
-              status: queue.length ? "awaiting_approval" : "thinking",
-            },
-            turnTimeline: appendTimelineEvent(
-              state.turnTimeline,
-              `user-input-resolved-${event.requestId}`,
-              event.turnId,
-              "user_input_resolved",
-              "用户输入已处理",
-              event.resolution.action,
-            ),
-          };
-        });
-        break;
-      case "change_applied":
-        set((state) => ({
-          changes: state.changes.some((change) => change.id === event.changeSet.id)
-            ? state.changes
-            : [...state.changes, event.changeSet],
-          turnTimeline: appendTimelineEvent(
-            state.turnTimeline,
-            `change-applied-${event.changeSet.id}`,
-            event.turnId,
-            "change_applied",
-            "编辑了文件",
-            event.changeSet.files.map((file) => file.path).join("、"),
-          ),
-        }));
-        break;
-      case "change_undone":
-        set((state) => ({
-          changes: state.changes.map((change) =>
-            change.id === event.changeId ? { ...change, undone: true } : change,
-          ),
-          turnTimeline: appendTimelineEvent(
-            state.turnTimeline,
-            `change-undone-${event.changeId}`,
-            event.turnId,
-            "change_undone",
-            "已撤销文件变更",
-            event.changeId,
-          ),
-        }));
-        break;
-      case "turn_completed":
-        set((state) => {
-          const completedAtMs = event.completedAtMs ?? Date.now();
-          const finalText = toConversationMessage(event.message, event.turnId).text;
-          let lastTextItemIndex = -1;
-          let lastToolItemIndex = -1;
-          for (let index = state.turnTimeline.length - 1; index >= 0; index -= 1) {
-            const item = state.turnTimeline[index];
-            const itemTurnId = item.type === "tool" ? item.activity.turnId : item.turnId;
-            if (itemTurnId !== event.turnId) continue;
-            if (lastTextItemIndex < 0 && item.type === "text") lastTextItemIndex = index;
-            if (lastToolItemIndex < 0 && item.type === "tool") lastToolItemIndex = index;
-            if (lastTextItemIndex >= 0 && lastToolItemIndex >= 0) break;
-          }
-          let turnTimeline = lastTextItemIndex > lastToolItemIndex
-            ? state.turnTimeline.map((item, index) => index === lastTextItemIndex
-              ? { type: "text" as const, id: event.message.id, turnId: event.turnId, text: finalText }
-              : item)
-            : finalText
-              ? [...state.turnTimeline, { type: "text" as const, id: event.message.id, turnId: event.turnId, text: finalText }]
-              : state.turnTimeline;
-          turnTimeline = finishRunningTools(turnTimeline, event.turnId, "failed", completedAtMs);
-          turnTimeline = appendTimelineEvent(
-            turnTimeline,
-            `turn-completed-${event.turnId}`,
-            event.turnId,
-            "turn_completed",
-            "任务完成",
-            null,
-            event.durationMs,
-          );
-          return {
-          activeTurnId: null,
-          activeTurnThreadId: null,
-          activityStatus: null,
-          pendingApproval: null,
-          pendingApprovals: [],
-          pendingUserInput: null,
-          pendingUserInputs: [],
-          usage: event.usage,
-          lastTurn: { turnId: event.turnId, state: "completed", error: null },
-          turnTimeline,
-          messages: state.messages.some((message) => message.turnId === event.turnId)
-            ? state.messages.map((message) => message.turnId === event.turnId
-                ? toConversationMessage(event.message, event.turnId)
-                : message)
-            : [...state.messages, toConversationMessage(event.message, event.turnId)],
-          };
-        });
-        // Turn 完成后，触发队列处理下一条消息
-        setTimeout(() => get().processQueue(), 500);
-        break;
-      case "turn_failed":
-        set((state) => {
-          const failedAtMs = event.completedAtMs ?? Date.now();
-          return {
-          activeTurnId: null,
-          activeTurnThreadId: null,
-          activityStatus: null,
-          pendingApproval: null,
-          pendingApprovals: [],
-          pendingUserInput: null,
-          pendingUserInputs: [],
-          error: event.message,
-          lastTurn: {
-            turnId: event.turnId,
-            state: "failed",
-            error: event.message,
-          },
-          messages: state.messages.map((message) =>
-            message.turnId === event.turnId
-              ? { ...message, status: "failed" as const }
-              : message,
-          ),
-          turnTimeline: appendTimelineEvent(
-            finishRunningTools(state.turnTimeline, event.turnId, "failed", failedAtMs),
-            `turn-failed-${event.turnId}`,
-            event.turnId,
-            "turn_failed",
-            "Turn 执行失败",
-            event.message,
-            event.durationMs,
-          ),
-          };
-        });
-        setTimeout(() => get().processQueue(), 500);
-        break;
-      case "turn_cancelled":
-        set((state) => {
-          const cancelledAtMs = Date.now();
-          return {
-            activeTurnId: null,
-            activeTurnThreadId: null,
-            activityStatus: null,
-            pendingApproval: null,
-            pendingApprovals: [],
-            pendingUserInput: null,
-            pendingUserInputs: [],
-            lastTurn: { turnId: event.turnId, state: "cancelled", error: null },
-            messages: state.messages.map((message) =>
-              message.turnId === event.turnId
-                ? { ...message, status: "cancelled" as const }
-                : message,
-            ),
-            turnTimeline: appendTimelineEvent(
-              finishRunningTools(state.turnTimeline, event.turnId, "cancelled", cancelledAtMs),
-              `turn-cancelled-${event.turnId}`,
-              event.turnId,
-              "turn_cancelled",
-              "Turn 已取消",
-              null,
-              event.durationMs,
-            ),
-          };
-        });
-        setTimeout(() => get().processQueue(), 500);
-        break;
-      case "todo_updated":
-        set((state) => {
-          const newTodos = new Map(state.todos);
-          newTodos.set(event.threadId, event.todos);
-          return {
-            todos: newTodos,
-          };
-        });
-        break;
+    const helpers: ReducerHelpers = {
+      toConversationMessage,
+      appendTimelineEvent,
+      insertApprovalRequestEvent,
+      insertApprovalResolutionEvent,
+      finishRunningTools,
+      approvalQueueState,
+      userInputQueueState,
+      enqueueApproval,
+      removeApproval,
+      enqueueUserInput,
+      removeUserInput,
+      appendToolOutput,
+      resultDurationMs,
+    };
+    const state = get();
+    const reduction = reduceAgentEvent(event, state, helpers);
+    if (!reduction) return;
+    if (Object.keys(reduction.state).length > 0) {
+      set(reduction.state);
+    }
+    if (reduction.sideEffects?.includes("processQueue")) {
+      void get().processQueue();
+    }
+    if (reduction.sideEffects?.includes("refreshPlan") && event.type === "tool_completed") {
+      void getPlan(event.threadId)
+        .then((updatedPlan) => {
+          if (get().activeThreadId === event.threadId) set({ plan: updatedPlan });
+        })
+        .catch(() => undefined);
     }
   },
 
@@ -1491,23 +1157,34 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
 
   forceResetState: async () => {
     const threadId = get().activeThreadId;
-    console.log("强制重置状态...");
+    const turnId = threadId ? get().activeTurns[threadId] : null;
+    let recoveryError = "";
 
-    // 尝试取消任何正在运行的 turn
-    if (threadId && get().activeTurns[threadId]) {
+    if (threadId && turnId) {
+      set((state) => ({
+        cancellingTurns: { ...state.cancellingTurns, [threadId]: turnId },
+      }));
       try {
-        await cancelTurn(threadId);
-      } catch (e) {
-        console.warn("取消 turn 失败（可能已完成）", e);
+        const result = await Promise.race([
+          interruptTurn(threadId, turnId).then(() => "accepted" as const),
+          new Promise<"timeout">((resolve) => window.setTimeout(() => resolve("timeout"), 3_000)),
+        ]);
+        if (result === "timeout") {
+          recoveryError = "精确停止请求超时，已重新同步运行时状态";
+        }
+      } catch (error) {
+        recoveryError = errorMessage(error);
       }
     }
 
-    // 清除所有可能导致卡住的状态
-    set((state) => ({
+    if (threadId) {
+      await get().selectThread(threadId);
+      if (recoveryError) set({ error: recoveryError });
+      return;
+    }
+    set({
       activeTurnId: null,
       activeTurnThreadId: null,
-      activeTurns: threadId ? withoutActiveTurn(state.activeTurns, threadId) : state.activeTurns,
-      cancellingTurns: threadId ? withoutActiveTurn(state.cancellingTurns, threadId) : state.cancellingTurns,
       pendingApproval: null,
       pendingApprovals: [],
       pendingUserInput: null,
@@ -1515,15 +1192,8 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
       turnTimeline: [],
       turnUserMessageIds: {},
       activityStatus: null,
-      error: "",
+      error: recoveryError,
       loading: false,
-    }));
-
-    // 重新加载当前线程的状态
-    if (threadId) {
-      await get().selectThread(threadId);
-    }
-
-    console.log("状态已重置");
+    });
   },
 }));

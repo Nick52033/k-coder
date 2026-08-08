@@ -17,10 +17,11 @@ use crate::policy::{
     ApprovalError, ApprovalManager, PolicyDecision, UserInputError, UserInputManager,
 };
 use crate::protocol::{
-    AgentActivityStatus, AgentEvent, AgentEventEnvelope, AgentMode, ApprovalAction, ApprovalMode,
-    ApprovalRequest, ApprovalResolution, ChangeSet, ChatMessage, ContentBlock, ExpectedFileHash,
-    ImageAttachment, MessageRole, PROTOCOL_VERSION, PatchPreview, ReasoningEffort, TokenUsage,
-    ToolCall, ToolResult, TurnState, UserInputAction, UserInputRequest, UserInputResolution,
+    AgentActivityStatus, AgentEvent, AgentEventEnvelope, AgentItemStatus, AgentItemType, AgentMode,
+    ApprovalAction, ApprovalMode, ApprovalRequest, ApprovalResolution, ChangeSet, ChatMessage,
+    ContentBlock, ExpectedFileHash, ImageAttachment, MessageRole, PROTOCOL_VERSION, PatchPreview,
+    ReasoningEffort, TokenUsage, ToolCall, ToolResult, TurnError, TurnState, UserInputAction,
+    UserInputRequest, UserInputResolution,
 };
 use crate::providers::{
     Provider, ProviderError, ProviderEvent, ProviderImage, ProviderMessage, ProviderRequest,
@@ -30,6 +31,10 @@ use crate::tools::{
     ApprovedToolExecution, ToolContext, ToolError, ToolProgress, ToolRegistry,
     tool_progress_channel,
 };
+
+pub mod mailbox;
+pub mod thread_operation;
+use mailbox::TurnControl;
 
 const MAX_INPUT_BYTES: usize = 100_000;
 const MAX_IMAGE_COUNT: usize = 4;
@@ -266,8 +271,79 @@ impl AgentRuntime {
         cancellation: CancellationToken,
         publisher: Arc<dyn EventPublisher>,
     ) -> Result<TurnOutcome, AgentRuntimeError> {
-        let input = validate_input(&request.input, !attachments.is_empty())?;
-        let message = user_message(input, attachments, self.supports_vision)?;
+        self.run_turn_with_attachments_and_id(
+            provider,
+            model,
+            request,
+            attachments,
+            Uuid::new_v4().to_string(),
+            cancellation,
+            publisher,
+        )
+        .await
+    }
+
+    pub async fn run_turn_with_attachments_and_id(
+        &self,
+        provider: Arc<dyn Provider>,
+        model: String,
+        request: RunTurnRequest,
+        attachments: Vec<ImageAttachment>,
+        turn_id: String,
+        cancellation: CancellationToken,
+        publisher: Arc<dyn EventPublisher>,
+    ) -> Result<TurnOutcome, AgentRuntimeError> {
+        self.run_turn_with_attachments_id_and_optional_control(
+            provider,
+            model,
+            request,
+            attachments,
+            turn_id,
+            cancellation,
+            None,
+            publisher,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn run_turn_with_attachments_id_and_control(
+        &self,
+        provider: Arc<dyn Provider>,
+        model: String,
+        request: RunTurnRequest,
+        attachments: Vec<ImageAttachment>,
+        turn_id: String,
+        cancellation: CancellationToken,
+        control: Arc<TurnControl>,
+        publisher: Arc<dyn EventPublisher>,
+    ) -> Result<TurnOutcome, AgentRuntimeError> {
+        self.run_turn_with_attachments_id_and_optional_control(
+            provider,
+            model,
+            request,
+            attachments,
+            turn_id,
+            cancellation,
+            Some(control),
+            publisher,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn run_turn_with_attachments_id_and_optional_control(
+        &self,
+        provider: Arc<dyn Provider>,
+        model: String,
+        request: RunTurnRequest,
+        attachments: Vec<ImageAttachment>,
+        turn_id: String,
+        cancellation: CancellationToken,
+        control: Option<Arc<TurnControl>>,
+        publisher: Arc<dyn EventPublisher>,
+    ) -> Result<TurnOutcome, AgentRuntimeError> {
+        let message = build_user_message(&request.input, attachments, self.supports_vision)?;
         let agent_mode = request
             .agent_mode
             .as_deref()
@@ -279,7 +355,9 @@ impl AgentRuntime {
             request.thread_id,
             Some(message),
             agent_mode,
+            turn_id,
             cancellation,
+            control,
             publisher,
         )
         .await
@@ -292,6 +370,56 @@ impl AgentRuntime {
         thread_id: String,
         agent_mode: AgentMode,
         cancellation: CancellationToken,
+        publisher: Arc<dyn EventPublisher>,
+    ) -> Result<TurnOutcome, AgentRuntimeError> {
+        self.retry_turn_with_id_and_optional_control(
+            provider,
+            model,
+            thread_id,
+            agent_mode,
+            Uuid::new_v4().to_string(),
+            cancellation,
+            None,
+            publisher,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn retry_turn_with_id_and_control(
+        &self,
+        provider: Arc<dyn Provider>,
+        model: String,
+        thread_id: String,
+        agent_mode: AgentMode,
+        turn_id: String,
+        cancellation: CancellationToken,
+        control: Arc<TurnControl>,
+        publisher: Arc<dyn EventPublisher>,
+    ) -> Result<TurnOutcome, AgentRuntimeError> {
+        self.retry_turn_with_id_and_optional_control(
+            provider,
+            model,
+            thread_id,
+            agent_mode,
+            turn_id,
+            cancellation,
+            Some(control),
+            publisher,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn retry_turn_with_id_and_optional_control(
+        &self,
+        provider: Arc<dyn Provider>,
+        model: String,
+        thread_id: String,
+        agent_mode: AgentMode,
+        turn_id: String,
+        cancellation: CancellationToken,
+        control: Option<Arc<TurnControl>>,
         publisher: Arc<dyn EventPublisher>,
     ) -> Result<TurnOutcome, AgentRuntimeError> {
         let events = self.repository.load(&thread_id).await?;
@@ -320,7 +448,9 @@ impl AgentRuntime {
             thread_id,
             None,
             agent_mode,
+            turn_id,
             cancellation,
+            control,
             publisher,
         )
         .await
@@ -334,13 +464,34 @@ impl AgentRuntime {
             provider_history(self.repository.load(thread_id).await?, self.supports_vision);
         let (summary, _) = context::compact(&history, self.context_limit);
         if summary.compacted_message_count > 0 {
+            let compaction_event = StoredEvent::new(
+                thread_id,
+                None,
+                StoredEventKind::ContextCompacted {
+                    summary: summary.clone(),
+                    automatic: false,
+                },
+            );
+            let item_id = compaction_event.event_id.clone();
             self.repository
                 .append(StoredEvent::new(
                     thread_id,
                     None,
-                    StoredEventKind::ContextCompacted {
-                        summary: summary.clone(),
-                        automatic: false,
+                    StoredEventKind::ItemStarted {
+                        item_id: item_id.clone(),
+                        item_type: AgentItemType::ContextCompaction,
+                    },
+                ))
+                .await?;
+            self.repository.append(compaction_event).await?;
+            self.repository
+                .append(StoredEvent::new(
+                    thread_id,
+                    None,
+                    StoredEventKind::ItemCompleted {
+                        item_id: item_id.clone(),
+                        item_type: AgentItemType::ContextCompaction,
+                        status: AgentItemStatus::Completed,
                     },
                 ))
                 .await?;
@@ -355,7 +506,9 @@ impl AgentRuntime {
         thread_id: String,
         new_input: Option<ChatMessage>,
         agent_mode: AgentMode,
+        turn_id: String,
         cancellation: CancellationToken,
+        control: Option<Arc<TurnControl>>,
         publisher: Arc<dyn EventPublisher>,
     ) -> Result<TurnOutcome, AgentRuntimeError> {
         let existing = self.repository.load(&thread_id).await?;
@@ -368,6 +521,7 @@ impl AgentRuntime {
             ));
         }
 
+        let started_user_message = new_input.clone();
         if let Some(message) = new_input {
             self.repository
                 .append(StoredEvent::new(
@@ -378,7 +532,6 @@ impl AgentRuntime {
                 .await?;
         }
 
-        let turn_id = Uuid::new_v4().to_string();
         self.repository
             .append(StoredEvent::new(
                 &thread_id,
@@ -396,6 +549,7 @@ impl AgentRuntime {
         publisher.publish(AgentEventEnvelope::new(AgentEvent::TurnStarted {
             thread_id: thread_id.clone(),
             turn_id: turn_id.clone(),
+            user_message: started_user_message,
         }));
 
         let result = async {
@@ -419,6 +573,15 @@ impl AgentRuntime {
 
         let mut iteration = 0usize;
         loop {
+            if let Some(control) = &control {
+                self.persist_steered_messages(
+                    &thread_id,
+                    &turn_id,
+                    control.take_pending(),
+                    &publisher,
+                )
+                .await?;
+            }
             // 进展检测：每 PROGRESS_CHECK_WINDOW 轮检查一次
             if iteration > 0 && iteration % PROGRESS_CHECK_WINDOW == 0 {
                 let events = self.repository.load(&thread_id).await?;
@@ -439,6 +602,7 @@ impl AgentRuntime {
                             publisher.publish(AgentEventEnvelope::new(AgentEvent::TextDelta {
                                 thread_id: thread_id.clone(),
                                 turn_id: turn_id.clone(),
+                                item_id: format!("agent-message-{turn_id}-no-progress"),
                                 delta: format!(
                                     "\n\n⚠️ 检测到连续 {} 轮无实质进展，提前终止任务。\n",
                                     no_progress_count * PROGRESS_CHECK_WINDOW
@@ -489,18 +653,35 @@ impl AgentRuntime {
                         },
                     );
                     let item_id = compaction_event.event_id.clone();
+                    self.start_item(
+                        &thread_id,
+                        &turn_id,
+                        &item_id,
+                        AgentItemType::ContextCompaction,
+                        &publisher,
+                    )
+                    .await?;
                     self.repository
                         .append(compaction_event)
                         .await?;
                     publisher.publish(AgentEventEnvelope::new(AgentEvent::ContextCompacted {
                         thread_id: thread_id.clone(),
                         turn_id: turn_id.clone(),
-                        item_id,
+                        item_id: item_id.clone(),
                         automatic: true,
                         compacted_message_count: summary.compacted_message_count,
                         user_constraint_count: summary.user_constraints.len(),
                         recent_tool_result_count: summary.recent_tool_results.len(),
                     }));
+                    self.complete_item(
+                        &thread_id,
+                        &turn_id,
+                        &item_id,
+                        AgentItemType::ContextCompaction,
+                        AgentItemStatus::Completed,
+                        &publisher,
+                    )
+                    .await?;
                     history = compacted;
                 }
             }
@@ -534,6 +715,15 @@ impl AgentRuntime {
             let response: String;
             let pending_tool_calls: Vec<ToolCall>;
             let completed: bool;
+            let assistant_item_id = Uuid::new_v4().to_string();
+            self.start_item(
+                &thread_id,
+                &turn_id,
+                &assistant_item_id,
+                AgentItemType::AgentMessage,
+                &publisher,
+            )
+            .await?;
 
             // 外层循环：支持整个请求的重试
             'retry_loop: loop {
@@ -585,6 +775,7 @@ impl AgentRuntime {
 
                 let mut response_inner = String::new();
                 let mut reasoning_summary_bytes = HashMap::<String, usize>::new();
+                let mut reasoning_items_completed = HashSet::<String>::new();
                 let mut responding_published = false;
                 let mut pending_tool_calls_inner = Vec::new(); // 暂存 ToolCall，等 Completed 后再启动
                 let mut iteration_usage_inner = None;
@@ -625,11 +816,25 @@ impl AgentRuntime {
                             publisher.publish(AgentEventEnvelope::new(AgentEvent::TextDelta {
                                 thread_id: thread_id.clone(),
                                 turn_id: turn_id.clone(),
+                                item_id: assistant_item_id.clone(),
                                 delta,
                             }));
                         }
                         Some(Ok(ProviderEvent::ReasoningSummaryDelta { item_id, delta })) => {
                             attempt_had_output = true;
+                            if reasoning_items_completed.contains(&item_id) {
+                                continue;
+                            }
+                            if !reasoning_summary_bytes.contains_key(&item_id) {
+                                self.start_item(
+                                    &thread_id,
+                                    &turn_id,
+                                    &item_id,
+                                    AgentItemType::Reasoning,
+                                    &publisher,
+                                )
+                                .await?;
+                            }
                             let total = reasoning_summary_bytes.entry(item_id.clone()).or_default();
                             *total = total.saturating_add(delta.len());
                             if *total > MAX_REASONING_SUMMARY_BYTES {
@@ -655,6 +860,20 @@ impl AgentRuntime {
                         }
                         Some(Ok(ProviderEvent::ReasoningSummaryCompleted { item_id, summary })) => {
                             attempt_had_output = true;
+                            if !reasoning_items_completed.insert(item_id.clone()) {
+                                continue;
+                            }
+                            if !reasoning_summary_bytes.contains_key(&item_id) {
+                                self.start_item(
+                                    &thread_id,
+                                    &turn_id,
+                                    &item_id,
+                                    AgentItemType::Reasoning,
+                                    &publisher,
+                                )
+                                .await?;
+                                reasoning_summary_bytes.insert(item_id.clone(), 0);
+                            }
                             if summary.len() > MAX_REASONING_SUMMARY_BYTES {
                                 return self
                                     .finish_failed(
@@ -681,10 +900,19 @@ impl AgentRuntime {
                                 AgentEvent::ReasoningSummaryCompleted {
                                     thread_id: thread_id.clone(),
                                     turn_id: turn_id.clone(),
-                                    item_id,
+                                    item_id: item_id.clone(),
                                     summary,
                                 },
                             ));
+                            self.complete_item(
+                                &thread_id,
+                                &turn_id,
+                                &item_id,
+                                AgentItemType::Reasoning,
+                                AgentItemStatus::Completed,
+                                &publisher,
+                            )
+                            .await?;
                         }
                         Some(Ok(ProviderEvent::ToolCall { call })) => {
                             attempt_had_output = true;
@@ -888,6 +1116,40 @@ impl AgentRuntime {
                         )
                         .await;
                 }
+                if let Some(steered) = control
+                    .as_ref()
+                    .and_then(|control| control.close_if_idle())
+                {
+                    let message = text_message_with_id(
+                        MessageRole::Assistant,
+                        assistant_item_id.clone(),
+                        response,
+                    );
+                    self.repository
+                        .append(StoredEvent::new(
+                            &thread_id,
+                            Some(turn_id.clone()),
+                            StoredEventKind::AssistantMessage { message },
+                        ))
+                        .await?;
+                    self.complete_active_items(
+                        &thread_id,
+                        &turn_id,
+                        AgentItemType::AgentMessage,
+                        AgentItemStatus::Completed,
+                        &publisher,
+                    )
+                    .await?;
+                    self.persist_steered_messages(
+                        &thread_id,
+                        &turn_id,
+                        steered,
+                        &publisher,
+                    )
+                    .await?;
+                    iteration = iteration.saturating_add(1);
+                    continue;
+                }
                 publisher.publish(AgentEventEnvelope::new(AgentEvent::ActivityStatusChanged {
                     thread_id: thread_id.clone(),
                     turn_id: turn_id.clone(),
@@ -897,6 +1159,7 @@ impl AgentRuntime {
                     .finish_completed(
                         &thread_id,
                         &turn_id,
+                        &assistant_item_id,
                         response,
                         has_usage.then_some(total_usage),
                         &publisher,
@@ -916,11 +1179,30 @@ impl AgentRuntime {
                     &thread_id,
                     Some(turn_id.clone()),
                     StoredEventKind::AssistantToolCalls {
+                        item_id: Some(assistant_item_id.clone()),
                         text: response.clone(),
                         calls: pending_tool_calls.clone(),
                     },
                 ))
                 .await?;
+            self.complete_active_items(
+                &thread_id,
+                &turn_id,
+                AgentItemType::AgentMessage,
+                AgentItemStatus::Completed,
+                &publisher,
+            )
+            .await?;
+            for call in &pending_tool_calls {
+                self.start_item(
+                    &thread_id,
+                    &turn_id,
+                    &call.id,
+                    AgentItemType::Tool,
+                    &publisher,
+                )
+                .await?;
+            }
 
             let mut stop_reason: Option<String> = None;
             let mut cancelled_batch = false;
@@ -945,8 +1227,15 @@ impl AgentRuntime {
                     if let Some(metrics) = &self.metrics {
                         metrics.tool(result.success);
                     }
-                    self.persist_tool_result(&thread_id, &turn_id, &call, &result, &publisher)
-                        .await?;
+                    self.persist_tool_result(
+                        &thread_id,
+                        &turn_id,
+                        &call,
+                        &result,
+                        AgentItemStatus::Failed,
+                        &publisher,
+                    )
+                    .await?;
                     continue;
                 }
 
@@ -955,8 +1244,20 @@ impl AgentRuntime {
                     if let Some(metrics) = &self.metrics {
                         metrics.tool(result.success);
                     }
-                    self.persist_tool_result(&thread_id, &turn_id, &call, &result, &publisher)
-                        .await?;
+                    let status = if cancelled_batch {
+                        AgentItemStatus::Cancelled
+                    } else {
+                        AgentItemStatus::Failed
+                    };
+                    self.persist_tool_result(
+                        &thread_id,
+                        &turn_id,
+                        &call,
+                        &result,
+                        status,
+                        &publisher,
+                    )
+                    .await?;
                     continue;
                 }
 
@@ -969,15 +1270,26 @@ impl AgentRuntime {
                     progress: None,
                 };
 
-                let result = match self
+                let (result, item_status) = match self
                     .execute_tool_with_progress(context, &call, cancellation.clone(), &publisher)
                     .await
                 {
-                    Ok(Some(tool_result)) => bound_tool_result(tool_result),
+                    Ok(Some(tool_result)) => {
+                        let result = bound_tool_result(tool_result);
+                        let status = if result.success {
+                            AgentItemStatus::Completed
+                        } else {
+                            AgentItemStatus::Failed
+                        };
+                        (result, status)
+                    }
                     Ok(None) => {
                         cancelled_batch = true;
                         stop_reason = Some("turn cancellation".to_string());
-                        failure_result("tool execution was cancelled".to_string())
+                        (
+                            failure_result("tool execution was cancelled".to_string()),
+                            AgentItemStatus::Cancelled,
+                        )
                     }
                     Err(error) => {
                         let message = error.to_string();
@@ -986,15 +1298,22 @@ impl AgentRuntime {
                             stop_reason = Some(format!("tool batch aborted: {message}"));
                             fatal_error = Some(error);
                         }
-                        failure_result(message)
+                        (failure_result(message), AgentItemStatus::Failed)
                     }
                 };
 
                 if let Some(metrics) = &self.metrics {
                     metrics.tool(result.success);
                 }
-                self.persist_tool_result(&thread_id, &turn_id, &call, &result, &publisher)
-                    .await?;
+                self.persist_tool_result(
+                    &thread_id,
+                    &turn_id,
+                    &call,
+                    &result,
+                    item_status,
+                    &publisher,
+                )
+                .await?;
             }
 
             if let Some(error) = fatal_error {
@@ -1025,6 +1344,32 @@ impl AgentRuntime {
                 Err(error)
             }
         }
+    }
+
+    async fn persist_steered_messages(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        messages: Vec<ChatMessage>,
+        publisher: &Arc<dyn EventPublisher>,
+    ) -> Result<(), AgentRuntimeError> {
+        for message in messages {
+            self.repository
+                .append(StoredEvent::new(
+                    thread_id,
+                    Some(turn_id.to_string()),
+                    StoredEventKind::UserMessage {
+                        message: message.clone(),
+                    },
+                ))
+                .await?;
+            publisher.publish(AgentEventEnvelope::new(AgentEvent::TurnSteered {
+                thread_id: thread_id.to_string(),
+                turn_id: turn_id.to_string(),
+                message,
+            }));
+        }
+        Ok(())
     }
 
     async fn execute_tool_with_progress(
@@ -1169,6 +1514,21 @@ impl AgentRuntime {
                         Err(error) => return Ok(Some(failure_result(error.to_string()))),
                     }
                 };
+                if let Err(error) = self
+                    .start_item(
+                        &context.thread_id,
+                        &context.turn_id,
+                        &request_id,
+                        AgentItemType::Approval,
+                        publisher,
+                    )
+                    .await
+                {
+                    if !auto_approve {
+                        self.approvals.discard(&request_id).await;
+                    }
+                    return Err(error);
+                }
                 if let Err(error) = self
                     .repository
                     .append(StoredEvent::new(
@@ -1353,6 +1713,15 @@ impl AgentRuntime {
                     Err(error) => failure_result(error.to_string()),
                 };
                 if let Some(change_set) = change_set_from_result(&result) {
+                    let change_item_id = change_set.id.clone();
+                    self.start_item(
+                        &context.thread_id,
+                        &context.turn_id,
+                        &change_item_id,
+                        AgentItemType::Change,
+                        publisher,
+                    )
+                    .await?;
                     if let Err(error) = self
                         .repository
                         .append(StoredEvent::new(
@@ -1370,11 +1739,30 @@ impl AgentRuntime {
                             .rollback_change(context.workspace_root.clone(), change_set.clone())
                             .await
                         {
+                            let _ = self
+                                .complete_item(
+                                    &context.thread_id,
+                                    &context.turn_id,
+                                    &change_item_id,
+                                    AgentItemType::Change,
+                                    AgentItemStatus::Failed,
+                                    publisher,
+                                )
+                                .await;
                             return Err(AgentRuntimeError::AuditCompensation {
                                 storage_error,
                                 rollback_error: rollback_error.to_string(),
                             });
                         }
+                        self.complete_item(
+                            &context.thread_id,
+                            &context.turn_id,
+                            &change_item_id,
+                            AgentItemType::Change,
+                            AgentItemStatus::Failed,
+                            publisher,
+                        )
+                        .await?;
                         return Err(error.into());
                     }
                     publisher.publish(AgentEventEnvelope::new(AgentEvent::ChangeApplied {
@@ -1382,6 +1770,15 @@ impl AgentRuntime {
                         turn_id: context.turn_id.clone(),
                         change_set,
                     }));
+                    self.complete_item(
+                        &context.thread_id,
+                        &context.turn_id,
+                        &change_item_id,
+                        AgentItemType::Change,
+                        AgentItemStatus::Completed,
+                        publisher,
+                    )
+                    .await?;
                 }
                 Ok(Some(result))
             }
@@ -1422,6 +1819,19 @@ impl AgentRuntime {
             Ok(receiver) => receiver,
             Err(error) => return Ok(Some(failure_result(error.to_string()))),
         };
+        if let Err(error) = self
+            .start_item(
+                &context.thread_id,
+                &context.turn_id,
+                &request_id,
+                AgentItemType::UserInput,
+                publisher,
+            )
+            .await
+        {
+            self.user_inputs.discard(&request_id).await;
+            return Err(error);
+        }
         if let Err(error) = self
             .repository
             .append(StoredEvent::new(
@@ -1545,6 +1955,19 @@ impl AgentRuntime {
             request_id: request_id.to_string(),
             resolution: resolution.clone(),
         }));
+        self.complete_item(
+            &context.thread_id,
+            &context.turn_id,
+            request_id,
+            AgentItemType::Approval,
+            match resolution.action {
+                ApprovalAction::Approved => AgentItemStatus::Completed,
+                ApprovalAction::Rejected | ApprovalAction::TimedOut => AgentItemStatus::Failed,
+                ApprovalAction::Cancelled => AgentItemStatus::Cancelled,
+            },
+            publisher,
+        )
+        .await?;
         Ok(())
     }
 
@@ -1571,6 +1994,19 @@ impl AgentRuntime {
             request_id: request_id.to_string(),
             resolution: resolution.clone(),
         }));
+        self.complete_item(
+            &context.thread_id,
+            &context.turn_id,
+            request_id,
+            AgentItemType::UserInput,
+            match resolution.action {
+                UserInputAction::Answered => AgentItemStatus::Completed,
+                UserInputAction::Skipped => AgentItemStatus::Failed,
+                UserInputAction::Cancelled => AgentItemStatus::Cancelled,
+            },
+            publisher,
+        )
+        .await?;
         Ok(())
     }
 
@@ -1580,6 +2016,7 @@ impl AgentRuntime {
         turn_id: &str,
         call: &ToolCall,
         result: &ToolResult,
+        status: AgentItemStatus,
         publisher: &Arc<dyn EventPublisher>,
     ) -> Result<(), AgentRuntimeError> {
         self.repository
@@ -1600,6 +2037,15 @@ impl AgentRuntime {
             name: call.name.clone(),
             result: result.clone(),
         }));
+        self.complete_item(
+            thread_id,
+            turn_id,
+            &call.id,
+            AgentItemType::Tool,
+            status,
+            publisher,
+        )
+        .await?;
         Ok(())
     }
 
@@ -1607,11 +2053,12 @@ impl AgentRuntime {
         &self,
         thread_id: &str,
         turn_id: &str,
+        item_id: &str,
         text: String,
         usage: Option<TokenUsage>,
         publisher: &Arc<dyn EventPublisher>,
     ) -> Result<TurnOutcome, AgentRuntimeError> {
-        let message = text_message(MessageRole::Assistant, text);
+        let message = text_message_with_id(MessageRole::Assistant, item_id.to_string(), text);
         self.repository
             .append(StoredEvent::new(
                 thread_id,
@@ -1621,6 +2068,21 @@ impl AgentRuntime {
                 },
             ))
             .await?;
+        self.complete_active_non_message_items(
+            thread_id,
+            turn_id,
+            AgentItemStatus::Failed,
+            publisher,
+        )
+        .await?;
+        self.complete_active_items(
+            thread_id,
+            turn_id,
+            AgentItemType::AgentMessage,
+            AgentItemStatus::Completed,
+            publisher,
+        )
+        .await?;
         let timing = self
             .append_terminal_event(thread_id, turn_id, StoredEventKind::TurnCompleted { usage })
             .await?;
@@ -1663,12 +2125,28 @@ impl AgentRuntime {
                 }),
             );
         }
+        self.complete_active_non_message_items(
+            thread_id,
+            turn_id,
+            AgentItemStatus::Failed,
+            publisher,
+        )
+        .await?;
+        self.complete_active_items(
+            thread_id,
+            turn_id,
+            AgentItemType::AgentMessage,
+            AgentItemStatus::Failed,
+            publisher,
+        )
+        .await?;
         let timing = self
             .append_terminal_event(
                 thread_id,
                 turn_id,
                 StoredEventKind::TurnFailed {
                     message: message.clone(),
+                    error: Some(TurnError::classify(message.clone())),
                 },
             )
             .await?;
@@ -1698,6 +2176,21 @@ impl AgentRuntime {
         turn_id: &str,
         publisher: &Arc<dyn EventPublisher>,
     ) -> Result<TurnOutcome, AgentRuntimeError> {
+        self.complete_active_non_message_items(
+            thread_id,
+            turn_id,
+            AgentItemStatus::Cancelled,
+            publisher,
+        )
+        .await?;
+        self.complete_active_items(
+            thread_id,
+            turn_id,
+            AgentItemType::AgentMessage,
+            AgentItemStatus::Cancelled,
+            publisher,
+        )
+        .await?;
         let timing = self
             .append_terminal_event(thread_id, turn_id, StoredEventKind::TurnCancelled)
             .await?;
@@ -1718,6 +2211,122 @@ impl AgentRuntime {
             None,
             timing,
         ))
+    }
+
+    async fn start_item(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        item_id: &str,
+        item_type: AgentItemType,
+        publisher: &Arc<dyn EventPublisher>,
+    ) -> Result<(), AgentRuntimeError> {
+        self.repository
+            .append(StoredEvent::new(
+                thread_id,
+                Some(turn_id.to_string()),
+                StoredEventKind::ItemStarted {
+                    item_id: item_id.to_string(),
+                    item_type,
+                },
+            ))
+            .await?;
+        publisher.publish(AgentEventEnvelope::new(AgentEvent::ItemStarted {
+            thread_id: thread_id.to_string(),
+            turn_id: turn_id.to_string(),
+            item_id: item_id.to_string(),
+            item_type,
+        }));
+        Ok(())
+    }
+
+    async fn complete_item(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        item_id: &str,
+        item_type: AgentItemType,
+        status: AgentItemStatus,
+        publisher: &Arc<dyn EventPublisher>,
+    ) -> Result<(), AgentRuntimeError> {
+        self.repository
+            .append(StoredEvent::new(
+                thread_id,
+                Some(turn_id.to_string()),
+                StoredEventKind::ItemCompleted {
+                    item_id: item_id.to_string(),
+                    item_type,
+                    status,
+                },
+            ))
+            .await?;
+        publisher.publish(AgentEventEnvelope::new(AgentEvent::ItemCompleted {
+            thread_id: thread_id.to_string(),
+            turn_id: turn_id.to_string(),
+            item_id: item_id.to_string(),
+            item_type,
+            status,
+        }));
+        Ok(())
+    }
+
+    async fn complete_active_items(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        item_type: AgentItemType,
+        status: AgentItemStatus,
+        publisher: &Arc<dyn EventPublisher>,
+    ) -> Result<(), AgentRuntimeError> {
+        let events = self.repository.load(thread_id).await?;
+        let mut active_item_ids = Vec::<String>::new();
+        for event in &events {
+            if event.turn_id.as_deref() != Some(turn_id) {
+                continue;
+            }
+            match &event.kind {
+                StoredEventKind::ItemStarted {
+                    item_id: started_item_id,
+                    item_type: started_type,
+                } if *started_type == item_type && !active_item_ids.contains(started_item_id) => {
+                    active_item_ids.push(started_item_id.clone());
+                }
+                StoredEventKind::ItemCompleted {
+                    item_id: completed_item_id,
+                    item_type: completed_type,
+                    ..
+                } if *completed_type == item_type => {
+                    active_item_ids.retain(|item_id| item_id != completed_item_id);
+                }
+                _ => {}
+            }
+        }
+        for item_id in active_item_ids {
+            self.complete_item(thread_id, turn_id, &item_id, item_type, status, publisher)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn complete_active_non_message_items(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        status: AgentItemStatus,
+        publisher: &Arc<dyn EventPublisher>,
+    ) -> Result<(), AgentRuntimeError> {
+        for item_type in [
+            AgentItemType::Reasoning,
+            AgentItemType::Tool,
+            AgentItemType::Approval,
+            AgentItemType::Change,
+            AgentItemType::ContextCompaction,
+            AgentItemType::UserInput,
+        ] {
+            self.complete_active_items(thread_id, turn_id, item_type, status, publisher)
+                .await?;
+        }
+        Ok(())
     }
 
     async fn append_terminal_event(
@@ -1800,7 +2409,7 @@ fn provider_history(events: Vec<StoredEvent>, supports_vision: bool) -> Vec<Prov
             | StoredEventKind::AssistantMessage { message } => {
                 chat_to_provider(message, supports_vision)
             }
-            StoredEventKind::AssistantToolCalls { text, calls } => {
+            StoredEventKind::AssistantToolCalls { text, calls, .. } => {
                 Some(ProviderMessage::AssistantToolCalls { text, calls })
             }
             StoredEventKind::ToolResult {
@@ -1993,10 +2602,15 @@ fn add_usage(left: TokenUsage, right: TokenUsage) -> TokenUsage {
     }
 }
 
+#[cfg(test)]
 fn text_message(role: MessageRole, text: String) -> ChatMessage {
+    text_message_with_id(role, Uuid::new_v4().to_string(), text)
+}
+
+fn text_message_with_id(role: MessageRole, id: String, text: String) -> ChatMessage {
     ChatMessage {
         schema_version: PROTOCOL_VERSION,
-        id: Uuid::new_v4().to_string(),
+        id,
         role,
         content: vec![ContentBlock::Text { text }],
         created_at_ms: now_ms(),
@@ -2071,6 +2685,15 @@ fn user_message(
         content,
         created_at_ms: now_ms(),
     })
+}
+
+pub(crate) fn build_user_message(
+    input: &str,
+    attachments: Vec<ImageAttachment>,
+    supports_vision: bool,
+) -> Result<ChatMessage, AgentRuntimeError> {
+    let input = validate_input(input, !attachments.is_empty())?;
+    user_message(input, attachments, supports_vision)
 }
 
 fn truncate_utf8(value: &str, max_bytes: usize) -> &str {
@@ -2276,12 +2899,29 @@ mod tests {
     struct CancellingPublisher {
         cancellation: CancellationToken,
         started_calls: Mutex<Vec<String>>,
+        events: Mutex<Vec<AgentEventEnvelope>>,
     }
 
     impl EventPublisher for CancellingPublisher {
         fn publish(&self, event: AgentEventEnvelope) {
-            if let AgentEvent::ToolStarted { call, .. } = event.event {
-                self.started_calls.lock().unwrap().push(call.id);
+            if let AgentEvent::ToolStarted { call, .. } = &event.event {
+                self.started_calls.lock().unwrap().push(call.id.clone());
+                self.cancellation.cancel();
+            }
+            self.events.lock().unwrap().push(event);
+        }
+    }
+
+    struct ReasoningCancellingPublisher {
+        cancellation: CancellationToken,
+        events: Mutex<Vec<AgentEventEnvelope>>,
+    }
+
+    impl EventPublisher for ReasoningCancellingPublisher {
+        fn publish(&self, event: AgentEventEnvelope) {
+            let should_cancel = matches!(&event.event, AgentEvent::ReasoningSummaryDelta { .. });
+            self.events.lock().unwrap().push(event);
+            if should_cancel {
                 self.cancellation.cancel();
             }
         }
@@ -2514,6 +3154,142 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn uses_the_caller_assigned_turn_id_for_events_and_persistence() {
+        let (_directory, repository, runtime, thread_id) = runtime_fixture().await;
+        let publisher = Arc::new(RecordingPublisher::default());
+        let turn_id = "turn-from-start-handle".to_string();
+
+        let outcome = runtime
+            .run_turn_with_attachments_and_id(
+                Arc::new(FakeProvider::text(&["done"])),
+                "fake-model".to_string(),
+                RunTurnRequest {
+                    thread_id: thread_id.clone(),
+                    input: "run asynchronously".to_string(),
+                    agent_mode: None,
+                },
+                Vec::new(),
+                turn_id.clone(),
+                CancellationToken::new(),
+                publisher.clone(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.turn_id, turn_id);
+        assert!(publisher.events.lock().unwrap().iter().any(|event| {
+            matches!(
+                &event.event,
+                AgentEvent::TurnStarted { turn_id: published, .. } if published == &turn_id
+            )
+        }));
+        assert!(
+            repository
+                .load(&thread_id)
+                .await
+                .unwrap()
+                .iter()
+                .any(|event| {
+                    event.turn_id.as_deref() == Some(turn_id.as_str())
+                        && matches!(event.kind, StoredEventKind::TurnStarted)
+                })
+        );
+        let history = repository.read_thread_history(&thread_id).await.unwrap();
+        assert!(
+            history
+                .turns
+                .data
+                .iter()
+                .any(|turn| { turn.id == turn_id && turn.state == TurnState::Completed })
+        );
+    }
+
+    #[tokio::test]
+    async fn steering_continues_the_same_turn_and_enters_the_next_provider_request() {
+        let (_directory, repository, runtime, thread_id) = runtime_fixture().await;
+        let provider = Arc::new(
+            FakeProvider::script(vec![
+                vec![
+                    Ok(ProviderEvent::TextDelta {
+                        delta: "first answer".into(),
+                    }),
+                    Ok(ProviderEvent::Completed),
+                ],
+                vec![
+                    Ok(ProviderEvent::TextDelta {
+                        delta: "adjusted answer".into(),
+                    }),
+                    Ok(ProviderEvent::Completed),
+                ],
+            ])
+            .with_delay(Duration::from_millis(20)),
+        );
+        let publisher = Arc::new(RecordingPublisher::default());
+        let control = TurnControl::new();
+        let task_control = control.clone();
+        let task_provider = provider.clone();
+        let task_publisher = publisher.clone();
+        let task_thread_id = thread_id.clone();
+
+        let task = tokio::spawn(async move {
+            runtime
+                .run_turn_with_attachments_id_and_control(
+                    task_provider,
+                    "fake-model".into(),
+                    RunTurnRequest {
+                        thread_id: task_thread_id,
+                        input: "initial request".into(),
+                        agent_mode: None,
+                    },
+                    Vec::new(),
+                    "turn-steered".into(),
+                    CancellationToken::new(),
+                    task_control,
+                    task_publisher,
+                )
+                .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while provider.requests().is_empty() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+        control
+            .steer(build_user_message("adjust it", Vec::new(), false).unwrap())
+            .unwrap();
+        let outcome = task.await.unwrap().unwrap();
+
+        assert_eq!(outcome.state, TurnState::Completed);
+        assert_eq!(provider.requests().len(), 2);
+        assert!(provider.requests()[1].messages.iter().any(|message| {
+            matches!(
+                message,
+                ProviderMessage::Text { role: MessageRole::User, text } if text == "adjust it"
+            )
+        }));
+        assert!(publisher.events.lock().unwrap().iter().any(|event| {
+            matches!(
+                &event.event,
+                AgentEvent::TurnSteered { turn_id, message, .. }
+                    if turn_id == "turn-steered" && message.visible_text() == "adjust it"
+            )
+        }));
+        assert_eq!(
+            repository
+                .load(&thread_id)
+                .await
+                .unwrap()
+                .iter()
+                .filter(|event| matches!(event.kind, StoredEventKind::UserMessage { .. }))
+                .count(),
+            2
+        );
+    }
+
+    #[tokio::test]
     async fn persists_and_publishes_a_streamed_text_turn() {
         let (_directory, repository, runtime, thread_id) = runtime_fixture().await;
         let provider = Arc::new(FakeProvider::text(&["hello", " world"]));
@@ -2541,11 +3317,73 @@ mod tests {
         );
         assert_eq!(detail.messages[1].text(), "hello world");
         assert_eq!(provider.requests()[0].messages.len(), 1);
+        let published = publisher.events.lock().unwrap().clone();
+        let text_item_ids = published
+            .iter()
+            .filter_map(|event| match &event.event {
+                AgentEvent::TextDelta { item_id, .. } => Some(item_id.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let completed_message_id = published
+            .iter()
+            .find_map(|event| match &event.event {
+                AgentEvent::TurnCompleted { message, .. } => Some(message.id.clone()),
+                _ => None,
+            })
+            .expect("turn completion should publish the final assistant item");
+        let item_lifecycle = published
+            .iter()
+            .filter_map(|event| match &event.event {
+                AgentEvent::ItemStarted {
+                    item_id, item_type, ..
+                } => Some((item_id.clone(), *item_type, None)),
+                AgentEvent::ItemCompleted {
+                    item_id,
+                    item_type,
+                    status,
+                    ..
+                } => Some((item_id.clone(), *item_type, Some(*status))),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(item_lifecycle.len(), 2);
+        assert_eq!(item_lifecycle[0].0, completed_message_id);
+        assert_eq!(item_lifecycle[0].1, AgentItemType::AgentMessage);
+        assert_eq!(item_lifecycle[1].0, completed_message_id);
+        assert_eq!(item_lifecycle[1].2, Some(AgentItemStatus::Completed));
+        let stored_lifecycle = repository
+            .load(&thread_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter_map(|event| match event.kind {
+                StoredEventKind::ItemStarted { item_id, item_type } => {
+                    Some((item_id, item_type, None))
+                }
+                StoredEventKind::ItemCompleted {
+                    item_id,
+                    item_type,
+                    status,
+                } => Some((item_id, item_type, Some(status))),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(stored_lifecycle, item_lifecycle);
+        assert_eq!(text_item_ids.len(), 2);
+        assert!(
+            text_item_ids
+                .iter()
+                .all(|item_id| item_id == &completed_message_id)
+        );
         assert!(matches!(
-            publisher
-                .events
-                .lock()
-                .unwrap()
+            detail.turn_timeline.as_slice(),
+            [TurnTimelineItem::Text { id, text, .. }, TurnTimelineItem::Event { .. }]
+                if id == &completed_message_id && text == "hello world"
+        ));
+        assert!(matches!(
+            published
+                .iter()
                 .last()
                 .map(|event| &event.event),
             Some(AgentEvent::TurnCompleted {
@@ -2557,6 +3395,224 @@ mod tests {
                 && *completed_at_ms == result.completed_at_ms
                 && *duration_ms == result.duration_ms
         ));
+    }
+
+    #[tokio::test]
+    async fn persists_reasoning_item_lifecycle_and_ignores_duplicate_completion() {
+        let (_directory, repository, runtime, thread_id) = runtime_fixture().await;
+        let provider = Arc::new(FakeProvider::new(vec![
+            Ok(ProviderEvent::ReasoningSummaryDelta {
+                item_id: "reasoning-1".into(),
+                delta: "检查公开契约。".into(),
+            }),
+            Ok(ProviderEvent::ReasoningSummaryCompleted {
+                item_id: "reasoning-1".into(),
+                summary: "检查公开契约。".into(),
+            }),
+            Ok(ProviderEvent::ReasoningSummaryCompleted {
+                item_id: "reasoning-1".into(),
+                summary: "不应重复。".into(),
+            }),
+            Ok(ProviderEvent::ReasoningSummaryCompleted {
+                item_id: "reasoning-2".into(),
+                summary: "直接完成的安全摘要。".into(),
+            }),
+            Ok(ProviderEvent::TextDelta {
+                delta: "完成。".into(),
+            }),
+            Ok(ProviderEvent::Completed),
+        ]));
+        let publisher = Arc::new(RecordingPublisher::default());
+
+        let outcome = runtime
+            .run_turn(
+                provider,
+                "fake".into(),
+                RunTurnRequest {
+                    thread_id: thread_id.clone(),
+                    input: "inspect".into(),
+                    agent_mode: None,
+                },
+                CancellationToken::new(),
+                publisher.clone(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.state, TurnState::Completed);
+        let events = repository.load(&thread_id).await.unwrap();
+        let reasoning_lifecycle = events
+            .iter()
+            .filter_map(|event| match &event.kind {
+                StoredEventKind::ItemStarted { item_id, item_type }
+                | StoredEventKind::ItemCompleted {
+                    item_id, item_type, ..
+                } if *item_type == AgentItemType::Reasoning => Some(item_id.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            reasoning_lifecycle,
+            ["reasoning-1", "reasoning-1", "reasoning-2", "reasoning-2"]
+        );
+        let summaries = events
+            .iter()
+            .filter_map(|event| match &event.kind {
+                StoredEventKind::ReasoningSummary { item_id, summary } => {
+                    Some((item_id.as_str(), summary.as_str()))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            summaries,
+            [
+                ("reasoning-1", "检查公开契约。"),
+                ("reasoning-2", "直接完成的安全摘要。")
+            ]
+        );
+        assert_eq!(
+            publisher
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|event| matches!(
+                    &event.event,
+                    AgentEvent::ItemCompleted {
+                        item_type: AgentItemType::Reasoning,
+                        status: AgentItemStatus::Completed,
+                        ..
+                    }
+                ))
+                .count(),
+            2
+        );
+        assert!(
+            !provider_history(events, false)
+                .iter()
+                .any(|message| match message {
+                    ProviderMessage::Text { text, .. }
+                    | ProviderMessage::UserContent { text, .. }
+                    | ProviderMessage::AssistantToolCalls { text, .. } => text.contains("安全摘要"),
+                    ProviderMessage::ToolResult { .. }
+                    | ProviderMessage::ProviderContext { .. } => false,
+                })
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_reasoning_item_is_closed_as_failed() {
+        let (_directory, repository, runtime, thread_id) = runtime_fixture().await;
+        let provider = Arc::new(FakeProvider::new(vec![Ok(
+            ProviderEvent::ReasoningSummaryDelta {
+                item_id: "reasoning-limit".into(),
+                delta: "x".repeat(MAX_REASONING_SUMMARY_BYTES + 1),
+            },
+        )]));
+
+        let outcome = runtime
+            .run_turn(
+                provider,
+                "fake".into(),
+                RunTurnRequest {
+                    thread_id: thread_id.clone(),
+                    input: "bounded".into(),
+                    agent_mode: None,
+                },
+                CancellationToken::new(),
+                Arc::new(RecordingPublisher::default()),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.state, TurnState::Failed);
+        assert!(
+            repository
+                .load(&thread_id)
+                .await
+                .unwrap()
+                .iter()
+                .any(|event| matches!(
+                    &event.kind,
+                    StoredEventKind::ItemCompleted {
+                        item_id,
+                        item_type: AgentItemType::Reasoning,
+                        status: AgentItemStatus::Failed,
+                    } if item_id == "reasoning-limit"
+                ))
+        );
+    }
+
+    #[tokio::test]
+    async fn active_reasoning_item_is_closed_when_the_turn_is_cancelled() {
+        let (_directory, repository, runtime, thread_id) = runtime_fixture().await;
+        let cancellation = CancellationToken::new();
+        let publisher = Arc::new(ReasoningCancellingPublisher {
+            cancellation: cancellation.clone(),
+            events: Mutex::new(Vec::new()),
+        });
+        let provider = Arc::new(
+            FakeProvider::new(vec![
+                Ok(ProviderEvent::ReasoningSummaryDelta {
+                    item_id: "reasoning-cancelled".into(),
+                    delta: "正在检查。".into(),
+                }),
+                Ok(ProviderEvent::TextDelta {
+                    delta: "不应完成".into(),
+                }),
+                Ok(ProviderEvent::Completed),
+            ])
+            .with_delay(Duration::from_millis(10)),
+        );
+
+        let outcome = runtime
+            .run_turn(
+                provider,
+                "fake".into(),
+                RunTurnRequest {
+                    thread_id: thread_id.clone(),
+                    input: "cancel reasoning".into(),
+                    agent_mode: None,
+                },
+                cancellation,
+                publisher.clone(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.state, TurnState::Cancelled);
+        assert!(
+            repository
+                .load(&thread_id)
+                .await
+                .unwrap()
+                .iter()
+                .any(|event| matches!(
+                    &event.kind,
+                    StoredEventKind::ItemCompleted {
+                        item_id,
+                        item_type: AgentItemType::Reasoning,
+                        status: AgentItemStatus::Cancelled,
+                    } if item_id == "reasoning-cancelled"
+                ))
+        );
+        assert!(
+            publisher
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| matches!(
+                    &event.event,
+                    AgentEvent::ItemCompleted {
+                        item_id,
+                        item_type: AgentItemType::Reasoning,
+                        status: AgentItemStatus::Cancelled,
+                        ..
+                    } if item_id == "reasoning-cancelled"
+                ))
+        );
     }
 
     #[tokio::test]
@@ -2624,6 +3680,76 @@ mod tests {
                 .filter(|event| matches!(event.kind, StoredEventKind::ToolResult { .. }))
                 .count(),
             1
+        );
+        let item_lifecycle = events
+            .iter()
+            .filter_map(|event| match &event.kind {
+                StoredEventKind::ItemStarted { item_id, item_type }
+                | StoredEventKind::ItemCompleted {
+                    item_id, item_type, ..
+                } if *item_type == AgentItemType::AgentMessage => Some(item_id.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(item_lifecycle.len(), 4);
+        assert_eq!(item_lifecycle[0], item_lifecycle[1]);
+        assert_ne!(item_lifecycle[1], item_lifecycle[2]);
+        assert_eq!(item_lifecycle[2], item_lifecycle[3]);
+        let stored_tool_lifecycle = events
+            .iter()
+            .filter_map(|event| match &event.kind {
+                StoredEventKind::ItemStarted { item_id, item_type }
+                    if *item_type == AgentItemType::Tool =>
+                {
+                    Some((item_id.clone(), None))
+                }
+                StoredEventKind::ItemCompleted {
+                    item_id,
+                    item_type,
+                    status,
+                } if *item_type == AgentItemType::Tool => Some((item_id.clone(), Some(*status))),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            stored_tool_lifecycle,
+            [
+                ("call-1".to_string(), None),
+                ("call-1".to_string(), Some(AgentItemStatus::Completed)),
+            ]
+        );
+        let published_tool_lifecycle = publisher
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|event| match &event.event {
+                AgentEvent::ItemStarted {
+                    item_id, item_type, ..
+                } if *item_type == AgentItemType::Tool => Some(format!("item_started:{item_id}")),
+                AgentEvent::ToolStarted { call, .. } => Some(format!("tool_started:{}", call.id)),
+                AgentEvent::ToolCompleted { call_id, .. } => {
+                    Some(format!("tool_completed:{call_id}"))
+                }
+                AgentEvent::ItemCompleted {
+                    item_id,
+                    item_type,
+                    status,
+                    ..
+                } if *item_type == AgentItemType::Tool => {
+                    Some(format!("item_completed:{item_id}:{status:?}"))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            published_tool_lifecycle,
+            [
+                "item_started:call-1",
+                "tool_started:call-1",
+                "tool_completed:call-1",
+                "item_completed:call-1:Completed",
+            ]
         );
         let detail = repository.read_thread(&thread_id).await.unwrap();
         assert_eq!(detail.tool_activities.len(), 1);
@@ -2739,8 +3865,10 @@ mod tests {
         ]));
         let runtime = Arc::new(runtime);
         let manager = runtime.user_input_manager();
+        let publisher = Arc::new(RecordingPublisher::default());
         let run_runtime = runtime.clone();
         let run_thread_id = thread_id.clone();
+        let run_publisher = publisher.clone();
         let run = tokio::spawn(async move {
             run_runtime
                 .run_turn(
@@ -2752,7 +3880,7 @@ mod tests {
                         agent_mode: None,
                     },
                     CancellationToken::new(),
-                    Arc::new(RecordingPublisher::default()),
+                    run_publisher,
                 )
                 .await
         });
@@ -2806,6 +3934,139 @@ mod tests {
                 ..
             }
         )));
+        let stored_lifecycle = repository
+            .load(&thread_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter_map(|event| match event.kind {
+                StoredEventKind::ItemStarted { item_id, item_type }
+                    if item_type == AgentItemType::UserInput =>
+                {
+                    Some((item_id, None))
+                }
+                StoredEventKind::ItemCompleted {
+                    item_id,
+                    item_type,
+                    status,
+                } if item_type == AgentItemType::UserInput => Some((item_id, Some(status))),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            stored_lifecycle,
+            [
+                (request.id.clone(), None),
+                (request.id.clone(), Some(AgentItemStatus::Completed)),
+            ]
+        );
+        let published_lifecycle = publisher
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|event| match &event.event {
+                AgentEvent::ItemStarted {
+                    item_id, item_type, ..
+                } if *item_type == AgentItemType::UserInput => Some((item_id.clone(), None)),
+                AgentEvent::ItemCompleted {
+                    item_id,
+                    item_type,
+                    status,
+                    ..
+                } if *item_type == AgentItemType::UserInput => {
+                    Some((item_id.clone(), Some(*status)))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(published_lifecycle, stored_lifecycle);
+    }
+
+    #[tokio::test]
+    async fn skipped_user_input_closes_item_as_failed() {
+        let (_directory, repository, runtime, thread_id) = runtime_fixture().await;
+        let call = ToolCall {
+            id: "call-skipped-input".to_string(),
+            name: REQUEST_USER_INPUT_TOOL_NAME.to_string(),
+            arguments: json!({
+                "questions": [{
+                    "question": "Choose an approach",
+                    "options": ["Conservative", "Fast"]
+                }]
+            }),
+            metadata: json!({}),
+        };
+        let provider = Arc::new(FakeProvider::script(vec![
+            vec![
+                Ok(ProviderEvent::ToolCall { call }),
+                Ok(ProviderEvent::Completed),
+            ],
+            vec![
+                Ok(ProviderEvent::TextDelta {
+                    delta: "Continuing without an answer".to_string(),
+                }),
+                Ok(ProviderEvent::Completed),
+            ],
+        ]));
+        let runtime = Arc::new(runtime);
+        let manager = runtime.user_input_manager();
+        let run_runtime = runtime.clone();
+        let run_thread_id = thread_id.clone();
+        let run = tokio::spawn(async move {
+            run_runtime
+                .run_turn(
+                    provider,
+                    "fake".to_string(),
+                    RunTurnRequest {
+                        thread_id: run_thread_id,
+                        input: "plan the change".to_string(),
+                        agent_mode: None,
+                    },
+                    CancellationToken::new(),
+                    Arc::new(RecordingPublisher::default()),
+                )
+                .await
+        });
+
+        let request_id = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let detail = repository.read_thread(&thread_id).await.unwrap();
+                if let Some(input) = detail.user_inputs.first() {
+                    break input.request.id.clone();
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("user input request should be persisted before the runtime waits");
+        manager
+            .resolve(
+                &request_id,
+                UserInputResolution {
+                    action: UserInputAction::Skipped,
+                    answers: Vec::new(),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(run.await.unwrap().unwrap().state, TurnState::Completed);
+        assert!(
+            repository
+                .load(&thread_id)
+                .await
+                .unwrap()
+                .iter()
+                .any(|event| matches!(
+                    &event.kind,
+                    StoredEventKind::ItemCompleted {
+                        item_id,
+                        item_type: AgentItemType::UserInput,
+                        status: AgentItemStatus::Failed,
+                    } if item_id == &request_id
+                ))
+        );
     }
 
     #[tokio::test]
@@ -2829,18 +4090,22 @@ mod tests {
             .unwrap();
         assert_eq!(cancelled.state, TurnState::Cancelled);
 
+        let retry_turn_id = "assigned-retry-turn".to_string();
         let completed = runtime
-            .retry_turn(
+            .retry_turn_with_id_and_control(
                 Arc::new(FakeProvider::text(&["retry completed"])),
                 "fake".to_string(),
                 thread_id.clone(),
                 AgentMode::Craft,
+                retry_turn_id.clone(),
                 CancellationToken::new(),
+                TurnControl::new(),
                 Arc::new(RecordingPublisher::default()),
             )
             .await
             .unwrap();
         assert_eq!(completed.state, TurnState::Completed);
+        assert_eq!(completed.turn_id, retry_turn_id);
 
         let detail = repository.read_thread(&thread_id).await.unwrap();
         assert_eq!(
@@ -3118,6 +4383,7 @@ mod tests {
             )),
         ]]));
 
+        let publisher = Arc::new(RecordingPublisher::default());
         let outcome = runtime
             .run_turn(
                 provider.clone(),
@@ -3128,13 +4394,28 @@ mod tests {
                     agent_mode: None,
                 },
                 CancellationToken::new(),
-                Arc::new(RecordingPublisher::default()),
+                publisher.clone(),
             )
             .await
             .unwrap();
 
         assert_eq!(outcome.state, TurnState::Failed);
         assert_eq!(provider.requests().len(), 1);
+        assert!(
+            publisher
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| matches!(
+                    &event.event,
+                    AgentEvent::ItemCompleted {
+                        item_type: AgentItemType::AgentMessage,
+                        status: AgentItemStatus::Failed,
+                        ..
+                    }
+                ))
+        );
         assert_eq!(
             repository
                 .read_thread(&thread_id)
@@ -3259,19 +4540,40 @@ mod tests {
             .unwrap();
 
         assert_eq!(outcome.state, TurnState::Completed);
-        assert!(
-            repository
-                .load(&thread_id)
-                .await
-                .unwrap()
-                .iter()
-                .any(|event| matches!(
-                    event.kind,
-                    StoredEventKind::ContextCompacted {
-                        automatic: true,
-                        ..
-                    }
-                ))
+        let events = repository.load(&thread_id).await.unwrap();
+        let compaction_item_id = events
+            .iter()
+            .find_map(|event| match &event.kind {
+                StoredEventKind::ContextCompacted {
+                    automatic: true, ..
+                } => Some(event.event_id.clone()),
+                _ => None,
+            })
+            .expect("automatic compaction should be persisted");
+        let stored_lifecycle = events
+            .iter()
+            .filter_map(|event| match &event.kind {
+                StoredEventKind::ItemStarted { item_id, item_type }
+                    if *item_type == AgentItemType::ContextCompaction =>
+                {
+                    Some((item_id.clone(), None))
+                }
+                StoredEventKind::ItemCompleted {
+                    item_id,
+                    item_type,
+                    status,
+                } if *item_type == AgentItemType::ContextCompaction => {
+                    Some((item_id.clone(), Some(*status)))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            stored_lifecycle,
+            [
+                (compaction_item_id.clone(), None),
+                (compaction_item_id.clone(), Some(AgentItemStatus::Completed),),
+            ]
         );
         assert!(
             publisher
@@ -3288,9 +4590,99 @@ mod tests {
                     } if *compacted_message_count > 0
                 ))
         );
+        let published_lifecycle = publisher
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|event| match &event.event {
+                AgentEvent::ItemStarted {
+                    item_id, item_type, ..
+                } if *item_type == AgentItemType::ContextCompaction => {
+                    Some((item_id.clone(), None))
+                }
+                AgentEvent::ItemCompleted {
+                    item_id,
+                    item_type,
+                    status,
+                    ..
+                } if *item_type == AgentItemType::ContextCompaction => {
+                    Some((item_id.clone(), Some(*status)))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(published_lifecycle, stored_lifecycle);
         let requests = provider.requests();
         assert_eq!(requests.len(), 2);
         assert!(requests[1].messages.len() < requests[0].messages.len());
+    }
+
+    #[tokio::test]
+    async fn manual_compaction_persists_a_completed_item_lifecycle() {
+        let (_directory, repository, runtime, thread_id) = runtime_fixture().await;
+        for index in 0..20 {
+            let role = if index % 2 == 0 {
+                MessageRole::User
+            } else {
+                MessageRole::Assistant
+            };
+            repository
+                .append(StoredEvent::new(
+                    &thread_id,
+                    None,
+                    StoredEventKind::AssistantMessage {
+                        message: text_message(
+                            role,
+                            format!("manual-history-{index} {}", "x".repeat(1_000)),
+                        ),
+                    },
+                ))
+                .await
+                .unwrap();
+        }
+
+        let summary = runtime
+            .with_context_limit(2_000)
+            .compact_thread(&thread_id)
+            .await
+            .unwrap();
+        assert!(summary.compacted_message_count > 0);
+        let events = repository.load(&thread_id).await.unwrap();
+        let compaction_item_id = events
+            .iter()
+            .find_map(|event| match &event.kind {
+                StoredEventKind::ContextCompacted {
+                    automatic: false, ..
+                } => Some(event.event_id.clone()),
+                _ => None,
+            })
+            .expect("manual compaction should be persisted");
+        let lifecycle = events
+            .iter()
+            .filter_map(|event| match &event.kind {
+                StoredEventKind::ItemStarted { item_id, item_type }
+                    if *item_type == AgentItemType::ContextCompaction =>
+                {
+                    Some((event.turn_id.clone(), item_id.clone(), None))
+                }
+                StoredEventKind::ItemCompleted {
+                    item_id,
+                    item_type,
+                    status,
+                } if *item_type == AgentItemType::ContextCompaction => {
+                    Some((event.turn_id.clone(), item_id.clone(), Some(*status)))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            lifecycle,
+            [
+                (None, compaction_item_id.clone(), None),
+                (None, compaction_item_id, Some(AgentItemStatus::Completed),),
+            ]
+        );
     }
 
     #[test]
@@ -3348,6 +4740,7 @@ mod tests {
                     "thread",
                     Some("interrupted-turn".to_string()),
                     StoredEventKind::AssistantToolCalls {
+                        item_id: None,
                         text: "Inspecting files".to_string(),
                         calls,
                     },
@@ -3385,6 +4778,7 @@ mod tests {
                 &thread_id,
                 Some(interrupted_turn_id.clone()),
                 StoredEventKind::AssistantToolCalls {
+                    item_id: None,
                     text: "Inspecting files".to_string(),
                     calls: vec![
                         ToolCall {
@@ -3572,9 +4966,10 @@ mod tests {
         let cancellation = CancellationToken::new();
         let cancel_from_test = cancellation.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
             cancel_from_test.cancel();
         });
+        let publisher = Arc::new(RecordingPublisher::default());
         let result = runtime
             .run_turn(
                 provider,
@@ -3585,20 +4980,38 @@ mod tests {
                     agent_mode: None,
                 },
                 cancellation,
-                Arc::new(RecordingPublisher::default()),
+                publisher.clone(),
             )
             .await
             .unwrap();
         assert_eq!(result.state, TurnState::Cancelled);
+        let events = repository.load(&thread_id).await.unwrap();
         assert!(matches!(
-            repository
-                .load(&thread_id)
-                .await
-                .unwrap()
-                .last()
-                .map(|event| &event.kind),
+            events.last().map(|event| &event.kind),
             Some(StoredEventKind::TurnCancelled)
         ));
+        assert!(matches!(
+            events.iter().find_map(|event| match &event.kind {
+                StoredEventKind::ItemCompleted { status, .. } => Some(status),
+                _ => None,
+            }),
+            Some(AgentItemStatus::Cancelled)
+        ));
+        assert!(
+            publisher
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| matches!(
+                    &event.event,
+                    AgentEvent::ItemCompleted {
+                        item_type: AgentItemType::AgentMessage,
+                        status: AgentItemStatus::Cancelled,
+                        ..
+                    }
+                ))
+        );
     }
 
     #[tokio::test]
@@ -3628,6 +5041,7 @@ mod tests {
         let publisher = Arc::new(CancellingPublisher {
             cancellation: cancellation.clone(),
             started_calls: Mutex::new(Vec::new()),
+            events: Mutex::new(Vec::new()),
         });
 
         let outcome = runtime
@@ -3651,6 +5065,55 @@ mod tests {
             events
                 .iter()
                 .filter(|event| matches!(event.kind, StoredEventKind::ToolResult { .. }))
+                .count(),
+            2
+        );
+        let tool_lifecycle = events
+            .iter()
+            .filter_map(|event| match &event.kind {
+                StoredEventKind::ItemStarted { item_id, item_type }
+                    if *item_type == AgentItemType::Tool =>
+                {
+                    Some((item_id.clone(), None))
+                }
+                StoredEventKind::ItemCompleted {
+                    item_id,
+                    item_type,
+                    status,
+                } if *item_type == AgentItemType::Tool => Some((item_id.clone(), Some(*status))),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            tool_lifecycle,
+            [
+                ("call-1".to_string(), None),
+                ("call-2".to_string(), None),
+                ("call-1".to_string(), Some(AgentItemStatus::Cancelled)),
+                ("call-2".to_string(), Some(AgentItemStatus::Cancelled)),
+            ]
+        );
+        let detail = repository.read_thread(&thread.id).await.unwrap();
+        assert!(
+            detail
+                .tool_activities
+                .iter()
+                .all(|activity| activity.state == crate::storage::ToolActivityState::Cancelled)
+        );
+        assert_eq!(
+            publisher
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|event| matches!(
+                    event.event,
+                    AgentEvent::ItemCompleted {
+                        item_type: AgentItemType::Tool,
+                        status: AgentItemStatus::Cancelled,
+                        ..
+                    }
+                ))
                 .count(),
             2
         );
@@ -3756,6 +5219,89 @@ mod tests {
             Some("before\n")
         );
         assert_eq!(approvals.pending_count().await, 0);
+        let approval_id = detail.approvals[0].request.id.clone();
+        let change_id = detail.changes[0].id.clone();
+        let stored_lifecycle = repository
+            .load(&thread_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter_map(|event| match event.kind {
+                StoredEventKind::ItemStarted { item_id, item_type }
+                    if matches!(item_type, AgentItemType::Approval | AgentItemType::Change) =>
+                {
+                    Some((item_id, item_type, None))
+                }
+                StoredEventKind::ItemCompleted {
+                    item_id,
+                    item_type,
+                    status,
+                } if matches!(item_type, AgentItemType::Approval | AgentItemType::Change) => {
+                    Some((item_id, item_type, Some(status)))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            stored_lifecycle,
+            [
+                (approval_id.clone(), AgentItemType::Approval, None),
+                (
+                    approval_id.clone(),
+                    AgentItemType::Approval,
+                    Some(AgentItemStatus::Completed),
+                ),
+                (change_id.clone(), AgentItemType::Change, None),
+                (
+                    change_id.clone(),
+                    AgentItemType::Change,
+                    Some(AgentItemStatus::Completed),
+                ),
+            ]
+        );
+        let published_sequence = publisher
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|event| match &event.event {
+                AgentEvent::ItemStarted {
+                    item_id, item_type, ..
+                } if matches!(item_type, AgentItemType::Approval | AgentItemType::Change) => {
+                    Some(format!("item_started:{item_type:?}:{item_id}"))
+                }
+                AgentEvent::ApprovalRequested { request, .. } => {
+                    Some(format!("approval_requested:{}", request.id))
+                }
+                AgentEvent::ApprovalResolved { request_id, .. } => {
+                    Some(format!("approval_resolved:{request_id}"))
+                }
+                AgentEvent::ChangeApplied { change_set, .. } => {
+                    Some(format!("change_applied:{}", change_set.id))
+                }
+                AgentEvent::ItemCompleted {
+                    item_id,
+                    item_type,
+                    status,
+                    ..
+                } if matches!(item_type, AgentItemType::Approval | AgentItemType::Change) => {
+                    Some(format!("item_completed:{item_type:?}:{item_id}:{status:?}"))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            published_sequence,
+            [
+                format!("item_started:Approval:{approval_id}"),
+                format!("approval_requested:{approval_id}"),
+                format!("approval_resolved:{approval_id}"),
+                format!("item_completed:Approval:{approval_id}:Completed"),
+                format!("item_started:Change:{change_id}"),
+                format!("change_applied:{change_id}"),
+                format!("item_completed:Change:{change_id}:Completed"),
+            ]
+        );
     }
 
     #[tokio::test]
@@ -3948,6 +5494,36 @@ mod tests {
         let detail = repository.read_thread(&thread.id).await.unwrap();
         assert_eq!(detail.changes.len(), 2);
         assert_eq!(detail.tool_activities.len(), 4);
+        assert!(detail.tool_activities.iter().any(|activity| {
+            activity.call.id == "check-failed"
+                && activity.state == crate::storage::ToolActivityState::Failed
+        }));
+        assert!(detail.tool_activities.iter().any(|activity| {
+            activity.call.id == "check-passed"
+                && activity.state == crate::storage::ToolActivityState::Completed
+        }));
+        let stored_tool_completions = repository
+            .load(&thread.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter_map(|event| match event.kind {
+                StoredEventKind::ItemCompleted {
+                    item_id,
+                    item_type: AgentItemType::Tool,
+                    status,
+                } => Some((item_id, status)),
+                _ => None,
+            })
+            .collect::<HashMap<_, _>>();
+        assert_eq!(
+            stored_tool_completions.get("check-failed"),
+            Some(&AgentItemStatus::Failed)
+        );
+        assert_eq!(
+            stored_tool_completions.get("check-passed"),
+            Some(&AgentItemStatus::Completed)
+        );
         assert_eq!(
             detail.messages.last().unwrap().text(),
             "The repair is complete and verified."
@@ -4165,6 +5741,26 @@ mod tests {
                 ..
             })
         ));
+        assert!(inner.load(&thread.id).await.unwrap().iter().any(|event| {
+            matches!(
+                &event.kind,
+                StoredEventKind::ItemCompleted {
+                    item_type: AgentItemType::Change,
+                    status: AgentItemStatus::Failed,
+                    ..
+                }
+            )
+        }));
+        assert!(publisher.events.lock().unwrap().iter().any(|event| {
+            matches!(
+                &event.event,
+                AgentEvent::ItemCompleted {
+                    item_type: AgentItemType::Change,
+                    status: AgentItemStatus::Failed,
+                    ..
+                }
+            )
+        }));
         assert!(publisher.events.lock().unwrap().iter().any(|event| {
             matches!(&event.event, AgentEvent::TurnFailed { message, .. } if message.contains("injected change audit failure"))
         }));
@@ -4233,6 +5829,34 @@ mod tests {
                     .unwrap()
                     .changes
                     .is_empty()
+            );
+            let events = repository.load(&thread_id).await.unwrap();
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(
+                        &event.kind,
+                        StoredEventKind::ItemStarted {
+                            item_type: AgentItemType::Approval,
+                            ..
+                        }
+                    ))
+                    .count(),
+                1
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(
+                        &event.kind,
+                        StoredEventKind::ItemCompleted {
+                            item_type: AgentItemType::Approval,
+                            status: AgentItemStatus::Failed,
+                            ..
+                        }
+                    ))
+                    .count(),
+                1
             );
         }
     }

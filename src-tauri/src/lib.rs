@@ -18,6 +18,7 @@ pub mod tools;
 pub mod workbench;
 
 use app_state::AppState;
+use std::path::{Path, PathBuf};
 use tauri::Manager;
 use tauri::image::Image;
 use tauri::menu::{Menu, MenuItem};
@@ -29,6 +30,23 @@ use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
 const SINGLE_INSTANCE_TITLE: &str = "k-Coder 已在运行";
 #[cfg(desktop)]
 const SINGLE_INSTANCE_MESSAGE: &str = "k-Coder 已在运行，已切换到现有窗口。";
+
+fn select_builtin_skills_root(resource_dir: &Path, development_root: Option<&Path>) -> PathBuf {
+    development_root
+        .filter(|root| root.is_dir())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| resource_dir.join("skills"))
+}
+
+fn builtin_skills_root(resource_dir: &Path) -> PathBuf {
+    #[cfg(debug_assertions)]
+    let development_root =
+        Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../src/resources/skills"));
+    #[cfg(not(debug_assertions))]
+    let development_root: Option<PathBuf> = None;
+
+    select_builtin_skills_root(resource_dir, development_root.as_deref())
+}
 
 fn show_main_window(app: &tauri::AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
@@ -60,7 +78,7 @@ pub fn run() {
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .setup(|app| {
             let data_root = app.path().app_data_dir()?.join("runtime-data");
-            let builtin_skills_root = app.path().resource_dir()?.join("skills");
+            let builtin_skills_root = builtin_skills_root(&app.path().resource_dir()?);
             let state = AppState::new_with_builtin_skills(data_root, builtin_skills_root)
                 .map_err(|error| std::io::Error::other(error.to_string()))?;
             app.manage(state);
@@ -174,9 +192,23 @@ pub fn run() {
             commands::save_mcp_secret,
             commands::delete_mcp_secret,
             commands::read_thread,
+            commands::read_thread_history,
+            commands::list_thread_turns,
+            commands::list_thread_items,
             commands::archive_thread,
             commands::compact_thread,
             commands::rebuild_session_projection,
+            commands::turn_start,
+            commands::turn_retry,
+            commands::read_thread_mailbox,
+            commands::remove_queued_turn,
+            commands::clear_thread_mailbox,
+            commands::turn_steer,
+            commands::turn_steer_queued,
+            commands::turn_interrupt,
+            commands::thread_fork,
+            commands::thread_resume,
+            commands::thread_rollback,
             commands::run_turn,
             commands::retry_turn,
             commands::cancel_turn,

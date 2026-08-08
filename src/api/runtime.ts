@@ -29,7 +29,16 @@ import type {
   StartCommandRequest,
   StartPtyRequest,
   ThreadDetail,
+  ThreadHistorySnapshot,
+  ThreadItemsPage,
   ThreadSummary,
+  ThreadTurnsPage,
+  HistorySortDirection,
+  TurnItemsView,
+  TurnHandle,
+  ThreadMailboxSnapshot,
+  ThreadMailboxChanged,
+  TurnSteerResponse,
   TurnOutcome,
   UserInputResolution,
   UsageSummary,
@@ -111,6 +120,46 @@ export function readThread(threadId: string) {
   return invoke<ThreadDetail>("read_thread", { threadId });
 }
 
+export function readThreadHistory(threadId: string) {
+  return invoke<ThreadHistorySnapshot>("read_thread_history", { threadId });
+}
+
+export function listThreadTurns(
+  threadId: string,
+  options: {
+    cursor?: string | null;
+    limit?: number;
+    sortDirection?: HistorySortDirection;
+    itemsView?: TurnItemsView;
+  } = {},
+) {
+  return invoke<ThreadTurnsPage>("list_thread_turns", {
+    threadId,
+    cursor: options.cursor ?? null,
+    limit: options.limit ?? null,
+    sortDirection: options.sortDirection ?? null,
+    itemsView: options.itemsView ?? null,
+  });
+}
+
+export function listThreadItems(
+  threadId: string,
+  options: {
+    turnId?: string | null;
+    cursor?: string | null;
+    limit?: number;
+    sortDirection?: HistorySortDirection;
+  } = {},
+) {
+  return invoke<ThreadItemsPage>("list_thread_items", {
+    threadId,
+    turnId: options.turnId ?? null,
+    cursor: options.cursor ?? null,
+    limit: options.limit ?? null,
+    sortDirection: options.sortDirection ?? null,
+  });
+}
+
 export function archiveThread(threadId: string) {
   return invoke<void>("archive_thread", { threadId });
 }
@@ -119,8 +168,61 @@ export function runTurn(threadId: string, input: string, attachments: ImageAttac
   return invoke<TurnOutcome>("run_turn", { request: { threadId, input, agentMode }, attachments });
 }
 
+export function startTurn(threadId: string, input: string, attachments: ImageAttachment[] = [], agentMode?: string) {
+  return invoke<TurnHandle>("turn_start", { request: { threadId, input, agentMode }, attachments });
+}
+
+export function readThreadMailbox(threadId: string) {
+  return invoke<ThreadMailboxSnapshot>("read_thread_mailbox", { threadId });
+}
+
+export function removeQueuedTurn(threadId: string, turnId: string) {
+  return invoke<boolean>("remove_queued_turn", { threadId, turnId });
+}
+
+export function clearThreadMailbox(threadId: string) {
+  return invoke<number>("clear_thread_mailbox", { threadId });
+}
+
+export function steerTurn(
+    threadId: string,
+  expectedTurnId: string,
+  input: string,
+  attachments: ImageAttachment[] = [],
+) {
+  return invoke<TurnSteerResponse>("turn_steer", {
+    request: { threadId, expectedTurnId, input, attachments },
+  });
+}
+
+export function steerQueuedTurn(threadId: string, expectedTurnId: string, queuedTurnId: string) {
+  return invoke<TurnSteerResponse>("turn_steer_queued", {
+    request: { threadId, expectedTurnId, queuedTurnId },
+  });
+}
+
+export function interruptTurn(threadId: string, turnId: string) {
+  return invoke<void>("turn_interrupt", { threadId, turnId });
+}
+
+export function forkThread(threadId: string, lastTurnId?: string) {
+  return invoke<ThreadSummary>("thread_fork", {
+    request: { threadId, lastTurnId: lastTurnId ?? null },
+  });
+}
+
+export function resumeThread(threadId: string) {
+  return invoke<ThreadHistorySnapshot>("thread_resume", { threadId });
+}
+
+export function rollbackThread(threadId: string, numTurns: number) {
+  return invoke<ThreadHistorySnapshot>("thread_rollback", {
+    request: { threadId, numTurns },
+  });
+}
+
 export function retryTurn(threadId: string) {
-  return invoke<TurnOutcome>("retry_turn", { threadId });
+  return invoke<TurnHandle>("turn_retry", { threadId });
 }
 
 export function cancelTurn(threadId: string) {
@@ -302,6 +404,12 @@ export function subscribeToAgentEvents(
   handler: (event: AgentEvent) => void,
 ): Promise<UnlistenFn> {
   return listen<AgentEvent>("agent-event", ({ payload }) => handler(payload));
+}
+
+export function subscribeToMailboxEvents(
+  handler: (event: ThreadMailboxChanged) => void,
+): Promise<UnlistenFn> {
+  return listen<ThreadMailboxChanged>("thread-mailbox-changed", ({ payload }) => handler(payload));
 }
 
 export function subscribeToSubagentEvents(
