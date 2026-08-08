@@ -14,7 +14,7 @@
 | 项目 | 当前值 |
 | --- | --- |
 | 当前阶段 | 阶段 7：运行时正确性、吞吐与可维护性实施中 |
-| 当前任务 | `P10-077` 沿职责边界拆分超大模块 |
+| 当前任务 | `P10-077` 沿职责边界拆分超大模块（本轮完成 storage 历史分页切片） |
 | 后续任务 | `P10-078` Monaco 包体治理 |
 | 已完成基础 | 稳定 Item 身份与生命周期、统一历史分页、异步 `turn_start`/`turn_retry`、Rust Thread mailbox、精确 steer/interrupt、Thread fork/resume/rollback、队列消息原子 steer |
 | 候选优化 | Thread 操作门、按线程持久化 writer、增量历史索引、事件驱动 mailbox 同步、结构化错误、模块拆分和 Monaco 体积治理 |
@@ -236,6 +236,24 @@
 ### 验收结果
 
 - 协议序列化测试覆盖各错误分类；旧事件兼容升级路径通过回归。
+
+## P10-077 本轮进展
+
+### 已完成切片
+
+- 将 `storage/mod.rs` 中的历史 turns/items 游标分页、游标编解码、页大小校验和 Item 视图裁剪提取到 `storage/history_pagination.rs`。
+- `JsonlThreadRepository` 继续负责仓储生命周期、事实事件追加和索引协调，只通过模块边界调用分页实现。
+- 保持公共协议、JSONL 事实来源、游标绑定条件、陈旧游标拒绝和 `NotLoaded`/`Summary`/`Full` 三种 Item 视图语义不变。
+
+### 验收结果
+
+- `cargo fmt --manifest-path src-tauri/Cargo.toml -- --check` 通过。
+- `cargo check --manifest-path src-tauri/Cargo.toml` 通过。
+- `cargo test --manifest-path src-tauri/Cargo.toml --lib -- --test-threads=1` 通过，249 项测试全部通过。
+- `pnpm build` 通过；构建仍提示 Monaco 编辑器 chunk 偏大，该问题属于后续 `P10-078`。
+- `git diff --check` 通过。
+
+本项仍在进行中，后续继续按同样的小步方式拆分 `agent/mod.rs`、`commands/mod.rs` 和 `workbenchStore.ts`，每个切片独立回归，避免一次性重写运行时。
 
 ## 剩余优化计划
 

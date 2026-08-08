@@ -587,40 +587,21 @@ function FileActivityDetails({ details }: { details: FileActivityDetailsValue })
 }
 
 function CommandDetails({ command }: { command: CommandDetailsValue }) {
-  const [open, setOpen] = useState(false);
-
   return (
-    <details className="turn-tool-details turn-tool-details--command" onToggle={(event) => setOpen(event.currentTarget.open)}>
-      <summary>
-        <SquareTerminal size={14} aria-hidden="true" />
-        <span>查看命令</span>
-        <ChevronDown size={14} aria-hidden="true" />
-      </summary>
-      {open ? <div className="turn-command-editor-shell">
-        <div className="turn-command-editor-header">
-          <span><SquareTerminal size={13} aria-hidden="true" />{command.shellLabel}</span>
-          <small>只读</small>
-        </div>
-        <Suspense fallback={<div className="turn-command-editor-loading">正在载入编辑器...</div>}>
-          <div className="turn-command-editor-frame" style={{ height: `${commandEditorHeight(command.text)}px` }}>
-            <ReadOnlyCodeEditor
-              path={`命令 ${command.id}`}
-              modelPath={`k-coder-command://${encodeURIComponent(command.id)}.${commandFileExtension(command.language)}`}
-              language={command.language}
-              value={command.text}
-              readOnly
-            />
-          </div>
-        </Suspense>
-        {command.cwd || command.timeoutMs ? (
-          <small className="turn-command-editor-meta">
-            {command.cwd ? `工作目录：${command.cwd}` : ""}
-            {command.cwd && command.timeoutMs ? " · " : ""}
-            {command.timeoutMs ? `超时：${formatDuration(command.timeoutMs)}` : ""}
-          </small>
-        ) : null}
-      </div> : null}
-    </details>
+    <div className="turn-command-inline">
+      <div className="turn-command-editor-header turn-command-inline-header">
+        <span><SquareTerminal size={13} aria-hidden="true" />命令</span>
+        <small>{command.shellLabel}</small>
+      </div>
+      <pre>{command.text}</pre>
+      {command.cwd || command.timeoutMs ? (
+        <small className="turn-command-editor-meta">
+          {command.cwd ? `工作目录：${command.cwd}` : ""}
+          {command.cwd && command.timeoutMs ? " · " : ""}
+          {command.timeoutMs ? `超时：${formatDuration(command.timeoutMs)}` : ""}
+        </small>
+      ) : null}
+    </div>
   );
 }
 
@@ -701,11 +682,9 @@ function findChange(item: Extract<TurnTimelineItem, { type: "event" }>, changes:
 }
 
 interface CommandDetailsValue {
-  id: string;
   text: string;
   cwd: string;
   timeoutMs: number | null;
-  language: "powershell" | "bat" | "shell";
   shellLabel: string;
 }
 
@@ -715,11 +694,9 @@ function commandDetails(activity: ToolActivity): CommandDetailsValue | null {
   const command = typeof argumentsValue.command === "string" ? argumentsValue.command.trim() : "";
   if (command) {
     return {
-      id: `${activity.turnId}-${activity.call.id}`,
       text: command,
       cwd: typeof argumentsValue.cwd === "string" ? argumentsValue.cwd : "",
       timeoutMs: typeof argumentsValue.timeoutMs === "number" ? argumentsValue.timeoutMs : null,
-      language: commandLanguage(shell),
       shellLabel: shellLabel(shell),
     };
   }
@@ -730,43 +707,21 @@ function commandDetails(activity: ToolActivity): CommandDetailsValue | null {
     : [];
   const text = [program, ...args].map(shellQuote).join(" ");
   return {
-    id: `${activity.turnId}-${activity.call.id}`,
     text,
     cwd: typeof argumentsValue.cwd === "string" ? argumentsValue.cwd : "",
     timeoutMs: typeof argumentsValue.timeoutMs === "number" ? argumentsValue.timeoutMs : null,
-    language: commandLanguage(shell),
     shellLabel: shellLabel(shell),
   };
-}
-
-function commandLanguage(shell: string): CommandDetailsValue["language"] {
-  const value = shell.toLowerCase();
-  if (value.includes("cmd")) return "bat";
-  if (value.includes("powershell") || value.includes("pwsh") || (typeof navigator !== "undefined" && /windows/i.test(navigator.userAgent))) {
-    return "powershell";
-  }
-  return "shell";
 }
 
 function shellLabel(shell: string) {
   const value = shell.toLowerCase();
   if (value.includes("cmd")) return "命令提示符 · CMD";
-  if (value.includes("powershell") || value.includes("pwsh") || (typeof navigator !== "undefined" && /windows/i.test(navigator.userAgent))) return "PowerShell";
+  if (value.includes("powershell") || value.includes("pwsh")) return "PowerShell";
   if (value.includes("zsh")) return "Zsh";
   if (value.includes("bash")) return "Bash";
   if (value.includes("sh")) return "Shell";
-  return "Shell 命令";
-}
-
-function commandEditorHeight(command: string) {
-  const lineCount = Math.max(1, command.split(/\r?\n/).length);
-  return Math.min(260, Math.max(84, lineCount * 19 + 14));
-}
-
-function commandFileExtension(language: CommandDetailsValue["language"]) {
-  if (language === "bat") return "cmd";
-  if (language === "shell") return "sh";
-  return "ps1";
+  return "Shell";
 }
 
 function fileDetailEditorHeight(content: string) {
