@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -21,26 +22,26 @@ use crate::protocol::{
     ApprovalAction, ApprovalMode, ApprovalRequest, ApprovalResolution, ChangeSet, ChatMessage,
     ContentBlock, ExpectedFileHash, ImageAttachment, MessageRole, PROTOCOL_VERSION, PatchPreview,
     ReasoningEffort, TokenUsage, ToolCall, ToolResult, TurnError, TurnState, UserInputAction,
-    UserInputRequest, UserInputResolution,
+    UserInputQuestion, UserInputRequest, UserInputRequestKind, UserInputResolution,
 };
-use crate::providers::{
-    Provider, ProviderError, ProviderEvent, ProviderImage, ProviderMessage, ProviderRequest,
-};
+use crate::providers::{Provider, ProviderError, ProviderEvent, ProviderMessage, ProviderRequest};
 use crate::storage::{StorageError, StoredEvent, StoredEventKind, ThreadRepository, now_ms};
 use crate::tools::{
     ApprovedToolExecution, ToolContext, ToolError, ToolProgress, ToolRegistry,
     tool_progress_channel,
 };
 
+mod input;
 pub mod mailbox;
+mod provider_history;
 pub mod thread_operation;
+pub(crate) use input::build_user_message;
 use mailbox::TurnControl;
+use provider_history::{last_active_context_usage, provider_history};
 
-const MAX_INPUT_BYTES: usize = 100_000;
-const MAX_IMAGE_COUNT: usize = 4;
-const MAX_IMAGE_BYTES: usize = 4 * 1024 * 1024;
-const MAX_OCR_TEXT_BYTES: usize = 16 * 1024;
-const MAX_TOTAL_IMAGE_BYTES: usize = 8 * 1024 * 1024;
+#[cfg(test)]
+use input::{chat_to_provider, user_message};
+
 const MAX_RESPONSE_BYTES: usize = 512 * 1024;
 const MAX_REASONING_SUMMARY_BYTES: usize = 64 * 1024;
 const MAX_PROVIDER_CONTEXT_BYTES: usize = 512 * 1024;
@@ -48,6 +49,93 @@ const MAX_TOOL_OUTPUT_BYTES: usize = 256 * 1024;
 const MAX_IDENTICAL_TOOL_CALLS: usize = 2;
 const PROGRESS_CHECK_WINDOW: usize = 5;
 const MAX_NO_PROGRESS_WINDOWS: usize = 3;
+pub const DEFAULT_SOFT_TURN_PROVIDER_CALLS: u32 = 30;
+pub const DEFAULT_SOFT_TURN_TOTAL_TOKENS: u64 = 1_000_000;
+pub const DEFAULT_SOFT_TURN_DURATION_MS: u64 = 10 * 60 * 1_000;
+
+const TURN_CONTINUATION_TOOL_CALL_ID: &str = "runtime-turn-continuation";
+const TURN_CONTINUE: &str = "continue";
+const TURN_COMPACT_AND_CONTINUE: &str = "compact_and_continue";
+const TURN_STOP: &str = "stop";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SoftTurnLimits {
+    provider_calls: u32,
+    total_tokens: u64,
+    duration_ms: u64,
+}
+
+impl Default for SoftTurnLimits {
+    fn default() -> Self {
+        Self {
+            provider_calls: DEFAULT_SOFT_TURN_PROVIDER_CALLS,
+            total_tokens: DEFAULT_SOFT_TURN_TOTAL_TOKENS,
+            duration_ms: DEFAULT_SOFT_TURN_DURATION_MS,
+        }
+    }
+}
+
+impl SoftTurnLimits {
+    #[cfg(test)]
+    fn new(provider_calls: u32, total_tokens: u64, duration_ms: u64) -> Self {
+        Self {
+            provider_calls: provider_calls.max(1),
+            total_tokens: total_tokens.max(1),
+            duration_ms,
+        }
+    }
+}
+
+struct SoftTurnSegment {
+    provider_calls_at_start: u32,
+    total_tokens_at_start: u64,
+    started_at: Instant,
+}
+
+impl SoftTurnSegment {
+    fn new(provider_calls: u32, total_tokens: u64) -> Self {
+        Self {
+            provider_calls_at_start: provider_calls,
+            total_tokens_at_start: total_tokens,
+            started_at: Instant::now(),
+        }
+    }
+
+    fn usage(&self, provider_calls: u32, total_tokens: u64) -> SoftTurnSegmentUsage {
+        SoftTurnSegmentUsage {
+            provider_calls: provider_calls.saturating_sub(self.provider_calls_at_start),
+            total_tokens: total_tokens.saturating_sub(self.total_tokens_at_start),
+            duration_ms: self.started_at.elapsed().as_millis().min(u64::MAX as u128) as u64,
+        }
+    }
+
+    fn reset(&mut self, provider_calls: u32, total_tokens: u64) {
+        *self = Self::new(provider_calls, total_tokens);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SoftTurnSegmentUsage {
+    provider_calls: u32,
+    total_tokens: u64,
+    duration_ms: u64,
+}
+
+impl SoftTurnSegmentUsage {
+    fn exceeds(self, limits: SoftTurnLimits) -> bool {
+        self.provider_calls > 0
+            && (self.provider_calls >= limits.provider_calls
+                || self.total_tokens >= limits.total_tokens
+                || self.duration_ms >= limits.duration_ms)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TurnContinuationDecision {
+    Continue,
+    CompactAndContinue,
+    Stop,
+}
 
 /// 进展快照：用于检测任务是否有实质性进展
 #[derive(Clone, PartialEq, Eq)]
@@ -120,6 +208,8 @@ pub enum AgentRuntimeError {
     Storage(#[from] StorageError),
     #[error(transparent)]
     Approval(#[from] ApprovalError),
+    #[error(transparent)]
+    UserInput(#[from] UserInputError),
     #[error("change audit failed: {storage_error}; rollback also failed: {rollback_error}")]
     AuditCompensation {
         storage_error: String,
@@ -140,6 +230,7 @@ pub struct AgentRuntime {
     user_inputs: Arc<UserInputManager>,
     runtime_instructions: String,
     max_total_tokens: Option<u64>,
+    soft_turn_limits: Option<SoftTurnLimits>,
     context_limit: usize,
     metrics: Option<RuntimeMetrics>,
     reasoning_effort: ReasoningEffort,
@@ -186,6 +277,7 @@ impl AgentRuntime {
             ))),
             runtime_instructions: String::new(),
             max_total_tokens: None,
+            soft_turn_limits: None,
             context_limit: DEFAULT_CONTEXT_LIMIT,
             metrics: None,
             reasoning_effort: ReasoningEffort::default(),
@@ -211,6 +303,11 @@ impl AgentRuntime {
 
     pub fn with_token_budget(mut self, max_total_tokens: u64) -> Self {
         self.max_total_tokens = Some(max_total_tokens);
+        self
+    }
+
+    pub fn with_soft_turn_limits(mut self, limits: SoftTurnLimits) -> Self {
+        self.soft_turn_limits = Some(limits);
         self
     }
 
@@ -566,6 +663,10 @@ impl AgentRuntime {
         let mut last_call_signature = None::<String>;
         let mut identical_call_streak = 0usize;
         let token_budget = self.max_total_tokens;
+        let mut soft_turn_segment = self
+            .soft_turn_limits
+            .map(|_| SoftTurnSegment::new(provider_call_index, total_usage.total_tokens));
+        let mut force_compaction = false;
 
         // 进展检测变量
         let mut no_progress_count = 0usize;
@@ -573,6 +674,11 @@ impl AgentRuntime {
 
         let mut iteration = 0usize;
         loop {
+            if cancellation.is_cancelled() {
+                return self
+                    .finish_cancelled(&thread_id, &turn_id, &publisher)
+                    .await;
+            }
             if let Some(control) = &control {
                 self.persist_steered_messages(
                     &thread_id,
@@ -581,6 +687,35 @@ impl AgentRuntime {
                     &publisher,
                 )
                 .await?;
+            }
+            if let (Some(limits), Some(segment)) =
+                (self.soft_turn_limits, soft_turn_segment.as_mut())
+            {
+                let segment_usage = segment.usage(provider_call_index, total_usage.total_tokens);
+                if segment_usage.exceeds(limits) {
+                    match self
+                        .request_turn_continuation(
+                            &thread_id,
+                            &turn_id,
+                            segment_usage,
+                            limits,
+                            cancellation.clone(),
+                            &publisher,
+                        )
+                        .await?
+                    {
+                        TurnContinuationDecision::Continue => {}
+                        TurnContinuationDecision::CompactAndContinue => {
+                            force_compaction = true;
+                        }
+                        TurnContinuationDecision::Stop => {
+                            return self
+                                .finish_cancelled(&thread_id, &turn_id, &publisher)
+                                .await;
+                        }
+                    }
+                    segment.reset(provider_call_index, total_usage.total_tokens);
+                }
             }
             // 进展检测：每 PROGRESS_CHECK_WINDOW 轮检查一次
             if iteration > 0 && iteration % PROGRESS_CHECK_WINDOW == 0 {
@@ -637,11 +772,13 @@ impl AgentRuntime {
             let events = self.repository.load(&thread_id).await?;
             let last_context_usage = last_active_context_usage(&events);
             let mut history = provider_history(events, self.supports_vision);
-            if context::needs_compaction(&history, self.context_limit)
+            if force_compaction
+                || context::needs_compaction(&history, self.context_limit)
                 || last_context_usage.is_some_and(|usage| {
                     context::needs_compaction_for_usage(usage.total_tokens, self.context_limit)
                 })
             {
+                force_compaction = false;
                 let (summary, compacted) = context::compact(&history, self.context_limit);
                 if summary.compacted_message_count > 0 {
                     let compaction_event = StoredEvent::new(
@@ -1785,6 +1922,124 @@ impl AgentRuntime {
         }
     }
 
+    async fn request_turn_continuation(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        usage: SoftTurnSegmentUsage,
+        limits: SoftTurnLimits,
+        cancellation: CancellationToken,
+        publisher: &Arc<dyn EventPublisher>,
+    ) -> Result<TurnContinuationDecision, AgentRuntimeError> {
+        let request_id = Uuid::new_v4().to_string();
+        let created_at_ms = now_ms();
+        let request = UserInputRequest {
+            id: request_id,
+            thread_id: thread_id.to_string(),
+            turn_id: turn_id.to_string(),
+            tool_call_id: TURN_CONTINUATION_TOOL_CALL_ID.to_string(),
+            kind: UserInputRequestKind::TurnContinuation,
+            questions: vec![UserInputQuestion {
+                question: format!(
+                    "当前执行段已调用模型 {} 次、累计消耗 {} tokens、运行 {} 秒。继续后会获得新一段额度（{} 次调用 / {} tokens / {} 秒）。",
+                    usage.provider_calls,
+                    usage.total_tokens,
+                    usage.duration_ms.div_ceil(1_000),
+                    limits.provider_calls,
+                    limits.total_tokens,
+                    limits.duration_ms.div_ceil(1_000),
+                ),
+                options: vec![
+                    TURN_CONTINUE.to_string(),
+                    TURN_COMPACT_AND_CONTINUE.to_string(),
+                    TURN_STOP.to_string(),
+                ],
+            }],
+            created_at_ms,
+            expires_at_ms: created_at_ms.saturating_add(self.user_inputs.timeout_ms()),
+        };
+        let resolution = self
+            .await_user_input(request, cancellation, publisher)
+            .await?;
+        if resolution.action != UserInputAction::Answered {
+            return Ok(TurnContinuationDecision::Stop);
+        }
+        Ok(
+            match resolution
+                .answers
+                .first()
+                .map(|answer| answer.answer.as_str())
+            {
+                Some(TURN_CONTINUE) => TurnContinuationDecision::Continue,
+                Some(TURN_COMPACT_AND_CONTINUE) => TurnContinuationDecision::CompactAndContinue,
+                _ => TurnContinuationDecision::Stop,
+            },
+        )
+    }
+
+    async fn await_user_input(
+        &self,
+        request: UserInputRequest,
+        cancellation: CancellationToken,
+        publisher: &Arc<dyn EventPublisher>,
+    ) -> Result<UserInputResolution, AgentRuntimeError> {
+        let request_id = request.id.clone();
+        let receiver = self.user_inputs.register(&request_id).await?;
+        if let Err(error) = self
+            .start_item(
+                &request.thread_id,
+                &request.turn_id,
+                &request_id,
+                AgentItemType::UserInput,
+                publisher,
+            )
+            .await
+        {
+            self.user_inputs.discard(&request_id).await;
+            return Err(error);
+        }
+        if let Err(error) = self
+            .repository
+            .append(StoredEvent::new(
+                &request.thread_id,
+                Some(request.turn_id.clone()),
+                StoredEventKind::UserInputRequested {
+                    request: request.clone(),
+                },
+            ))
+            .await
+        {
+            self.user_inputs.discard(&request_id).await;
+            return Err(error.into());
+        }
+        publisher.publish(AgentEventEnvelope::new(AgentEvent::UserInputRequested {
+            thread_id: request.thread_id.clone(),
+            turn_id: request.turn_id.clone(),
+            request: request.clone(),
+        }));
+        let resolution = match self
+            .user_inputs
+            .wait(&request_id, receiver, cancellation)
+            .await
+        {
+            Ok(resolution) => resolution,
+            Err(UserInputError::Cancelled) => UserInputResolution {
+                action: UserInputAction::Cancelled,
+                answers: Vec::new(),
+            },
+            Err(error) => return Err(error.into()),
+        };
+        self.persist_user_input_resolution(
+            &request.thread_id,
+            &request.turn_id,
+            &request_id,
+            &resolution,
+            publisher,
+        )
+        .await?;
+        Ok(resolution)
+    }
+
     /// 执行 `request_user_input`：向前端发起提问并阻塞等待回答。
     async fn execute_request_user_input(
         &self,
@@ -1804,6 +2059,7 @@ impl AgentRuntime {
             thread_id: context.thread_id.clone(),
             turn_id: context.turn_id.clone(),
             tool_call_id: call.id.clone(),
+            kind: UserInputRequestKind::ModelQuestion,
             questions: args
                 .questions
                 .iter()
@@ -1815,63 +2071,16 @@ impl AgentRuntime {
             created_at_ms,
             expires_at_ms: created_at_ms.saturating_add(self.user_inputs.timeout_ms()),
         };
-        let receiver = match self.user_inputs.register(&request_id).await {
-            Ok(receiver) => receiver,
-            Err(error) => return Ok(Some(failure_result(error.to_string()))),
-        };
-        if let Err(error) = self
-            .start_item(
-                &context.thread_id,
-                &context.turn_id,
-                &request_id,
-                AgentItemType::UserInput,
-                publisher,
-            )
-            .await
-        {
-            self.user_inputs.discard(&request_id).await;
-            return Err(error);
-        }
-        if let Err(error) = self
-            .repository
-            .append(StoredEvent::new(
-                &context.thread_id,
-                Some(context.turn_id.clone()),
-                StoredEventKind::UserInputRequested {
-                    request: request.clone(),
-                },
-            ))
-            .await
-        {
-            self.user_inputs.discard(&request_id).await;
-            return Err(error.into());
-        }
-        publisher.publish(AgentEventEnvelope::new(AgentEvent::UserInputRequested {
-            thread_id: context.thread_id.clone(),
-            turn_id: context.turn_id.clone(),
-            request: request.clone(),
-        }));
         let resolution = match self
-            .user_inputs
-            .wait(&request_id, receiver, cancellation.clone())
+            .await_user_input(request, cancellation, publisher)
             .await
         {
             Ok(resolution) => resolution,
-            Err(UserInputError::Cancelled) => {
-                let resolution = UserInputResolution {
-                    action: UserInputAction::Cancelled,
-                    answers: Vec::new(),
-                };
-                self.persist_user_input_resolution(context, &request_id, &resolution, publisher)
-                    .await?;
-                return Ok(None);
-            }
-            Err(error) => {
+            Err(AgentRuntimeError::UserInput(error)) => {
                 return Ok(Some(failure_result(error.to_string())));
             }
+            Err(error) => return Err(error),
         };
-        self.persist_user_input_resolution(context, &request_id, &resolution, publisher)
-            .await?;
         match resolution.action {
             UserInputAction::Answered => {
                 let summary = resolution
@@ -1973,15 +2182,16 @@ impl AgentRuntime {
 
     async fn persist_user_input_resolution(
         &self,
-        context: &ToolContext,
+        thread_id: &str,
+        turn_id: &str,
         request_id: &str,
         resolution: &crate::protocol::UserInputResolution,
         publisher: &Arc<dyn EventPublisher>,
     ) -> Result<(), AgentRuntimeError> {
         self.repository
             .append(StoredEvent::new(
-                &context.thread_id,
-                Some(context.turn_id.clone()),
+                thread_id,
+                Some(turn_id.to_string()),
                 StoredEventKind::UserInputResolved {
                     request_id: request_id.to_string(),
                     resolution: resolution.clone(),
@@ -1989,14 +2199,14 @@ impl AgentRuntime {
             ))
             .await?;
         publisher.publish(AgentEventEnvelope::new(AgentEvent::UserInputResolved {
-            thread_id: context.thread_id.clone(),
-            turn_id: context.turn_id.clone(),
+            thread_id: thread_id.to_string(),
+            turn_id: turn_id.to_string(),
             request_id: request_id.to_string(),
             resolution: resolution.clone(),
         }));
         self.complete_item(
-            &context.thread_id,
-            &context.turn_id,
+            thread_id,
+            turn_id,
             request_id,
             AgentItemType::UserInput,
             match resolution.action {
@@ -2401,55 +2611,6 @@ impl AgentRuntime {
     }
 }
 
-fn provider_history(events: Vec<StoredEvent>, supports_vision: bool) -> Vec<ProviderMessage> {
-    let mut history = Vec::new();
-    for event in events {
-        let message = match event.kind {
-            StoredEventKind::UserMessage { message }
-            | StoredEventKind::AssistantMessage { message } => {
-                chat_to_provider(message, supports_vision)
-            }
-            StoredEventKind::AssistantToolCalls { text, calls, .. } => {
-                Some(ProviderMessage::AssistantToolCalls { text, calls })
-            }
-            StoredEventKind::ToolResult {
-                call_id,
-                name,
-                result,
-            } => Some(ProviderMessage::ToolResult {
-                call_id,
-                name,
-                success: result.success,
-                output: result.output,
-            }),
-            StoredEventKind::ProviderContext { provider, item } => {
-                Some(ProviderMessage::ProviderContext { provider, item })
-            }
-            StoredEventKind::ContextCompacted { summary, .. } => {
-                history.clear();
-                history.push(ProviderMessage::Text {
-                    role: MessageRole::User,
-                    text: context::render_summary(&summary),
-                });
-                None
-            }
-            _ => None,
-        };
-        if let Some(message) = message {
-            history.push(message);
-        }
-    }
-    context::repair_tool_history(history)
-}
-
-fn last_active_context_usage(events: &[StoredEvent]) -> Option<TokenUsage> {
-    events.iter().fold(None, |usage, event| match &event.kind {
-        StoredEventKind::ProviderCallUsage { usage, .. } => Some(*usage),
-        StoredEventKind::ContextCompacted { .. } => None,
-        _ => usage,
-    })
-}
-
 fn preview_hashes(preview: &PatchPreview) -> Vec<ExpectedFileHash> {
     preview
         .files
@@ -2617,153 +2778,6 @@ fn text_message_with_id(role: MessageRole, id: String, text: String) -> ChatMess
     }
 }
 
-fn user_message(
-    text: String,
-    attachments: Vec<ImageAttachment>,
-    supports_vision: bool,
-) -> Result<ChatMessage, AgentRuntimeError> {
-    if attachments.len() > MAX_IMAGE_COUNT {
-        return Err(AgentRuntimeError::InvalidInput(format!(
-            "at most {MAX_IMAGE_COUNT} images may be attached"
-        )));
-    }
-    let mut total = 0usize;
-    let mut content = if text.is_empty() {
-        vec![ContentBlock::Context {
-            text: if supports_vision {
-                "请分析用户提供的图片。".into()
-            } else {
-                "请根据本地图片文字识别结果回答。".into()
-            },
-        }]
-    } else {
-        vec![ContentBlock::Text { text }]
-    };
-    for attachment in attachments {
-        let name: String = attachment.name.chars().take(255).collect();
-        let (_, encoded) = parse_image_data_url(&attachment.data_url)?;
-        let decoded = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, encoded)
-            .map_err(|_| {
-            AgentRuntimeError::InvalidInput("image data is not valid base64".into())
-        })?;
-        if decoded.len() > MAX_IMAGE_BYTES {
-            return Err(AgentRuntimeError::InvalidInput(
-                "an attached image exceeds the 4 MiB limit".into(),
-            ));
-        }
-        total = total.saturating_add(decoded.len());
-        if total > MAX_TOTAL_IMAGE_BYTES {
-            return Err(AgentRuntimeError::InvalidInput(
-                "attached images exceed the 8 MiB total limit".into(),
-            ));
-        }
-        let ocr_text = attachment
-            .ocr_text
-            .as_deref()
-            .map(str::trim)
-            .filter(|text| !text.is_empty());
-        if !supports_vision && ocr_text.is_none() {
-            return Err(AgentRuntimeError::InvalidInput(format!(
-                "the selected model does not support images and local OCR produced no text for {name}"
-            )));
-        }
-        if let Some(ocr_text) = ocr_text {
-            let ocr_text = truncate_utf8(ocr_text, MAX_OCR_TEXT_BYTES);
-            content.push(ContentBlock::Context {
-                text: format!("\n\n[图片文字识别: {name}]\n{ocr_text}"),
-            });
-        }
-        content.push(ContentBlock::Image {
-            name,
-            data_url: attachment.data_url,
-        });
-    }
-    Ok(ChatMessage {
-        schema_version: PROTOCOL_VERSION,
-        id: Uuid::new_v4().to_string(),
-        role: MessageRole::User,
-        content,
-        created_at_ms: now_ms(),
-    })
-}
-
-pub(crate) fn build_user_message(
-    input: &str,
-    attachments: Vec<ImageAttachment>,
-    supports_vision: bool,
-) -> Result<ChatMessage, AgentRuntimeError> {
-    let input = validate_input(input, !attachments.is_empty())?;
-    user_message(input, attachments, supports_vision)
-}
-
-fn truncate_utf8(value: &str, max_bytes: usize) -> &str {
-    if value.len() <= max_bytes {
-        return value;
-    }
-    let mut end = max_bytes;
-    while !value.is_char_boundary(end) {
-        end -= 1;
-    }
-    &value[..end]
-}
-
-fn parse_image_data_url(value: &str) -> Result<(&str, &str), AgentRuntimeError> {
-    let (metadata, encoded) = value.split_once(',').ok_or_else(|| {
-        AgentRuntimeError::InvalidInput("image attachment must be a data URL".into())
-    })?;
-    let media_type = metadata
-        .strip_prefix("data:")
-        .and_then(|value| value.strip_suffix(";base64"))
-        .ok_or_else(|| AgentRuntimeError::InvalidInput("image data URL must use base64".into()))?;
-    if !matches!(
-        media_type,
-        "image/png" | "image/jpeg" | "image/gif" | "image/webp"
-    ) {
-        return Err(AgentRuntimeError::InvalidInput(
-            "image type must be PNG, JPEG, GIF, or WebP".into(),
-        ));
-    }
-    Ok((media_type, encoded))
-}
-
-fn chat_to_provider(message: ChatMessage, supports_vision: bool) -> Option<ProviderMessage> {
-    let text = message.text();
-    let images = message
-        .content
-        .into_iter()
-        .filter_map(|block| match block {
-            ContentBlock::Image { name, data_url } if supports_vision => {
-                Some(ProviderImage { name, data_url })
-            }
-            ContentBlock::Image { .. } => None,
-            ContentBlock::Text { .. } | ContentBlock::Context { .. } => None,
-        })
-        .collect::<Vec<_>>();
-    if message.role == MessageRole::User && !images.is_empty() {
-        Some(ProviderMessage::UserContent { text, images })
-    } else {
-        Some(ProviderMessage::Text {
-            role: message.role,
-            text,
-        })
-    }
-}
-
-fn validate_input(input: &str, allow_empty: bool) -> Result<String, AgentRuntimeError> {
-    let input = input.trim();
-    if input.is_empty() && !allow_empty {
-        return Err(AgentRuntimeError::InvalidInput(
-            "input must not be empty".to_string(),
-        ));
-    }
-    if input.len() > MAX_INPUT_BYTES {
-        return Err(AgentRuntimeError::InvalidInput(format!(
-            "input exceeds the {MAX_INPUT_BYTES} byte limit"
-        )));
-    }
-    Ok(input.to_string())
-}
-
 fn outcome(
     thread_id: &str,
     turn_id: &str,
@@ -2792,7 +2806,7 @@ mod tests {
     use async_trait::async_trait;
 
     use super::*;
-    use crate::protocol::{ToolDefinition, ToolRisk};
+    use crate::protocol::{ToolDefinition, ToolRisk, UserInputAnswer};
     use crate::providers::testing::FakeProvider;
     use crate::storage::{JsonlThreadRepository, TurnTimelineItem};
     use crate::tools::ToolHandler;
@@ -2948,6 +2962,48 @@ mod tests {
                         .resolve(&request_id, resolution)
                         .await
                         .expect("approval should resolve");
+                });
+            }
+            self.events.lock().unwrap().push(event);
+        }
+    }
+
+    struct UserInputResolvingPublisher {
+        events: Mutex<Vec<AgentEventEnvelope>>,
+        user_inputs: Arc<UserInputManager>,
+        answer: &'static str,
+    }
+
+    impl UserInputResolvingPublisher {
+        fn new(user_inputs: Arc<UserInputManager>, answer: &'static str) -> Self {
+            Self {
+                events: Mutex::new(Vec::new()),
+                user_inputs,
+                answer,
+            }
+        }
+    }
+
+    impl EventPublisher for UserInputResolvingPublisher {
+        fn publish(&self, event: AgentEventEnvelope) {
+            if let AgentEvent::UserInputRequested { request, .. } = &event.event
+                && request.kind == UserInputRequestKind::TurnContinuation
+            {
+                let user_inputs = self.user_inputs.clone();
+                let request_id = request.id.clone();
+                let question = request.questions[0].question.clone();
+                let answer = self.answer.to_string();
+                tokio::spawn(async move {
+                    user_inputs
+                        .resolve(
+                            &request_id,
+                            UserInputResolution {
+                                action: UserInputAction::Answered,
+                                answers: vec![UserInputAnswer { question, answer }],
+                            },
+                        )
+                        .await
+                        .expect("turn continuation should resolve");
                 });
             }
             self.events.lock().unwrap().push(event);
@@ -4289,6 +4345,229 @@ mod tests {
             })
             .sum::<u64>();
         assert_eq!(total_tokens, 1_160_800);
+    }
+
+    #[test]
+    fn soft_turn_segment_checks_calls_tokens_and_elapsed_time() {
+        let limits = SoftTurnLimits::new(30, 1_000, 60_000);
+        assert!(
+            !SoftTurnSegmentUsage {
+                provider_calls: 0,
+                total_tokens: 2_000,
+                duration_ms: 120_000,
+            }
+            .exceeds(limits)
+        );
+        assert!(
+            SoftTurnSegmentUsage {
+                provider_calls: 30,
+                total_tokens: 0,
+                duration_ms: 0,
+            }
+            .exceeds(limits)
+        );
+        assert!(
+            SoftTurnSegmentUsage {
+                provider_calls: 1,
+                total_tokens: 1_000,
+                duration_ms: 0,
+            }
+            .exceeds(limits)
+        );
+        assert!(
+            SoftTurnSegmentUsage {
+                provider_calls: 1,
+                total_tokens: 0,
+                duration_ms: 60_000,
+            }
+            .exceeds(limits)
+        );
+    }
+
+    #[tokio::test]
+    async fn soft_turn_limit_can_continue_with_a_fresh_segment() {
+        let (_directory, repository, runtime, thread_id) = runtime_fixture().await;
+        let provider = Arc::new(FakeProvider::script(vec![
+            vec![
+                Ok(ProviderEvent::ToolCall {
+                    call: ToolCall {
+                        id: "before-continuation".into(),
+                        name: "list_directory".into(),
+                        arguments: json!({ "path": "." }),
+                        metadata: json!({}),
+                    },
+                }),
+                Ok(ProviderEvent::Completed),
+            ],
+            vec![
+                Ok(ProviderEvent::TextDelta {
+                    delta: "continued safely".into(),
+                }),
+                Ok(ProviderEvent::Completed),
+            ],
+        ]));
+        let publisher = Arc::new(UserInputResolvingPublisher::new(
+            runtime.user_input_manager(),
+            TURN_CONTINUE,
+        ));
+
+        let outcome = runtime
+            .with_soft_turn_limits(SoftTurnLimits::new(1, u64::MAX, u64::MAX))
+            .run_turn(
+                provider.clone(),
+                "fake".into(),
+                RunTurnRequest {
+                    thread_id: thread_id.clone(),
+                    input: "inspect and continue".into(),
+                    agent_mode: None,
+                },
+                CancellationToken::new(),
+                publisher,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.state, TurnState::Completed);
+        assert_eq!(provider.requests().len(), 2);
+        let detail = repository.read_thread(&thread_id).await.unwrap();
+        assert_eq!(detail.user_inputs.len(), 1);
+        assert_eq!(
+            detail.user_inputs[0].request.kind,
+            UserInputRequestKind::TurnContinuation
+        );
+        assert_eq!(
+            detail.user_inputs[0]
+                .resolution
+                .as_ref()
+                .and_then(|resolution| resolution.answers.first())
+                .map(|answer| answer.answer.as_str()),
+            Some(TURN_CONTINUE)
+        );
+    }
+
+    #[tokio::test]
+    async fn soft_turn_limit_stop_cancels_before_another_provider_call() {
+        let (_directory, _repository, runtime, thread_id) = runtime_fixture().await;
+        let provider = Arc::new(FakeProvider::script(vec![
+            vec![
+                Ok(ProviderEvent::ToolCall {
+                    call: ToolCall {
+                        id: "before-stop".into(),
+                        name: "list_directory".into(),
+                        arguments: json!({ "path": "." }),
+                        metadata: json!({}),
+                    },
+                }),
+                Ok(ProviderEvent::Completed),
+            ],
+            vec![
+                Ok(ProviderEvent::TextDelta {
+                    delta: "must not run".into(),
+                }),
+                Ok(ProviderEvent::Completed),
+            ],
+        ]));
+        let publisher = Arc::new(UserInputResolvingPublisher::new(
+            runtime.user_input_manager(),
+            TURN_STOP,
+        ));
+
+        let outcome = runtime
+            .with_soft_turn_limits(SoftTurnLimits::new(1, u64::MAX, u64::MAX))
+            .run_turn(
+                provider.clone(),
+                "fake".into(),
+                RunTurnRequest {
+                    thread_id,
+                    input: "stop at the soft boundary".into(),
+                    agent_mode: None,
+                },
+                CancellationToken::new(),
+                publisher,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.state, TurnState::Cancelled);
+        assert_eq!(provider.requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn soft_turn_limit_can_force_compaction_before_continuing() {
+        let (_directory, repository, runtime, thread_id) = runtime_fixture().await;
+        for index in 0..8 {
+            repository
+                .append(StoredEvent::new(
+                    &thread_id,
+                    None,
+                    StoredEventKind::AssistantMessage {
+                        message: text_message(
+                            MessageRole::Assistant,
+                            format!("history-{index} {}", "x".repeat(300)),
+                        ),
+                    },
+                ))
+                .await
+                .unwrap();
+        }
+        let provider = Arc::new(FakeProvider::script(vec![
+            vec![
+                Ok(ProviderEvent::ToolCall {
+                    call: ToolCall {
+                        id: "before-forced-compaction".into(),
+                        name: "list_directory".into(),
+                        arguments: json!({ "path": "." }),
+                        metadata: json!({}),
+                    },
+                }),
+                Ok(ProviderEvent::Completed),
+            ],
+            vec![
+                Ok(ProviderEvent::TextDelta {
+                    delta: "compacted and continued".into(),
+                }),
+                Ok(ProviderEvent::Completed),
+            ],
+        ]));
+        let publisher = Arc::new(UserInputResolvingPublisher::new(
+            runtime.user_input_manager(),
+            TURN_COMPACT_AND_CONTINUE,
+        ));
+
+        let outcome = runtime
+            .with_context_limit(2_000)
+            .with_soft_turn_limits(SoftTurnLimits::new(1, u64::MAX, u64::MAX))
+            .run_turn(
+                provider,
+                "fake".into(),
+                RunTurnRequest {
+                    thread_id: thread_id.clone(),
+                    input: "compact before continuing".into(),
+                    agent_mode: None,
+                },
+                CancellationToken::new(),
+                publisher,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.state, TurnState::Completed);
+        assert!(
+            repository
+                .load(&thread_id)
+                .await
+                .unwrap()
+                .iter()
+                .any(|event| {
+                    matches!(
+                        event.kind,
+                        StoredEventKind::ContextCompacted {
+                            automatic: true,
+                            ..
+                        }
+                    )
+                })
+        );
     }
 
     #[tokio::test]

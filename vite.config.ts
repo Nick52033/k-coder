@@ -17,6 +17,11 @@ export default defineConfig(async () => ({
       ),
     },
   },
+  optimizeDeps: {
+    // monaco-editor 以纯 ESM 交付；Vite 7 依赖优化处理其 `?worker` 导入会抛出
+    // "optimized info should be defined" 并让 worker 请求 504，排除后走原生 ESM 与 worker 管线。
+    exclude: ["monaco-editor"],
+  },
   build: {
     rollupOptions: {
       output: {

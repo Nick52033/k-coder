@@ -945,6 +945,14 @@ pub struct UserInputQuestion {
     pub options: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum UserInputRequestKind {
+    #[default]
+    ModelQuestion,
+    TurnContinuation,
+}
+
 /// `request_user_input` 工具发起的提问请求
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -953,6 +961,8 @@ pub struct UserInputRequest {
     pub thread_id: String,
     pub turn_id: String,
     pub tool_call_id: String,
+    #[serde(default)]
+    pub kind: UserInputRequestKind,
     pub questions: Vec<UserInputQuestion>,
     pub created_at_ms: u64,
     pub expires_at_ms: u64,
@@ -996,6 +1006,28 @@ mod tests {
         assert_eq!(
             serde_json::from_value::<ApprovalMode>(serde_json::json!("ask")).unwrap(),
             ApprovalMode::Ask
+        );
+    }
+
+    #[test]
+    fn user_input_kind_is_typed_and_legacy_requests_default_to_model_questions() {
+        let legacy = serde_json::json!({
+            "id": "input-1",
+            "threadId": "thread-1",
+            "turnId": "turn-1",
+            "toolCallId": "call-1",
+            "questions": [],
+            "createdAtMs": 1,
+            "expiresAtMs": 2
+        });
+        let request: UserInputRequest = serde_json::from_value(legacy).unwrap();
+        assert_eq!(request.kind, UserInputRequestKind::ModelQuestion);
+
+        let mut continuation = request;
+        continuation.kind = UserInputRequestKind::TurnContinuation;
+        assert_eq!(
+            serde_json::to_value(continuation).unwrap()["kind"],
+            "turn_continuation"
         );
     }
 

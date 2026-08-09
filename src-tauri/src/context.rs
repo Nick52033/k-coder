@@ -6,8 +6,11 @@ use crate::protocol::MessageRole;
 use crate::providers::ProviderMessage;
 
 pub const DEFAULT_CONTEXT_LIMIT: usize = 128_000;
-pub const AUTO_COMPACT_THRESHOLD_PERCENT: usize = 80;
+pub const AUTO_COMPACT_THRESHOLD_PERCENT: usize = 65;
 const CHARS_PER_TOKEN: usize = 4;
+const RECENT_TOOL_RESULT_LIMIT: usize = 2;
+const LARGE_TOOL_OUTPUT_BYTES: usize = 4 * 1_024;
+const TOOL_OUTPUT_PREVIEW_BYTES: usize = 1_500;
 
 #[derive(Debug, Clone, Copy)]
 pub struct ContextBudget {
@@ -66,8 +69,8 @@ pub fn compact(
         .iter()
         .rev()
         .filter(|message| matches!(message, ProviderMessage::ToolResult { .. }))
-        .take(4)
-        .cloned()
+        .take(RECENT_TOOL_RESULT_LIMIT)
+        .map(summarize_large_tool_result)
         .collect::<Vec<_>>()
         .into_iter()
         .rev()
@@ -98,7 +101,7 @@ pub fn compact(
         if used + tokens > keep_tokens && !kept.is_empty() {
             break;
         }
-        kept.push(message.clone());
+        kept.push(summarize_large_tool_result(message));
         used += tokens;
     }
     kept.reverse();
@@ -141,6 +144,38 @@ pub fn compact(
     result.extend(kept);
     let result = repair_tool_history(result);
     (summary, result)
+}
+
+fn summarize_large_tool_result(message: &ProviderMessage) -> ProviderMessage {
+    let ProviderMessage::ToolResult {
+        call_id,
+        name,
+        success,
+        output,
+    } = message
+    else {
+        return message.clone();
+    };
+    if output.len() <= LARGE_TOOL_OUTPUT_BYTES {
+        return message.clone();
+    }
+
+    let mut tail_start = output.len().saturating_sub(TOOL_OUTPUT_PREVIEW_BYTES);
+    while tail_start < output.len() && !output.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+    ProviderMessage::ToolResult {
+        call_id: call_id.clone(),
+        name: name.clone(),
+        success: *success,
+        output: format!(
+            "[Tool output summary: {} bytes, {} lines; middle omitted]\nFirst section:\n{}\nLast section:\n{}",
+            output.len(),
+            output.lines().count(),
+            bound(output, TOOL_OUTPUT_PREVIEW_BYTES),
+            &output[tail_start..],
+        ),
+    }
 }
 
 /// Keep only complete assistant-tool groups before sending history to a provider.
@@ -291,8 +326,40 @@ mod tests {
 
     #[test]
     fn reported_context_usage_uses_the_auto_compact_threshold() {
-        assert!(!needs_compaction_for_usage(159_999, 200_000));
-        assert!(needs_compaction_for_usage(160_000, 200_000));
+        assert!(!needs_compaction_for_usage(129_999, 200_000));
+        assert!(needs_compaction_for_usage(130_000, 200_000));
+    }
+
+    #[test]
+    fn compaction_keeps_two_recent_tools_and_summarizes_large_outputs() {
+        let messages = (0..3)
+            .map(|index| ProviderMessage::ToolResult {
+                call_id: format!("call-{index}"),
+                name: "run_command".into(),
+                success: true,
+                output: if index == 2 {
+                    format!("first-line\n{}\nlast-line", "x".repeat(6_000))
+                } else {
+                    format!("result-{index}")
+                },
+            })
+            .collect::<Vec<_>>();
+
+        let (summary, _) = compact(&messages, 2_000);
+
+        assert_eq!(summary.recent_tool_results.len(), 2);
+        assert!(matches!(
+            &summary.recent_tool_results[0],
+            ProviderMessage::ToolResult { call_id, .. } if call_id == "call-1"
+        ));
+        assert!(matches!(
+            &summary.recent_tool_results[1],
+            ProviderMessage::ToolResult { output, .. }
+                if output.contains("Tool output summary: 6021 bytes")
+                    && output.contains("first-line")
+                    && output.contains("last-line")
+                    && output.len() < LARGE_TOOL_OUTPUT_BYTES
+        ));
     }
 
     #[test]

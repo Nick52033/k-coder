@@ -1,4 +1,4 @@
-import { Fragment, FormEvent, KeyboardEvent, useEffect, useRef, useState } from "react";
+import { Fragment, FormEvent, KeyboardEvent, useEffect, useMemo, useRef, useState } from "react";
 import {
   Activity,
   ArrowUp,
@@ -619,83 +619,119 @@ function App() {
   );
   const anyTurnBusy = Object.keys(activeTurns).length > 0;
   const retryable = !currentThreadBusy && ["failed", "cancelled"].includes(lastTurn?.state ?? "");
-  const toolActivities = turnTimeline.flatMap((item) => item.type === "tool" ? [item.activity] : []);
-  const activitiesByTurn = new Map<string, typeof toolActivities>();
-  for (const activity of toolActivities) {
-    const turnActivities = activitiesByTurn.get(activity.turnId) ?? [];
-    turnActivities.push(activity);
-    activitiesByTurn.set(activity.turnId, turnActivities);
-  }
-  const timelineByTurn = new Map<string, typeof turnTimeline>();
-  for (const item of turnTimeline) {
-    const turnId = item.type === "tool" ? item.activity.turnId : item.turnId;
-    const turnItems = timelineByTurn.get(turnId) ?? [];
-    turnItems.push(item);
-    timelineByTurn.set(turnId, turnItems);
-  }
-  const representedTurnIds = new Set(
-    messages.flatMap((message) => message.role === "assistant" && message.turnId ? [message.turnId] : []),
+  const toolActivities = useMemo(
+    () => turnTimeline.flatMap((item) => item.type === "tool" ? [item.activity] : []),
+    [turnTimeline],
   );
-  const assistantMessagesByTurn = new Map(
-    messages.flatMap((message) => message.role === "assistant" && message.turnId
-      ? [[message.turnId, message] as const]
-      : []),
-  );
-  const orderedTurnIds: string[] = [];
-  const seenTurnIds = new Set<string>();
-  for (const item of turnTimeline) {
-    const turnId = item.type === "tool" ? item.activity.turnId : item.turnId;
-    if (!seenTurnIds.has(turnId)) {
-      seenTurnIds.add(turnId);
-      orderedTurnIds.push(turnId);
+  const activitiesByTurn = useMemo(() => {
+    const map = new Map<string, typeof toolActivities>();
+    for (const activity of toolActivities) {
+      const turnActivities = map.get(activity.turnId) ?? [];
+      turnActivities.push(activity);
+      map.set(activity.turnId, turnActivities);
     }
-  }
-  for (const message of messages) {
-    if (message.role === "assistant" && message.turnId && !seenTurnIds.has(message.turnId)) {
-      seenTurnIds.add(message.turnId);
-      orderedTurnIds.push(message.turnId);
+    return map;
+  }, [toolActivities]);
+  const timelineByTurn = useMemo(() => {
+    const map = new Map<string, typeof turnTimeline>();
+    for (const item of turnTimeline) {
+      const turnId = item.type === "tool" ? item.activity.turnId : item.turnId;
+      const turnItems = map.get(turnId) ?? [];
+      turnItems.push(item);
+      map.set(turnId, turnItems);
     }
-  }
-  const retryTurnGroupsByUserMessage = new Map<string, string[]>();
-  for (const turnId of orderedTurnIds) {
-    const userMessageId = turnUserMessageIds[turnId];
-    if (!userMessageId) continue;
-    const turnIds = retryTurnGroupsByUserMessage.get(userMessageId) ?? [];
-    turnIds.push(turnId);
-    retryTurnGroupsByUserMessage.set(userMessageId, turnIds);
-  }
-  for (const [userMessageId, turnIds] of retryTurnGroupsByUserMessage) {
-    if (turnIds.length < 2) retryTurnGroupsByUserMessage.delete(userMessageId);
-  }
-  const groupedRetryTurnIds = new Set([...retryTurnGroupsByUserMessage.values()].flat());
-  const latestPlanActivity = [...toolActivities].reverse().find((activity) => activity.call.name === "update_plan");
-  const latestAssistantTurnId = [...messages].reverse().find(
-    (message) => message.role === "assistant" && message.turnId,
-  )?.turnId;
-  const planTurnId = plan?.steps.length
-    ? latestPlanActivity?.turnId ?? (currentThreadBusy ? currentThreadTurnId : latestAssistantTurnId)
-    : null;
-  const orphanTurnIds = [...new Set([...activitiesByTurn.keys(), ...timelineByTurn.keys()])]
-    .filter((turnId) => !representedTurnIds.has(turnId) && !groupedRetryTurnIds.has(turnId));
-  const orphanTurnsByUserMessage = new Map<string, string[]>();
-  const unanchoredOrphanTurnIds: string[] = [];
-  for (const turnId of orphanTurnIds) {
-    const messageId = turnUserMessageIds[turnId];
-    if (!messageId) {
-      unanchoredOrphanTurnIds.push(turnId);
-      continue;
+    return map;
+  }, [turnTimeline]);
+  const derivedTurnData = useMemo(() => {
+    const representedTurnIds = new Set(
+      messages.flatMap((message) => message.role === "assistant" && message.turnId ? [message.turnId] : []),
+    );
+    const assistantMessagesByTurn = new Map(
+      messages.flatMap((message) => message.role === "assistant" && message.turnId
+        ? [[message.turnId, message] as const]
+        : []),
+    );
+    const orderedTurnIds: string[] = [];
+    const seenTurnIds = new Set<string>();
+    for (const item of turnTimeline) {
+      const turnId = item.type === "tool" ? item.activity.turnId : item.turnId;
+      if (!seenTurnIds.has(turnId)) {
+        seenTurnIds.add(turnId);
+        orderedTurnIds.push(turnId);
+      }
     }
-    const anchored = orphanTurnsByUserMessage.get(messageId) ?? [];
-    anchored.push(turnId);
-    orphanTurnsByUserMessage.set(messageId, anchored);
-  }
-  const planIsAttached = Boolean(planTurnId && representedTurnIds.has(planTurnId));
-  const planIsAttachedToOrphan = Boolean(
-    planTurnId && orphanTurnIds.includes(planTurnId),
-  );
-  const planIsAttachedToRetryGroup = Boolean(
-    planTurnId && groupedRetryTurnIds.has(planTurnId),
-  );
+    for (const message of messages) {
+      if (message.role === "assistant" && message.turnId && !seenTurnIds.has(message.turnId)) {
+        seenTurnIds.add(message.turnId);
+        orderedTurnIds.push(message.turnId);
+      }
+    }
+    const retryTurnGroupsByUserMessage = new Map<string, string[]>();
+    for (const turnId of orderedTurnIds) {
+      const userMessageId = turnUserMessageIds[turnId];
+      if (!userMessageId) continue;
+      const turnIds = retryTurnGroupsByUserMessage.get(userMessageId) ?? [];
+      turnIds.push(turnId);
+      retryTurnGroupsByUserMessage.set(userMessageId, turnIds);
+    }
+    for (const [userMessageId, turnIds] of retryTurnGroupsByUserMessage) {
+      if (turnIds.length < 2) retryTurnGroupsByUserMessage.delete(userMessageId);
+    }
+    const groupedRetryTurnIds = new Set([...retryTurnGroupsByUserMessage.values()].flat());
+    const latestPlanActivity = [...toolActivities].reverse().find((activity) => activity.call.name === "update_plan");
+    const latestAssistantTurnId = [...messages].reverse().find(
+      (message) => message.role === "assistant" && message.turnId,
+    )?.turnId;
+    const planTurnId = plan?.steps.length
+      ? latestPlanActivity?.turnId ?? (currentThreadBusy ? currentThreadTurnId : latestAssistantTurnId)
+      : null;
+    const orphanTurnIds = [...new Set([...activitiesByTurn.keys(), ...timelineByTurn.keys()])]
+      .filter((turnId) => !representedTurnIds.has(turnId) && !groupedRetryTurnIds.has(turnId));
+    const orphanTurnsByUserMessage = new Map<string, string[]>();
+    const unanchoredOrphanTurnIds: string[] = [];
+    for (const turnId of orphanTurnIds) {
+      const messageId = turnUserMessageIds[turnId];
+      if (!messageId) {
+        unanchoredOrphanTurnIds.push(turnId);
+        continue;
+      }
+      const anchored = orphanTurnsByUserMessage.get(messageId) ?? [];
+      anchored.push(turnId);
+      orphanTurnsByUserMessage.set(messageId, anchored);
+    }
+    const planIsAttached = Boolean(planTurnId && representedTurnIds.has(planTurnId));
+    const planIsAttachedToOrphan = Boolean(
+      planTurnId && orphanTurnIds.includes(planTurnId),
+    );
+    const planIsAttachedToRetryGroup = Boolean(
+      planTurnId && groupedRetryTurnIds.has(planTurnId),
+    );
+    return {
+      representedTurnIds,
+      assistantMessagesByTurn,
+      orderedTurnIds,
+      retryTurnGroupsByUserMessage,
+      groupedRetryTurnIds,
+      planTurnId,
+      orphanTurnIds,
+      orphanTurnsByUserMessage,
+      unanchoredOrphanTurnIds,
+      planIsAttached,
+      planIsAttachedToOrphan,
+      planIsAttachedToRetryGroup,
+    };
+  }, [messages, turnTimeline, turnUserMessageIds, toolActivities, activitiesByTurn, timelineByTurn, plan?.steps.length, currentThreadBusy, currentThreadTurnId]);
+
+  const assistantMessagesByTurn = derivedTurnData.assistantMessagesByTurn;
+  const retryTurnGroupsByUserMessage = derivedTurnData.retryTurnGroupsByUserMessage;
+  const groupedRetryTurnIds = derivedTurnData.groupedRetryTurnIds;
+  const planTurnId = derivedTurnData.planTurnId;
+  const orphanTurnIds = derivedTurnData.orphanTurnIds;
+  const orphanTurnsByUserMessage = derivedTurnData.orphanTurnsByUserMessage;
+  const unanchoredOrphanTurnIds = derivedTurnData.unanchoredOrphanTurnIds;
+  const planIsAttached = derivedTurnData.planIsAttached;
+  const planIsAttachedToOrphan = derivedTurnData.planIsAttachedToOrphan;
+  const planIsAttachedToRetryGroup = derivedTurnData.planIsAttachedToRetryGroup;
   const hasConversationContent = messages.length > 0
     || orphanTurnIds.length > 0
     || Boolean(plan?.steps.length)
@@ -2126,6 +2162,49 @@ function UserInputCard({ request, onResolve }: {
   onResolve: (resolution: import("./types/runtime").UserInputResolution) => void;
 }) {
   const [answers, setAnswers] = useState<Record<number, string>>({});
+
+  function resolveContinuation(answer: string) {
+    const question = request.questions[0]?.question ?? "是否继续执行？";
+    onResolve({ action: "answered", answers: [{ question, answer }] });
+  }
+
+  if (request.kind === "turn_continuation") {
+    return (
+      <article className="message message--approval">
+        <div className="message-body">
+          <div className="message-role">执行额度已用完</div>
+          <div className="approval-inline">
+            <div className="user-input-question">
+              <div className="user-input-question-text">{request.questions[0]?.question}</div>
+            </div>
+            <div className="approval-options">
+              <button
+                type="button"
+                className="approval-option"
+                onClick={() => resolveContinuation("continue")}
+              >
+                继续执行
+              </button>
+              <button
+                type="button"
+                className="approval-option"
+                onClick={() => resolveContinuation("compact_and_continue")}
+              >
+                压缩后继续
+              </button>
+              <button
+                type="button"
+                className="approval-option approval-option--danger"
+                onClick={() => resolveContinuation("stop")}
+              >
+                停止执行
+              </button>
+            </div>
+          </div>
+        </div>
+      </article>
+    );
+  }
 
   function submit() {
     const resolved = request.questions.map((q, idx) => ({

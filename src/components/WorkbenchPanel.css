@@ -105,6 +105,13 @@
   line-height: 1.65;
 }
 
+.terminal-tab-host {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  flex-direction: column;
+}
+
 .git-actions {
   flex-wrap: wrap;
 }

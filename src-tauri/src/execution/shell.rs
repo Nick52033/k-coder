@@ -6,6 +6,8 @@ use super::{CommandAssessment, CommandMode, CommandRisk, StartCommandRequest, as
 
 const POWERSHELL_UTF8_OUTPUT_PREFIX: &str =
     "try { [Console]::OutputEncoding=[System.Text.Encoding]::UTF8 } catch {}\n";
+#[cfg(windows)]
+const POWERSHELL_UTF8_INTERACTIVE_INIT: &str = "try { [Console]::InputEncoding=[System.Text.Encoding]::UTF8; [Console]::OutputEncoding=[System.Text.Encoding]::UTF8 } catch {}";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ShellType {
@@ -83,6 +85,29 @@ impl DetectedShell {
 
     pub(super) fn assess(&self, command: &str) -> CommandAssessment {
         assess_script(self.shell_type, command)
+    }
+
+    /// 交互式终端（PTY）启动参数：程序路径与保持会话存活的初始化参数。
+    pub(super) fn interactive_launch(&self) -> (String, Vec<String>) {
+        let program = self.program.to_string_lossy().into_owned();
+        let args = match self.shell_type {
+            #[cfg(windows)]
+            ShellType::PowerShell => vec![
+                "-NoProfile".to_string(),
+                "-NoExit".to_string(),
+                "-Command".to_string(),
+                POWERSHELL_UTF8_INTERACTIVE_INIT.to_string(),
+            ],
+            #[cfg(windows)]
+            ShellType::Cmd => vec![
+                "/D".to_string(),
+                "/K".to_string(),
+                "chcp 65001>nul".to_string(),
+            ],
+            #[cfg(not(windows))]
+            ShellType::Zsh | ShellType::Bash | ShellType::Sh => Vec::new(),
+        };
+        (program, args)
     }
 }
 
@@ -368,6 +393,26 @@ mod tests {
 
         #[cfg(windows)]
         assert!(assess_script(ShellType::Cmd, "echo %TEMP%").requires_approval);
+    }
+
+    #[test]
+    fn interactive_launch_keeps_default_shell_alive_with_utf8_init() {
+        let shell = default_user_shell();
+        let (program, args) = shell.interactive_launch();
+        assert!(!program.trim().is_empty());
+        #[cfg(windows)]
+        match shell.shell_type {
+            ShellType::PowerShell => {
+                assert_eq!(&args[..3], ["-NoProfile", "-NoExit", "-Command"]);
+                assert!(args[3].contains("OutputEncoding"));
+                assert!(args[3].contains("InputEncoding"));
+            }
+            ShellType::Cmd => {
+                assert_eq!(args, ["/D", "/K", "chcp 65001>nul"]);
+            }
+        }
+        #[cfg(not(windows))]
+        assert!(args.is_empty());
     }
 
     #[test]

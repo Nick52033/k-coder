@@ -2992,6 +2992,7 @@ mod tests {
             thread_id: thread.id.clone(),
             turn_id: turn_id.clone(),
             tool_call_id: "call-input".into(),
+            kind: crate::protocol::UserInputRequestKind::ModelQuestion,
             questions: vec![UserInputQuestion {
                 question: "选择实现方式".into(),
                 options: vec!["稳妥".into(), "快速".into()],

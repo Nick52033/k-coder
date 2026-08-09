@@ -475,6 +475,11 @@ impl CommandRuntime {
             )));
         }
         let cwd = resolve_cwd(&self.workspace_root, &request.cwd)?;
+        // P10-035: canonicalize 注入的 \\?\ 前缀仅用于内部路径比对，
+        // 传给子进程（包括 Windows 终端子进程）会原样出现在提示符或
+        // `cd %CD%` 输出中。CommandBuilder 接受 user-facing 路径，
+        // 因此这里在交给 PTY 之前剥掉 verbatim 前缀。
+        let cwd_for_shell = strip_verbatim_prefix(&cwd);
         let limit = request
             .buffer_bytes
             .unwrap_or(DEFAULT_BUFFER_BYTES)
@@ -500,7 +505,7 @@ impl CommandRuntime {
         let mut command = Command::new(&request.program);
         command
             .args(&request.args)
-            .current_dir(cwd)
+            .current_dir(&cwd_for_shell)
             .envs(request.env.iter().filter(|(key, _)| !is_sensitive_key(key)))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -770,6 +775,28 @@ fn resolve_cwd(root: &Path, cwd: &str) -> Result<PathBuf, ExecutionError> {
     Ok(target)
 }
 
+/// 把路径中的 Windows verbatim (`\\?\`) 前缀还原成 user-facing 形式。
+///
+/// Rust 的 `canonicalize` 在 Windows 上会返回带 `\\?\` 前缀的"扩展长度"路径，
+/// 传给子进程（特别是 PTY 的 PowerShell/cmd）会原样回显在 `$PWD` 和
+/// 提示符中。`extensions::user_facing_path` 已对诊断和文案做了同样处理，
+/// 这里保持一致：仅当目标平台是 Windows 且 `cwd` 看起来是绝对路径时才剥；
+/// 其他平台（包括已在 user-facing 形式下的输入）原样返回。
+fn strip_verbatim_prefix(cwd: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let raw = cwd.as_os_str();
+        let text = raw.to_string_lossy();
+        if let Some(stripped) = text.strip_prefix(r"\\?\UNC\") {
+            return PathBuf::from(format!(r"\\{stripped}"));
+        }
+        if let Some(stripped) = text.strip_prefix(r"\\?\") {
+            return PathBuf::from(stripped);
+        }
+    }
+    cwd.to_path_buf()
+}
+
 fn is_sensitive_key(key: &str) -> bool {
     let key = key.to_ascii_uppercase();
     [
@@ -963,15 +990,23 @@ impl NativePtyRuntime {
     }
 
     pub async fn start(&self, request: StartPtyRequest) -> Result<PtySessionView, ExecutionError> {
-        if request.program.trim().is_empty() {
-            return Err(ExecutionError::Invalid("program must not be empty".into()));
-        }
         if request.rows == 0 || request.cols == 0 {
             return Err(ExecutionError::Invalid(
                 "PTY rows and columns must be greater than zero".into(),
             ));
         }
+        // 空 program 表示界面交互终端：使用平台默认 shell 的交互式启动参数。
+        let (program, args) = if request.program.trim().is_empty() {
+            shell::default_user_shell().interactive_launch()
+        } else {
+            (request.program.clone(), request.args.clone())
+        };
         let cwd = resolve_cwd(&self.workspace_root, &request.cwd)?;
+        // P10-035: canonicalize 注入的 \\?\ 前缀仅用于内部路径比对，
+        // 传给子进程（包括 Windows 终端子进程）会原样出现在提示符或
+        // `cd %CD%` 输出中。CommandBuilder 接受 user-facing 路径，
+        // 因此这里在交给 PTY 之前剥掉 verbatim 前缀。
+        let cwd_for_shell = strip_verbatim_prefix(&cwd);
         let size = PtySize {
             rows: request.rows,
             cols: request.cols,
@@ -981,9 +1016,9 @@ impl NativePtyRuntime {
         let pair = native_pty_system()
             .openpty(size)
             .map_err(|error| ExecutionError::Io(error.to_string()))?;
-        let mut command = CommandBuilder::new(&request.program);
-        command.args(&request.args);
-        command.cwd(cwd);
+        let mut command = CommandBuilder::new(&program);
+        command.args(&args);
+        command.cwd(&cwd_for_shell);
         for (key, value) in request.env.iter().filter(|(key, _)| !is_sensitive_key(key)) {
             command.env(key, value);
         }
@@ -1240,6 +1275,29 @@ fn read_pty_stream(mut reader: Box<dyn Read + Send>, session: Arc<PtySession>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strip_verbatim_prefix_strips_windows_extended_length_prefix() {
+        // 内部 canonicalize 形式必须被还原成 user-facing 形式，
+        // 才能让 PowerShell/cmd 提示符与 `cd %CD%` 输出保持整洁。
+        assert_eq!(
+            strip_verbatim_prefix(Path::new(r"\\?\D:\code\k-coder")),
+            PathBuf::from(r"D:\code\k-coder"),
+        );
+        assert_eq!(
+            strip_verbatim_prefix(Path::new(r"\\?\UNC\server\share\repo")),
+            PathBuf::from(r"\\server\share\repo"),
+        );
+        // 已经是 user-facing 形式时保持原样。
+        assert_eq!(
+            strip_verbatim_prefix(Path::new(r"D:\code\k-coder")),
+            PathBuf::from(r"D:\code\k-coder"),
+        );
+        assert_eq!(
+            strip_verbatim_prefix(Path::new("/tmp/k-coder")),
+            PathBuf::from("/tmp/k-coder"),
+        );
+    }
 
     #[test]
     fn risk_is_derived_from_program_and_arguments() {
@@ -1514,6 +1572,49 @@ mod tests {
             CommandState::Exited { code: 0 }
         ));
         runtime.close(&short.id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pty_empty_program_starts_default_interactive_shell_in_workspace() {
+        let workspace = tempfile::tempdir().unwrap();
+        let runtime = NativePtyRuntime::new(workspace.path()).unwrap();
+        let session = runtime
+            .start(StartPtyRequest {
+                program: String::new(),
+                args: Vec::new(),
+                cwd: String::new(),
+                env: HashMap::new(),
+                rows: 24,
+                cols: 80,
+                buffer_bytes: Some(8192),
+            })
+            .await
+            .unwrap();
+        #[cfg(windows)]
+        runtime.write(&session.id, "\x1b[1;1R").await.unwrap();
+        #[cfg(windows)]
+        let input = "echo pty-default-ok\r\n";
+        #[cfg(unix)]
+        let input = "echo pty-default-ok\n";
+        runtime.write(&session.id, input).await.unwrap();
+        let mut terminal_output = String::new();
+        for _ in 0..240 {
+            let page = runtime.read(&session.id, 0, 200).await.unwrap();
+            terminal_output = page
+                .chunks
+                .iter()
+                .map(|chunk| chunk.text.as_str())
+                .collect();
+            if terminal_output.contains("pty-default-ok") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(
+            terminal_output.contains("pty-default-ok"),
+            "default interactive shell did not echo marker: {terminal_output:?}"
+        );
+        runtime.close(&session.id).await.unwrap();
     }
 
     #[test]

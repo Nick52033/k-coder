@@ -26,6 +26,8 @@ test.beforeEach(async ({ page }) => {
       attachments: unknown[];
     }>>();
     const invocationArgs: Record<string, unknown> = {};
+    const ptyStartRequests: unknown[] = [];
+    const ptyWrites: string[] = [];
     const responses: Record<string, unknown> = {
       runtime_status: { ready: true, phase: "advanced-agent", version: "0.10.0", uptimeSeconds: 12, capabilities: ["skills", "mcp-stdio", "tool-hooks", "persistent-plans", "budgeted-goals"] },
       get_approval_mode: "ask",
@@ -389,12 +391,53 @@ test.beforeEach(async ({ page }) => {
             reasoningEffort = args?.effort as typeof reasoningEffort;
             return reasoningEffort;
           }
+          if (command === "start_pty") {
+            ptyStartRequests.push(args?.request ?? null);
+            const exited = localStorage.getItem("kcoder_e2e_pty_state") === "exited";
+            return {
+              id: `pty-${ptyStartRequests.length}`,
+              state: exited ? { state: "exited", code: 0 } : { state: "running" },
+              startedAtMs: 1,
+              finishedAtMs: exited ? 2 : null,
+              rows: 24,
+              cols: 80,
+              nextCursor: 1,
+              oldestCursor: 0,
+              outputTruncated: false,
+            };
+          }
+          if (command === "pty_status") {
+            const exited = localStorage.getItem("kcoder_e2e_pty_state") === "exited";
+            return {
+              id: String(args?.sessionId ?? "pty-1"),
+              state: exited ? { state: "exited", code: 0 } : { state: "running" },
+              startedAtMs: 1,
+              finishedAtMs: exited ? 2 : null,
+              rows: 24,
+              cols: 80,
+              nextCursor: 1,
+              oldestCursor: 0,
+              outputTruncated: false,
+            };
+          }
+          if (command === "read_pty_output") {
+            const cursor = Number(args?.cursor ?? 0);
+            const chunks = cursor === 0 ? [{ cursor: 0, text: "PS D:\\code\\k-coder> " }] : [];
+            return { chunks, nextCursor: cursor === 0 ? 1 : cursor, oldestCursor: 0, truncatedBeforeCursor: false };
+          }
+          if (command === "write_pty") {
+            ptyWrites.push(String(args?.input ?? ""));
+            return undefined;
+          }
+          if (command === "resize_pty" || command === "close_pty") return undefined;
           return responses[command] ?? null;
         },
       },
       __TAURI_EVENT_PLUGIN_INTERNALS__: { unregisterListener: () => undefined },
       __invoked: [],
       __invocationArgs: invocationArgs,
+      __ptyStartRequests: ptyStartRequests,
+      __ptyWrites: ptyWrites,
       __runTurnCalls: runTurnCalls,
       __lastProviderRequest: null,
       __lastActivatedProvider: null,
@@ -443,7 +486,9 @@ test("supports the primary workbench inspection flow", async ({ page }, testInfo
   await expect(page.locator(".turn-timeline-tool").getByText("应用补丁 src/App.css", { exact: true })).toBeVisible();
   await page.getByText("查看补丁", { exact: true }).click();
   const patchEditor = page.locator(".turn-tool-details--file").filter({ hasText: "查看补丁" });
-  await expect(patchEditor.locator('.code-editor[data-language="diff"] .monaco-editor')).toBeVisible();
+  // dev server 下 Monaco 以未优化的原生 ESM 加载（optimizeDeps 排除 monaco-editor），
+  // 首个 diff 编辑器需要完成整棵模块树的瀑布请求，放宽首次可见等待时间。
+  await expect(patchEditor.locator('.code-editor[data-language="diff"] .monaco-editor')).toBeVisible({ timeout: 20000 });
   await expect(patchEditor.locator(".view-lines")).toContainText("*** Update File: src/App.css");
   const readTool = page.locator(".turn-timeline-tool").filter({ hasText: "读取 src/stores/workbenchStore.ts L42" });
   await expect(readTool).toBeVisible();
@@ -1704,6 +1749,7 @@ test("restores a pending user question after reopening the thread", async ({ pag
           threadId: "thread-1",
           turnId: "turn-question",
           toolCallId: "call-input",
+          kind: "model_question",
           questions: [{ question: "Choose an approach", options: ["Conservative", "Fast"] }],
           createdAtMs: 1,
           expiresAtMs: Date.now() + 300000,
@@ -1722,6 +1768,55 @@ test("restores a pending user question after reopening the thread", async ({ pag
   await page.getByRole("button", { name: "Fast", exact: true }).click();
   await page.getByRole("button", { name: "提交回答", exact: true }).click();
   await expect.poll(() => page.evaluate(() => (window as unknown as { __invoked: string[] }).__invoked.filter((command) => command === "resolve_user_input").length)).toBe(1);
+});
+
+test("restores a soft turn continuation gate with direct actions", async ({ page }) => {
+  const question = "当前执行段已调用模型 30 次、累计消耗 920000 tokens、运行 480 秒。";
+  await page.addInitScript((continuationQuestion) => {
+    localStorage.setItem("kcoder_e2e_thread_detail", JSON.stringify({
+      schemaVersion: 1,
+      summary: { schemaVersion: 1, id: "thread-1", title: "Long running turn", createdAtMs: 1, updatedAtMs: 2, archived: false },
+      messages: [{ schemaVersion: 1, id: "continuation-user", role: "user", content: [{ type: "text", text: "Complete the task" }], createdAtMs: 1 }],
+      messageTurnIds: {},
+      turnUserMessageIds: { "turn-continuation": "continuation-user" },
+      lastTurn: { turnId: "turn-continuation", state: "awaiting_approval", error: null },
+      toolActivities: [],
+      turnTimeline: [{ type: "event", itemId: "user-input-requested-continuation-1", turnId: "turn-continuation", kind: "user_input_requested", title: "User input requested", detail: continuationQuestion }],
+      approvals: [],
+      userInputs: [{
+        request: {
+          id: "continuation-1",
+          threadId: "thread-1",
+          turnId: "turn-continuation",
+          toolCallId: "runtime-turn-continuation",
+          kind: "turn_continuation",
+          questions: [{ question: continuationQuestion, options: ["continue", "compact_and_continue", "stop"] }],
+          createdAtMs: 1,
+          expiresAtMs: Date.now() + 300000,
+        },
+        resolution: null,
+      }],
+      changes: [],
+      todos: [],
+      lastUsage: null,
+    }));
+  }, question);
+
+  await page.goto("/");
+  await expect(page.getByText("执行额度已用完", { exact: true })).toBeVisible();
+  await expect(page.locator(".user-input-question-text").getByText(question, { exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "继续执行", exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "停止执行", exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "压缩后继续", exact: true }).click();
+  await expect.poll(() => page.evaluate(() => (
+    window as unknown as { __invocationArgs: Record<string, unknown> }
+  ).__invocationArgs.resolve_user_input)).toEqual({
+    requestId: "continuation-1",
+    resolution: {
+      action: "answered",
+      answers: [{ question, answer: "compact_and_continue" }],
+    },
+  });
 });
 
 test("replays live events received while a thread snapshot is loading", async ({ page }) => {
@@ -2161,7 +2256,8 @@ test("hydrates the unified thread item page and loads older turns", async ({ pag
   });
 });
 
-test("clears the previous thread view while the selected thread is loading", async ({ page }) => {
+test("clears the previous thread view while the selected thread is loading", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name === "narrow", "窄屏隐藏会话侧边栏");
   await page.addInitScript(() => {
     const secondThread = {
       schemaVersion: 1,
@@ -2200,4 +2296,45 @@ test("clears the previous thread view while the selected thread is loading", asy
   expect(await page.getByText("检查完成。", { exact: true }).isVisible()).toBe(false);
   expect(await page.getByText("检查工作区", { exact: true }).isVisible()).toBe(false);
   await expect(page.getByText("正在读取会话", { exact: true })).toBeVisible();
+});
+
+test("starts a workspace terminal from the workbench tab and forwards keystrokes", async ({ page }) => {
+  const startCount = () => page.evaluate(() => (window as unknown as { __ptyStartRequests: unknown[] }).__ptyStartRequests.length);
+  await page.goto("/");
+  await page.getByRole("button", { name: "工作台", exact: true }).click();
+  await page.getByRole("tab", { name: "终端" }).click();
+
+  await expect(page.locator(".terminal-view .xterm")).toBeVisible();
+  await expect.poll(startCount).toBeGreaterThanOrEqual(1);
+  const request = await page.evaluate(() => {
+    const list = (window as unknown as { __ptyStartRequests: Array<{ program?: string; cwd?: string }> }).__ptyStartRequests;
+    return list[list.length - 1];
+  });
+  expect(request.program).toBe("");
+  expect(request.cwd ?? "").toBe("");
+
+  await page.locator(".terminal-view .xterm-helper-textarea").focus();
+  await page.keyboard.type("pnpm tauri build");
+  await expect.poll(() => page.evaluate(() => (window as unknown as { __ptyWrites: string[] }).__ptyWrites.join(""))).toContain("pnpm tauri build");
+
+  const started = await startCount();
+  await page.getByRole("tab", { name: "文件" }).click();
+  await expect(page.locator(".terminal-view")).toBeHidden();
+  await page.getByRole("tab", { name: "终端" }).click();
+  await expect(page.locator(".terminal-view .xterm")).toBeVisible();
+  expect(await startCount()).toBe(started);
+});
+
+test("shows the terminal exit state and restarts the session", async ({ page }) => {
+  await page.addInitScript(() => {
+    localStorage.setItem("kcoder_e2e_pty_state", "exited");
+  });
+  await page.goto("/");
+  await page.getByRole("button", { name: "工作台", exact: true }).click();
+  await page.getByRole("tab", { name: "终端" }).click();
+
+  await expect(page.getByText("进程已退出（代码 0）", { exact: true })).toBeVisible();
+  const started = await page.evaluate(() => (window as unknown as { __ptyStartRequests: unknown[] }).__ptyStartRequests.length);
+  await page.getByRole("button", { name: "重启终端" }).click();
+  await expect.poll(() => page.evaluate(() => (window as unknown as { __ptyStartRequests: unknown[] }).__ptyStartRequests.length)).toBe(started + 1);
 });

@@ -2031,6 +2031,7 @@ mod tests {
                     thread_id: thread.id.clone(),
                     turn_id: turn_id.clone(),
                     tool_call_id: "call-input".to_string(),
+                    kind: crate::protocol::UserInputRequestKind::ModelQuestion,
                     questions: vec![UserInputQuestion {
                         question: "继续吗".to_string(),
                         options: vec!["继续".to_string(), "停止".to_string()],

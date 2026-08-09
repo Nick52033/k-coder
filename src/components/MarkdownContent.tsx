@@ -1,11 +1,11 @@
 import { Check, Copy, FileDiff } from "lucide-react";
-import { Children, isValidElement, type ReactNode, useState } from "react";
+import { Children, isValidElement, memo, type ReactNode, useState } from "react";
 import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 
 const PROPOSED_PLAN = /<proposed_plan>([\s\S]*?)(?:<\/proposed_plan>|$)/g;
 
-export function MarkdownContent({ text }: { text: string }) {
+export const MarkdownContent = memo(function MarkdownContent({ text }: { text: string }) {
   if (!text) return null;
 
   const parts: ReactNode[] = [];
@@ -36,15 +36,18 @@ export function MarkdownContent({ text }: { text: string }) {
   }
 
   return <div className="markdown-content">{parts.length ? parts : <MarkdownDocument text={text} />}</div>;
-}
+});
 
-function MarkdownDocument({ text }: { text: string }) {
-  return (
-    <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents} skipHtml>
-      {text}
-    </ReactMarkdown>
-  );
-}
+const MarkdownDocument = memo(
+  function MarkdownDocument({ text }: { text: string }) {
+    return (
+      <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents} skipHtml>
+        {text}
+      </ReactMarkdown>
+    );
+  },
+  (prev, next) => prev.text === next.text,
+);
 
 const markdownComponents: Components = {
   a: ({ children, ...props }) => (

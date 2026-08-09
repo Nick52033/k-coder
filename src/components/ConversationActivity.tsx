@@ -14,7 +14,7 @@ import {
   LoaderCircle,
   SquareTerminal,
 } from "lucide-react";
-import { lazy, Suspense, useEffect, useRef, useState, type ReactNode } from "react";
+import { lazy, memo, Suspense, useEffect, useRef, useState, type ReactNode } from "react";
 import type {
   AgentActivityStatus,
   ChangeSet,
@@ -29,7 +29,7 @@ import type {
 const ReadOnlyCodeEditor = lazy(() => import("./CodeEditor").then((module) => ({ default: module.CodeEditor })));
 const ChangeCodeDiffEditor = lazy(() => import("./CodeEditor").then((module) => ({ default: module.CodeDiffEditor })));
 
-export function ConversationTurnActivity({
+export const ConversationTurnActivity = memo(function ConversationTurnActivity({
   activities,
   timeline = [],
   changes = [],
@@ -169,7 +169,7 @@ export function ConversationTurnActivity({
       ) : null}
     </div>
   );
-}
+});
 
 function isTerminalEvent(kind: TimelineEventKind) {
   return kind === "turn_completed" || kind === "turn_failed" || kind === "turn_cancelled";

@@ -1,4 +1,4 @@
-import { lazy, Suspense, useEffect, useState } from "react";
+import { lazy, memo, Suspense, useCallback, useEffect, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
   ArrowDownToLine, Braces, ChevronDown, ChevronRight, CircleCheck,
@@ -20,9 +20,10 @@ import type {
   SearchResult,
 } from "../types/runtime";
 
-type Tab = "files" | "git";
+type Tab = "files" | "git" | "terminal";
 
 const CodeEditor = lazy(() => import("./CodeEditor").then((module) => ({ default: module.CodeEditor })));
+const TerminalPanel = lazy(() => import("./TerminalPanel").then((module) => ({ default: module.TerminalPanel })));
 
 export function WorkspacePicker({ onChanged, compact = false }: { onChanged: () => void; compact?: boolean }) {
   const [state, setState] = useState<WorkspaceState | null>(null);
@@ -81,14 +82,27 @@ export function WorkspacePicker({ onChanged, compact = false }: { onChanged: () 
 
 export function WorkbenchPanel({ onAttach, open = false }: { onAttach: (attachment: AttachmentContent) => void; open?: boolean }) {
   const [tab, setTab] = useState<Tab>("files");
+  const [terminalMounted, setTerminalMounted] = useState(false);
+  const openTerminal = () => {
+    setTerminalMounted(true);
+    setTab("terminal");
+  };
   return (
     <aside className={`workbench-panel ${open ? "workbench-panel--open" : ""}`}>
       <div className="workbench-tabs" role="tablist" aria-label="工作台面板">
         <TabButton active={tab === "files"} icon={<FileCode2 size={15} />} label="文件" onClick={() => setTab("files")} />
         <TabButton active={tab === "git"} icon={<GitBranch size={15} />} label="Git" onClick={() => setTab("git")} />
+        <TabButton active={tab === "terminal"} icon={<Terminal size={15} />} label="终端" onClick={openTerminal} />
       </div>
       {tab === "files" && <FilesView onAttach={onAttach} />}
       {tab === "git" && <GitView />}
+      {terminalMounted && tab === "terminal" && (
+        <div className="terminal-tab-host">
+          <Suspense fallback={<div className="panel-empty">正在载入终端...</div>}>
+            <TerminalPanel visible />
+          </Suspense>
+        </div>
+      )}
     </aside>
   );
 }
@@ -110,7 +124,7 @@ function FilesView({ onAttach }: { onAttach: (attachment: AttachmentContent) => 
   const [mdView, setMdView] = useState<"preview" | "source">("preview");
   const dirty = Boolean(preview?.editable && draft !== (preview.content ?? ""));
 
-  async function select(path: string) {
+  const select = useCallback(async (path: string) => {
     if (path === preview?.path) return;
     if (dirty && !window.confirm("当前文件有未保存的修改，放弃修改并打开其他文件？")) return;
     try {
@@ -123,9 +137,9 @@ function FilesView({ onAttach }: { onAttach: (attachment: AttachmentContent) => 
     } catch (error) {
       setError(toReadableError(error));
     }
-  }
+  }, [preview?.path, dirty]);
 
-  async function save() {
+  const save = useCallback(async () => {
     if (!preview?.editable || !preview.contentHash || !dirty || saving) return;
     setSaving(true);
     setNotice("");
@@ -145,20 +159,20 @@ function FilesView({ onAttach }: { onAttach: (attachment: AttachmentContent) => 
     } finally {
       setSaving(false);
     }
-  }
+  }, [preview?.editable, preview?.contentHash, preview?.path, draft, dirty, saving]);
 
-  function closePreview() {
+  const closePreview = useCallback(() => {
     if (dirty && !window.confirm("当前文件有未保存的修改，确定关闭？")) return;
     setPreview(null);
     setDraft("");
     setMdView("preview");
     setNotice("");
     setError("");
-  }
+  }, [dirty]);
 
-  async function attach() {
+  const attach = useCallback(async () => {
     if (preview) onAttach(await extractAttachment(preview.path));
-  }
+  }, [preview, onAttach]);
 
   useEffect(() => {
     if (!preview) return;
@@ -167,7 +181,7 @@ function FilesView({ onAttach }: { onAttach: (attachment: AttachmentContent) => 
     }
     document.addEventListener("keydown", handleKeyDown);
     return () => document.removeEventListener("keydown", handleKeyDown);
-  });
+  }, [preview, closePreview]);
 
   useEffect(() => {
     void getWorkspaceState()
@@ -233,7 +247,7 @@ function FilesView({ onAttach }: { onAttach: (attachment: AttachmentContent) => 
   );
 }
 
-function DirectoryNode({ path, depth, selectedPath, onSelect }: { path: string; depth: number; selectedPath: string | null; onSelect: (path: string) => void }) {
+const DirectoryNode = memo(function DirectoryNode({ path, depth, selectedPath, onSelect }: { path: string; depth: number; selectedPath: string | null; onSelect: (path: string) => void }) {
   const [entries, setEntries] = useState<FileEntry[]>([]);
   const [error, setError] = useState("");
   useEffect(() => {
@@ -248,9 +262,9 @@ function DirectoryNode({ path, depth, selectedPath, onSelect }: { path: string; 
       <FileTypeIcon name={entry.name} /><span>{entry.name}</span>
     </button>
   ))}</>;
-}
+});
 
-function FolderNode({ entry, depth, selectedPath, onSelect }: { entry: FileEntry; depth: number; selectedPath: string | null; onSelect: (path: string) => void }) {
+const FolderNode = memo(function FolderNode({ entry, depth, selectedPath, onSelect }: { entry: FileEntry; depth: number; selectedPath: string | null; onSelect: (path: string) => void }) {
   const [open, setOpen] = useState(false);
   return <div>
     <button className="tree-row" style={{ paddingLeft: 8 + depth * 14 }} type="button" onClick={() => setOpen(!open)} aria-expanded={open}>
@@ -258,7 +272,7 @@ function FolderNode({ entry, depth, selectedPath, onSelect }: { entry: FileEntry
     </button>
     {open && <DirectoryNode path={entry.path} depth={depth + 1} selectedPath={selectedPath} onSelect={onSelect} />}
   </div>;
-}
+});
 
 function toReadableError(reason: unknown): string {
   if (typeof reason === "string") return reason;
@@ -334,11 +348,11 @@ function GitView() {
   </div>;
 }
 
-function FileTypeIcon({ name }: { name: string }) {
+const FileTypeIcon = memo(function FileTypeIcon({ name }: { name: string }) {
   const visual = fileVisual(name);
   const Icon = visual.icon;
   return <Icon className={`file-type-icon file-type-icon--${visual.kind}`} size={14} aria-hidden="true" />;
-}
+});
 
 function fileVisual(name: string) {
   const lower = name.toLowerCase();

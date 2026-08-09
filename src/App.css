@@ -3812,7 +3812,7 @@ button {
 .workbench--panel-open .workbench-panel > * {
   min-width: 0;
 }
-.workbench-tabs { display: grid; grid-template-columns: repeat(2,1fr); border-bottom: 1px solid var(--color-border); }
+.workbench-tabs { display: grid; grid-template-columns: repeat(3,1fr); border-bottom: 1px solid var(--color-border); }
 .workbench-tabs button { display: flex; min-width: 0; align-items: center; justify-content: center; gap: 5px; border: 0; border-bottom: 2px solid transparent; color: var(--color-ink-subtle); background: transparent; cursor: pointer; font-size: var(--font-size-sm); }
 .workbench-tabs button.active { border-bottom-color: #4F8AFF; color: #4F8AFF; font-weight: 600; }
 .files-view, .git-view { display: flex; min-height: 0; flex-direction: column; overflow: hidden; }

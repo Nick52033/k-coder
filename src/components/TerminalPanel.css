@@ -1,0 +1,38 @@
+.terminal-view {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  flex-direction: column;
+  background: var(--color-surface-panel);
+}
+
+.terminal-toolbar {
+  flex: none;
+}
+
+.terminal-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  color: var(--color-ink);
+}
+
+.terminal-title small {
+  overflow: hidden;
+  color: var(--color-ink-muted);
+  font-size: var(--font-size-sm);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.terminal-host {
+  flex: 1;
+  min-height: 0;
+  padding: 6px 4px 6px 8px;
+  overflow: hidden;
+}
+
+.terminal-host .xterm {
+  height: 100%;
+}

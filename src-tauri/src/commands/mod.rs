@@ -15,9 +15,10 @@ use crate::advanced::{
 };
 use crate::agent::mailbox::{MailboxTurn, MailboxTurnKind, QueuedTurnSteerError};
 use crate::agent::thread_operation::ThreadOperationGuard;
-use crate::agent::{AgentRuntime, EventPublisher, RunTurnRequest, TurnOutcome, build_user_message};
+use crate::agent::{
+    AgentRuntime, EventPublisher, RunTurnRequest, SoftTurnLimits, TurnOutcome, build_user_message,
+};
 use crate::app_state::{AppState, AppStateError};
-use crate::context::CompactionSummary;
 use crate::execution::{
     CommandSessionView, OutputPage, PtyOutputPage, PtySessionView, StartCommandRequest,
     StartPtyRequest,
@@ -29,19 +30,18 @@ use crate::multi_agent::{
     SubagentView, delegation_tools,
 };
 use crate::ocr::{self, OcrResult};
-use crate::persistence::{ProjectRecord, UsageSummary};
+use crate::persistence::ProjectRecord;
 use crate::protocol::{
     AgentEvent, AgentEventEnvelope, AgentMode, ApprovalMode, ApprovalResolution, ChangeSet,
-    HistorySortDirection, ImageAttachment, MessageRole, PROTOCOL_VERSION, PatchPreview,
-    QueuedTurnSteerRequest, ReasoningEffort, RuntimeStatus, ThreadForkRequest,
-    ThreadHistorySnapshot, ThreadItemsPage, ThreadMailboxChanged, ThreadMailboxSnapshot,
-    ThreadRollbackRequest, ThreadTurnsPage, TokenUsage, TurnHandle, TurnItemsView, TurnState,
+    ImageAttachment, MessageRole, PROTOCOL_VERSION, PatchPreview, QueuedTurnSteerRequest,
+    ReasoningEffort, RuntimeStatus, ThreadForkRequest, ThreadHistorySnapshot, ThreadMailboxChanged,
+    ThreadMailboxSnapshot, ThreadRollbackRequest, TokenUsage, TurnHandle, TurnState,
     TurnSteerRequest, TurnSteerResponse, UserInputResolution,
 };
 use crate::providers::{
     ProviderConfigView, ProviderEvent, ProviderMessage, ProviderRequest, SaveProviderConfigRequest,
 };
-use crate::storage::{StoredEvent, StoredEventKind, ThreadDetail, ThreadRepository, ThreadSummary};
+use crate::storage::{StoredEvent, StoredEventKind, ThreadRepository, ThreadSummary};
 use crate::workbench::{
     self, AttachmentContent, FileEntry, FilePreview, GitBranchView, GitStatusView,
     SaveWorkspaceFileRequest, WorkspaceState,
@@ -59,6 +59,12 @@ const CRAFT_MODE_INSTRUCTIONS: &str = include_str!("../../templates/craft_mode.m
 const AGENT_EVENT_NAME: &str = "agent-event";
 const SUBAGENT_EVENT_NAME: &str = "subagent-event";
 const THREAD_MAILBOX_CHANGED_EVENT_NAME: &str = "thread-mailbox-changed";
+
+fn ordinary_turn_soft_limits(has_active_goal: bool) -> Option<SoftTurnLimits> {
+    (!has_active_goal).then(SoftTurnLimits::default)
+}
+
+pub(crate) mod threads;
 
 async fn emit_mailbox_changed(app: &AppHandle, state: &AppState, thread_id: &str) {
     let revision = state.thread_mailbox().revision(thread_id).await;
@@ -248,15 +254,6 @@ fn subagent_context(
         agent_events: Arc::new(TauriEventPublisher { app: app.clone() }),
         lifecycle_events: Arc::new(TauriSubagentEventPublisher { app: app.clone() }),
         logger: Some(state.logger()),
-    }
-}
-
-fn append_runtime_instructions(base: String, memory: String) -> String {
-    match (base.trim().is_empty(), memory.trim().is_empty()) {
-        (true, true) => String::new(),
-        (false, true) => base,
-        (true, false) => memory,
-        (false, false) => format!("{base}\n\n{memory}"),
     }
 }
 
@@ -749,74 +746,6 @@ pub fn delete_provider_api_key(
 }
 
 #[tauri::command]
-pub async fn create_thread(state: State<'_, AppState>) -> CommandResult<ThreadSummary> {
-    let workspace_root = state.workspace_root();
-    state
-        .repository()
-        .create_thread_in_workspace(&workspace_root)
-        .await
-        .map_err(|error| CommandError::new("storage", error))
-}
-
-#[tauri::command]
-pub async fn list_threads(state: State<'_, AppState>) -> CommandResult<Vec<ThreadSummary>> {
-    state
-        .repository()
-        .list_threads()
-        .await
-        .map_err(|error| CommandError::new("storage", error))
-}
-
-#[tauri::command(rename_all = "camelCase")]
-pub async fn search_threads(
-    state: State<'_, AppState>,
-    query: String,
-) -> CommandResult<Vec<ThreadSummary>> {
-    state
-        .repository()
-        .search_threads(&query)
-        .await
-        .map_err(|error| CommandError::new("storage", error))
-}
-
-#[tauri::command(rename_all = "camelCase")]
-pub async fn rename_thread(
-    state: State<'_, AppState>,
-    thread_id: String,
-    title: String,
-) -> CommandResult<ThreadSummary> {
-    state
-        .repository()
-        .rename_thread(&thread_id, title)
-        .await
-        .map_err(|error| CommandError::new("storage", error))
-}
-
-#[tauri::command(rename_all = "camelCase")]
-pub async fn delete_thread(state: State<'_, AppState>, thread_id: String) -> CommandResult<()> {
-    if state.is_turn_active(&thread_id).await {
-        return Err(CommandError::new(
-            "turn_active",
-            "stop the active turn before deleting",
-        ));
-    }
-    state
-        .repository()
-        .delete_thread(&thread_id)
-        .await
-        .map_err(|error| CommandError::new("storage", error))
-}
-
-#[tauri::command]
-pub fn usage_summary(state: State<'_, AppState>) -> CommandResult<UsageSummary> {
-    state
-        .repository()
-        .projection()
-        .usage_summary()
-        .map_err(|error| CommandError::new("projection", error))
-}
-
-#[tauri::command]
 pub async fn extension_overview(
     state: State<'_, AppState>,
     refresh: bool,
@@ -1035,124 +964,6 @@ pub fn git_action(
         confirmed,
     )
     .map_err(|error| CommandError::new("git", error))
-}
-
-#[tauri::command(rename_all = "camelCase")]
-pub async fn read_thread(
-    state: State<'_, AppState>,
-    thread_id: String,
-) -> CommandResult<ThreadDetail> {
-    state
-        .read_thread(&thread_id)
-        .await
-        .map_err(|error| CommandError::new("storage", error))
-}
-
-#[tauri::command(rename_all = "camelCase")]
-pub async fn read_thread_history(
-    state: State<'_, AppState>,
-    thread_id: String,
-) -> CommandResult<ThreadHistorySnapshot> {
-    state
-        .read_thread_history(&thread_id)
-        .await
-        .map_err(|error| CommandError::new("storage", error))
-}
-
-#[tauri::command(rename_all = "camelCase")]
-pub async fn list_thread_turns(
-    state: State<'_, AppState>,
-    thread_id: String,
-    cursor: Option<String>,
-    limit: Option<u32>,
-    sort_direction: Option<HistorySortDirection>,
-    items_view: Option<TurnItemsView>,
-) -> CommandResult<ThreadTurnsPage> {
-    state
-        .list_thread_turns(
-            &thread_id,
-            cursor.as_deref(),
-            limit,
-            sort_direction.unwrap_or_default(),
-            items_view.unwrap_or(TurnItemsView::Summary),
-        )
-        .await
-        .map_err(|error| CommandError::new("storage", error))
-}
-
-#[tauri::command(rename_all = "camelCase")]
-pub async fn list_thread_items(
-    state: State<'_, AppState>,
-    thread_id: String,
-    turn_id: Option<String>,
-    cursor: Option<String>,
-    limit: Option<u32>,
-    sort_direction: Option<HistorySortDirection>,
-) -> CommandResult<ThreadItemsPage> {
-    state
-        .list_thread_items(
-            &thread_id,
-            turn_id.as_deref(),
-            cursor.as_deref(),
-            limit,
-            sort_direction.unwrap_or(HistorySortDirection::Asc),
-        )
-        .await
-        .map_err(|error| CommandError::new("storage", error))
-}
-
-#[tauri::command(rename_all = "camelCase")]
-pub async fn archive_thread(state: State<'_, AppState>, thread_id: String) -> CommandResult<()> {
-    if state.is_turn_active(&thread_id).await {
-        return Err(CommandError::new(
-            "turn_active",
-            "stop the active turn before archiving this thread",
-        ));
-    }
-    state
-        .repository()
-        .archive_thread(&thread_id)
-        .await
-        .map_err(|error| CommandError::new("storage", error))
-}
-
-#[tauri::command(rename_all = "camelCase")]
-pub async fn compact_thread(
-    state: State<'_, AppState>,
-    thread_id: String,
-) -> CommandResult<CompactionSummary> {
-    if state.is_turn_active(&thread_id).await {
-        return Err(CommandError::new(
-            "turn_active",
-            "stop the active turn before compacting",
-        ));
-    }
-    let workspace_root = state
-        .ensure_thread_workspace(&thread_id)
-        .await
-        .map_err(|error| CommandError::new("workspace_mismatch", error))?;
-    let context_limit = state
-        .provider_context_limit()
-        .map_err(|error| CommandError::new("provider_config", error))?;
-    let runtime = AgentRuntime::with_tools_and_approvals(
-        state.runtime_repository(),
-        state.tool_registry(),
-        workspace_root,
-        state.approvals(),
-    )
-    .with_context_limit(context_limit);
-    runtime
-        .compact_thread(&thread_id)
-        .await
-        .map_err(|error| CommandError::new("context_compaction", error))
-}
-
-#[tauri::command]
-pub fn rebuild_session_projection(state: State<'_, AppState>) -> CommandResult<()> {
-    state
-        .repository()
-        .rebuild_projection()
-        .map_err(|error| CommandError::new("projection_rebuild", error))
 }
 
 #[tauri::command]
@@ -1728,6 +1539,9 @@ async fn execute_turn(
     .with_vision_support(supports_vision)
     .with_user_inputs(state.user_inputs())
     .with_logger(state.logger());
+    if let Some(limits) = ordinary_turn_soft_limits(goal_budget.is_some()) {
+        runtime = runtime.with_soft_turn_limits(limits);
+    }
     if let Some((_, Some(remaining_tokens))) = &goal_budget {
         runtime = runtime.with_token_budget(*remaining_tokens);
     }
@@ -1926,6 +1740,9 @@ async fn execute_retry(
     .with_vision_support(supports_vision)
     .with_user_inputs(state.user_inputs())
     .with_logger(state.logger());
+    if let Some(limits) = ordinary_turn_soft_limits(goal_budget.is_some()) {
+        runtime = runtime.with_soft_turn_limits(limits);
+    }
     if let Some((_, Some(remaining_tokens))) = &goal_budget {
         runtime = runtime.with_token_budget(*remaining_tokens);
     }
@@ -2384,7 +2201,8 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::{
-        CRAFT_MODE_INSTRUCTIONS, CommandError, TurnStartPublisher, build_system_prompt, retry_mode,
+        CRAFT_MODE_INSTRUCTIONS, CommandError, TurnStartPublisher, build_system_prompt,
+        ordinary_turn_soft_limits, retry_mode,
     };
     use crate::agent::EventPublisher;
     use crate::protocol::{AgentEvent, AgentEventEnvelope, AgentMode};
@@ -2399,6 +2217,12 @@ mod tests {
         fn publish(&self, event: AgentEventEnvelope) {
             self.events.lock().unwrap().push(event);
         }
+    }
+
+    #[test]
+    fn soft_turn_limits_apply_only_without_an_active_goal() {
+        assert!(ordinary_turn_soft_limits(false).is_some());
+        assert!(ordinary_turn_soft_limits(true).is_none());
     }
 
     #[tokio::test]

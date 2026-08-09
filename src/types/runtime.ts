@@ -654,11 +654,14 @@ export interface UserInputQuestion {
   options: string[];
 }
 
+export type UserInputRequestKind = "model_question" | "turn_continuation";
+
 export interface UserInputRequest {
   id: string;
   threadId: string;
   turnId: string;
   toolCallId: string;
+  kind: UserInputRequestKind;
   questions: UserInputQuestion[];
   createdAtMs: number;
   expiresAtMs: number;
