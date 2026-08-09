@@ -93,6 +93,10 @@ pub enum ProviderEvent {
     TextDelta {
         delta: String,
     },
+    Image {
+        mime_type: String,
+        data: String,
+    },
     ReasoningSummaryDelta {
         item_id: String,
         delta: String,

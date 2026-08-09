@@ -276,6 +276,14 @@ impl ProviderConfig {
     }
 
     pub fn gemini_stream_url(&self) -> Result<Url, ProviderConfigError> {
+        self.gemini_content_url("streamGenerateContent", true)
+    }
+
+    pub fn gemini_generate_url(&self) -> Result<Url, ProviderConfigError> {
+        self.gemini_content_url("generateContent", false)
+    }
+
+    fn gemini_content_url(&self, operation: &str, sse: bool) -> Result<Url, ProviderConfigError> {
         let mut url = Url::parse(&self.base_url)
             .map_err(|_| ProviderConfigError::Invalid("Gemini URL is invalid".to_string()))?;
         let model = self.model.strip_prefix("models/").unwrap_or(&self.model);
@@ -285,9 +293,11 @@ impl ProviderConfig {
             })?;
             segments.pop_if_empty();
             segments.push("models");
-            segments.push(&format!("{model}:streamGenerateContent"));
+            segments.push(&format!("{model}:{operation}"));
         }
-        url.query_pairs_mut().append_pair("alt", "sse");
+        if sse {
+            url.query_pairs_mut().append_pair("alt", "sse");
+        }
         Ok(url)
     }
 
@@ -861,6 +871,10 @@ mod tests {
         assert_eq!(
             config.gemini_stream_url().unwrap().as_str(),
             "https://example.com/v1/models/test-model:streamGenerateContent?alt=sse"
+        );
+        assert_eq!(
+            config.gemini_generate_url().unwrap().as_str(),
+            "https://example.com/v1/models/test-model:generateContent"
         );
     }
 

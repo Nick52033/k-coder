@@ -1537,8 +1537,8 @@ function App() {
                           <CopyMessageButton text={message.text} />
                         ) : null}
                       </div>
-                      {message.role === "user" && message.attachments?.length ? (
-                        <div className="message-attachments" aria-label="图片附件">
+                      {message.attachments?.length ? (
+                        <div className="message-attachments" aria-label={message.role === "user" ? "图片附件" : "生成的图片"}>
                           {message.attachments.map((attachment, index) => (
                             <button
                               className="message-image-attachment"

@@ -43,6 +43,7 @@ use provider_history::{last_active_context_usage, provider_history};
 use input::{chat_to_provider, user_message};
 
 const MAX_RESPONSE_BYTES: usize = 512 * 1024;
+const MAX_RESPONSE_IMAGE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_REASONING_SUMMARY_BYTES: usize = 64 * 1024;
 const MAX_PROVIDER_CONTEXT_BYTES: usize = 512 * 1024;
 const MAX_TOOL_OUTPUT_BYTES: usize = 256 * 1024;
@@ -850,6 +851,7 @@ impl AgentRuntime {
 
             // 声明需要在重试循环外部的变量
             let response: String;
+            let response_images: Vec<ContentBlock>;
             let pending_tool_calls: Vec<ToolCall>;
             let completed: bool;
             let assistant_item_id = Uuid::new_v4().to_string();
@@ -915,6 +917,7 @@ impl AgentRuntime {
                 let mut reasoning_items_completed = HashSet::<String>::new();
                 let mut responding_published = false;
                 let mut pending_tool_calls_inner = Vec::new(); // 暂存 ToolCall，等 Completed 后再启动
+                let mut response_images_inner = Vec::new();
                 let mut iteration_usage_inner = None;
                 let mut attempt_had_output = false;
                 let completed_inner = loop {
@@ -956,6 +959,53 @@ impl AgentRuntime {
                                 item_id: assistant_item_id.clone(),
                                 delta,
                             }));
+                        }
+                        Some(Ok(ProviderEvent::Image { mime_type, data })) => {
+                            attempt_had_output = true;
+                            let valid_mime = matches!(
+                                mime_type.as_str(),
+                                "image/png" | "image/jpeg" | "image/gif" | "image/webp"
+                            );
+                            let valid_base64 = base64::Engine::decode(
+                                &base64::engine::general_purpose::STANDARD,
+                                &data,
+                            )
+                            .is_ok();
+                            if !valid_mime || !valid_base64 {
+                                return self
+                                    .finish_failed(
+                                        &thread_id,
+                                        &turn_id,
+                                        "provider returned an invalid generated image".to_string(),
+                                        &publisher,
+                                    )
+                                    .await;
+                            }
+                            if data.len() > MAX_RESPONSE_IMAGE_BYTES
+                                || response_images_inner.iter().map(|image: &ContentBlock| match image {
+                                    ContentBlock::Image { data_url, .. } => data_url.len(),
+                                    _ => 0,
+                                }).sum::<usize>().saturating_add(data.len()) > MAX_RESPONSE_IMAGE_BYTES
+                            {
+                                return self
+                                    .finish_failed(
+                                        &thread_id,
+                                        &turn_id,
+                                        format!("response_limit: generated images exceed {MAX_RESPONSE_IMAGE_BYTES} bytes"),
+                                        &publisher,
+                                    )
+                                    .await;
+                            }
+                            let extension = mime_type
+                                .split('/')
+                                .nth(1)
+                                .filter(|value| value.chars().all(|character| character.is_ascii_alphanumeric()))
+                                .unwrap_or("png");
+                            let index = response_images_inner.len() + 1;
+                            response_images_inner.push(ContentBlock::Image {
+                                name: format!("generated-image-{index}.{extension}"),
+                                data_url: format!("data:{mime_type};base64,{data}"),
+                            });
                         }
                         Some(Ok(ProviderEvent::ReasoningSummaryDelta { item_id, delta })) => {
                             attempt_had_output = true;
@@ -1226,6 +1276,7 @@ impl AgentRuntime {
                     .await?;
                 }
                 response = response_inner;
+                response_images = response_images_inner;
                 pending_tool_calls = pending_tool_calls_inner;
                 completed = completed_inner;
                 break;
@@ -1243,7 +1294,7 @@ impl AgentRuntime {
             }
             // AI 完成输出后的处理
             if pending_tool_calls.is_empty() {
-                if response.is_empty() {
+                if response.is_empty() && response_images.is_empty() {
                     return self
                         .finish_failed(
                             &thread_id,
@@ -1257,10 +1308,10 @@ impl AgentRuntime {
                     .as_ref()
                     .and_then(|control| control.close_if_idle())
                 {
-                    let message = text_message_with_id(
-                        MessageRole::Assistant,
+                    let message = assistant_message_with_content(
                         assistant_item_id.clone(),
                         response,
+                        response_images,
                     );
                     self.repository
                         .append(StoredEvent::new(
@@ -1298,6 +1349,7 @@ impl AgentRuntime {
                         &turn_id,
                         &assistant_item_id,
                         response,
+                        response_images,
                         has_usage.then_some(total_usage),
                         &publisher,
                     )
@@ -2265,10 +2317,11 @@ impl AgentRuntime {
         turn_id: &str,
         item_id: &str,
         text: String,
+        images: Vec<ContentBlock>,
         usage: Option<TokenUsage>,
         publisher: &Arc<dyn EventPublisher>,
     ) -> Result<TurnOutcome, AgentRuntimeError> {
-        let message = text_message_with_id(MessageRole::Assistant, item_id.to_string(), text);
+        let message = assistant_message_with_content(item_id.to_string(), text, images);
         self.repository
             .append(StoredEvent::new(
                 thread_id,
@@ -2768,12 +2821,32 @@ fn text_message(role: MessageRole, text: String) -> ChatMessage {
     text_message_with_id(role, Uuid::new_v4().to_string(), text)
 }
 
+#[cfg(test)]
 fn text_message_with_id(role: MessageRole, id: String, text: String) -> ChatMessage {
     ChatMessage {
         schema_version: PROTOCOL_VERSION,
         id,
         role,
         content: vec![ContentBlock::Text { text }],
+        created_at_ms: now_ms(),
+    }
+}
+
+fn assistant_message_with_content(
+    id: String,
+    text: String,
+    images: Vec<ContentBlock>,
+) -> ChatMessage {
+    let mut content = Vec::with_capacity(1 + images.len());
+    if !text.is_empty() {
+        content.push(ContentBlock::Text { text });
+    }
+    content.extend(images);
+    ChatMessage {
+        schema_version: PROTOCOL_VERSION,
+        id,
+        role: MessageRole::Assistant,
+        content,
         created_at_ms: now_ms(),
     }
 }
@@ -3451,6 +3524,81 @@ mod tests {
                 && *completed_at_ms == result.completed_at_ms
                 && *duration_ms == result.duration_ms
         ));
+    }
+
+    #[tokio::test]
+    async fn persists_generated_images_as_assistant_content() {
+        let (_directory, repository, runtime, thread_id) = runtime_fixture().await;
+        let provider = Arc::new(FakeProvider::new(vec![
+            Ok(ProviderEvent::Image {
+                mime_type: "image/png".into(),
+                data: "AA==".into(),
+            }),
+            Ok(ProviderEvent::Completed),
+        ]));
+        let publisher = Arc::new(RecordingPublisher::default());
+
+        let outcome = runtime
+            .run_turn(
+                provider,
+                "gemini-3-pro-image-preview".into(),
+                RunTurnRequest {
+                    thread_id: thread_id.clone(),
+                    input: "draw a blue square".into(),
+                    agent_mode: None,
+                },
+                CancellationToken::new(),
+                publisher.clone(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.state, TurnState::Completed);
+        let detail = repository.read_thread(&thread_id).await.unwrap();
+        assert!(matches!(
+            detail.messages[1].content.as_slice(),
+            [ContentBlock::Image { name, data_url }]
+                if name == "generated-image-1.png" && data_url == "data:image/png;base64,AA=="
+        ));
+        assert!(matches!(
+            publisher.events.lock().unwrap().iter().find_map(|event| match &event.event {
+                AgentEvent::TurnCompleted { message, .. } => Some(message),
+                _ => None,
+            }),
+            Some(ChatMessage { content, .. })
+                if matches!(content.as_slice(), [ContentBlock::Image { .. }])
+        ));
+    }
+
+    #[tokio::test]
+    async fn rejects_invalid_generated_image_payloads() {
+        let (_directory, _repository, runtime, thread_id) = runtime_fixture().await;
+        let provider = Arc::new(FakeProvider::new(vec![
+            Ok(ProviderEvent::Image {
+                mime_type: "image/svg+xml".into(),
+                data: "AA==".into(),
+            }),
+            Ok(ProviderEvent::Completed),
+        ]));
+        let publisher = Arc::new(RecordingPublisher::default());
+
+        let outcome = runtime
+            .run_turn(
+                provider,
+                "gemini-3-pro-image-preview".into(),
+                RunTurnRequest {
+                    thread_id,
+                    input: "draw it".into(),
+                    agent_mode: None,
+                },
+                CancellationToken::new(),
+                publisher,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.state, TurnState::Failed);
+        assert!(outcome.error.unwrap().contains("invalid generated image"));
     }
 
     #[tokio::test]

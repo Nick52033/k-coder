@@ -41,9 +41,17 @@ impl GoogleGeminiProvider {
 struct GeminiResponsePart {
     text: Option<String>,
     function_call: Option<GeminiFunctionCall>,
+    inline_data: Option<GeminiInlineData>,
     thought_signature: Option<String>,
     #[serde(default)]
     thought: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GeminiInlineData {
+    mime_type: Option<String>,
+    data: String,
 }
 
 #[derive(Deserialize)]
@@ -112,10 +120,13 @@ impl Provider for GoogleGeminiProvider {
         request: ProviderRequest,
         cancellation: CancellationToken,
     ) -> Result<ProviderStream, ProviderError> {
-        let endpoint = self
-            .config
-            .gemini_stream_url()
-            .map_err(|error| ProviderError::Request(error.to_string()))?;
+        let image_generation = is_image_generation_model(&request.model);
+        let endpoint = if image_generation {
+            self.config.gemini_generate_url()
+        } else {
+            self.config.gemini_stream_url()
+        }
+        .map_err(|error| ProviderError::Request(error.to_string()))?;
         let mut payload = json!({ "contents": gemini_contents(&request.messages) });
         // Gemini 的 system 消息需要放在顶层 systemInstruction 字段
         let system_text: Vec<&str> = request
@@ -134,7 +145,7 @@ impl Provider for GoogleGeminiProvider {
                 "parts": [{ "text": system_text.join("\n\n") }]
             });
         }
-        if !request.tools.is_empty() {
+        if !request.tools.is_empty() && !image_generation {
             payload["tools"] = json!([{
                 "functionDeclarations": request.tools.iter().map(|tool| json!({
                     "name": tool.name,
@@ -143,7 +154,11 @@ impl Provider for GoogleGeminiProvider {
                 })).collect::<Vec<_>>()
             }]);
         }
-        if let Some(thinking_config) = gemini_thinking_config(request.reasoning_effort) {
+        if image_generation {
+            payload["generationConfig"] = json!({
+                "responseModalities": ["TEXT", "IMAGE"]
+            });
+        } else if let Some(thinking_config) = gemini_thinking_config(request.reasoning_effort) {
             payload["generationConfig"] = json!({ "thinkingConfig": thinking_config });
         }
 
@@ -152,7 +167,14 @@ impl Provider for GoogleGeminiProvider {
             response = self.client
                 .post(endpoint)
                 .header("x-goog-api-key", &self.api_key)
-                .header("accept", "text/event-stream")
+                .header(
+                    "accept",
+                    if image_generation {
+                        "application/json"
+                    } else {
+                        "text/event-stream"
+                    },
+                )
                 .json(&payload)
                 .send() => response.map_err(|error| ProviderError::Request(error.to_string()))?,
         };
@@ -163,53 +185,92 @@ impl Provider for GoogleGeminiProvider {
         }
 
         let secret = self.api_key.clone();
-        Ok(Box::pin(async_stream::stream! {
-            let mut body = response.bytes_stream();
-            let mut decoder = SseDecoder::default();
-            let reasoning_item_id = format!("gemini-reasoning-{}", Uuid::new_v4());
-            let mut reasoning_summary = String::new();
-            loop {
-                let chunk = tokio::select! {
+        if image_generation {
+            Ok(Box::pin(async_stream::stream! {
+                let body = tokio::select! {
                     _ = cancellation.cancelled() => { yield Err(ProviderError::Cancelled); return; }
-                    chunk = body.next() => chunk,
+                    body = response.bytes() => body,
                 };
-                match chunk {
-                    Some(Ok(bytes)) => match decoder.push(&bytes) {
-                        Ok(frames) => for frame in frames {
-                            match parse_sse_data(&frame, &reasoning_item_id) {
-                                Ok(parsed) => {
-                                    for event in parsed.events {
-                                        if let ProviderEvent::ReasoningSummaryDelta { delta, .. } = &event {
-                                            reasoning_summary.push_str(delta);
-                                        }
-                                        yield Ok(redact_event(event, &secret));
-                                    }
-                                    if let Some(error) = parsed.terminal_error {
-                                        yield Err(redact_error(error, &secret));
-                                        return;
-                                    }
-                                    if parsed.completed {
-                                        if !reasoning_summary.is_empty() {
-                                            yield Ok(redact_event(ProviderEvent::ReasoningSummaryCompleted {
-                                                item_id: reasoning_item_id.clone(),
-                                                summary: reasoning_summary,
-                                            }, &secret));
-                                        }
-                                        yield Ok(ProviderEvent::Completed);
-                                        return;
-                                    }
-                                }
-                                Err(error) => { yield Err(redact_error(error, &secret)); return; }
-                            }
-                        },
-                        Err(error) => { yield Err(error); return; }
-                    },
-                    Some(Err(error)) => { yield Err(redact_error(ProviderError::Request(error.to_string()), &secret)); return; }
-                    None => { yield Err(decoder.finish().err().unwrap_or(ProviderError::Interrupted)); return; }
+                let bytes = match body {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        yield Err(redact_error(ProviderError::Request(error.to_string()), &secret));
+                        return;
+                    }
+                };
+                let data = String::from_utf8_lossy(&bytes);
+                match parse_sse_data(&data, &format!("gemini-reasoning-{}", Uuid::new_v4())) {
+                    Ok(parsed) => {
+                        for event in parsed.events {
+                            yield Ok(redact_event(event, &secret));
+                        }
+                        if let Some(error) = parsed.terminal_error {
+                            yield Err(redact_error(error, &secret));
+                            return;
+                        }
+                        if parsed.completed {
+                            yield Ok(ProviderEvent::Completed);
+                        } else {
+                            yield Err(ProviderError::Interrupted);
+                        }
+                    }
+                    Err(error) => yield Err(redact_error(error, &secret)),
                 }
-            }
-        }))
+            }))
+        } else {
+            Ok(Box::pin(async_stream::stream! {
+                let mut body = response.bytes_stream();
+                let mut decoder = SseDecoder::default();
+                let reasoning_item_id = format!("gemini-reasoning-{}", Uuid::new_v4());
+                let mut reasoning_summary = String::new();
+                loop {
+                    let chunk = tokio::select! {
+                        _ = cancellation.cancelled() => { yield Err(ProviderError::Cancelled); return; }
+                        chunk = body.next() => chunk,
+                    };
+                    match chunk {
+                        Some(Ok(bytes)) => match decoder.push(&bytes) {
+                            Ok(frames) => for frame in frames {
+                                match parse_sse_data(&frame, &reasoning_item_id) {
+                                    Ok(parsed) => {
+                                        for event in parsed.events {
+                                            if let ProviderEvent::ReasoningSummaryDelta { delta, .. } = &event {
+                                                reasoning_summary.push_str(delta);
+                                            }
+                                            yield Ok(redact_event(event, &secret));
+                                        }
+                                        if let Some(error) = parsed.terminal_error {
+                                            yield Err(redact_error(error, &secret));
+                                            return;
+                                        }
+                                        if parsed.completed {
+                                            if !reasoning_summary.is_empty() {
+                                                yield Ok(redact_event(ProviderEvent::ReasoningSummaryCompleted {
+                                                    item_id: reasoning_item_id.clone(),
+                                                    summary: reasoning_summary,
+                                                }, &secret));
+                                            }
+                                            yield Ok(ProviderEvent::Completed);
+                                            return;
+                                        }
+                                    }
+                                    Err(error) => { yield Err(redact_error(error, &secret)); return; }
+                                }
+                            },
+                            Err(error) => { yield Err(error); return; }
+                        },
+                        Some(Err(error)) => { yield Err(redact_error(ProviderError::Request(error.to_string()), &secret)); return; }
+                        None => { yield Err(decoder.finish().err().unwrap_or(ProviderError::Interrupted)); return; }
+                    }
+                }
+            }))
+        }
     }
+}
+
+fn is_image_generation_model(model: &str) -> bool {
+    let model = model.to_ascii_lowercase();
+    model.contains("image-generation") || model.contains("-image-") || model.ends_with("-image")
 }
 
 fn gemini_thinking_config(reasoning_effort: ReasoningEffort) -> Option<Value> {
@@ -294,6 +355,19 @@ fn parse_sse_data(data: &str, reasoning_item_id: &str) -> Result<ParsedGeminiEve
                         });
                     } else {
                         events.push(ProviderEvent::TextDelta { delta });
+                    }
+                }
+                if !part.thought {
+                    if let Some(inline_data) = &part.inline_data {
+                        if !inline_data.data.is_empty() {
+                            events.push(ProviderEvent::Image {
+                                mime_type: inline_data
+                                    .mime_type
+                                    .clone()
+                                    .unwrap_or_else(|| "image/png".to_string()),
+                                data: inline_data.data.clone(),
+                            });
+                        }
                     }
                 }
                 if let Some(call) = &part.function_call {
@@ -414,6 +488,30 @@ mod tests {
             &parsed.events[1],
             ProviderEvent::TextDelta { delta } if delta == "Final answer."
         ));
+    }
+
+    #[test]
+    fn parses_generated_inline_images() {
+        let parsed = parse_sse_data(
+            r#"{"candidates":[{"content":{"parts":[{"inlineData":{"mimeType":"image/png","data":"AA=="}}]},"finishReason":"STOP"}]}"#,
+            "reasoning-1",
+        )
+        .unwrap();
+        assert!(matches!(
+            &parsed.events[0],
+            ProviderEvent::Image { mime_type, data }
+                if mime_type == "image/png" && data == "AA=="
+        ));
+        assert!(parsed.completed);
+    }
+
+    #[test]
+    fn detects_gemini_image_generation_models() {
+        assert!(is_image_generation_model("gemini-3-pro-image-preview"));
+        assert!(is_image_generation_model(
+            "gemini-2.0-flash-preview-image-generation"
+        ));
+        assert!(!is_image_generation_model("gemini-2.5-flash"));
     }
 
     #[test]
