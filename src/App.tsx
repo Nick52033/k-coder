@@ -26,7 +26,6 @@ import {
   Pin,
   PinOff,
   Plus,
-  RefreshCw,
   ScrollText,
   Search,
   Settings,
@@ -41,6 +40,7 @@ import {
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { getRuntimeStatus, getWorkspaceState, switchWorkspace, subscribeToAgentEvents, subscribeToMailboxEvents, listSubagents, getExtensionOverview, searchWorkspaceFiles } from "./api/runtime";
 import { useWorkbenchStore } from "./stores/workbenchStore";
+import { reconcileConversationMessages } from "./stores/reducers/historyProjection";
 import { PatchReviewDialog } from "./components/PatchReviewDialog";
 import { SettingsDialog, type SettingsSection } from "./components/SettingsDialog";
 import { LogViewerDialog } from "./components/LogViewerDialog";
@@ -50,7 +50,7 @@ import { ModelSelector } from "./components/ModelSelector";
 import { ApprovalModeSelector } from "./components/ApprovalModeSelector";
 import { ReasoningSelector } from "./components/ReasoningSelector";
 import { TodoList } from "./components/TodoList";
-import { ConversationTurnActivity } from "./components/ConversationActivity";
+import { ConversationTurnActivity, isVisibleConversationTimelineItem } from "./components/ConversationActivity";
 import { MarkdownContent } from "./components/MarkdownContent";
 import { ImagePreviewDialog } from "./components/ImagePreviewDialog";
 import { cn } from "./lib/cn";
@@ -223,6 +223,10 @@ function App() {
     clearQueue,
     forceResetState,
   } = useWorkbenchStore();
+  const displayMessages = useMemo(
+    () => reconcileConversationMessages(messages, turnTimeline),
+    [messages, turnTimeline],
+  );
   const currentThreadQueue = messageQueue.filter((message) => message.threadId === activeThreadId);
   const pendingQueueCount = currentThreadQueue.filter((message) => message.status === "pending").length;
   // 普通会话列表只展示未绑定到项目的会话；绑定到项目的会话只出现在"项目"tab。
@@ -337,7 +341,7 @@ function App() {
         scrollFrameRef.current = null;
       }
     };
-  }, [activeThreadId, loading, messages.length]);
+  }, [activeThreadId, loading, displayMessages.length]);
 
   useEffect(() => {
     followLatestRef.current = true;
@@ -644,10 +648,10 @@ function App() {
   }, [turnTimeline]);
   const derivedTurnData = useMemo(() => {
     const representedTurnIds = new Set(
-      messages.flatMap((message) => message.role === "assistant" && message.turnId ? [message.turnId] : []),
+      displayMessages.flatMap((message) => message.role === "assistant" && message.turnId ? [message.turnId] : []),
     );
     const assistantMessagesByTurn = new Map(
-      messages.flatMap((message) => message.role === "assistant" && message.turnId
+      displayMessages.flatMap((message) => message.role === "assistant" && message.turnId
         ? [[message.turnId, message] as const]
         : []),
     );
@@ -660,7 +664,7 @@ function App() {
         orderedTurnIds.push(turnId);
       }
     }
-    for (const message of messages) {
+    for (const message of displayMessages) {
       if (message.role === "assistant" && message.turnId && !seenTurnIds.has(message.turnId)) {
         seenTurnIds.add(message.turnId);
         orderedTurnIds.push(message.turnId);
@@ -679,14 +683,19 @@ function App() {
     }
     const groupedRetryTurnIds = new Set([...retryTurnGroupsByUserMessage.values()].flat());
     const latestPlanActivity = [...toolActivities].reverse().find((activity) => activity.call.name === "update_plan");
-    const latestAssistantTurnId = [...messages].reverse().find(
+    const latestAssistantTurnId = [...displayMessages].reverse().find(
       (message) => message.role === "assistant" && message.turnId,
     )?.turnId;
     const planTurnId = plan?.steps.length
       ? latestPlanActivity?.turnId ?? (currentThreadBusy ? currentThreadTurnId : latestAssistantTurnId)
       : null;
     const orphanTurnIds = [...new Set([...activitiesByTurn.keys(), ...timelineByTurn.keys()])]
-      .filter((turnId) => !representedTurnIds.has(turnId) && !groupedRetryTurnIds.has(turnId));
+      .filter((turnId) => !representedTurnIds.has(turnId) && !groupedRetryTurnIds.has(turnId))
+      .filter((turnId) => (activitiesByTurn.get(turnId)?.length ?? 0) > 0
+        || (timelineByTurn.get(turnId) ?? []).some(isVisibleConversationTimelineItem)
+        || (turnId === planTurnId && Boolean(plan?.steps.length))
+        || turnId === currentThreadTurnId
+        || turnId === activityStatus?.turnId);
     const orphanTurnsByUserMessage = new Map<string, string[]>();
     const unanchoredOrphanTurnIds: string[] = [];
     for (const turnId of orphanTurnIds) {
@@ -720,7 +729,7 @@ function App() {
       planIsAttachedToOrphan,
       planIsAttachedToRetryGroup,
     };
-  }, [messages, turnTimeline, turnUserMessageIds, toolActivities, activitiesByTurn, timelineByTurn, plan?.steps.length, currentThreadBusy, currentThreadTurnId]);
+  }, [displayMessages, turnTimeline, turnUserMessageIds, toolActivities, activitiesByTurn, timelineByTurn, plan?.steps.length, currentThreadBusy, currentThreadTurnId, activityStatus?.turnId]);
 
   const assistantMessagesByTurn = derivedTurnData.assistantMessagesByTurn;
   const retryTurnGroupsByUserMessage = derivedTurnData.retryTurnGroupsByUserMessage;
@@ -732,7 +741,7 @@ function App() {
   const planIsAttached = derivedTurnData.planIsAttached;
   const planIsAttachedToOrphan = derivedTurnData.planIsAttachedToOrphan;
   const planIsAttachedToRetryGroup = derivedTurnData.planIsAttachedToRetryGroup;
-  const hasConversationContent = messages.length > 0
+  const hasConversationContent = displayMessages.length > 0
     || orphanTurnIds.length > 0
     || Boolean(plan?.steps.length)
     || Boolean(pendingApproval)
@@ -751,6 +760,7 @@ function App() {
             streaming={turnId === currentThreadTurnId}
             activityStatus={turnId === activityStatus?.turnId ? activityStatus.status : null}
             renderText={renderMessageText}
+            onRetry={retryable && lastTurn?.turnId === turnId ? () => void retryLastTurn() : undefined}
           />
         </div>
       </article>
@@ -808,6 +818,9 @@ function App() {
             const attemptActivities = activitiesByTurn.get(turnId) ?? [];
             const attemptPlan = turnId === planTurnId ? plan : null;
             const attemptActivityStatus = turnId === activityStatus?.turnId ? activityStatus.status : null;
+            const attemptHasTerminalEvent = attemptTimeline.some(
+              (item) => item.type === "event" && ["turn_completed", "turn_failed", "turn_cancelled"].includes(item.kind),
+            );
             return (
               <section className="message-retry-attempt" data-turn-id={turnId} key={turnId}>
                 <ConversationTurnActivity
@@ -819,12 +832,13 @@ function App() {
                   activityStatus={attemptActivityStatus}
                   finalMessageId={assistantMessage?.id}
                   renderText={renderMessageText}
+                  onRetry={retryable && lastTurn?.turnId === turnId ? () => void retryLastTurn() : undefined}
                 />
                 {!attemptTimeline.length && assistantMessage?.text ? (
                   <div className="message-content">{renderMessageText(assistantMessage.text)}</div>
                 ) : null}
-                {assistantMessage?.status === "failed" ? <div className="message-status message-status--error">生成失败</div> : null}
-                {assistantMessage?.status === "cancelled" ? <div className="message-status">已停止</div> : null}
+                {!attemptHasTerminalEvent && assistantMessage?.status === "failed" ? <div className="message-status message-status--error">生成失败</div> : null}
+                {!attemptHasTerminalEvent && assistantMessage?.status === "cancelled" ? <div className="message-status">已停止</div> : null}
               </section>
             );
           })}
@@ -1457,9 +1471,11 @@ function App() {
         <div className="conversation-header">
           <div>
             <h1>{activeThread?.title ?? "新会话"}</h1>
-            <span className="mode-label">
-              {currentThreadCancelling ? "正在停止" : currentThreadBusy ? "正在生成" : usage ? `${usage.totalTokens} tokens` : "纯文本对话"}
-            </span>
+            {(currentThreadCancelling || currentThreadBusy) ? (
+              <span className="mode-label">
+                {currentThreadCancelling ? "正在停止" : "正在生成"}
+              </span>
+            ) : null}
           </div>
         </div>
 
@@ -1485,7 +1501,7 @@ function App() {
                 <TodoList todos={todos.get(activeThreadId)!} />
               )}
 
-              {messages.map((message) => {
+              {displayMessages.map((message) => {
                 if (message.role === "assistant" && message.turnId && groupedRetryTurnIds.has(message.turnId)) {
                   return null;
                 }
@@ -1507,6 +1523,9 @@ function App() {
                   && message.turnId === activityStatus.turnId
                   ? activityStatus.status
                   : null;
+                const messageHasTerminalEvent = messageTimeline.some(
+                  (item) => item.type === "event" && ["turn_completed", "turn_failed", "turn_cancelled"].includes(item.kind),
+                );
 
                 return (
                   <Fragment key={message.role === "assistant" && message.turnId ? `assistant-turn-${message.turnId}` : message.id}>
@@ -1545,6 +1564,7 @@ function App() {
                           activityStatus={messageActivityStatus}
                           finalMessageId={message.id}
                           renderText={renderMessageText}
+                          onRetry={retryable && lastTurn?.turnId === message.turnId ? () => void retryLastTurn() : undefined}
                         />
                       )}
                       {!messageTimeline.length && (message.text || (message.status === "streaming" && !messageActivityStatus)) ? <div className="message-content">
@@ -1561,8 +1581,8 @@ function App() {
 
                       {message.role === "assistant" ? renderMessageChanges(message.id, messageChanges) : null}
 
-                      {message.status === "failed" && <div className="message-status message-status--error">生成失败</div>}
-                      {message.status === "cancelled" && <div className="message-status">已停止</div>}
+                      {!messageHasTerminalEvent && message.status === "failed" && <div className="message-status message-status--error">生成失败</div>}
+                      {!messageHasTerminalEvent && message.status === "cancelled" && <div className="message-status">已停止</div>}
                     </div>
                   </article>
                   {message.role === "user"
@@ -1654,12 +1674,6 @@ function App() {
                   <Activity className="spin" size={20} />
                   <span>正在读取会话</span>
                 </div>
-              )}
-              {retryable && (
-                <button className="retry-button" type="button" onClick={() => void retryLastTurn()}>
-                  <RefreshCw size={15} />
-                  重试
-                </button>
               )}
             </div>
           ) : (

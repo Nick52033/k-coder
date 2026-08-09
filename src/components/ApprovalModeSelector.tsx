@@ -43,15 +43,15 @@ export function ApprovalModeSelector({ mode, disabled, onChange }: ApprovalModeS
       <button
         type="button"
         className={`approval-mode-trigger ${fullAccess ? "approval-mode-trigger--full" : ""}`}
-        aria-label="选择操作批准方式"
+        aria-label={`操作批准方式：${fullAccess ? "完整访问" : "请求批准"}`}
         aria-haspopup="menu"
         aria-expanded={open}
-        title="选择操作批准方式"
+        title={fullAccess ? "完整访问：自动批准工具操作" : "请求批准：敏感操作前先询问"}
         disabled={disabled}
         onClick={() => setOpen((value) => !value)}
       >
         {fullAccess ? <ShieldCheck size={16} /> : <Hand size={16} />}
-        <span>{fullAccess ? "完整访问" : "请求批准"}</span>
+        {fullAccess ? <span>完整访问</span> : null}
         <ChevronDown size={14} className="approval-mode-chevron" />
       </button>
       {open && (

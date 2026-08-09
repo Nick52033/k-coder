@@ -467,16 +467,16 @@ test("supports the primary workbench inspection flow", async ({ page }, testInfo
   await expect(page.getByRole("heading", { name: "Phase 6 workbench" })).toBeVisible();
   await expect(page.getByText("检查完成。", { exact: true })).toBeVisible();
   await expect(page.getByText("执行了 1.8s", { exact: true })).toBeVisible();
+  await expect(page.locator(".conversation-header").getByText("1280 tokens", { exact: true })).toHaveCount(0);
   await expect(page.getByText("我先检查相关文件并修改实现。", { exact: true })).toBeHidden();
   await page.screenshot({ path: testInfo.outputPath("collapsed-turn.png"), fullPage: true });
   await page.getByText("执行了 1.8s", { exact: true }).click();
   await page.screenshot({ path: testInfo.outputPath("collapsed-steps.png"), fullPage: true });
-  const providerContextStep = page.locator(".turn-event-step--provider_context");
-  await expect(providerContextStep.getByText("已保留模型上下文", { exact: true })).toBeVisible();
-  await expect(providerContextStep.getByText("openai_responses · reasoning · rs_fixture", { exact: true })).toBeHidden();
-  await providerContextStep.locator(":scope > summary").click();
-  await expect(providerContextStep.getByText("openai_responses · reasoning · rs_fixture", { exact: true })).toBeVisible();
-  await expect(page.locator(".turn-event-step--usage").getByText("输入 1200 · 输出 80 · 总计 1280 tokens", { exact: true })).toBeHidden();
+  await expect(page.locator(".turn-event-step--provider_context")).toHaveCount(0);
+  await expect(page.locator(".turn-event-step--usage")).toHaveCount(0);
+  await expect(page.locator(".turn-plan")).not.toHaveAttribute("open", "");
+  await expect(page.locator(".turn-plan").getByText("检查工作区", { exact: true })).toBeHidden();
+  await page.locator(".turn-plan > summary").click();
   await expect(page.locator(".turn-plan").getByText("检查工作区", { exact: true })).toBeVisible();
   await expect(page.getByText("我先检查相关文件并修改实现。", { exact: true })).toBeVisible();
   const inspectionGroup = page.locator(".turn-tool-group").filter({ hasText: "执行了多个操作" });
@@ -702,8 +702,12 @@ test("streams thinking, safe reasoning summaries, command output, and file diffs
     const base = { schemaVersion: 1, threadId: "thread-1", turnId: "turn-live" };
     emit({ ...base, type: "turn_started", phase: "exploring" });
     emit({ ...base, type: "activity_status_changed", phase: "exploring", status: "thinking" });
+    emit({ ...base, type: "item_started", phase: "planning", itemId: "rs-live", itemType: "reasoning" });
+    emit({ ...base, type: "reasoning_summary_delta", phase: "planning", itemId: "rs-live", delta: "Planning parallel cargo check and test" });
   });
   await expect(page.getByText("思考中", { exact: true })).toBeVisible();
+  await expect(page.getByText("Planning parallel cargo check and test", { exact: true })).toHaveCount(0);
+  await expect(page.locator(".turn-reasoning")).toHaveCount(0);
   await expect(page.getByText("等待工具调用…", { exact: true })).toHaveCount(0);
   await expect(page.locator(".turn-timeline--empty")).toHaveCount(0);
   await page.screenshot({ path: testInfo.outputPath("compact-thinking-status.png"), fullPage: true });
@@ -713,13 +717,11 @@ test("streams thinking, safe reasoning summaries, command output, and file diffs
   await page.evaluate(() => {
     const emit = (window as unknown as { __emitAgentEvent: (event: unknown) => void }).__emitAgentEvent;
     const base = { schemaVersion: 1, threadId: "thread-1", turnId: "turn-live" };
-    emit({ ...base, type: "item_started", phase: "planning", itemId: "rs-live", itemType: "reasoning" });
-    emit({ ...base, type: "reasoning_summary_delta", phase: "planning", itemId: "rs-live", delta: "正在检查公开事件契约。" });
-    emit({ ...base, type: "reasoning_summary_completed", phase: "planning", itemId: "rs-live", summary: "正在检查公开事件契约。" });
+    emit({ ...base, type: "reasoning_summary_completed", phase: "planning", itemId: "rs-live", summary: "Planning parallel cargo check and test" });
     emit({ ...base, type: "item_completed", phase: "planning", itemId: "rs-live", itemType: "reasoning", status: "completed" });
     emit({ ...base, type: "item_started", phase: "planning", itemId: "rs-live-2", itemType: "reasoning" });
-    emit({ ...base, type: "reasoning_summary_delta", phase: "planning", itemId: "rs-live-2", delta: "正在核对工具输出边界。" });
-    emit({ ...base, type: "reasoning_summary_completed", phase: "planning", itemId: "rs-live-2", summary: "正在核对工具输出边界。" });
+    emit({ ...base, type: "reasoning_summary_delta", phase: "planning", itemId: "rs-live-2", delta: "已确认工具输出按游标去重，下一步核对脱敏边界。" });
+    emit({ ...base, type: "reasoning_summary_completed", phase: "planning", itemId: "rs-live-2", summary: "已确认工具输出按游标去重，下一步核对脱敏边界。" });
     emit({ ...base, type: "item_completed", phase: "planning", itemId: "rs-live-2", itemType: "reasoning", status: "completed" });
     emit({ ...base, type: "item_started", phase: "executing", itemId: "call-live", itemType: "tool" });
     emit({ ...base, type: "tool_started", phase: "executing", call: { id: "call-live", name: "run_command", arguments: { command: "pnpm build" }, metadata: {} } });
@@ -743,12 +745,14 @@ test("streams thinking, safe reasoning summaries, command output, and file diffs
   });
 
   const reasoning = page.locator(".turn-reasoning").last();
-  await expect(page.getByText("思考内容", { exact: true })).toHaveCount(1);
-  await expect(reasoning.locator(".turn-reasoning-segment")).toHaveCount(2);
-  await expect(reasoning.getByText("2 段", { exact: true })).toBeVisible();
-  await expect(reasoning).toHaveAttribute("open", "");
-  await expect(page.getByText("正在检查公开事件契约。", { exact: true })).toBeVisible();
-  await expect(page.getByText("正在核对工具输出边界。", { exact: true })).toBeVisible();
+  await expect(page.getByText("思考摘要", { exact: true })).toHaveCount(1);
+  await expect(page.getByText("思考内容", { exact: true })).toHaveCount(0);
+  await expect(reasoning.locator(".turn-reasoning-segment")).toHaveCount(1);
+  await expect(reasoning.getByText("已完成", { exact: true })).toBeVisible();
+  await expect(reasoning).not.toHaveAttribute("open", "");
+  await reasoning.locator(":scope > summary").click();
+  await expect(page.getByText("Planning parallel cargo check and test", { exact: true })).toHaveCount(0);
+  await expect(page.getByText("已确认工具输出按游标去重，下一步核对脱敏边界。", { exact: true })).toBeVisible();
   const liveExecution = page.locator(".message--assistant").last().locator(".turn-execution--live");
   await expect(liveExecution.locator(":scope > summary .turn-disclosure-chevron")).toHaveCount(0);
   await expect.poll(async () => {
@@ -758,14 +762,18 @@ test("streams thinking, safe reasoning summaries, command output, and file diffs
   }).toBe(true);
   await page.screenshot({ path: testInfo.outputPath("grouped-reasoning-summaries.png"), fullPage: true });
   const liveCommandGroup = liveExecution.locator(".turn-tool-group").filter({ hasText: "运行了命令" });
-  await expect(liveCommandGroup).toHaveAttribute("open", "");
-  await expect(page.locator(".turn-tool-output").last()).toHaveAttribute("open", "");
+  await expect(liveCommandGroup).not.toHaveAttribute("open", "");
+  await liveCommandGroup.locator(":scope > summary").click();
+  const liveCommandOutput = page.locator(".turn-tool-output").last();
+  await expect(liveCommandOutput).not.toHaveAttribute("open", "");
+  await liveCommandOutput.locator(":scope > summary").click();
   await expect(page.locator(".turn-tool-output-line--stdout").filter({ hasText: "building client" })).toBeVisible();
   await expect(page.locator(".turn-tool-output-line--stderr").filter({ hasText: "warning: fixture" })).toBeVisible();
   await expect(page.getByText("耗时 1.2s", { exact: true })).toBeVisible();
   const compactionStep = liveExecution.locator(".turn-event-step--compacted");
   await expect(compactionStep.getByText("已自动压缩上下文", { exact: true })).toBeVisible();
-  await expect(compactionStep).toHaveAttribute("open", "");
+  await expect(compactionStep).not.toHaveAttribute("open", "");
+  await compactionStep.locator(":scope > summary").click();
   await expect(compactionStep.getByText("压缩了 18 条历史消息，保留 1 项用户约束和 1 项近期工具结果", { exact: true })).toBeVisible();
   const commandDetails = page.locator(".turn-command-inline").last();
   await expect(commandDetails.locator(".turn-command-inline-header")).toContainText("PowerShell");
@@ -773,11 +781,13 @@ test("streams thinking, safe reasoning summaries, command output, and file diffs
   await commandDetails.screenshot({ path: testInfo.outputPath("command-inline.png") });
   const changeStep = liveExecution.locator(".turn-event-step--change_applied");
   await expect(changeStep.getByText("编辑了文件", { exact: true })).toBeVisible();
-  await expect(changeStep).toHaveAttribute("open", "");
+  await expect(changeStep).not.toHaveAttribute("open", "");
+  await changeStep.locator(":scope > summary").click();
   await expect(page.getByText("已编辑 src/App.tsx", { exact: true }).last()).toBeVisible();
   const changeFile = page.locator(".turn-change-file").filter({ hasText: "src/App.tsx" });
   const diffEditor = changeFile.locator('.code-diff-editor[data-language="typescript"]');
-  await expect(diffEditor.locator(".monaco-diff-editor")).toBeVisible();
+  await expect(changeFile.getByText("正在载入编辑器...", { exact: true })).toBeVisible();
+  await expect(diffEditor.locator(".monaco-diff-editor")).toBeVisible({ timeout: 15_000 });
   await expect(diffEditor.locator(".monaco-editor").last()).toHaveClass(/vs-dark/);
   await expect(changeFile.locator(".turn-change-editor-header")).toContainText("src/App.tsx+1-1");
   await expect(diffEditor.locator(".view-lines").last()).toContainText("const after = true;");
@@ -923,7 +933,7 @@ test("paces streamed text and preserves timeline order before tools and completi
   await expect(liveMessage.getByText("执行了 1.8s", { exact: true })).toBeVisible();
 });
 
-test("keeps completed steps open until the turn succeeds", async ({ page }) => {
+test("keeps the active tool open and folds it as soon as it finishes", async ({ page }) => {
   await page.goto("/");
   const emit = (event: Record<string, unknown>) => page.evaluate((payload) => {
     (window as unknown as { __emitAgentEvent: (value: unknown) => void }).__emitAgentEvent(payload);
@@ -952,7 +962,7 @@ test("keeps completed steps open until the turn succeeds", async ({ page }) => {
     result: { success: true, output: "done", metadata: { durationMs: 120 } },
   });
 
-  await expect(group).toHaveAttribute("open", "");
+  await expect(group).not.toHaveAttribute("open", "");
   await emit({
     ...base,
     type: "turn_completed",
@@ -1330,7 +1340,8 @@ test("streams progress and tools in event order before the turn completes", asyn
   });
   const completedReadGroup = liveMessage.locator(".turn-tool-group").filter({ hasText: "执行了操作" });
   await expect(completedReadGroup).toBeVisible();
-  await expect(completedReadGroup).toHaveAttribute("open", "");
+  await expect(completedReadGroup).not.toHaveAttribute("open", "");
+  await completedReadGroup.locator(":scope > summary").click();
   await expect(liveMessage.locator(".turn-timeline-tool--completed").getByText("读取 src/App.tsx L3370-3382", { exact: true })).toBeVisible();
   await expect(liveMessage.locator(".turn-tool-meta > span").getByText("已完成", { exact: true })).toBeVisible();
   await expect(liveMessage.getByText("思考中", { exact: true })).toBeVisible();
@@ -1358,7 +1369,8 @@ test("streams progress and tools in event order before the turn completes", asyn
   await liveMessage.getByText("执行了 4.2s", { exact: true }).click();
   await liveMessage.locator(".turn-tool-group").filter({ hasText: "执行了操作" }).locator(":scope > summary").click();
   await expect(liveMessage.locator(".turn-timeline-tool--completed").getByText("读取 src/App.tsx L3370-3382", { exact: true })).toBeVisible();
-  await expect(liveMessage.locator(".turn-timeline > *")).toHaveCount(3);
+  await expect(liveMessage.locator(".turn-timeline > *")).toHaveCount(2);
+  await expect(liveMessage.getByText("Turn 已完成", { exact: true })).toHaveCount(0);
 });
 
 test("shows the backend error instead of failed tool arguments", async ({ page }) => {
@@ -1494,17 +1506,8 @@ test("completes and restores an approved edit test repair workflow", async ({ pa
   await expect(liveMessage.locator(".turn-timeline-tool")).toHaveCount(5);
   await expect(liveMessage.locator(".turn-timeline-tool").first()).toBeHidden();
   await liveMessage.getByText("执行了 2分05秒", { exact: true }).click();
-  const timelineOrder = await liveMessage.locator(".turn-timeline").first().evaluate((timeline) =>
-    Array.from(timeline.children).map((child) => child.className),
-  );
-  const approvalRequestIndex = timelineOrder.findIndex((className) => className.includes("approval_requested"));
-  const approvalResolvedIndex = timelineOrder.findIndex((className) => className.includes("approval_resolved"));
-  const toolIndexes = timelineOrder
-    .map((className, index) => className.includes("turn-tool-group") ? index : -1)
-    .filter((index) => index >= 0);
-  expect(approvalRequestIndex).toBeGreaterThanOrEqual(0);
-  expect(approvalResolvedIndex).toBeGreaterThan(approvalRequestIndex);
-  expect(approvalResolvedIndex).toBeLessThan(toolIndexes[1]);
+  await expect(liveMessage.locator(".turn-event-step--approval_requested")).toHaveCount(0);
+  await expect(liveMessage.locator(".turn-event-step--approval_resolved")).toHaveCount(0);
   await expect(liveMessage.getByText("测试失败，修正实现后重新验证。", { exact: true })).toBeVisible();
   await expect(liveMessage.locator(".turn-tool-output-line--stderr")).toHaveText("test failed\n");
   await expect(liveMessage.getByText("修复完成，测试已经通过。", { exact: true })).toHaveCount(1);
@@ -1544,16 +1547,8 @@ test("completes and restores an approved edit test repair workflow", async ({ pa
   await expect(restoredMessage.locator(".turn-timeline-tool")).toHaveCount(5);
   await expect(restoredMessage.locator(".turn-timeline-tool").first()).toBeHidden();
   await restoredMessage.getByText("执行了 2分05秒", { exact: true }).click();
-  const restoredTimelineOrder = await restoredMessage.locator(".turn-timeline").first().evaluate((timeline) =>
-    Array.from(timeline.children).map((child) => child.className),
-  );
-  const restoredRequestIndex = restoredTimelineOrder.findIndex((className) => className.includes("approval_requested"));
-  const restoredResolutionIndex = restoredTimelineOrder.findIndex((className) => className.includes("approval_resolved"));
-  const restoredToolIndexes = restoredTimelineOrder
-    .map((className, index) => className.includes("turn-tool-group") ? index : -1)
-    .filter((index) => index >= 0);
-  expect(restoredRequestIndex).toBeLessThan(restoredToolIndexes[1]);
-  expect(restoredResolutionIndex).toBeLessThan(restoredToolIndexes[1]);
+  await expect(restoredMessage.locator(".turn-event-step--approval_requested")).toHaveCount(0);
+  await expect(restoredMessage.locator(".turn-event-step--approval_resolved")).toHaveCount(0);
   await expect(restoredMessage.locator(".turn-tool-output-line--stderr")).toHaveText("test failed\n");
   await expect(restoredMessage.getByText("修复完成，测试已经通过。", { exact: true })).toHaveCount(1);
   await expect(restoredMessage.locator(".changes-toggle")).toContainText("2 个文件");
@@ -1593,12 +1588,17 @@ test("keeps a cancelled turn busy until the terminal event and then retries", as
   });
   const cancelledMessage = page.locator(".message--assistant").last();
   await expect(cancelledMessage.locator(".turn-timeline-tool--running")).toHaveCount(0);
+  const cancelledExecution = cancelledMessage.locator(".turn-execution");
+  const cancelledToolGroup = cancelledMessage.locator(".turn-tool-group--cancelled");
+  await expect(cancelledExecution).not.toHaveAttribute("open", "");
+  await expect(cancelledExecution.locator(":scope > summary .turn-disclosure-title")).toHaveText("已停止");
+  await expect(cancelledExecution.getByRole("button", { name: "重试" })).not.toBeVisible();
+  await cancelledExecution.locator(":scope > summary").click();
+  await expect(cancelledToolGroup).not.toHaveAttribute("open", "");
+  await cancelledToolGroup.locator(":scope > summary").click();
   await expect(cancelledMessage.locator(".turn-timeline-tool--cancelled")).toContainText("已取消");
-  await expect(cancelledMessage.locator(".turn-execution")).toHaveAttribute("open", "");
-  await expect(cancelledMessage.locator(".turn-tool-group--cancelled")).toHaveAttribute("open", "");
-  await expect(cancelledMessage.locator(".turn-execution > summary .turn-disclosure-title")).toHaveText("已停止");
-  await expect(page.getByRole("button", { name: "重试" })).toBeVisible();
-  await page.getByRole("button", { name: "重试" }).click();
+  await expect(cancelledExecution.getByRole("button", { name: "重试" })).toBeVisible();
+  await cancelledExecution.getByRole("button", { name: "重试" }).click();
   await expect.poll(() => page.evaluate(() => (window as unknown as { __invoked: string[] }).__invoked.filter((command) => command === "turn_retry").length)).toBe(1);
   await expect.poll(() => page.evaluate(() => (window as unknown as { __invoked: string[] }).__invoked.filter((command) => command === "retry_turn").length)).toBe(0);
 });
@@ -1622,6 +1622,57 @@ test("allows retrying a stop request after the IPC timeout", async ({ page }) =>
   await expect(page.getByRole("button", { name: "停止生成" })).toBeEnabled();
   await page.getByRole("button", { name: "停止生成" }).click();
   await expect.poll(() => page.evaluate(() => (window as unknown as { __invoked: string[] }).__invoked.filter((command) => command === "turn_interrupt").length)).toBe(2);
+});
+
+test("presents a failed turn as one actionable error disclosure", async ({ page }, testInfo) => {
+  await page.addInitScript(() => {
+    localStorage.setItem("kcoder_e2e_hold_retry", "true");
+    localStorage.setItem("kcoder_theme", "dark");
+  });
+  await page.goto("/");
+  await page.evaluate(() => {
+    const emit = (window as unknown as { __emitAgentEvent: (event: unknown) => void }).__emitAgentEvent;
+    const base = { schemaVersion: 1, threadId: "thread-1", turnId: "turn-rate-limited" };
+    emit({ ...base, type: "turn_started", phase: "exploring" });
+    emit({ ...base, type: "item_started", phase: "planning", itemId: "reasoning-rate-limited", itemType: "reasoning" });
+    emit({ ...base, type: "reasoning_summary_delta", phase: "planning", itemId: "reasoning-rate-limited", delta: "正在检查上游响应。" });
+    emit({
+      ...base,
+      type: "turn_failed",
+      phase: "failed",
+      message: "provider returned HTTP 429: Upstream rate limit exceeded, please retry later",
+      startedAtMs: 1_000,
+      completedAtMs: 5_600,
+      durationMs: 4_600,
+    });
+  });
+
+  const failedExecution = page.locator(".message--assistant").last().locator(".turn-execution--failed");
+  await expect(failedExecution).not.toHaveAttribute("open", "");
+  await expect(failedExecution.locator(":scope > summary .turn-disclosure-title")).toHaveText("请求未完成");
+  await expect(failedExecution.locator(":scope > summary .turn-disclosure-status")).toHaveText("耗时 4.6s");
+  await expect(failedExecution.getByText("错误原因", { exact: true })).not.toBeVisible();
+  await expect(failedExecution.getByText("Turn 执行失败", { exact: true })).toHaveCount(0);
+  await expect(failedExecution.getByText("执行失败", { exact: true })).toHaveCount(0);
+  await expect(page.locator(".error-banner")).toHaveCount(0);
+  await expect(failedExecution.getByRole("button", { name: "重试", exact: true })).not.toBeVisible();
+  await page.screenshot({ path: testInfo.outputPath("failed-turn-agent-ui-collapsed.png"), fullPage: true });
+
+  await failedExecution.locator(":scope > summary").click();
+  await expect(failedExecution).toHaveAttribute("open", "");
+  await expect(failedExecution.getByText("错误原因", { exact: true })).toBeVisible();
+  await expect(failedExecution.getByText("provider returned HTTP 429: Upstream rate limit exceeded, please retry later", { exact: true })).toBeVisible();
+  await expect(failedExecution.locator(".turn-reasoning")).toHaveCount(0);
+  await expect(failedExecution.getByText("正在检查上游响应。", { exact: true })).toHaveCount(0);
+  await expect(failedExecution.getByText("生成中", { exact: true })).toHaveCount(0);
+  await expect(failedExecution.locator(".turn-plan")).not.toHaveAttribute("open", "");
+  await expect(failedExecution.getByRole("button", { name: "重试", exact: true })).toBeVisible();
+  await page.waitForTimeout(450);
+  await page.screenshot({ path: testInfo.outputPath("failed-turn-agent-ui-expanded.png"), fullPage: true });
+  await failedExecution.getByRole("button", { name: "重试", exact: true }).click();
+  await expect.poll(() => page.evaluate(() => (
+    window as unknown as { __invoked: string[] }
+  ).__invoked.filter((command) => command === "turn_retry").length)).toBe(1);
 });
 
 test("uses the exact active turn when recovering a stuck conversation", async ({ page }) => {
@@ -1680,9 +1731,13 @@ test("keeps retry attempts in one assistant reply before and after recovery", as
   }, failedDetail);
   await page.goto("/");
 
-  const failedExecution = page.locator(".message--activity-only .turn-execution").filter({ hasText: "Turn 已失败" });
-  await expect(failedExecution).toHaveAttribute("open", "");
-  await expect(failedExecution.getByText("执行失败", { exact: true })).toBeVisible();
+  const failedExecution = page.locator(".message--activity-only .turn-execution--failed").filter({ hasText: "provider failed" });
+  await expect(failedExecution).not.toHaveAttribute("open", "");
+  await expect(failedExecution.getByText("请求未完成", { exact: true })).toBeVisible();
+  await expect(failedExecution.getByText("错误原因", { exact: true })).not.toBeVisible();
+  await expect(failedExecution.getByText("Turn 已失败", { exact: true })).toHaveCount(0);
+  await failedExecution.locator(":scope > summary").click();
+  await expect(failedExecution.getByText("错误原因", { exact: true })).toBeVisible();
   await expect(failedExecution.getByText("provider failed", { exact: true })).toBeVisible();
 
   await page.getByRole("button", { name: "重试", exact: true }).click();
@@ -1944,9 +1999,10 @@ test("switches providers and models from the composer footer", async ({ page }, 
 
 test("switches the runtime approval mode from the composer", async ({ page }, testInfo) => {
   await page.goto("/");
-  const trigger = page.getByRole("button", { name: "选择操作批准方式" });
+  const trigger = page.getByRole("button", { name: /操作批准方式/ });
 
-  await expect(trigger).toContainText("请求批准");
+  await expect(trigger).toHaveAttribute("aria-label", "操作批准方式：请求批准");
+  await expect(trigger).not.toContainText("请求批准");
   await trigger.click();
   const menu = page.getByRole("menu", { name: "操作批准方式" });
   await expect(menu).toBeVisible();
@@ -1980,11 +2036,10 @@ test("switches the runtime approval mode from the composer", async ({ page }, te
       },
     });
   });
-  const autoApprovalStep = page.locator(".turn-event-step--approval_requested").last();
-  await expect(autoApprovalStep.getByText("已自动批准操作", { exact: true })).toBeVisible();
-  await expect(autoApprovalStep).toHaveAttribute("open", "");
-  await expect(autoApprovalStep.getByText("run_command · full-access mode automatically approved: fixture", { exact: true })).toBeVisible();
+  await expect(page.locator(".turn-event-step--approval_requested")).toHaveCount(0);
+  await expect(page.getByText("已自动批准操作", { exact: true })).toHaveCount(0);
   await expect(page.locator(".message--approval")).toHaveCount(0);
+  await expect(page.locator(".message-role").getByText("k-Coder", { exact: true })).toHaveCount(1);
   await trigger.click();
   await expect(menu.getByRole("menuitemradio", { name: /完整访问/ })).toHaveAttribute("aria-checked", "true");
   await page.waitForTimeout(250);
@@ -2254,6 +2309,139 @@ test("hydrates the unified thread item page and loads older turns", async ({ pag
     sortDirection: "desc",
     itemsView: "full",
   });
+});
+
+test("renders a recovered assistant item only once when its turn comes from the timeline", async ({ page }) => {
+  await page.addInitScript(() => {
+    const turnId = "turn-recovered";
+    const answerId = "answer-recovered";
+    const answer = "代码已提交并推送成功。";
+    localStorage.setItem("kcoder_e2e_thread_history", JSON.stringify({
+      schemaVersion: 1,
+      summary: {
+        schemaVersion: 1,
+        id: "thread-1",
+        title: "Phase 6 workbench",
+        createdAtMs: 1,
+        updatedAtMs: 4,
+        archived: false,
+        workspacePath: "D:\\code\\k-coder",
+      },
+      lastTurn: { turnId, state: "completed", error: null },
+      todos: [],
+      lastUsage: { inputTokens: 172555, outputTokens: 2683, totalTokens: 175238 },
+      turns: {
+        data: [{
+          schemaVersion: 1,
+          id: turnId,
+          userMessageId: "push-user",
+          state: "completed",
+          error: null,
+          startedAtMs: 2,
+          completedAtMs: 4,
+          durationMs: 2,
+          itemsView: "full",
+          items: [{
+            schemaVersion: 1,
+            id: "push-user",
+            turnId,
+            status: "completed",
+            startedAtMs: 2,
+            completedAtMs: 2,
+            timelineItems: [],
+            type: "user_message",
+            message: {
+              schemaVersion: 1,
+              id: "push-user",
+              role: "user",
+              content: [{ type: "text", text: "推送代码" }],
+              createdAtMs: 2,
+            },
+          }],
+        }],
+        nextCursor: null,
+        backwardsCursor: null,
+      },
+      unscopedItems: [{
+        schemaVersion: 1,
+        id: answerId,
+        turnId: null,
+        status: "completed",
+        startedAtMs: 3,
+        completedAtMs: 3,
+        timelineItems: [
+          { type: "text", id: answerId, turnId, text: answer },
+          { type: "event", itemId: `turn-completed-${turnId}`, turnId, kind: "turn_completed", title: "Turn 已完成", detail: null, durationMs: 2 },
+        ],
+        type: "agent_message",
+        phase: "final_answer",
+        message: {
+          schemaVersion: 1,
+          id: answerId,
+          role: "assistant",
+          content: [{ type: "text", text: answer }],
+          createdAtMs: 3,
+        },
+      }],
+    }));
+  });
+  await page.goto("/");
+
+  await expect(page.getByText("代码已提交并推送成功。", { exact: true })).toHaveCount(1);
+  await expect(page.locator(".message--assistant")).toHaveCount(1);
+  await expect(page.locator(".message--assistant .turn-execution")).toHaveCount(1);
+});
+
+test("coalesces multiple assistant projections for the same turn", async ({ page }) => {
+  await page.addInitScript(() => {
+    const turnId = "turn-overlap";
+    const item = (id: string, text: string, createdAtMs: number) => ({
+      schemaVersion: 1,
+      id,
+      turnId,
+      status: "completed",
+      startedAtMs: createdAtMs,
+      completedAtMs: createdAtMs,
+      timelineItems: [{ type: "text", id, turnId, text }],
+      type: "agent_message",
+      phase: "final_answer",
+      message: {
+        schemaVersion: 1,
+        id,
+        role: "assistant",
+        content: [{ type: "text", text }],
+        createdAtMs,
+      },
+    });
+    localStorage.setItem("kcoder_e2e_thread_history", JSON.stringify({
+      schemaVersion: 1,
+      summary: { schemaVersion: 1, id: "thread-1", title: "Phase 6 workbench", createdAtMs: 1, updatedAtMs: 5, archived: false },
+      lastTurn: { turnId, state: "completed", error: null },
+      todos: [],
+      lastUsage: null,
+      turns: {
+        data: [{
+          schemaVersion: 1,
+          id: turnId,
+          userMessageId: null,
+          state: "completed",
+          error: null,
+          startedAtMs: 2,
+          completedAtMs: 5,
+          durationMs: 3,
+          itemsView: "full",
+          items: [item("answer-overlap-old", "阶段性答复", 3), item("answer-overlap-final", "最终答复", 4)],
+        }],
+        nextCursor: null,
+        backwardsCursor: null,
+      },
+      unscopedItems: [],
+    }));
+  });
+  await page.goto("/");
+
+  await expect(page.locator(".message--assistant")).toHaveCount(1);
+  await expect(page.getByText("最终答复", { exact: true })).toHaveCount(1);
 });
 
 test("clears the previous thread view while the selected thread is loading", async ({ page }, testInfo) => {

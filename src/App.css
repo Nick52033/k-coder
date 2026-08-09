@@ -2426,6 +2426,18 @@ button {
   color: var(--color-error);
 }
 
+.turn-execution--failed {
+  border-color: color-mix(in srgb, var(--color-error) 24%, var(--color-border));
+}
+
+.turn-execution--failed > summary {
+  background: color-mix(in srgb, var(--color-error) 4%, transparent);
+}
+
+.turn-execution--failed > summary:hover {
+  background: color-mix(in srgb, var(--color-error) 7%, var(--color-surface-hover));
+}
+
 .turn-execution--cancelled > summary > svg:first-child {
   color: var(--color-ink-muted);
 }
@@ -2472,6 +2484,78 @@ button {
   color: var(--color-ink-muted);
   font-size: var(--font-size-sm);
   line-height: 1.6;
+}
+
+.turn-failure-detail {
+  display: grid;
+  min-width: 0;
+  margin: 6px 0 2px;
+  padding: 10px 10px 10px 12px;
+  grid-template-columns: 18px minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 9px;
+  border-left: 2px solid var(--color-error);
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--color-error) 5%, transparent);
+}
+
+.turn-failure-detail > svg {
+  margin-top: 1px;
+  color: var(--color-error);
+}
+
+.turn-failure-copy {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.turn-failure-copy strong {
+  color: var(--color-ink);
+  font-size: var(--font-size-sm);
+  font-weight: 600;
+  line-height: 1.35;
+}
+
+.turn-failure-copy small {
+  color: var(--color-ink-subtle);
+  font-size: var(--font-size-xs);
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.turn-retry-button {
+  display: inline-flex;
+  min-height: 30px;
+  padding: 5px 9px;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-sm);
+  color: var(--color-ink);
+  background: var(--color-surface);
+  cursor: pointer;
+  font: inherit;
+  font-size: var(--font-size-sm);
+  white-space: nowrap;
+  transition: border-color var(--transition-fast), background-color var(--transition-fast);
+}
+
+.turn-retry-button:hover {
+  border-color: var(--color-ink-muted);
+  background: var(--color-surface-hover);
+}
+
+.turn-retry-button:focus-visible {
+  outline: 2px solid var(--color-brand);
+  outline-offset: 2px;
+}
+
+.turn-terminal-actions {
+  display: flex;
+  padding: 6px 0 2px;
 }
 
 .turn-final-response .turn-progress-text {
@@ -3129,29 +3213,6 @@ button {
   padding: 12px 0 16px;
   color: var(--color-ink-subtle);
   font-size: var(--font-size-sm);
-}
-
-.retry-button {
-  display: flex;
-  min-height: 32px;
-  margin: -12px 0 20px;
-  padding: 6px 10px;
-  align-items: center;
-  gap: 7px;
-  border: 1px solid var(--color-border-strong);
-  border-radius: var(--radius-sm);
-  background: var(--color-surface);
-  cursor: pointer;
-  font-size: var(--font-size-base);
-  transition: background-color var(--transition-fast);
-}
-
-.retry-button:hover {
-  background: var(--color-surface-hover);
-}
-
-.retry-button:active {
-  background: var(--color-surface-panel);
 }
 
 .empty-thread {

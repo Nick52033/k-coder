@@ -34,6 +34,58 @@ export function toConversationMessage(message: ChatMessage, turnId?: string): Co
   };
 }
 
+export function reconcileConversationMessages(
+  messages: ConversationMessage[],
+  timeline: TurnTimelineItem[],
+) {
+  const textTurnIds = new Map<string, string>();
+  for (const item of timeline) {
+    if (item.type === "text") textTurnIds.set(item.id, item.turnId);
+  }
+
+  const reconciled: ConversationMessage[] = [];
+  const messageIndexes = new Map<string, number>();
+  for (const message of messages) {
+    const inferredTurnId = message.role === "assistant"
+      ? message.turnId ?? textTurnIds.get(message.id)
+      : message.turnId;
+    const normalized = inferredTurnId === message.turnId
+      ? message
+      : { ...message, turnId: inferredTurnId };
+    const key = message.role === "assistant" && inferredTurnId
+      ? `assistant-turn:${inferredTurnId}`
+      : `${message.role}-message:${message.id}`;
+    const existingIndex = messageIndexes.get(key);
+    if (existingIndex === undefined) {
+      messageIndexes.set(key, reconciled.length);
+      reconciled.push(normalized);
+      continue;
+    }
+    reconciled[existingIndex] = preferredConversationMessage(reconciled[existingIndex], normalized);
+  }
+  return reconciled;
+}
+
+function preferredConversationMessage(
+  current: ConversationMessage,
+  candidate: ConversationMessage,
+) {
+  const currentRank = conversationMessageRank(current);
+  const candidateRank = conversationMessageRank(candidate);
+  if (candidateRank !== currentRank) return candidateRank > currentRank ? candidate : current;
+  return candidate.createdAtMs >= current.createdAtMs ? candidate : current;
+}
+
+function conversationMessageRank(message: ConversationMessage) {
+  const lifecycleRank = message.status === "streaming"
+    ? 0
+    : message.status === "failed" || message.status === "cancelled"
+      ? 1
+      : 2;
+  const hasContent = Boolean(message.text || message.attachments?.length);
+  return lifecycleRank * 2 + Number(hasContent);
+}
+
 export function normalizeApprovalTimeline(
   timeline: TurnTimelineItem[],
   approvals: ApprovalSnapshot[],

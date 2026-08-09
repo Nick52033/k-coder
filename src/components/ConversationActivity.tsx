@@ -4,6 +4,7 @@ import {
   Check,
   ChevronDown,
   Circle,
+  CircleAlert,
   CircleCheck,
   CircleDot,
   CircleX,
@@ -12,6 +13,7 @@ import {
   FileText,
   ListChecks,
   LoaderCircle,
+  RotateCcw,
   SquareTerminal,
 } from "lucide-react";
 import { lazy, memo, Suspense, useEffect, useRef, useState, type ReactNode } from "react";
@@ -29,6 +31,15 @@ import type {
 const ReadOnlyCodeEditor = lazy(() => import("./CodeEditor").then((module) => ({ default: module.CodeEditor })));
 const ChangeCodeDiffEditor = lazy(() => import("./CodeEditor").then((module) => ({ default: module.CodeDiffEditor })));
 
+const HIDDEN_PROCESS_EVENT_KINDS = new Set<TimelineEventKind>([
+  "provider_context",
+  "usage",
+  "approval_requested",
+  "approval_resolved",
+]);
+const GENERIC_REASONING_NOTE_PATTERN = /^(?:(?:planning|preparing|checking|reviewing|inspecting|running|reading|analyzing|investigating|updating|implementing|verifying|testing|searching|exploring|gathering|examining|assessing|comparing|confirming|fixing|editing|applying|building|waiting)\b|(?:(?:正在|准备|计划|将要)?(?:规划|计划|准备|检查|查看|读取|运行|执行|验证|测试|搜索|分析|调查|更新|修改|修复|构建|等待)))/i;
+const REASONING_INSIGHT_PATTERN = /(?:found|confirmed|because|therefore|however|mismatch|failed|failure|risk|requires?|needs?|发现|确认|原因|因此|由于|但是|不一致|失败|风险|需要)/i;
+
 export const ConversationTurnActivity = memo(function ConversationTurnActivity({
   activities,
   timeline = [],
@@ -38,6 +49,7 @@ export const ConversationTurnActivity = memo(function ConversationTurnActivity({
   activityStatus = null,
   finalMessageId,
   renderText,
+  onRetry,
 }: {
   activities: ToolActivity[];
   timeline?: TurnTimelineItem[];
@@ -47,6 +59,7 @@ export const ConversationTurnActivity = memo(function ConversationTurnActivity({
   activityStatus?: AgentActivityStatus | null;
   finalMessageId?: string;
   renderText?: (text: string) => ReactNode;
+  onRetry?: () => void;
 }) {
   const paced = usePacedTimeline(timeline, streaming);
   const visuallyStreaming = streaming || paced.settling;
@@ -63,7 +76,7 @@ export const ConversationTurnActivity = memo(function ConversationTurnActivity({
   const terminalEvent = [...processTimeline].reverse().find(
     (item): item is Extract<TurnTimelineItem, { type: "event" }> => item.type === "event" && isTerminalEvent(item.kind),
   );
-  const processItems = processTimeline.filter((item) => item !== terminalEvent);
+  const processItems = processTimeline.filter((item) => item !== terminalEvent && isVisibleConversationTimelineItem(item));
   const hasItems = Boolean(plan?.steps.length || activities.length || processItems.length);
   const hasProcess = hasItems || Boolean(activityStatus) || terminalEvent?.kind === "turn_failed" || terminalEvent?.kind === "turn_cancelled";
   const toolCount = processTimeline.filter((item) => item.type === "tool").length || activities.length;
@@ -71,14 +84,14 @@ export const ConversationTurnActivity = memo(function ConversationTurnActivity({
     ? terminalEvent.kind === "turn_cancelled"
       ? "已停止"
       : terminalEvent.kind === "turn_failed"
-        ? "执行失败"
+        ? "请求未完成"
         : `执行了 ${formatDuration(terminalEvent.durationMs)}`
     : terminalEvent?.kind === "turn_cancelled"
       ? "已停止"
       : terminalEvent?.kind === "turn_failed"
-        ? "执行失败"
+        ? "请求未完成"
         : "执行过程";
-  const autoCollapse = !visuallyStreaming && terminalEvent?.kind === "turn_completed";
+  const terminalCollapse = !visuallyStreaming && Boolean(terminalEvent);
   const SummaryIcon = visuallyStreaming
     ? LoaderCircle
     : terminalEvent?.kind === "turn_cancelled"
@@ -86,10 +99,14 @@ export const ConversationTurnActivity = memo(function ConversationTurnActivity({
       : terminalEvent?.kind === "turn_failed"
         ? CircleX
         : Activity;
+  const terminalMeta = [
+    toolCount ? `${toolCount} 个操作` : null,
+    terminalEvent?.durationMs !== undefined ? `耗时 ${formatDuration(terminalEvent.durationMs)}` : null,
+  ].filter(Boolean).join(" · ");
   const summaryStatus = terminalEvent?.kind === "turn_completed"
     ? (toolCount ? `${toolCount} 个操作` : "已完成")
-    : terminalEvent?.durationMs !== undefined
-      ? `耗时 ${formatDuration(terminalEvent.durationMs)}`
+    : terminalEvent
+      ? terminalMeta || "已结束"
       : toolCount ? `${toolCount} 个操作` : "处理中";
   const statusLabel = paced.pendingTextIds.size
     ? "生成回复中"
@@ -100,24 +117,23 @@ export const ConversationTurnActivity = memo(function ConversationTurnActivity({
       awaiting_approval: "等待确认",
       finalizing: "整理结果中",
     }[activityStatus] : visuallyStreaming ? "生成回复中" : null;
-  const groupedProcessTimeline = groupConsecutiveTimeline(processTimeline);
+  const groupedProcessTimeline = groupConsecutiveTimeline(processItems);
   const processContent = (
     <div className="turn-disclosure-panel">
       <div className={visuallyStreaming ? "turn-execution-live" : "turn-execution-content"}>
-        {plan?.steps.length ? <ConversationPlan plan={plan} allowAutoCollapse={autoCollapse} /> : null}
-        {processTimeline.length ? (
+        {plan?.steps.length ? <ConversationPlan plan={plan} activeTurn={visuallyStreaming} /> : null}
+        {processItems.length ? (
           <div className="turn-timeline">
             {groupedProcessTimeline.map((entry) => entry.type === "reasoning_group" ? (
               <ReasoningGroup
                 items={entry.items}
                 renderText={renderText}
-                allowAutoCollapse={autoCollapse}
+                activeTurn={visuallyStreaming}
                 key={`reasoning-group-${entry.items.map((item) => item.itemId).join("-")}`}
               />
             ) : entry.type === "tool_group" ? (
               <ToolActivityGroup
                 activities={entry.activities}
-                allowAutoCollapse={autoCollapse}
                 key={`tool-group-${entry.activities.map((activity) => activity.call.id).join("-")}`}
               />
             ) : (
@@ -125,7 +141,7 @@ export const ConversationTurnActivity = memo(function ConversationTurnActivity({
                 item={entry.item}
                 changes={changes}
                 renderText={renderText}
-                allowAutoCollapse={autoCollapse}
+                activeTurn={visuallyStreaming}
                 typing={entry.item.type === "text" && paced.pendingTextIds.has(entry.item.id)}
                 key={timelineItemKey(entry.item)}
               />
@@ -133,7 +149,29 @@ export const ConversationTurnActivity = memo(function ConversationTurnActivity({
           </div>
         ) : activities.length ? (
           <div className="turn-timeline">
-            <ToolActivityGroup activities={activities} allowAutoCollapse={autoCollapse} />
+            <ToolActivityGroup activities={activities} />
+          </div>
+        ) : null}
+        {terminalEvent?.kind === "turn_failed" ? (
+          <div className="turn-failure-detail">
+            <CircleAlert size={16} aria-hidden="true" />
+            <div className="turn-failure-copy">
+              <strong>错误原因</strong>
+              <small>{terminalEvent.detail || "本轮未能完成，且没有返回更多错误信息。"}</small>
+            </div>
+            {onRetry ? (
+              <button className="turn-retry-button" type="button" onClick={onRetry}>
+                <RotateCcw size={14} aria-hidden="true" />
+                <span>重试</span>
+              </button>
+            ) : null}
+          </div>
+        ) : terminalEvent?.kind === "turn_cancelled" && onRetry ? (
+          <div className="turn-terminal-actions">
+            <button className="turn-retry-button" type="button" onClick={onRetry}>
+              <RotateCcw size={14} aria-hidden="true" />
+              <span>重试</span>
+            </button>
           </div>
         ) : null}
       </div>
@@ -145,7 +183,7 @@ export const ConversationTurnActivity = memo(function ConversationTurnActivity({
       {hasProcess ? (
         <details
           className={`turn-disclosure turn-execution${visuallyStreaming ? " turn-execution--live" : ""}${terminalEvent?.kind === "turn_cancelled" ? " turn-execution--cancelled" : terminalEvent?.kind === "turn_failed" ? " turn-execution--failed" : ""}`}
-          open={!autoCollapse || undefined}
+          open={!terminalCollapse || undefined}
         >
           <summary>
             <SummaryIcon size={15} aria-hidden="true" className={visuallyStreaming ? "turn-tool-running" : undefined} />
@@ -164,7 +202,7 @@ export const ConversationTurnActivity = memo(function ConversationTurnActivity({
       ) : null}
       {finalResponse ? (
         <div className="turn-final-response">
-          <TimelineItem item={finalResponse} changes={changes} renderText={renderText} allowAutoCollapse={autoCollapse} typing={false} />
+          <TimelineItem item={finalResponse} changes={changes} renderText={renderText} activeTurn={false} typing={false} />
         </div>
       ) : null}
     </div>
@@ -175,17 +213,30 @@ function isTerminalEvent(kind: TimelineEventKind) {
   return kind === "turn_completed" || kind === "turn_failed" || kind === "turn_cancelled";
 }
 
+export function isVisibleConversationTimelineItem(item: TurnTimelineItem) {
+  if (item.type === "reasoning") return isDisplayableReasoningSummary(item.summary);
+  if (item.type !== "event") return true;
+  return item.kind !== "turn_completed" && !HIDDEN_PROCESS_EVENT_KINDS.has(item.kind);
+}
+
+function isDisplayableReasoningSummary(summary: string) {
+  const normalized = summary.replace(/\s+/g, " ").trim().replace(/^[#>*_`\-\s]+/, "");
+  if (!normalized) return false;
+  if (summary.includes("\n") || normalized.length > 160 || REASONING_INSIGHT_PATTERN.test(normalized)) return true;
+  return !GENERIC_REASONING_NOTE_PATTERN.test(normalized);
+}
+
 function TimelineItem({
   item,
   changes,
   renderText,
-  allowAutoCollapse,
+  activeTurn,
   typing = false,
 }: {
   item: TurnTimelineItem;
   changes: ChangeSet[];
   renderText?: (text: string) => ReactNode;
-  allowAutoCollapse: boolean;
+  activeTurn: boolean;
   typing?: boolean;
 }) {
   if (item.type === "text") {
@@ -196,10 +247,10 @@ function TimelineItem({
     );
   }
   if (item.type === "reasoning") {
-    return <ReasoningGroup items={[item]} renderText={renderText} allowAutoCollapse={allowAutoCollapse} />;
+    return <ReasoningGroup items={[item]} renderText={renderText} activeTurn={activeTurn} />;
   }
   if (item.type === "event") {
-    return <TimelineEventRow item={item} changes={changes} allowAutoCollapse={allowAutoCollapse} />;
+    return <TimelineEventRow item={item} changes={changes} />;
   }
   return <ToolActivityRow activity={item.activity} />;
 }
@@ -207,11 +258,9 @@ function TimelineItem({
 function TimelineEventRow({
   item,
   changes,
-  allowAutoCollapse,
 }: {
   item: Extract<TurnTimelineItem, { type: "event" }>;
   changes: ChangeSet[];
-  allowAutoCollapse: boolean;
 }) {
   const Icon = item.kind === "turn_completed"
     ? CircleCheck
@@ -222,8 +271,7 @@ function TimelineEventRow({
         : CircleDot;
   const change = item.kind === "change_applied" ? findChange(item, changes) : null;
   const hasDetails = Boolean(item.detail || change);
-  const expanded = !allowAutoCollapse || item.kind === "turn_failed";
-  const [open, setOpen] = useState(expanded);
+  const [open, setOpen] = useState(false);
   if (!hasDetails) {
     return (
       <div className={`turn-timeline-event turn-timeline-event--${item.kind}`}>
@@ -235,7 +283,6 @@ function TimelineEventRow({
   return (
     <details
       className={`turn-disclosure turn-timeline-event turn-event-step turn-event-step--${item.kind} turn-timeline-event--${item.kind}`}
-      open={expanded || undefined}
       onToggle={(event) => setOpen(event.currentTarget.open)}
     >
       <summary>
@@ -407,19 +454,23 @@ function groupConsecutiveTimeline(items: TurnTimelineItem[]): TimelineRenderEntr
 function ReasoningGroup({
   items,
   renderText,
-  allowAutoCollapse,
+  activeTurn,
 }: {
   items: ReasoningTimelineItem[];
   renderText?: (text: string) => ReactNode;
-  allowAutoCollapse: boolean;
+  activeTurn: boolean;
 }) {
   const complete = items.every((item) => item.complete);
-  const status = complete && items.length > 1 ? `${items.length} 段` : complete ? "已完成" : "生成中";
+  const status = complete && items.length > 1
+    ? `${items.length} 段`
+    : complete
+      ? "已完成"
+      : activeTurn ? "生成中" : "已结束";
   return (
-    <details className="turn-disclosure turn-reasoning" open={allowAutoCollapse ? (!complete || undefined) : true}>
+    <details className="turn-disclosure turn-reasoning" open={activeTurn && !complete ? true : undefined}>
       <summary>
         <Brain size={15} aria-hidden="true" />
-        <span className="turn-disclosure-title">思考内容</span>
+        <span className="turn-disclosure-title">思考摘要</span>
         <span className="turn-disclosure-status">{status}</span>
         <ChevronDown className="turn-disclosure-chevron" size={15} aria-hidden="true" />
       </summary>
@@ -436,7 +487,7 @@ function ReasoningGroup({
   );
 }
 
-function ToolActivityGroup({ activities, allowAutoCollapse }: { activities: ToolActivity[]; allowAutoCollapse: boolean }) {
+function ToolActivityGroup({ activities }: { activities: ToolActivity[] }) {
   const state = toolGroupState(activities);
   const allCommands = activities.every((activity) => activity.call.name === "run_command");
   const count = activities.length;
@@ -459,10 +510,9 @@ function ToolActivityGroup({ activities, allowAutoCollapse }: { activities: Tool
       : state === "running"
         ? LoaderCircle
         : allCommands ? SquareTerminal : Activity;
-  const expanded = state !== "completed";
-
+  const active = state === "running" || state === "pending";
   return (
-    <details className={`turn-disclosure turn-tool-group turn-tool-group--${state}`} open={allowAutoCollapse ? (expanded || undefined) : true}>
+    <details className={`turn-disclosure turn-tool-group turn-tool-group--${state}`} open={active || undefined}>
       <summary>
         <Icon className={state === "running" ? "turn-tool-running" : undefined} size={15} aria-hidden="true" />
         <span className="turn-disclosure-title">{title}</span>
@@ -471,7 +521,7 @@ function ToolActivityGroup({ activities, allowAutoCollapse }: { activities: Tool
       </summary>
       <div className="turn-disclosure-panel">
         <div className="turn-tool-group-content">
-          {activities.map((activity) => <ToolActivityRow activity={activity} keepDetailsExpanded={!allowAutoCollapse} key={activity.call.id} />)}
+          {activities.map((activity) => <ToolActivityRow activity={activity} key={activity.call.id} />)}
         </div>
       </div>
     </details>
@@ -487,7 +537,7 @@ function toolGroupState(activities: ToolActivity[]): ToolActivity["state"] {
 }
 
 
-function ToolActivityRow({ activity, keepDetailsExpanded = false }: { activity: ToolActivity; keepDetailsExpanded?: boolean }) {
+function ToolActivityRow({ activity }: { activity: ToolActivity }) {
   const outputChunks = visibleOutput(activity);
   const elapsedMs = useActivityDuration(activity);
   const command = activity.call.name === "run_command" ? commandDetails(activity) : null;
@@ -521,7 +571,7 @@ function ToolActivityRow({ activity, keepDetailsExpanded = false }: { activity: 
       {command ? <CommandDetails command={command} /> : null}
       {fileDetails ? <FileActivityDetails details={fileDetails} /> : null}
       {outputChunks.length ? (
-        <details className="turn-tool-output" open={keepDetailsExpanded || isRunning || activity.state === "failed" || activity.state === "cancelled" || undefined}>
+        <details className="turn-tool-output" open={isRunning || undefined}>
           <summary>
             <SquareTerminal size={14} aria-hidden="true" />
             <span>命令输出</span>
@@ -885,12 +935,12 @@ function visibleOutput(activity: ToolActivity): ToolOutputDelta[] {
   return [];
 }
 
-function ConversationPlan({ plan, allowAutoCollapse }: { plan: PlanView; allowAutoCollapse: boolean }) {
+function ConversationPlan({ plan, activeTurn }: { plan: PlanView; activeTurn: boolean }) {
   const completed = plan.steps.filter((step) => step.status === "completed" || step.status === "skipped").length;
   const active = plan.steps.some((step) => step.status === "in_progress");
 
   return (
-    <details className="turn-disclosure turn-plan" open={allowAutoCollapse ? (active || undefined) : true}>
+    <details className="turn-disclosure turn-plan" open={activeTurn && active ? true : undefined}>
       <summary>
         <ListChecks size={15} aria-hidden="true" />
         <span className="turn-disclosure-title">计划</span>

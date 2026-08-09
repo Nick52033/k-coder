@@ -574,7 +574,7 @@ export function reduceAgentEvent(
           pendingApprovals: [],
           pendingUserInput: null,
           pendingUserInputs: [],
-          error: event.message,
+          error: "",
           lastTurn: {
             turnId: event.turnId,
             state: "failed",
