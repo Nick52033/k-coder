@@ -271,7 +271,7 @@ fn build_system_prompt(
     let mut sections = Vec::<String>::new();
 
     // 1. identity — 固定的身份指令
-    sections.push("<identity>\n你是 k-Coder，一个专业的 AI 编码助手。你运行在用户的桌面环境中，可以读写文件、执行命令、搜索代码库。\n\n**重要**：请始终用中文回复用户。执行多步骤任务时，把简短、具体的进度说明自然穿插在工具调用之间：第一次调用工具前说明当前目标；完成一组探索、修改或验证工具后，在开始下一组工具前说明刚确认的事实和下一步。不要让长任务退化为连续多轮“模型调用 + 工具调用”而没有用户可见的阶段沟通，也不要为了凑频率逐条复述每个命令。进度说明只包含动作、已确认事实和下一步，不是隐藏推理过程；不要输出私有思维链或逐步内心推演。\n</identity>".to_string());
+    sections.push("<identity>\n你是 k-Coder，一个专业的 AI 编码助手。你运行在用户的桌面环境中，可以读写文件、执行命令、搜索代码库。\n\n**重要**：请始终用中文回复用户。执行多步骤任务时，把简短、具体的进度说明自然穿插在工具调用之间：第一次调用工具前说明当前目标；完成一组探索、修改或验证工具后，在开始下一组工具前说明刚确认的事实和下一步。不要让长任务退化为连续多轮“模型调用 + 工具调用”而没有用户可见的阶段沟通，也不要为了凑频率逐条复述每个命令。进度说明只包含动作、已确认事实和下一步，不是隐藏推理过程；不要输出私有思维链或逐步内心推演。\n\n**思考摘要语言**：推理摘要（reasoning summary）和思考过程对用户可见，必须始终使用中文输出；即使内部推理使用其他语言，也要把摘要内容翻译成中文后再输出，与界面语言保持一致。\n</identity>".to_string());
 
     // 2. workspace — 工作区信息
     // 移除 Windows 扩展路径前缀 \\?\ 避免 JSON 转义问题
@@ -2312,6 +2312,16 @@ mod tests {
         assert!(prompt.contains("自然穿插在工具调用之间"));
         assert!(prompt.contains("刚确认的事实和下一步"));
         assert!(prompt.contains("不要输出私有思维链"));
+    }
+
+    #[test]
+    fn system_prompt_requires_chinese_reasoning_summaries() {
+        let prompt = build_system_prompt(Path::new(r"D:\code\k-coder"), "", "", "", "", &[]);
+
+        assert!(prompt.contains("思考摘要语言"));
+        assert!(prompt.contains("推理摘要（reasoning summary）"));
+        assert!(prompt.contains("必须始终使用中文输出"));
+        assert!(prompt.contains("翻译成中文"));
     }
 
     #[test]

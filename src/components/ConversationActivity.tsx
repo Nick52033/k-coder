@@ -1,6 +1,5 @@
 import {
   Activity,
-  Brain,
   Check,
   ChevronDown,
   Circle,
@@ -12,9 +11,11 @@ import {
   Copy,
   FileText,
   ListChecks,
+  Lightbulb,
   LoaderCircle,
   RotateCcw,
   SquareTerminal,
+  Wrench,
 } from "lucide-react";
 import { lazy, memo, Suspense, useEffect, useRef, useState, type ReactNode } from "react";
 import type {
@@ -98,7 +99,9 @@ export const ConversationTurnActivity = memo(function ConversationTurnActivity({
       ? Circle
       : terminalEvent?.kind === "turn_failed"
         ? CircleX
-        : Activity;
+        : terminalEvent?.kind === "turn_completed"
+          ? CircleCheck
+          : Activity;
   const terminalMeta = [
     toolCount ? `${toolCount} 个操作` : null,
     terminalEvent?.durationMs !== undefined ? `耗时 ${formatDuration(terminalEvent.durationMs)}` : null,
@@ -469,7 +472,7 @@ function ReasoningGroup({
   return (
     <details className="turn-disclosure turn-reasoning" open={activeTurn && !complete ? true : undefined}>
       <summary>
-        <Brain size={15} aria-hidden="true" />
+        <Lightbulb size={15} aria-hidden="true" />
         <span className="turn-disclosure-title">思考摘要</span>
         <span className="turn-disclosure-status">{status}</span>
         <ChevronDown className="turn-disclosure-chevron" size={15} aria-hidden="true" />
@@ -509,7 +512,7 @@ function ToolActivityGroup({ activities }: { activities: ToolActivity[] }) {
       ? Circle
       : state === "running"
         ? LoaderCircle
-        : allCommands ? SquareTerminal : Activity;
+        : allCommands ? SquareTerminal : Wrench;
   const active = state === "running" || state === "pending";
   return (
     <details className={`turn-disclosure turn-tool-group turn-tool-group--${state}`} open={active || undefined}>

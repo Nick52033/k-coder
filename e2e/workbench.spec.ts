@@ -467,6 +467,7 @@ test("supports the primary workbench inspection flow", async ({ page }, testInfo
   await expect(page.getByRole("heading", { name: "Phase 6 workbench" })).toBeVisible();
   await expect(page.getByText("检查完成。", { exact: true })).toBeVisible();
   await expect(page.getByText("执行了 1.8s", { exact: true })).toBeVisible();
+  await expect(page.locator(".turn-execution > summary > svg.lucide-circle-check")).toHaveCount(1);
   await expect(page.locator(".conversation-header").getByText("1280 tokens", { exact: true })).toHaveCount(0);
   await expect(page.getByText("我先检查相关文件并修改实现。", { exact: true })).toBeHidden();
   await page.screenshot({ path: testInfo.outputPath("collapsed-turn.png"), fullPage: true });
@@ -479,8 +480,20 @@ test("supports the primary workbench inspection flow", async ({ page }, testInfo
   await page.locator(".turn-plan > summary").click();
   await expect(page.locator(".turn-plan").getByText("检查工作区", { exact: true })).toBeVisible();
   await expect(page.getByText("我先检查相关文件并修改实现。", { exact: true })).toBeVisible();
+  const inkColor = await page.evaluate(() => {
+    const probe = document.createElement("span");
+    probe.style.color = "var(--color-ink)";
+    document.body.append(probe);
+    const color = getComputedStyle(probe).color;
+    probe.remove();
+    return color;
+  });
   const inspectionGroup = page.locator(".turn-tool-group").filter({ hasText: "执行了多个操作" });
   await expect(inspectionGroup).toBeVisible();
+  const inspectionIcon = inspectionGroup.locator(":scope > summary > svg.lucide-wrench");
+  await expect(inspectionIcon).toHaveCount(1);
+  await expect(inspectionIcon).toHaveCSS("color", inkColor);
+  await inspectionGroup.locator(":scope > summary").screenshot({ path: testInfo.outputPath("operation-group-icon.png") });
   await expect(page.locator(".turn-timeline-tool").getByText("应用补丁 src/App.css", { exact: true })).toBeHidden();
   await inspectionGroup.locator(":scope > summary").click();
   await expect(page.locator(".turn-timeline-tool").getByText("应用补丁 src/App.css", { exact: true })).toBeVisible();
@@ -499,6 +512,9 @@ test("supports the primary workbench inspection flow", async ({ page }, testInfo
   await expect(page.getByText("修改完成，接着运行验证。", { exact: true })).toBeVisible();
   const commandGroup = page.locator(".turn-tool-group").filter({ hasText: "运行了命令" }).first();
   await expect(commandGroup).toBeVisible();
+  const commandIcon = commandGroup.locator(":scope > summary > svg.lucide-square-terminal");
+  await expect(commandIcon).toHaveCount(1);
+  await expect(commandIcon).toHaveCSS("color", inkColor);
   await expect(page.locator(".turn-timeline-tool").getByText("执行 pnpm build", { exact: true })).toBeHidden();
   await commandGroup.locator(":scope > summary").click();
   await expect(page.locator(".turn-timeline-tool").getByText("执行 pnpm build", { exact: true })).toBeVisible();
@@ -746,6 +762,7 @@ test("streams thinking, safe reasoning summaries, command output, and file diffs
 
   const reasoning = page.locator(".turn-reasoning").last();
   await expect(page.getByText("思考摘要", { exact: true })).toHaveCount(1);
+  await expect(reasoning.locator(":scope > summary > svg.lucide-lightbulb")).toHaveCount(1);
   await expect(page.getByText("思考内容", { exact: true })).toHaveCount(0);
   await expect(reasoning.locator(".turn-reasoning-segment")).toHaveCount(1);
   await expect(reasoning.getByText("已完成", { exact: true })).toBeVisible();
