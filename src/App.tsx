@@ -56,9 +56,11 @@ import { ImagePreviewDialog } from "./components/ImagePreviewDialog";
 import { cn } from "./lib/cn";
 import { open } from "@tauri-apps/plugin-dialog";
 import { readFile } from "@tauri-apps/plugin-fs";
-import type { AttachmentContent, FileEntry, GoalView, ImageAttachment, RuntimeStatus } from "./types/runtime";
+import type { AttachmentContent, FileEntry, GoalView, ImageAttachment, ProjectRecord, RuntimeStatus, WorkspaceState } from "./types/runtime";
 import { ComposerSuggestionMenu, type ComposerSuggestion } from "./components/ComposerSuggestionMenu";
+import { ProjectSelector } from "./components/ProjectSelector";
 import { findComposerTrigger, type ComposerTrigger } from "./lib/composerTrigger";
+import { workspacePathKey, workspacePathsEqual } from "./lib/path";
 import "./App.css";
 import "./enhanced-animations.css"; // UI 增强动画
 import "./components/ModeSelector.css";
@@ -79,6 +81,7 @@ type ThemeMode = "light" | "dark";
 
 const STORAGE_THEME = "kcoder_theme";
 const THREAD_PROJECT_KEY = "kcoder_thread_project_map";
+const KNOWN_PROJECTS_KEY = "kcoder_known_projects";
 const appWindow = getCurrentWindow();
 
 function readThreadProjectMap(): Record<string, string> {
@@ -99,16 +102,28 @@ function readStored<T>(key: string, fallback: T): T {
   }
 }
 
-function workspacePathsEqual(left: string, right: string): boolean {
-  const normalize = (value: string) => value
-    .replace(/^\\\\\?\\/, "")
-    .replace(/\\/g, "/")
-    .replace(/\/$/, "");
-  const normalizedLeft = normalize(left);
-  const normalizedRight = normalize(right);
-  return navigator.userAgent.includes("Windows")
-    ? normalizedLeft.toLowerCase() === normalizedRight.toLowerCase()
-    : normalizedLeft === normalizedRight;
+function workspaceProjects(state: WorkspaceState): ProjectRecord[] {
+  const projects = new Map<string, ProjectRecord>();
+  for (const project of [state.current, ...state.recent]) {
+    const key = workspacePathKey(project.path);
+    if (!projects.has(key)) projects.set(key, project);
+  }
+  return [...projects.values()];
+}
+
+function readKnownProjectPaths(): string[] {
+  try {
+    const raw = localStorage.getItem(KNOWN_PROJECTS_KEY);
+    return raw ? (JSON.parse(raw) as string[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+function mergeWorkspacePaths(current: string[], additions: string[]): string[] {
+  const paths = new Map(current.map((path) => [workspacePathKey(path), path]));
+  for (const path of additions) paths.set(workspacePathKey(path), path);
+  return [...paths.values()];
 }
 
 function toReadableError(reason: unknown): string {
@@ -147,9 +162,11 @@ function App() {
   const [subagentThreadIds, setSubagentThreadIds] = useState<Set<string>>(new Set());
   const [sideView, setSideView] = useState<"conversations" | "projects">("conversations");
   const [workspacePath, setWorkspacePath] = useState("");
+  const [recentProjects, setRecentProjects] = useState<ProjectRecord[]>([]);
   const [workspaceSwitching, setWorkspaceSwitching] = useState(false);
   const [workspaceError, setWorkspaceError] = useState("");
   const [threadProjectMap, setThreadProjectMap] = useState<Record<string, string>>(() => readThreadProjectMap());
+  const [knownProjectPaths, setKnownProjectPaths] = useState<string[]>(() => readKnownProjectPaths());
   const [expandedProjects, setExpandedProjects] = useState<Set<string>>(new Set());
   const [projectMenuOpen, setProjectMenuOpen] = useState<string | null>(null);
   const [pinnedProjects, setPinnedProjects] = useState<Set<string>>(() => {
@@ -173,6 +190,7 @@ function App() {
     messages,
     lastTurn,
     activeTurns,
+    restoredActiveTurns,
     cancellingTurns,
     usage,
     turnTimeline,
@@ -229,8 +247,8 @@ function App() {
   );
   const currentThreadQueue = messageQueue.filter((message) => message.threadId === activeThreadId);
   const pendingQueueCount = currentThreadQueue.filter((message) => message.status === "pending").length;
-  // 普通会话列表只展示未绑定到项目的会话；绑定到项目的会话只出现在"项目"tab。
-  const standaloneThreads = threads.filter((thread) => !threadProjectMap[thread.id]);
+  // 普通会话列表只展示未绑定到项目的会话；持久化绑定优先于旧的本地展示映射。
+  const standaloneThreads = threads.filter((thread) => !(thread.workspacePath ?? threadProjectMap[thread.id]));
 
   useEffect(() => {
     let disposed = false;
@@ -252,7 +270,10 @@ function App() {
         }
         await initialize();
         const workspace = await getWorkspaceState();
-        if (!disposed) setWorkspacePath(workspace.current.path);
+        if (!disposed) {
+          setWorkspacePath(workspace.current.path);
+          setRecentProjects(workspaceProjects(workspace));
+        }
 
         // Fetch all subagents to mark their threads
         const subagents = await listSubagents();
@@ -359,11 +380,16 @@ function App() {
     try { localStorage.setItem(THREAD_PROJECT_KEY, JSON.stringify(map)); } catch { /* noop */ }
   };
 
+  useEffect(() => {
+    try { localStorage.setItem(KNOWN_PROJECTS_KEY, JSON.stringify(knownProjectPaths)); } catch { /* noop */ }
+  }, [knownProjectPaths]);
+
   const ensureProjectWorkspace = async (projectPath: string) => {
     workspaceOperationCountRef.current += 1;
     setWorkspaceSwitching(true);
     try {
       const state = await getWorkspaceState();
+      setRecentProjects(workspaceProjects(state));
       if (workspacePathsEqual(state.current.path, projectPath)) {
         setWorkspacePath(state.current.path);
         setWorkspaceError("");
@@ -371,6 +397,10 @@ function App() {
       }
       const project = await switchWorkspace(projectPath, true);
       setWorkspacePath(project.path);
+      setRecentProjects((projects) => [
+        project,
+        ...projects.filter((item) => !workspacePathsEqual(item.path, project.path)),
+      ]);
       setWorkspaceRevision((value) => value + 1);
       setWorkspaceError("");
       return project.path;
@@ -385,7 +415,7 @@ function App() {
   };
 
   const selectSessionThread = async (thread: (typeof threads)[number]) => {
-    const targetWorkspace = threadProjectMap[thread.id] ?? thread.workspacePath;
+    const targetWorkspace = thread.workspacePath ?? threadProjectMap[thread.id];
     try {
       if (targetWorkspace) await ensureProjectWorkspace(targetWorkspace);
       await selectThread(thread.id);
@@ -428,17 +458,34 @@ function App() {
         : `信任并打开 ${paths.length} 个工作区？\n\n${paths.join("\n")}\n\n信任后，智能体可以读取文件并在审批后修改内容。第一个项目会作为活动工作区，其余仅注册到项目列表（其下尚无会话，会在创建首个会话后显示）。`;
       const trusted = window.confirm(summary);
       if (!trusted) return;
-      await switchWorkspace(paths[0], true);
-      setWorkspacePath(paths[0]);
-      const knownRaw = localStorage.getItem("kcoder_known_projects");
-      const known = knownRaw ? (JSON.parse(knownRaw) as string[]) : [];
-      const merged = Array.from(new Set([...known, ...paths]));
-      localStorage.setItem("kcoder_known_projects", JSON.stringify(merged));
+      const project = await switchWorkspace(paths[0], true);
+      setWorkspacePath(project.path);
+      setRecentProjects((projects) => [
+        project,
+        ...projects.filter((item) => !workspacePathsEqual(item.path, project.path)),
+      ]);
+      setKnownProjectPaths((current) => mergeWorkspacePaths(current, paths));
       setThreadProjectMap(readThreadProjectMap());
       setWorkspaceRevision((value) => value + 1);
       void initialize();
     } catch (err) {
       console.error("切换工作区失败:", err);
+    }
+  };
+
+  const pickProjectForComposer = async () => {
+    try {
+      const selected = await open({ directory: true, multiple: false, title: "选择项目工作区" });
+      const projectPath = typeof selected === "string" ? selected : selected?.[0];
+      if (!projectPath) return;
+      const trusted = window.confirm(
+        `信任并在此项目中新建会话？\n\n${projectPath}\n\n信任后，智能体可以读取文件并在审批后修改内容。`,
+      );
+      if (!trusted) return;
+      setKnownProjectPaths((current) => mergeWorkspacePaths(current, [projectPath]));
+      await createSessionUnderProject(projectPath);
+    } catch (reason) {
+      setWorkspaceError(`无法打开项目：${toReadableError(reason)}`);
     }
   };
 
@@ -563,41 +610,6 @@ function App() {
     });
   };
 
-  const getProjectsWithThreads = () => {
-    const projects = new Map<string, { name: string; threads: typeof threads; updatedAtMs: number }>();
-    // 只把显式归到某个项目的会话算作"项目内"会话；没有归类的会话不出现在"项目"tab。
-    for (const thread of threads) {
-      const projectPath = threadProjectMap[thread.id];
-      if (!projectPath) continue;
-      if (!projects.has(projectPath)) {
-        const name = projectPath.split(/[/\\]/).filter(Boolean).pop() || projectPath;
-        projects.set(projectPath, { name, threads: [], updatedAtMs: 0 });
-      }
-      const entry = projects.get(projectPath)!;
-      entry.threads.push(thread);
-      entry.updatedAtMs = Math.max(entry.updatedAtMs, thread.updatedAtMs);
-    }
-    // 合并"已添加但暂无会话"的项目（多选添加但还未创建会话的项目）。
-    // 读一次 localStorage 避免重复 IO。
-    try {
-      const knownRaw = localStorage.getItem("kcoder_known_projects");
-      const known = knownRaw ? (JSON.parse(knownRaw) as string[]) : [];
-      for (const projectPath of known) {
-        if (projects.has(projectPath)) continue;
-        const name = projectPath.split(/[/\\]/).filter(Boolean).pop() || projectPath;
-        projects.set(projectPath, { name, threads: [], updatedAtMs: 0 });
-      }
-    } catch { /* noop */ }
-    return Array.from(projects.entries())
-      .map(([path, data]) => ({ path, name: data.name, threads: data.threads, updatedAtMs: data.updatedAtMs }))
-      .sort((a, b) => {
-        const aPinned = pinnedProjects.has(a.path) ? 1 : 0;
-        const bPinned = pinnedProjects.has(b.path) ? 1 : 0;
-        if (aPinned !== bPinned) return bPinned - aPinned;
-        return b.updatedAtMs - a.updatedAtMs;
-      });
-  };
-
   const toggleTheme = () => {
     const next = themeMode === "light" ? "dark" : "light";
     setThemeModeState(next);
@@ -606,8 +618,91 @@ function App() {
 
   const activeThread = threads.find((thread) => thread.id === activeThreadId) ?? null;
   const activeThreadWorkspacePath = activeThread
-    ? threadProjectMap[activeThread.id] ?? activeThread.workspacePath
+    ? activeThread.workspacePath ?? threadProjectMap[activeThread.id]
     : null;
+  const effectiveWorkspacePath = activeThreadWorkspacePath ?? workspacePath;
+  const projectsWithThreads = useMemo(() => {
+    type ProjectGroup = {
+      key: string;
+      record: ProjectRecord;
+      threads: typeof threads;
+      updatedAtMs: number;
+    };
+
+    const registeredByPath = new Map(
+      recentProjects.map((project) => [workspacePathKey(project.path), project]),
+    );
+    const projects = new Map<string, ProjectGroup>();
+    const ensureProject = (projectPath: string) => {
+      const key = workspacePathKey(projectPath);
+      const existing = projects.get(key);
+      if (existing) return existing;
+      const registered = registeredByPath.get(key);
+      const path = registered?.path ?? projectPath;
+      const name = registered?.name
+        ?? projectPath.split(/[/\\]/).filter(Boolean).pop()
+        ?? projectPath;
+      const group: ProjectGroup = {
+        key,
+        record: registered ?? {
+          id: `workspace:${key}`,
+          name,
+          path,
+          trusted: true,
+          lastOpenedAtMs: 0,
+        },
+        threads: [],
+        updatedAtMs: 0,
+      };
+      projects.set(key, group);
+      return group;
+    };
+
+    // 持久化会话工作区是项目归属的首要事实；旧本地映射只服务尚未迁移的会话。
+    for (const thread of threads) {
+      const projectPath = thread.workspacePath ?? threadProjectMap[thread.id];
+      if (!projectPath) continue;
+      const project = ensureProject(projectPath);
+      project.threads.push(thread);
+      project.updatedAtMs = Math.max(project.updatedAtMs, thread.updatedAtMs);
+    }
+
+    // 已显式添加但尚无会话的项目继续保留在两处项目列表中。
+    for (const projectPath of knownProjectPaths) ensureProject(projectPath);
+
+    // 空白会话或首次启动时，当前工作区也必须同时出现在侧栏和输入区选择器中。
+    if (effectiveWorkspacePath) ensureProject(effectiveWorkspacePath);
+
+    const pinnedKeys = new Set([...pinnedProjects].map(workspacePathKey));
+    return [...projects.values()].sort((left, right) => {
+      const leftPinned = pinnedKeys.has(left.key) ? 1 : 0;
+      const rightPinned = pinnedKeys.has(right.key) ? 1 : 0;
+      if (leftPinned !== rightPinned) return rightPinned - leftPinned;
+      return right.updatedAtMs - left.updatedAtMs;
+    });
+  }, [effectiveWorkspacePath, knownProjectPaths, pinnedProjects, recentProjects, threadProjectMap, threads]);
+  const selectableProjects = useMemo(
+    () => projectsWithThreads.map((project) => project.record),
+    [projectsWithThreads],
+  );
+  const activeProject = useMemo<ProjectRecord | null>(() => {
+    if (!effectiveWorkspacePath) return null;
+    const registered = selectableProjects.find((project) => workspacePathsEqual(project.path, effectiveWorkspacePath));
+    if (registered) return registered;
+    const name = effectiveWorkspacePath.split(/[/\\]/).filter(Boolean).pop() || effectiveWorkspacePath;
+    return {
+      id: `workspace:${effectiveWorkspacePath}`,
+      name,
+      path: effectiveWorkspacePath,
+      trusted: true,
+      lastOpenedAtMs: 0,
+    };
+  }, [effectiveWorkspacePath, selectableProjects]);
+
+  const selectComposerProject = async (project: ProjectRecord) => {
+    if (activeProject && workspacePathsEqual(project.path, activeProject.path)) return;
+    await createSessionUnderProject(project.path);
+  };
   useEffect(() => {
     if (!activeThreadWorkspacePath) return;
     void ensureProjectWorkspace(activeThreadWorkspacePath).catch(() => undefined);
@@ -615,6 +710,9 @@ function App() {
   const selectedChange = changes.find((change) => change.id === selectedChangeId) ?? null;
   // 仅当正在生成的 turn 属于当前线程时才视为"忙"，避免旧线程的 turn 阻塞新对话
   const currentThreadTurnId = activeThreadId ? activeTurns[activeThreadId] ?? null : null;
+  const restoredCurrentTurnId = activeThreadId
+    ? restoredActiveTurns[activeThreadId] ?? null
+    : null;
   const currentThreadBusy = Boolean(currentThreadTurnId);
   const currentThreadCancelling = Boolean(
     activeThreadId
@@ -758,6 +856,7 @@ function App() {
             changes={changes}
             plan={turnId === planTurnId ? plan : null}
             streaming={turnId === currentThreadTurnId}
+            initialTextVisible={turnId === restoredCurrentTurnId}
             activityStatus={turnId === activityStatus?.turnId ? activityStatus.status : null}
             renderText={renderMessageText}
             onRetry={retryable && lastTurn?.turnId === turnId ? () => void retryLastTurn() : undefined}
@@ -829,6 +928,7 @@ function App() {
                   changes={changes}
                   plan={attemptPlan}
                   streaming={turnId === currentThreadTurnId}
+                  initialTextVisible={turnId === restoredCurrentTurnId}
                   activityStatus={attemptActivityStatus}
                   finalMessageId={assistantMessage?.id}
                   renderText={renderMessageText}
@@ -1295,8 +1395,7 @@ function App() {
           ) : (
             <nav className="thread-list" aria-label="项目列表">
               {(() => {
-                const projects = getProjectsWithThreads();
-                if (!projects.length) {
+                if (!projectsWithThreads.length) {
                   return (
                     <div className="thread-empty">
                       <Folder size={16} />
@@ -1304,28 +1403,37 @@ function App() {
                     </div>
                   );
                 }
-                return projects.map((project) => {
-                  const isExpanded = expandedProjects.has(project.path);
+                return projectsWithThreads.map((project) => {
+                  const projectPath = project.record.path;
+                  const isExpanded = expandedProjects.has(projectPath);
+                  const isActiveProject = activeProject
+                    ? workspacePathsEqual(projectPath, activeProject.path)
+                    : false;
                   return (
-                    <div className="project-group" key={project.path}>
-                      <div className={cn("project-group-header", isExpanded && "project-group-header--expanded")}>
+                    <div className="project-group" key={project.key}>
+                      <div className={cn(
+                        "project-group-header",
+                        isExpanded && "project-group-header--expanded",
+                        isActiveProject && "project-group-header--active",
+                      )}>
                         <button
                           type="button"
                           className="project-group-toggle"
                           aria-label={isExpanded ? "折叠项目" : "展开项目"}
                           aria-expanded={isExpanded}
+                          aria-current={isActiveProject ? "page" : undefined}
                           onClick={() => {
                             setExpandedProjects((prev) => {
                               const next = new Set(prev);
-                              if (next.has(project.path)) next.delete(project.path);
-                              else next.add(project.path);
+                              if (next.has(projectPath)) next.delete(projectPath);
+                              else next.add(projectPath);
                               return next;
                             });
                           }}
                         >
                           <ChevronRight size={13} className={cn("project-group-chevron", isExpanded && "is-expanded")} />
                           <Folder size={15} />
-                          <span className="project-group-name">{project.name}</span>
+                          <span className="project-group-name">{project.record.name}</span>
                         </button>
                         <span className="project-group-count">{project.threads.length}</span>
                         <span className="project-group-actions">
@@ -1336,7 +1444,7 @@ function App() {
                             aria-label="在项目中新建会话"
                             onClick={async (event) => {
                               event.stopPropagation();
-                              await createSessionUnderProject(project.path);
+                              await createSessionUnderProject(projectPath);
                             }}
                           >
                             <Plus size={13} />
@@ -1349,21 +1457,21 @@ function App() {
                               aria-label="更多操作"
                               onClick={(event) => {
                                 event.stopPropagation();
-                                setProjectMenuOpen(projectMenuOpen === project.path ? null : project.path);
+                                setProjectMenuOpen(projectMenuOpen === projectPath ? null : projectPath);
                               }}
                             >
                               <MoreHorizontal size={13} />
                             </button>
-                            {projectMenuOpen === project.path && (
+                            {projectMenuOpen === projectPath && (
                               <div className="project-group-menu">
                                 <button
                                   type="button"
                                   onClick={() => {
-                                    togglePinProject(project.path);
+                                    togglePinProject(projectPath);
                                     setProjectMenuOpen(null);
                                   }}
                                 >
-                                  {pinnedProjects.has(project.path) ? (
+                                  {pinnedProjects.has(projectPath) ? (
                                     <><PinOff size={13} /><span>取消置顶</span></>
                                   ) : (
                                     <><Pin size={13} /><span>置顶</span></>
@@ -1371,29 +1479,26 @@ function App() {
                                 </button>
                                 <button
                                   type="button"
+                                  disabled={project.threads.length > 0}
+                                  title={project.threads.length > 0 ? "项目包含会话，无法移除" : "从项目列表移除"}
                                   onClick={() => {
-                                    if (window.confirm(`确定从项目列表中删除"${project.name}"？\n\n该操作不会删除项目内的会话。`)) {
+                                    if (window.confirm(`确定从项目列表中删除"${project.record.name}"？\n\n该操作不会删除项目内的会话。`)) {
                                       const map = readThreadProjectMap();
                                       let changed = false;
                                       for (const id of Object.keys(map)) {
-                                        if (map[id] === project.path) { delete map[id]; changed = true; }
+                                        if (workspacePathsEqual(map[id], projectPath)) { delete map[id]; changed = true; }
                                       }
                                       if (changed) {
                                         setThreadProjectMap(map);
                                         saveThreadProjectMap(map);
                                       }
                                       // 同时从 known 列表移除空项目
-                                      try {
-                                        const knownRaw = localStorage.getItem("kcoder_known_projects");
-                                        const known = knownRaw ? (JSON.parse(knownRaw) as string[]) : [];
-                                        const filtered = known.filter((p) => p !== project.path);
-                                        if (filtered.length !== known.length) {
-                                          localStorage.setItem("kcoder_known_projects", JSON.stringify(filtered));
-                                        }
-                                      } catch { /* noop */ }
+                                      setKnownProjectPaths((current) => current.filter(
+                                        (path) => !workspacePathsEqual(path, projectPath),
+                                      ));
                                       setExpandedProjects((prev) => {
                                         const next = new Set(prev);
-                                        next.delete(project.path);
+                                        next.delete(projectPath);
                                         return next;
                                       });
                                     }
@@ -1561,6 +1666,7 @@ function App() {
                           changes={changes}
                           plan={messagePlan}
                           streaming={message.status === "streaming"}
+                          initialTextVisible={message.turnId === restoredCurrentTurnId}
                           activityStatus={messageActivityStatus}
                           finalMessageId={message.id}
                           renderText={renderMessageText}
@@ -1826,6 +1932,14 @@ function App() {
             />
           )}
           <div className="composer-footer">
+            <ProjectSelector
+              projects={selectableProjects}
+              activeProject={activeProject}
+              disabled={anyTurnBusy}
+              switching={workspaceSwitching}
+              onSelect={selectComposerProject}
+              onCreateProject={pickProjectForComposer}
+            />
             <button
               type="button"
               className="composer-pick-image"

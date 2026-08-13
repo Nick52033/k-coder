@@ -5,7 +5,7 @@ test.beforeEach(async ({ page }) => {
     const callbacks = new Map<number, (...args: unknown[]) => void>();
     let callbackId = 1;
     let agentEventCallbackId: number | null = null;
-    const thread = { schemaVersion: 1, id: "thread-1", title: "Phase 6 workbench", createdAtMs: 1, updatedAtMs: 2, archived: false };
+    const thread = { schemaVersion: 1, id: "thread-1", title: "Phase 6 workbench", createdAtMs: 1, updatedAtMs: 2, archived: false, workspacePath: "D:\\code\\k-coder" };
     const secondThread = { schemaVersion: 1, id: "thread-2", title: "Parallel conversation", createdAtMs: 3, updatedAtMs: 3, archived: false };
     const openAiProvider = { schemaVersion: 1, id: "openai", kind: "open_ai_compatible", transport: "open_ai_chat_completions", name: "OpenAI", baseUrl: "https://api.openai.com/v1", model: "gpt-4.1", models: [{ id: "gpt-4.1", displayName: "GPT-4.1", contextWindow: 128000, fallback: false }, { id: "gpt-4o", displayName: "GPT-4 Omni", contextWindow: 64000, fallback: false }], endpoints: [], hasApiKey: true };
     const ziccProvider = { schemaVersion: 1, id: "zicc", kind: "open_ai_compatible", transport: "open_ai_responses", name: "zicc", baseUrl: "https://zicc.example.com/v1", model: "gpt-5.6-terra", models: [{ id: "gpt-5.6-terra", displayName: "gpt-5.6-terra", contextWindow: 128000, fallback: false }, { id: "gpt-5.5", displayName: "gpt-5.5", contextWindow: 128000, fallback: false }], endpoints: [], hasApiKey: true };
@@ -13,7 +13,13 @@ test.beforeEach(async ({ page }) => {
     let providerCatalog: { schemaVersion: number; activeProviderId: string | null; providers: Array<typeof openAiProvider> } = { schemaVersion: 1, activeProviderId: "openai", providers: [openAiProvider, ziccProvider, pendingProvider] };
     let approvalMode: "ask" | "full_access" = "ask";
     let reasoningEffort: "off" | "minimal" | "low" | "medium" | "high" | "x_high" = "medium";
-    let workspaceState = { current: { id: "project-1", name: "k-coder", path: "D:\\code\\k-coder", trusted: true, lastOpenedAtMs: 2 }, recent: [] as Array<{ id: string; name: string; path: string; trusted: boolean; lastOpenedAtMs: number }> };
+    let workspaceState = {
+      current: { id: "project-1", name: "k-coder", path: "D:\\code\\k-coder", trusted: true, lastOpenedAtMs: 2 },
+      recent: [
+        { id: "project-1", name: "k-coder", path: "D:\\code\\k-coder", trusted: true, lastOpenedAtMs: 2 },
+        { id: "project-2", name: "paypro-platform-be", path: "D:\\code\\paypro-platform-be", trusted: true, lastOpenedAtMs: 1 },
+      ] as Array<{ id: string; name: string; path: string; trusted: boolean; lastOpenedAtMs: number }>,
+    };
     const runTurnCalls: unknown[] = [];
     let startedTurnCount = 0;
     const activeTurnIds = new Map<string, string>();
@@ -126,6 +132,7 @@ test.beforeEach(async ({ page }) => {
           }
           if (command === "workspace_state") {
             const forcedPath = localStorage.getItem("kcoder_e2e_workspace_path");
+            const forcedRecentProjects = localStorage.getItem("kcoder_e2e_recent_projects");
             if (forcedPath) {
               workspaceState = {
                 ...workspaceState,
@@ -134,6 +141,12 @@ test.beforeEach(async ({ page }) => {
                   name: forcedPath.split(/[/\\]/).filter(Boolean).pop() ?? forcedPath,
                   path: forcedPath,
                 },
+              };
+            }
+            if (forcedRecentProjects) {
+              workspaceState = {
+                ...workspaceState,
+                recent: JSON.parse(forcedRecentProjects),
               };
             }
             return workspaceState;
@@ -314,6 +327,8 @@ test.beforeEach(async ({ page }) => {
           if (command === "list_threads") {
             const configured = localStorage.getItem("kcoder_e2e_threads");
             if (configured) return JSON.parse(configured);
+            const forcedThreadWorkspacePath = localStorage.getItem("kcoder_e2e_thread_workspace_path");
+            if (forcedThreadWorkspacePath) return [{ ...thread, workspacePath: forcedThreadWorkspacePath }];
           }
           if (
             (command === "get_plan" || command === "get_goal")
@@ -340,6 +355,14 @@ test.beforeEach(async ({ page }) => {
             }
             const recovered = localStorage.getItem("kcoder_e2e_thread_detail");
             if (recovered) return JSON.parse(recovered);
+            const forcedThreadWorkspacePath = localStorage.getItem("kcoder_e2e_thread_workspace_path");
+            if (forcedThreadWorkspacePath) {
+              const detail = responses.read_thread as { summary: typeof thread };
+              return {
+                ...detail,
+                summary: { ...detail.summary, workspacePath: forcedThreadWorkspacePath },
+              };
+            }
           }
           if (command === "get_provider_config") {
             return providerCatalog.providers.find((provider) => provider.id === providerCatalog.activeProviderId) ?? null;
@@ -690,6 +713,125 @@ test("keeps messages, composer, and send action inside the conversation when the
   await expect.poll(() => composer.evaluate((element) => element.scrollWidth - element.clientWidth)).toBeLessThanOrEqual(1);
   await expect.poll(() => messageArea.evaluate((element) => element.scrollWidth - element.clientWidth)).toBeLessThanOrEqual(1);
   await page.screenshot({ path: testInfo.outputPath("workbench-composer-bounds.png"), fullPage: true });
+});
+
+test("selects the active workspace project from the composer", async ({ page }, testInfo) => {
+  await page.addInitScript(() => {
+    const currentPath = "\\\\?\\D:\\code\\k-coder";
+    // A stale presentation-only project group must not override the persisted thread workspace.
+    localStorage.setItem("kcoder_thread_project_map", JSON.stringify({ "thread-1": "D:\\code\\paypro-platform-be" }));
+    localStorage.setItem("kcoder_known_projects", JSON.stringify([
+      "\\\\?\\D:\\code\\paypro-platform-be",
+      "\\\\?\\UNC\\server\\share\\repo",
+    ]));
+    localStorage.setItem("kcoder_e2e_workspace_path", currentPath);
+    localStorage.setItem("kcoder_e2e_thread_workspace_path", currentPath);
+    localStorage.setItem("kcoder_e2e_recent_projects", JSON.stringify([
+      { id: "project-1", name: "k-coder", path: currentPath, trusted: true, lastOpenedAtMs: 3 },
+      { id: "project-2", name: "paypro-platform-be", path: "\\\\?\\D:\\code\\paypro-platform-be", trusted: true, lastOpenedAtMs: 2 },
+      { id: "project-3", name: "shared-repo", path: "\\\\?\\UNC\\server\\share\\repo", trusted: true, lastOpenedAtMs: 1 },
+    ]));
+  });
+  await page.goto("/");
+  const composer = page.locator(".composer");
+  const initialTrigger = composer.getByRole("button", { name: "当前项目 k-coder" });
+  await expect(initialTrigger).toBeVisible();
+  await expect(initialTrigger).toHaveAttribute("title", "D:\\code\\k-coder");
+  await expect(page.locator(".workspace-current")).toHaveAttribute("title", "D:\\code\\k-coder");
+
+  await initialTrigger.click();
+  const dialog = page.getByRole("dialog", { name: "选择项目" });
+  await expect(dialog).toBeVisible();
+  await expect(dialog.getByRole("option")).toHaveCount(3);
+  await expect(dialog.getByText("D:\\code\\k-coder", { exact: true })).toBeVisible();
+  await expect(dialog.getByText("\\\\server\\share\\repo", { exact: true })).toBeVisible();
+  expect(await dialog.textContent()).not.toContain("\\\\?\\");
+  const dialogBox = await dialog.boundingBox();
+  const viewport = page.viewportSize();
+  expect(dialogBox).not.toBeNull();
+  expect(dialogBox?.x ?? 0).toBeGreaterThanOrEqual(0);
+  expect((dialogBox?.x ?? 0) + (dialogBox?.width ?? 0)).toBeLessThanOrEqual(viewport?.width ?? 0);
+  expect(dialogBox?.y ?? 0).toBeGreaterThanOrEqual(0);
+  await page.screenshot({ path: testInfo.outputPath("composer-project-menu.png"), fullPage: true });
+  const search = dialog.getByRole("textbox", { name: "搜索项目" });
+  await search.fill("\\\\server\\share");
+  await expect(dialog.getByRole("option", { name: /shared-repo/ })).toBeVisible();
+  await search.fill("paypro");
+  const projectOption = dialog.getByRole("option", { name: /paypro-platform-be/ });
+  await expect(projectOption).toBeVisible();
+  await projectOption.click();
+
+  await expect(composer.getByRole("button", { name: "当前项目 paypro-platform-be" })).toBeVisible();
+  await expect.poll(() => page.evaluate(() =>
+    (window as unknown as { __invoked: string[] }).__invoked.filter((command) => command === "switch_workspace").length,
+  )).toBeGreaterThanOrEqual(1);
+  expect(await page.evaluate(() =>
+    (window as unknown as { __invocationArgs: Record<string, { path?: string }> }).__invocationArgs.switch_workspace?.path,
+  )).toBe("\\\\?\\D:\\code\\paypro-platform-be");
+  const calls = await page.evaluate(() => (window as unknown as { __invoked: string[] }).__invoked);
+  expect(calls.lastIndexOf("create_thread")).toBeGreaterThan(calls.lastIndexOf("switch_workspace"));
+  await expect.poll(() => composer.evaluate((element) => element.scrollWidth - element.clientWidth)).toBeLessThanOrEqual(1);
+  await page.screenshot({ path: testInfo.outputPath("composer-project-selector.png"), fullPage: true });
+});
+
+test("keeps the sidebar and composer project selection in sync", async ({ page }, testInfo) => {
+  await page.addInitScript(() => {
+    const currentPath = "D:\\code\\k-coder";
+    const codexPath = "D:\\code\\codex";
+    localStorage.setItem("kcoder_thread_project_map", JSON.stringify({ "thread-1": currentPath }));
+    localStorage.setItem("kcoder_known_projects", JSON.stringify([currentPath, codexPath]));
+    localStorage.setItem("kcoder_e2e_workspace_path", currentPath);
+    localStorage.setItem("kcoder_e2e_recent_projects", JSON.stringify([
+      { id: "project-1", name: "k-coder", path: currentPath, trusted: true, lastOpenedAtMs: 4 },
+      { id: "project-2", name: "codex", path: codexPath, trusted: true, lastOpenedAtMs: 3 },
+      { id: "project-3", name: "Nick", path: "D:\\code\\Nick", trusted: true, lastOpenedAtMs: 2 },
+      { id: "project-4", name: "src-tauri", path: "D:\\code\\Nick\\k-coder\\src-tauri", trusted: true, lastOpenedAtMs: 1 },
+    ]));
+  });
+  await page.goto("/");
+
+  const composer = page.locator(".composer");
+  const projectTrigger = composer.getByRole("button", { name: "当前项目 k-coder" });
+  await expect(projectTrigger).toBeVisible();
+  await projectTrigger.click();
+  const dialog = page.getByRole("dialog", { name: "选择项目" });
+  await expect(dialog.getByRole("option")).toHaveCount(2);
+  await expect(dialog.getByRole("option", { name: /k-coder/ })).toBeVisible();
+  const codexOption = dialog.getByRole("option", { name: /codex/ });
+  await expect(codexOption).toBeVisible();
+  await expect(dialog.getByText("Nick", { exact: true })).toHaveCount(0);
+  await expect(dialog.getByText("src-tauri", { exact: true })).toHaveCount(0);
+
+  if (testInfo.project.name !== "narrow") {
+    await page.keyboard.press("Escape");
+    await page.getByRole("tab", { name: "项目" }).click();
+    const projectList = page.getByRole("navigation", { name: "项目列表" });
+    await expect(projectList.locator(".project-group")).toHaveCount(2);
+    const kCoderGroup = projectList.locator(".project-group").filter({ hasText: "k-coder" });
+    await expect(kCoderGroup.locator(".project-group-toggle")).toHaveAttribute("aria-current", "page");
+    await kCoderGroup.getByRole("button", { name: "更多操作" }).click();
+    const removeBoundProject = kCoderGroup.getByRole("button", { name: "删除" });
+    await expect(removeBoundProject).toBeDisabled();
+    await expect(removeBoundProject).toHaveAttribute("title", "项目包含会话，无法移除");
+    await kCoderGroup.getByRole("button", { name: "更多操作" }).click();
+    await projectTrigger.click();
+  }
+
+  await page.getByRole("dialog", { name: "选择项目" }).getByRole("option", { name: /codex/ }).click();
+  await expect(composer.getByRole("button", { name: "当前项目 codex" })).toBeVisible();
+
+  if (testInfo.project.name !== "narrow") {
+    const projectList = page.getByRole("navigation", { name: "项目列表" });
+    const codexGroup = projectList.locator(".project-group").filter({ hasText: "codex" });
+    await expect(codexGroup.locator(".project-group-toggle")).toHaveAttribute("aria-current", "page");
+    const kCoderGroup = projectList.locator(".project-group").filter({ hasText: "k-coder" });
+    await kCoderGroup.getByRole("button", { name: "展开项目" }).click();
+    await kCoderGroup.getByText("Phase 6 workbench", { exact: true }).click();
+    await expect(composer.getByRole("button", { name: "当前项目 k-coder" })).toBeVisible();
+    await expect(kCoderGroup.locator(".project-group-toggle")).toHaveAttribute("aria-current", "page");
+  }
+
+  await page.screenshot({ path: testInfo.outputPath("linked-project-selection.png"), fullPage: true });
 });
 
 test("selects and persists the global reasoning effort", async ({ page }) => {
@@ -1194,6 +1336,130 @@ test("runs different conversations concurrently while keeping each conversation 
       .__runTurnCalls.map((call) => call.request.threadId)
   )).toEqual(["thread-1", "thread-2"]);
   await expect(page.locator(".message-queue")).toHaveCount(0);
+});
+
+test("restores an active conversation without replaying existing text or restarting its turn", async ({ page }) => {
+  const progressText = "已确认会话切换只影响展示状态，当前任务仍在后台继续执行。".repeat(24);
+  const laterDelta = "切回后收到的新进度仍然按照实时节奏继续展示。".repeat(12);
+  await page.emulateMedia({ reducedMotion: "no-preference" });
+  await page.addInitScript(({ progress }) => {
+    const firstThread = {
+      schemaVersion: 1,
+      id: "thread-1",
+      title: "Restored active turn",
+      createdAtMs: 1,
+      updatedAtMs: 2,
+      archived: false,
+    };
+    const secondThread = {
+      schemaVersion: 1,
+      id: "thread-2",
+      title: "Parallel conversation",
+      createdAtMs: 3,
+      updatedAtMs: 3,
+      archived: false,
+    };
+    const emptyDetail = {
+      schemaVersion: 1,
+      summary: secondThread,
+      messages: [],
+      messageTurnIds: {},
+      turnUserMessageIds: {},
+      lastTurn: null,
+      toolActivities: [],
+      turnTimeline: [],
+      approvals: [],
+      userInputs: [],
+      changes: [],
+      todos: [],
+      lastUsage: null,
+    };
+    localStorage.setItem("kcoder_e2e_threads", JSON.stringify([firstThread, secondThread]));
+    localStorage.setItem("kcoder_e2e_empty_thread_id", secondThread.id);
+    localStorage.setItem("kcoder_e2e_thread_detail_by_id", JSON.stringify({
+      [firstThread.id]: {
+        ...emptyDetail,
+        summary: firstThread,
+        messages: [{
+          schemaVersion: 1,
+          id: "switch-user",
+          role: "user",
+          content: [{ type: "text", text: "检查会话切换" }],
+          createdAtMs: 1,
+        }],
+      },
+      [secondThread.id]: emptyDetail,
+    }));
+    localStorage.setItem("kcoder_e2e_switch_progress", progress);
+  }, { progress: progressText });
+
+  await page.goto("/");
+  await page.evaluate((progress) => {
+    const emit = (window as unknown as { __emitAgentEvent: (event: unknown) => void }).__emitAgentEvent;
+    const base = { schemaVersion: 4, threadId: "thread-1", turnId: "turn-switch-active" };
+    emit({ ...base, type: "turn_started", phase: "exploring" });
+    emit({
+      ...base,
+      type: "text_delta",
+      phase: "responding",
+      itemId: "switch-progress",
+      delta: progress,
+    });
+  }, progressText);
+  await expect(page.getByText(progressText, { exact: true })).toBeVisible({ timeout: 10_000 });
+
+  await page.evaluate((progress) => {
+    const details = JSON.parse(localStorage.getItem("kcoder_e2e_thread_detail_by_id") ?? "{}") as Record<string, Record<string, unknown>>;
+    details["thread-1"] = {
+      ...details["thread-1"],
+      messageTurnIds: {},
+      turnUserMessageIds: { "turn-switch-active": "switch-user" },
+      lastTurn: { turnId: "turn-switch-active", state: "streaming", error: null },
+      turnTimeline: [{
+        type: "text",
+        id: "switch-progress",
+        turnId: "turn-switch-active",
+        text: progress,
+      }],
+    };
+    localStorage.setItem("kcoder_e2e_thread_detail_by_id", JSON.stringify(details));
+  }, progressText);
+
+  await page.locator(".thread-item-main").filter({ hasText: "Parallel conversation" })
+    .evaluate((element) => (element as HTMLButtonElement).click());
+  await expect(page.getByRole("heading", { name: "Parallel conversation", exact: true })).toBeVisible();
+
+  await page.locator(".sidebar-segmented [role='tab']").nth(1)
+    .evaluate((element) => (element as HTMLButtonElement).click());
+  const projectToggle = page.locator(".project-group-toggle").first();
+  await projectToggle.evaluate((element) => (element as HTMLButtonElement).click());
+  await page.locator(".thread-item--child .thread-item-main").filter({ hasText: "Restored active turn" })
+    .evaluate((element) => (element as HTMLButtonElement).click());
+  await expect(page.getByRole("heading", { name: "Restored active turn", exact: true })).toBeVisible();
+
+  const progress = page.locator(".turn-progress-text").last();
+  expect(await progress.textContent()).toBe(progressText);
+  expect(await page.evaluate(() => (
+    window as unknown as { __runTurnCalls: unknown[] }
+  ).__runTurnCalls)).toHaveLength(0);
+
+  await page.evaluate((delta) => {
+    (window as unknown as { __emitAgentEvent: (event: unknown) => void }).__emitAgentEvent({
+      schemaVersion: 4,
+      threadId: "thread-1",
+      turnId: "turn-switch-active",
+      type: "text_delta",
+      phase: "responding",
+      itemId: "switch-progress",
+      delta,
+    });
+  }, laterDelta);
+  const completeText = progressText + laterDelta;
+  expect(await progress.textContent()).not.toBe(completeText);
+  await expect(page.getByText(completeText, { exact: true })).toBeVisible({ timeout: 10_000 });
+  expect(await page.evaluate(() => (
+    window as unknown as { __invoked: string[] }
+  ).__invoked.filter((command) => command === "turn_start" || command === "turn_retry"))).toHaveLength(0);
 });
 
 test("sends images without frontend OCR and opens the conversation preview", async ({ page }, testInfo) => {

@@ -97,6 +97,7 @@ interface WorkbenchState {
   activeTurnId: string | null;
   activeTurnThreadId: string | null;
   activeTurns: Record<string, string>;
+  restoredActiveTurns: Record<string, string>;
   cancellingTurns: Record<string, string>;
   mailboxRevisions: Record<string, number>;
   messageQueue: QueuedMessage[];
@@ -386,6 +387,7 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
   activeTurnId: null,
   activeTurnThreadId: null,
   activeTurns: {},
+  restoredActiveTurns: {},
   cancellingTurns: {},
   mailboxRevisions: {},
   messageQueue: [],
@@ -551,6 +553,9 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
       const activeTurns = restoredActiveTurnId
         ? { ...get().activeTurns, [threadId]: restoredActiveTurnId }
         : withoutActiveTurn(get().activeTurns, threadId);
+      const restoredActiveTurns = restoredActiveTurnId
+        ? { ...get().restoredActiveTurns, [threadId]: restoredActiveTurnId }
+        : withoutActiveTurn(get().restoredActiveTurns, threadId);
       const cancellingTurns = restoredActiveTurnId
         && get().cancellingTurns[threadId] === restoredActiveTurnId
           ? get().cancellingTurns
@@ -599,6 +604,7 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
         plan,
         goal,
         activeTurns,
+        restoredActiveTurns,
         cancellingTurns,
         mailboxRevisions: {
           ...get().mailboxRevisions,
@@ -969,6 +975,11 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
       terminalTurnIds.delete(event.turnId);
     } else if (terminalEvent) {
       rememberTerminalTurn(event.turnId);
+    }
+    if (event.type === "turn_started" || terminalEvent) {
+      set((state) => ({
+        restoredActiveTurns: withoutActiveTurn(state.restoredActiveTurns, event.threadId),
+      }));
     }
     const lifecyclePatch = reduceTurnLifecycle(event, {
       activeTurns: get().activeTurns,

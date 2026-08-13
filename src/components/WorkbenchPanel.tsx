@@ -8,6 +8,7 @@ import {
 } from "lucide-react";
 import "./WorkbenchPanel.css";
 import { MarkdownContent } from "./MarkdownContent";
+import { toUserFacingPath } from "../lib/path";
 import {
   extractAttachment, getGitBranches, getGitDiff, getGitStatus, getWorkspaceState,
   listWorkspaceDirectory, openWorkspaceFile, previewWorkspaceFile, revealWorkspaceFile,
@@ -55,11 +56,11 @@ export function WorkspacePicker({ onChanged, compact = false }: { onChanged: () 
 
   return (
     <div className={`workspace-picker${compact ? " workspace-picker--compact" : ""}`}>
-      <button className="workspace-current" type="button" onClick={() => setExpanded(!expanded)} aria-expanded={expanded} title={state?.current.path ?? "工作区路径"}>
+      <button className="workspace-current" type="button" onClick={() => setExpanded(!expanded)} aria-expanded={expanded} title={state?.current.path ? toUserFacingPath(state.current.path) : "工作区路径"}>
         <span className="workspace-glyph"><FolderOpen size={compact ? 13 : 15} /></span>
         <span className="workspace-info">
           <strong>{state?.current.name ?? "工作区"}</strong>
-          {!compact && state?.current.path && <small>{state.current.path.replace(/^\\\\\?\\/, '').replace(/\\/g, '/')}</small>}
+          {!compact && state?.current.path && <small>{toUserFacingPath(state.current.path)}</small>}
         </span>
         <ChevronDown size={compact ? 12 : 14} />
       </button>
@@ -68,7 +69,7 @@ export function WorkspacePicker({ onChanged, compact = false }: { onChanged: () 
           <div className="workspace-menu-label">最近项目</div>
           {state?.recent.slice(0, 6).map((project) => (
             <button type="button" key={project.id} onClick={() => void select(project)}>
-              <Folder size={14} /><span><strong>{project.name}</strong><small>{project.path.replace(/^\\\\\?\\/, '').replace(/\\/g, '/')}</small></span>
+              <Folder size={14} /><span><strong>{project.name}</strong><small>{toUserFacingPath(project.path)}</small></span>
               {project.id === state.current.id && <CircleCheck size={14} />}
             </button>
           ))}

@@ -47,6 +47,7 @@ export const ConversationTurnActivity = memo(function ConversationTurnActivity({
   changes = [],
   plan,
   streaming = false,
+  initialTextVisible = false,
   activityStatus = null,
   finalMessageId,
   renderText,
@@ -57,12 +58,13 @@ export const ConversationTurnActivity = memo(function ConversationTurnActivity({
   changes?: ChangeSet[];
   plan: PlanView | null;
   streaming?: boolean;
+  initialTextVisible?: boolean;
   activityStatus?: AgentActivityStatus | null;
   finalMessageId?: string;
   renderText?: (text: string) => ReactNode;
   onRetry?: () => void;
 }) {
-  const paced = usePacedTimeline(timeline, streaming);
+  const paced = usePacedTimeline(timeline, streaming, initialTextVisible);
   const visuallyStreaming = streaming || paced.settling;
   const visibleTimeline = visuallyStreaming && !streaming
     ? paced.timeline.filter((item) => item.type !== "event" || !isTerminalEvent(item.kind))
@@ -324,14 +326,20 @@ interface PacedTimeline {
   pendingTextIds: Set<string>;
 }
 
-function usePacedTimeline(timeline: TurnTimelineItem[], streaming: boolean): PacedTimeline {
+function usePacedTimeline(
+  timeline: TurnTimelineItem[],
+  streaming: boolean,
+  initialTextVisible: boolean,
+): PacedTimeline {
   const targets = collectTextTargets(timeline);
   const targetSignature = targets.map((target) => `${target.key}:${target.id}:${target.text.length}:${target.text.slice(-32)}`).join("\u0000");
   const wasStreaming = useRef(streaming);
   if (streaming) wasStreaming.current = true;
 
   const [displayed, setDisplayed] = useState<Record<string, string>>(() => {
-    if (streaming) return Object.fromEntries(targets.map((target) => [target.key, ""]));
+    if (streaming && !initialTextVisible) {
+      return Object.fromEntries(targets.map((target) => [target.key, ""]));
+    }
     return Object.fromEntries(targets.map((target) => [target.key, target.text]));
   });
 
