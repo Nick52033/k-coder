@@ -451,9 +451,17 @@ pub enum MessageRole {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ContentBlock {
-    Text { text: String },
-    Context { text: String },
-    Image { name: String, data_url: String },
+    Text {
+        text: String,
+    },
+    Context {
+        text: String,
+    },
+    Image {
+        name: String,
+        #[serde(rename = "dataUrl", alias = "data_url")]
+        data_url: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -996,6 +1004,32 @@ pub struct UserInputResolution {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn image_content_blocks_use_camel_case_and_read_legacy_jsonl() {
+        let block = ContentBlock::Image {
+            name: "screen.png".into(),
+            data_url: "data:image/png;base64,iVBORw0KGgo=".into(),
+        };
+        let value = serde_json::to_value(&block).expect("image block should serialize");
+
+        assert_eq!(value["type"], "image");
+        assert_eq!(value["name"], "screen.png");
+        assert_eq!(value["dataUrl"], "data:image/png;base64,iVBORw0KGgo=");
+        assert!(value.get("data_url").is_none());
+
+        let legacy: ContentBlock = serde_json::from_value(serde_json::json!({
+            "type": "image",
+            "name": "legacy.png",
+            "data_url": "data:image/png;base64,bGVnYWN5"
+        }))
+        .expect("legacy image block should remain readable");
+        assert!(matches!(
+            legacy,
+            ContentBlock::Image { name, data_url }
+                if name == "legacy.png" && data_url == "data:image/png;base64,bGVnYWN5"
+        ));
+    }
 
     #[test]
     fn approval_mode_uses_the_public_snake_case_contract() {

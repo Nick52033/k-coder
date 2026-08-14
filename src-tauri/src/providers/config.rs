@@ -10,6 +10,8 @@ use crate::protocol::PROTOCOL_VERSION;
 pub const DEFAULT_MODEL_CONTEXT_WINDOW: u32 = 128_000;
 const MIN_MODEL_CONTEXT_WINDOW: u32 = 1_024;
 const MAX_MODEL_CONTEXT_WINDOW: u32 = 10_000_000;
+const LEGACY_PROVIDER_CATALOG_SCHEMA_VERSION: u32 = 1;
+const PROVIDER_CATALOG_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -401,19 +403,23 @@ struct ProviderCatalog {
 impl ProviderCatalog {
     fn empty() -> Self {
         Self {
-            schema_version: PROTOCOL_VERSION,
+            schema_version: PROVIDER_CATALOG_SCHEMA_VERSION,
             active_provider_id: None,
             providers: Vec::new(),
         }
     }
 
     fn validate(mut self) -> Result<Self, ProviderConfigError> {
-        if self.schema_version != PROTOCOL_VERSION {
-            return Err(ProviderConfigError::Invalid(format!(
-                "unsupported provider catalog schema version {}",
-                self.schema_version
-            )));
-        }
+        let migrate_legacy_vision_support = match self.schema_version {
+            LEGACY_PROVIDER_CATALOG_SCHEMA_VERSION => true,
+            PROVIDER_CATALOG_SCHEMA_VERSION => false,
+            _ => {
+                return Err(ProviderConfigError::Invalid(format!(
+                    "unsupported provider catalog schema version {}",
+                    self.schema_version
+                )));
+            }
+        };
         if self.providers.len() > 32 {
             return Err(ProviderConfigError::Invalid(
                 "a provider catalog may contain at most 32 providers".to_string(),
@@ -422,7 +428,12 @@ impl ProviderCatalog {
         let mut ids = std::collections::HashSet::new();
         let mut providers = Vec::with_capacity(self.providers.len());
         for provider in self.providers {
-            let provider = provider.validate()?;
+            let mut provider = provider.validate()?;
+            if migrate_legacy_vision_support {
+                for model in &mut provider.models {
+                    model.supports_vision |= legacy_model_supports_vision(&model.id);
+                }
+            }
             if !ids.insert(provider.id.clone()) {
                 return Err(ProviderConfigError::Invalid(
                     "provider IDs must be unique".to_string(),
@@ -430,6 +441,7 @@ impl ProviderCatalog {
             }
             providers.push(provider);
         }
+        self.schema_version = PROVIDER_CATALOG_SCHEMA_VERSION;
         self.providers = providers;
         if !self
             .active_provider_id
@@ -574,7 +586,7 @@ impl ProviderConfigStore {
             .map_err(|error| ProviderConfigError::Invalid(error.to_string()))?;
         let config = config.validate()?;
         ProviderCatalog {
-            schema_version: PROTOCOL_VERSION,
+            schema_version: LEGACY_PROVIDER_CATALOG_SCHEMA_VERSION,
             active_provider_id: Some(config.id.clone()),
             providers: vec![config],
         }
@@ -598,6 +610,16 @@ impl ProviderConfigStore {
         replace_file(&temp_path, &self.catalog_path)?;
         Ok(())
     }
+}
+
+fn legacy_model_supports_vision(model_id: &str) -> bool {
+    let model_id = model_id.trim().to_ascii_lowercase();
+    ["gpt-4o", "gpt-4.1", "gpt-5"].iter().any(|family| {
+        model_id == *family
+            || model_id
+                .strip_prefix(family)
+                .is_some_and(|suffix| matches!(suffix.as_bytes().first(), Some(b'-' | b'.')))
+    })
 }
 
 fn replace_file(source: &Path, destination: &Path) -> Result<(), ProviderConfigError> {
@@ -709,6 +731,70 @@ mod tests {
 
         store.activate("second").unwrap();
         assert_eq!(store.load().unwrap(), Some(second));
+    }
+
+    #[test]
+    fn migrates_known_multimodal_models_in_legacy_catalogs() {
+        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        let store = ProviderConfigStore::new(directory.path());
+        let mut provider = config("https://example.com/v1");
+        provider.model = "gpt-5.6-sol".into();
+        provider.models = vec![
+            ProviderModelConfig {
+                id: "gpt-5.6-sol".into(),
+                display_name: "GPT-5.6 Sol".into(),
+                context_window: 200_000,
+                max_output_tokens: None,
+                supports_vision: false,
+                fallback: false,
+            },
+            ProviderModelConfig {
+                id: "deepseek-text".into(),
+                display_name: "DeepSeek Text".into(),
+                context_window: 128_000,
+                max_output_tokens: None,
+                supports_vision: false,
+                fallback: false,
+            },
+            ProviderModelConfig {
+                id: "o3-mini".into(),
+                display_name: "O3 Mini".into(),
+                context_window: 128_000,
+                max_output_tokens: None,
+                supports_vision: false,
+                fallback: false,
+            },
+        ];
+        let provider = provider.validate().expect("provider should validate");
+        let legacy = ProviderCatalog {
+            schema_version: LEGACY_PROVIDER_CATALOG_SCHEMA_VERSION,
+            active_provider_id: Some(provider.id.clone()),
+            providers: vec![provider],
+        };
+        fs::write(
+            directory.path().join("providers.json"),
+            serde_json::to_vec(&legacy).unwrap(),
+        )
+        .unwrap();
+
+        let mut loaded = store.load().unwrap().expect("active provider should load");
+
+        assert!(loaded.models[0].supports_vision);
+        assert!(!loaded.models[1].supports_vision);
+        assert!(!loaded.models[2].supports_vision);
+        store.save_provider(&loaded, true).unwrap();
+        let persisted: serde_json::Value =
+            serde_json::from_slice(&fs::read(directory.path().join("providers.json")).unwrap())
+                .unwrap();
+        assert_eq!(persisted["schemaVersion"], PROVIDER_CATALOG_SCHEMA_VERSION);
+
+        loaded.models[0].supports_vision = false;
+        store.save_provider(&loaded, true).unwrap();
+        let reloaded = store
+            .load()
+            .unwrap()
+            .expect("active provider should reload");
+        assert!(!reloaded.models[0].supports_vision);
     }
 
     #[test]

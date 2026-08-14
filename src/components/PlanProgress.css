@@ -1,0 +1,249 @@
+.plan-progress {
+  display: flex;
+  width: fit-content;
+  max-width: 100%;
+  margin-top: 10px;
+  align-items: center;
+}
+
+.plan-progress-trigger {
+  display: inline-flex;
+  min-width: 0;
+  max-width: 100%;
+  min-height: 32px;
+  padding: 0 9px 0 11px;
+  align-items: center;
+  gap: 7px;
+  border: 1px solid color-mix(in srgb, var(--color-brand) 62%, var(--color-border));
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--color-surface-raised) 92%, transparent);
+  color: var(--color-ink-subtle);
+  cursor: pointer;
+  font: inherit;
+  font-size: var(--font-size-sm);
+  line-height: 1;
+  white-space: nowrap;
+  transition:
+    border-color var(--transition-fast),
+    background var(--transition-fast),
+    color var(--transition-fast);
+}
+
+.plan-progress-trigger:hover,
+.plan-progress-trigger[aria-expanded="true"] {
+  border-color: var(--color-brand);
+  background: color-mix(in srgb, var(--color-brand) 7%, var(--color-surface-raised));
+  color: var(--color-ink);
+}
+
+.plan-progress--completed .plan-progress-trigger {
+  border-color: color-mix(in srgb, var(--color-success) 70%, var(--color-border));
+}
+
+.plan-progress--failed .plan-progress-trigger {
+  border-color: color-mix(in srgb, var(--color-error) 72%, var(--color-border));
+}
+
+.plan-progress-position {
+  flex: 0 0 auto;
+  color: var(--color-ink);
+  font-weight: var(--font-weight-semibold);
+}
+
+.plan-progress-separator {
+  flex: 0 0 auto;
+  color: var(--color-ink-faint);
+}
+
+.plan-progress-files {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.plan-progress-added,
+.plan-progress-deleted {
+  flex: 0 0 auto;
+  font-family: var(--font-family-mono);
+  font-size: var(--font-size-xs);
+  font-weight: var(--font-weight-semibold);
+}
+
+.plan-progress-added { color: var(--color-success-text); }
+.plan-progress-deleted { color: var(--color-error-text); }
+
+.plan-progress-chevron {
+  flex: 0 0 auto;
+  color: var(--color-ink-muted);
+  transition: transform var(--transition-base);
+}
+
+.plan-progress-trigger[aria-expanded="true"] .plan-progress-chevron {
+  transform: rotate(180deg);
+}
+
+.plan-progress-popover {
+  position: fixed;
+  inset: auto;
+  width: min(400px, calc(100vw - 24px));
+  max-height: min(440px, calc(100vh - 24px));
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+  border: 0;
+  border-radius: var(--radius-md);
+  background: var(--color-surface-raised);
+  box-shadow:
+    0 4px 8px rgba(10, 18, 14, 0.18),
+    0 0 0 1px var(--color-border-strong);
+  color: var(--color-ink);
+}
+
+.plan-progress-popover:popover-open {
+  animation: plan-progress-popover-in 160ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.plan-progress-popover-header {
+  display: flex;
+  min-height: 40px;
+  padding: 0 12px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  border-bottom: 1px solid var(--color-border);
+}
+
+.plan-progress-popover-header strong {
+  font-size: var(--font-size-base);
+  font-weight: var(--font-weight-semibold);
+}
+
+.plan-progress-popover-header span {
+  color: var(--color-ink-subtle);
+  font-size: var(--font-size-xs);
+  white-space: nowrap;
+}
+
+.plan-progress-steps {
+  max-height: min(380px, calc(100vh - 76px));
+  margin: 0;
+  padding: 5px;
+  overflow-y: auto;
+  list-style: none;
+}
+
+.plan-progress-step {
+  display: grid;
+  min-height: 42px;
+  padding: 7px;
+  grid-template-columns: 18px minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 8px;
+  border-radius: var(--radius-sm);
+}
+
+.plan-progress-step + .plan-progress-step {
+  border-top: 1px solid color-mix(in srgb, var(--color-border) 70%, transparent);
+}
+
+.plan-progress-step > svg {
+  margin-top: 1px;
+  color: var(--color-ink-muted);
+}
+
+.plan-progress-step--completed > svg { color: var(--color-success); }
+.plan-progress-step--in_progress > svg { color: var(--color-brand); }
+.plan-progress-step--failed > svg { color: var(--color-error); }
+
+.plan-progress--live .plan-progress-step--in_progress > svg {
+  animation: plan-progress-active 1.4s ease-in-out infinite;
+}
+
+.plan-progress-step-copy {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.plan-progress-step-copy strong {
+  font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-medium);
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+.plan-progress-step-copy small {
+  color: var(--color-ink-subtle);
+  font-size: var(--font-size-xs);
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+.plan-progress-step--completed .plan-progress-step-copy strong {
+  color: var(--color-ink-subtle);
+  text-decoration: line-through;
+  text-decoration-thickness: 1px;
+}
+
+.plan-progress-step--skipped {
+  opacity: 0.62;
+}
+
+.plan-progress-step--in_progress {
+  background: color-mix(in srgb, var(--color-brand) 7%, transparent);
+}
+
+.plan-progress-step-status {
+  display: inline-flex;
+  min-height: 18px;
+  align-items: center;
+  gap: 4px;
+  color: var(--color-ink-muted);
+  font-size: var(--font-size-xs);
+  white-space: nowrap;
+}
+
+.plan-progress-step--completed .plan-progress-step-status { color: var(--color-success-text); }
+.plan-progress-step--in_progress .plan-progress-step-status { color: var(--color-brand); }
+.plan-progress-step--failed .plan-progress-step-status { color: var(--color-error-text); }
+
+.plan-progress-step-number {
+  display: grid;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 3px;
+  place-items: center;
+  border-radius: 3px;
+  background: var(--color-surface-hover);
+  color: var(--color-ink-subtle);
+  font-family: var(--font-family-mono);
+  font-size: 9px;
+}
+
+@keyframes plan-progress-popover-in {
+  from { opacity: 0; transform: translateY(3px) scale(0.985); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+@keyframes plan-progress-active {
+  50% { opacity: 0.45; }
+}
+
+@media (max-width: 540px) {
+  .plan-progress-files { display: none; }
+  .plan-progress-trigger { gap: 6px; }
+  .plan-progress-popover { width: calc(100vw - 20px); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .plan-progress-trigger,
+  .plan-progress-chevron {
+    transition: none;
+  }
+
+  .plan-progress-popover:popover-open,
+  .plan-progress--live .plan-progress-step--in_progress > svg {
+    animation: none;
+  }
+}

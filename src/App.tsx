@@ -855,6 +855,7 @@ function App() {
             timeline={timelineByTurn.get(turnId) ?? []}
             changes={changes}
             plan={turnId === planTurnId ? plan : null}
+            turnId={turnId}
             streaming={turnId === currentThreadTurnId}
             initialTextVisible={turnId === restoredCurrentTurnId}
             activityStatus={turnId === activityStatus?.turnId ? activityStatus.status : null}
@@ -927,6 +928,7 @@ function App() {
                   timeline={attemptTimeline}
                   changes={changes}
                   plan={attemptPlan}
+                  turnId={turnId}
                   streaming={turnId === currentThreadTurnId}
                   initialTextVisible={turnId === restoredCurrentTurnId}
                   activityStatus={attemptActivityStatus}
@@ -1665,6 +1667,7 @@ function App() {
                           timeline={messageTimeline}
                           changes={changes}
                           plan={messagePlan}
+                          turnId={message.turnId}
                           streaming={message.status === "streaming"}
                           initialTextVisible={message.turnId === restoredCurrentTurnId}
                           activityStatus={messageActivityStatus}

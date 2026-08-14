@@ -75,7 +75,24 @@ test.beforeEach(async ({ page }) => {
         { type: "tool", activity: { turnId: "turn-1", call: { id: "call-test", name: "run_command", arguments: { command: "pnpm build", cwd: ".", timeoutMs: 120000 }, metadata: {} }, state: "completed", result: { success: true, output: "tests passed", metadata: { durationMs: 1530, shell: "powershell" } }, startedAtMs: 1300, completedAtMs: 2830, durationMs: 1530 } },
         { type: "text", id: "message-assistant", turnId: "turn-1", text: "检查完成。" },
         { type: "event", itemId: "turn-completed-turn-1", turnId: "turn-1", kind: "turn_completed", title: "Turn 已完成", detail: null, durationMs: 1830 },
-      ], approvals: [], changes: [] },
+      ], approvals: [], changes: [{
+        id: "change-plan-summary",
+        threadId: "thread-1",
+        turnId: "turn-1",
+        toolCallId: "call-edit",
+        createdAtMs: 2,
+        undone: false,
+        files: [{
+          path: "src/App.css",
+          destinationPath: null,
+          operation: "modify",
+          beforeHash: "before-plan-summary",
+          afterHash: "after-plan-summary",
+          beforeContent: "old\n",
+          afterContent: "new\n",
+          unifiedDiff: "--- a/src/App.css\n+++ b/src/App.css\n@@ -1 +1 @@\n-old\n+new\n",
+        }],
+      }] },
       workspace_state: { current: { id: "project-1", name: "k-coder", path: "D:\\code\\k-coder", trusted: true, lastOpenedAtMs: 2 }, recent: [] },
       list_workspace_directory: [
         { name: "src", path: "src", isDirectory: true, size: null, modifiedAtMs: 2 },
@@ -498,10 +515,25 @@ test("supports the primary workbench inspection flow", async ({ page }, testInfo
   await page.screenshot({ path: testInfo.outputPath("collapsed-steps.png"), fullPage: true });
   await expect(page.locator(".turn-event-step--provider_context")).toHaveCount(0);
   await expect(page.locator(".turn-event-step--usage")).toHaveCount(0);
-  await expect(page.locator(".turn-plan")).not.toHaveAttribute("open", "");
-  await expect(page.locator(".turn-plan").getByText("检查工作区", { exact: true })).toBeHidden();
-  await page.locator(".turn-plan > summary").click();
-  await expect(page.locator(".turn-plan").getByText("检查工作区", { exact: true })).toBeVisible();
+  const planProgress = page.locator(".plan-progress").first();
+  const planProgressTrigger = planProgress.getByRole("button", { name: /执行计划：第 2\/2 步/ });
+  await expect(planProgressTrigger).toContainText("第 2/2 步");
+  await expect(planProgressTrigger).toContainText("1 个文件已更新");
+  await expect(planProgressTrigger).toContainText("+1");
+  await expect(planProgressTrigger).toContainText("-1");
+  await planProgressTrigger.hover();
+  const planPopover = page.getByRole("dialog", { name: "执行计划详情" });
+  await expect(planPopover).toBeVisible();
+  await expect(planPopover.locator(".plan-progress-step--completed").getByText("检查工作区", { exact: true })).toBeVisible();
+  await expect(planPopover.locator(".plan-progress-step--completed").getByText("已完成", { exact: true })).toBeVisible();
+  await expect(planPopover.locator(".plan-progress-step--in_progress").getByText("验证实现", { exact: true })).toBeVisible();
+  await expect(planPopover.locator(".plan-progress-step--in_progress").getByText("进行中", { exact: true })).toBeVisible();
+  await page.screenshot({ path: testInfo.outputPath("plan-progress-hover.png"), fullPage: true });
+  await planProgressTrigger.click();
+  await page.mouse.move(0, 0);
+  await expect(planPopover).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(planPopover).toBeHidden();
   await expect(page.getByText("我先检查相关文件并修改实现。", { exact: true })).toBeVisible();
   const inkColor = await page.evaluate(() => {
     const probe = document.createElement("span");
@@ -1948,7 +1980,7 @@ test("presents a failed turn as one actionable error disclosure", async ({ page 
   await expect(failedExecution.locator(".turn-reasoning")).toHaveCount(0);
   await expect(failedExecution.getByText("正在检查上游响应。", { exact: true })).toHaveCount(0);
   await expect(failedExecution.getByText("生成中", { exact: true })).toHaveCount(0);
-  await expect(failedExecution.locator(".turn-plan")).not.toHaveAttribute("open", "");
+  await expect(page.locator(".plan-progress-popover").last()).not.toBeVisible();
   await expect(failedExecution.getByRole("button", { name: "重试", exact: true })).toBeVisible();
   await page.waitForTimeout(450);
   await page.screenshot({ path: testInfo.outputPath("failed-turn-agent-ui-expanded.png"), fullPage: true });
@@ -2335,20 +2367,21 @@ test("adds, edits, deletes, and saves structured provider models", async ({ page
 
   await page.getByRole("button", { name: "新增模型" }).click();
   await expect(page.locator(".provider-model-card")).toHaveCount(3);
-  await page.getByLabel("模型 ID 3").fill("o3-mini");
-  await page.getByLabel("显示名称 3").fill("O3 Mini");
+  await page.getByLabel("模型 ID 3").fill("gpt-5.6-sol");
+  await page.getByLabel("显示名称 3").fill("GPT-5.6 Sol");
   await page.getByLabel("上下文长度 3").fill("200000");
-  await page.getByLabel(/设为默认模型：O3 Mini/).check();
+  await expect(page.locator(".provider-model-card").nth(2).getByRole("checkbox", { name: "支持图片" })).toBeChecked();
+  await page.getByLabel(/设为默认模型：GPT-5.6 Sol/).check();
 
   await page.getByRole("button", { name: "删除模型：GPT-4 Omni" }).click();
   await expect(page.locator(".provider-model-card")).toHaveCount(2);
   await page.getByRole("button", { name: "保存配置" }).click();
 
-  await expect.poll(() => page.evaluate(() => (window as unknown as { __lastProviderRequest: { model: string } | null }).__lastProviderRequest?.model)).toBe("o3-mini");
+  await expect.poll(() => page.evaluate(() => (window as unknown as { __lastProviderRequest: { model: string } | null }).__lastProviderRequest?.model)).toBe("gpt-5.6-sol");
   const request = await page.evaluate(() => (window as unknown as { __lastProviderRequest: { models: unknown[] } }).__lastProviderRequest);
   expect(request.models).toEqual([
-    { id: "gpt-4.1", displayName: "GPT-4.1", contextWindow: 128000, maxOutputTokens: undefined, supportsVision: false, fallback: false },
-    { id: "o3-mini", displayName: "O3 Mini", contextWindow: 200000, maxOutputTokens: undefined, supportsVision: false, fallback: false },
+    { id: "gpt-4.1", displayName: "GPT-4.1", contextWindow: 128000, maxOutputTokens: undefined, supportsVision: true, fallback: false },
+    { id: "gpt-5.6-sol", displayName: "GPT-5.6 Sol", contextWindow: 200000, maxOutputTokens: undefined, supportsVision: true, fallback: false },
   ]);
 });
 

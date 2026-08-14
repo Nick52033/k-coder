@@ -10,7 +10,6 @@ import {
   Clock3,
   Copy,
   FileText,
-  ListChecks,
   Lightbulb,
   LoaderCircle,
   RotateCcw,
@@ -21,13 +20,14 @@ import { lazy, memo, Suspense, useEffect, useRef, useState, type ReactNode } fro
 import type {
   AgentActivityStatus,
   ChangeSet,
-  PlanStepState,
   PlanView,
   ToolActivity,
   ToolOutputDelta,
   TimelineEventKind,
   TurnTimelineItem,
 } from "../types/runtime";
+import { changeLineStats } from "../lib/diff";
+import { PlanProgress } from "./PlanProgress";
 
 const ReadOnlyCodeEditor = lazy(() => import("./CodeEditor").then((module) => ({ default: module.CodeEditor })));
 const ChangeCodeDiffEditor = lazy(() => import("./CodeEditor").then((module) => ({ default: module.CodeDiffEditor })));
@@ -46,6 +46,7 @@ export const ConversationTurnActivity = memo(function ConversationTurnActivity({
   timeline = [],
   changes = [],
   plan,
+  turnId,
   streaming = false,
   initialTextVisible = false,
   activityStatus = null,
@@ -57,6 +58,7 @@ export const ConversationTurnActivity = memo(function ConversationTurnActivity({
   timeline?: TurnTimelineItem[];
   changes?: ChangeSet[];
   plan: PlanView | null;
+  turnId?: string;
   streaming?: boolean;
   initialTextVisible?: boolean;
   activityStatus?: AgentActivityStatus | null;
@@ -80,7 +82,7 @@ export const ConversationTurnActivity = memo(function ConversationTurnActivity({
     (item): item is Extract<TurnTimelineItem, { type: "event" }> => item.type === "event" && isTerminalEvent(item.kind),
   );
   const processItems = processTimeline.filter((item) => item !== terminalEvent && isVisibleConversationTimelineItem(item));
-  const hasItems = Boolean(plan?.steps.length || activities.length || processItems.length);
+  const hasItems = Boolean(activities.length || processItems.length);
   const hasProcess = hasItems || Boolean(activityStatus) || terminalEvent?.kind === "turn_failed" || terminalEvent?.kind === "turn_cancelled";
   const toolCount = processTimeline.filter((item) => item.type === "tool").length || activities.length;
   const summaryTitle = terminalEvent?.durationMs !== undefined
@@ -126,7 +128,6 @@ export const ConversationTurnActivity = memo(function ConversationTurnActivity({
   const processContent = (
     <div className="turn-disclosure-panel">
       <div className={visuallyStreaming ? "turn-execution-live" : "turn-execution-content"}>
-        {plan?.steps.length ? <ConversationPlan plan={plan} activeTurn={visuallyStreaming} /> : null}
         {processItems.length ? (
           <div className="turn-timeline">
             {groupedProcessTimeline.map((entry) => entry.type === "reasoning_group" ? (
@@ -209,6 +210,14 @@ export const ConversationTurnActivity = memo(function ConversationTurnActivity({
         <div className="turn-final-response">
           <TimelineItem item={finalResponse} changes={changes} renderText={renderText} activeTurn={false} typing={false} />
         </div>
+      ) : null}
+      {plan?.steps.length ? (
+        <PlanProgress
+          activeTurn={visuallyStreaming}
+          changes={changes}
+          plan={plan}
+          turnId={turnId}
+        />
       ) : null}
     </div>
   );
@@ -790,16 +799,6 @@ function fileDetailEditorHeight(content: string) {
   return Math.min(320, Math.max(100, lines * 19 + 14));
 }
 
-function changeLineStats(diff: string) {
-  let added = 0;
-  let deleted = 0;
-  for (const line of diff.split(/\r?\n/)) {
-    if (line.startsWith("+") && !line.startsWith("+++")) added += 1;
-    if (line.startsWith("-") && !line.startsWith("---")) deleted += 1;
-  }
-  return { added, deleted };
-}
-
 function changeEditorHeight(file: ChangeSet["files"][number]) {
   const stats = changeLineStats(file.unifiedDiff);
   const originalLines = lineCount(file.beforeContent);
@@ -944,42 +943,6 @@ function visibleOutput(activity: ToolActivity): ToolOutputDelta[] {
     return [{ stream: "stdout", cursor: 0, text: activity.result.output.slice(-64 * 1024) }];
   }
   return [];
-}
-
-function ConversationPlan({ plan, activeTurn }: { plan: PlanView; activeTurn: boolean }) {
-  const completed = plan.steps.filter((step) => step.status === "completed" || step.status === "skipped").length;
-  const active = plan.steps.some((step) => step.status === "in_progress");
-
-  return (
-    <details className="turn-disclosure turn-plan" open={activeTurn && active ? true : undefined}>
-      <summary>
-        <ListChecks size={15} aria-hidden="true" />
-        <span className="turn-disclosure-title">计划</span>
-        <span className="turn-disclosure-status">{completed}/{plan.steps.length}</span>
-        <ChevronDown className="turn-disclosure-chevron" size={15} aria-hidden="true" />
-      </summary>
-      <div className="turn-disclosure-panel">
-        <ol className="turn-plan-steps">
-          {plan.steps.map((step) => (
-            <li className={`turn-plan-step turn-plan-step--${step.status}`} key={step.id}>
-              <PlanStateIcon status={step.status} />
-              <span>
-                <strong>{step.step}</strong>
-                {step.detail ? <small>{step.detail}</small> : null}
-              </span>
-            </li>
-          ))}
-        </ol>
-      </div>
-    </details>
-  );
-}
-
-function PlanStateIcon({ status }: { status: PlanStepState }) {
-  if (status === "completed") return <CircleCheck size={15} aria-hidden="true" />;
-  if (status === "in_progress") return <CircleDot className="turn-tool-running" size={15} aria-hidden="true" />;
-  if (status === "failed") return <CircleX size={15} aria-hidden="true" />;
-  return <Circle size={15} aria-hidden="true" />;
 }
 
 function toolLabel(name: string) {

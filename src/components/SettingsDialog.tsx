@@ -115,7 +115,7 @@ function editableModel(model?: Partial<ProviderModelConfig>): EditableProviderMo
     displayName: model?.displayName ?? "",
     contextWindow: model?.contextWindow ?? 200_000,
     maxOutputTokens: model?.maxOutputTokens,
-    supportsVision: model?.supportsVision ?? false,
+    supportsVision: model?.supportsVision ?? true,
     fallback: model?.fallback ?? false,
   };
 }
