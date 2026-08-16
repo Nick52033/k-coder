@@ -202,8 +202,13 @@ export interface ContextCompactionSummary {
   contractVersion: number;
   summary: string;
   userConstraints: string[];
+  recentUserMessages?: string[];
+  currentUserRequest?: string;
+  importantToolObservations?: string[];
   recentToolResults: unknown[];
   compactedMessageCount: number;
+  estimatedBeforeTokens?: number;
+  estimatedAfterTokens?: number;
 }
 
 export interface ThreadSummary {
@@ -213,6 +218,7 @@ export interface ThreadSummary {
   createdAtMs: number;
   updatedAtMs: number;
   archived: boolean;
+  inProject?: boolean;
   workspacePath?: string | null;
 }
 
@@ -266,6 +272,7 @@ export type ThreadItem = ThreadItemBase & (
       compactedMessageCount: number;
       userConstraintCount: number;
       recentToolResultCount: number;
+      recentUserMessageCount?: number;
     }
   | { type: "event" }
 );
@@ -505,7 +512,7 @@ export interface BrowserSettings { enabled: boolean; allowLocalhost: boolean; }
 export interface BrowserAuditEvent { timestampMs: number; action: string; target: string; success: boolean; detail: string; }
 export interface BrowserArtifact { id: string; name: string; mediaType: string; sizeBytes: number; createdAtMs: number; }
 export interface DocumentContent { path: string; name: string; mediaType: string; content: string; sourceBytes: number; extractedBytes: number; truncated: boolean; }
-export interface MetricsSnapshot { providerCalls: number; providerFailures: number; averageProviderLatencyMs: number; inputTokens: number; outputTokens: number; toolCalls: number; toolSuccessRate: number; fallbackCount: number; completedTasks: number; failedTasks: number; estimatedCostUsd: number | null; }
+export interface MetricsSnapshot { providerCalls: number; providerFailures: number; averageProviderLatencyMs: number; inputTokens: number; outputTokens: number; compactionCount: number; compactedMessages: number; estimatedContextTokensSaved: number; toolCalls: number; toolSuccessRate: number; fallbackCount: number; completedTasks: number; failedTasks: number; estimatedCostUsd: number | null; }
 export interface EvaluationReport { total: number; passed: number; passRate: number; failures: string[]; }
 
 export interface TurnOutcome {
@@ -595,6 +602,7 @@ export type AgentEvent =
       compactedMessageCount: number;
       userConstraintCount: number;
       recentToolResultCount: number;
+      recentUserMessageCount?: number;
     })
   | (EventBase & { type: "tool_started"; call: ToolCall })
   | (EventBase & {

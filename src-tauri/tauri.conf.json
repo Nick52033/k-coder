@@ -30,6 +30,7 @@
     "targets": "all",
     "resources": {
       "../src/resources/skills/": "skills/",
+      "../src/resources/tools/windows-x86_64/": "tools/",
       "../src/resources/ocr/onnxruntime.dll": "ocr/onnxruntime.dll",
       "../src/resources/ocr/onnxruntime_providers_shared.dll": "ocr/onnxruntime_providers_shared.dll",
       "../src/resources/ocr/ppocrv5_mobile_det.onnx": "ocr/ppocrv5_mobile_det.onnx",

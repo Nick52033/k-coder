@@ -6,7 +6,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use crate::protocol::{HistorySortDirection, ThreadItem, ThreadTurn, TodoItem, TokenUsage};
 use crate::storage::{StoredEvent, StoredEventKind, ThreadSummary, TurnSnapshot};
 
-pub const DATABASE_SCHEMA_VERSION: u32 = 4;
+pub const DATABASE_SCHEMA_VERSION: u32 = 5;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -102,12 +102,14 @@ impl ProjectionDb {
             .map_err(|_| ProjectionError::Poisoned)?;
         let transaction = connection.transaction()?;
         transaction.execute(
-            "INSERT INTO sessions(id,title,created_at_ms,updated_at_ms,archived,event_count,workspace_path)
-             VALUES(?1,?2,?3,?4,?5,?6,?7)
+            "INSERT INTO sessions(id,title,created_at_ms,updated_at_ms,archived,event_count,workspace_path,in_project)
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8)
              ON CONFLICT(id) DO UPDATE SET title=excluded.title,updated_at_ms=excluded.updated_at_ms,
-             archived=excluded.archived,event_count=excluded.event_count,workspace_path=excluded.workspace_path",
+             archived=excluded.archived,event_count=excluded.event_count,workspace_path=excluded.workspace_path,
+             in_project=excluded.in_project",
             params![summary.id, summary.title, summary.created_at_ms, summary.updated_at_ms,
-                summary.archived as i64, events.len() as u64, summary.workspace_path],
+                summary.archived as i64, events.len() as u64, summary.workspace_path,
+                summary.in_project as i64],
         )?;
         transaction.execute("DELETE FROM usage WHERE thread_id=?1", [&summary.id])?;
         transaction.execute(
@@ -149,11 +151,11 @@ impl ProjectionDb {
             .map_err(|_| ProjectionError::Poisoned)?;
         let transaction = connection.transaction()?;
         match &event.kind {
-            StoredEventKind::ThreadCreated { title } => {
+            StoredEventKind::ThreadCreated { title, in_project } => {
                 transaction.execute(
-                    "INSERT INTO sessions(id,title,created_at_ms,updated_at_ms,archived,event_count,workspace_path)
-                     VALUES(?1,?2,?3,?3,0,1,NULL)",
-                    params![event.thread_id, title, event.created_at_ms],
+                    "INSERT INTO sessions(id,title,created_at_ms,updated_at_ms,archived,event_count,workspace_path,in_project)
+                     VALUES(?1,?2,?3,?3,0,1,NULL,?4)",
+                    params![event.thread_id, title, event.created_at_ms, *in_project as i64],
                 )?;
             }
             kind => {
@@ -525,7 +527,7 @@ impl ProjectionDb {
             .lock()
             .map_err(|_| ProjectionError::Poisoned)?;
         let mut statement = connection.prepare(
-            "SELECT id,title,created_at_ms,updated_at_ms,archived,workspace_path FROM sessions
+            "SELECT id,title,created_at_ms,updated_at_ms,archived,workspace_path,in_project FROM sessions
              WHERE archived=0 ORDER BY updated_at_ms DESC",
         )?;
         Ok(statement
@@ -538,6 +540,7 @@ impl ProjectionDb {
                     updated_at_ms: row.get(3)?,
                     archived: row.get::<_, i64>(4)? != 0,
                     workspace_path: row.get(5)?,
+                    in_project: row.get::<_, i64>(6)? != 0,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?)
@@ -765,6 +768,14 @@ fn migrate(connection: &Connection) -> Result<(), rusqlite::Error> {
              COMMIT;",
         )?;
     }
+    if version < 5 {
+        connection.execute_batch(
+            "BEGIN;
+             ALTER TABLE sessions ADD COLUMN in_project INTEGER NOT NULL DEFAULT 1;
+             INSERT INTO schema_migrations(version,applied_at) VALUES(5,datetime('now'));
+             COMMIT;",
+        )?;
+    }
     Ok(())
 }
 
@@ -797,6 +808,7 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
         assert!(columns.iter().any(|column| column == "workspace_path"));
+        assert!(columns.iter().any(|column| column == "in_project"));
         let tables = db
             .connection
             .lock()

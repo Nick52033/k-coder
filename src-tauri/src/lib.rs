@@ -48,6 +48,22 @@ fn builtin_skills_root(resource_dir: &Path) -> PathBuf {
     select_builtin_skills_root(resource_dir, development_root.as_deref())
 }
 
+#[cfg(windows)]
+fn bundled_tools_root(_resource_dir: &Path) -> Option<PathBuf> {
+    #[cfg(debug_assertions)]
+    let root =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../src/resources/tools/windows-x86_64");
+    #[cfg(not(debug_assertions))]
+    let root = _resource_dir.join("tools");
+
+    Some(root)
+}
+
+#[cfg(not(windows))]
+fn bundled_tools_root(_resource_dir: &Path) -> Option<PathBuf> {
+    None
+}
+
 fn show_main_window(app: &tauri::AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.show();
@@ -78,9 +94,15 @@ pub fn run() {
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .setup(|app| {
             let data_root = app.path().app_data_dir()?.join("runtime-data");
-            let builtin_skills_root = builtin_skills_root(&app.path().resource_dir()?);
-            let state = AppState::new_with_builtin_skills(data_root, builtin_skills_root)
-                .map_err(|error| std::io::Error::other(error.to_string()))?;
+            let resource_dir = app.path().resource_dir()?;
+            let builtin_skills_root = builtin_skills_root(&resource_dir);
+            let bundled_tools_root = bundled_tools_root(&resource_dir);
+            let state = AppState::new_with_builtin_resources(
+                data_root,
+                builtin_skills_root,
+                bundled_tools_root,
+            )
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
             app.manage(state);
 
             // 创建系统托盘

@@ -65,6 +65,8 @@ pub enum ThreadItemPayload {
         compacted_message_count: usize,
         user_constraint_count: usize,
         recent_tool_result_count: usize,
+        #[serde(default)]
+        recent_user_message_count: usize,
     },
     Event,
 }
@@ -807,6 +809,8 @@ pub enum AgentEvent {
         compacted_message_count: usize,
         user_constraint_count: usize,
         recent_tool_result_count: usize,
+        #[serde(default)]
+        recent_user_message_count: usize,
     },
     ToolStarted {
         thread_id: String,
@@ -1207,6 +1211,7 @@ mod tests {
             compacted_message_count: 18,
             user_constraint_count: 2,
             recent_tool_result_count: 3,
+            recent_user_message_count: 4,
         });
         let value = serde_json::to_value(event).unwrap();
 
@@ -1217,6 +1222,7 @@ mod tests {
         assert_eq!(value["compactedMessageCount"], 18);
         assert_eq!(value["userConstraintCount"], 2);
         assert_eq!(value["recentToolResultCount"], 3);
+        assert_eq!(value["recentUserMessageCount"], 4);
         assert!(value.get("summary").is_none());
     }
 

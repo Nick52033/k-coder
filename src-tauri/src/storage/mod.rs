@@ -34,7 +34,11 @@ mod writer;
 
 use writer::ThreadWriters;
 
-pub const EVENT_SCHEMA_VERSION: u32 = 8;
+pub const EVENT_SCHEMA_VERSION: u32 = 9;
+
+fn default_in_project() -> bool {
+    true
+}
 const MAX_TIMELINE_DETAIL_CHARS: usize = 2_000;
 pub const DEFAULT_THREAD_HISTORY_PAGE_SIZE: u32 = 50;
 pub const MAX_THREAD_HISTORY_PAGE_SIZE: u32 = 100;
@@ -73,6 +77,8 @@ impl StoredEvent {
 pub enum StoredEventKind {
     ThreadCreated {
         title: String,
+        #[serde(default = "default_in_project")]
+        in_project: bool,
     },
     ThreadWorkspaceBound {
         path: String,
@@ -183,6 +189,8 @@ pub struct ThreadSummary {
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
     pub archived: bool,
+    #[serde(default = "default_in_project")]
+    pub in_project: bool,
     pub workspace_path: Option<String>,
 }
 
@@ -335,12 +343,24 @@ impl JsonlThreadRepository {
     }
 
     pub async fn create_thread(&self) -> Result<ThreadSummary, StorageError> {
+        self.create_thread_with_project_mode(true).await
+    }
+
+    pub async fn create_standalone_thread(&self) -> Result<ThreadSummary, StorageError> {
+        self.create_thread_with_project_mode(false).await
+    }
+
+    async fn create_thread_with_project_mode(
+        &self,
+        in_project: bool,
+    ) -> Result<ThreadSummary, StorageError> {
         let thread_id = Uuid::new_v4().to_string();
         self.append(StoredEvent::new(
             &thread_id,
             None,
             StoredEventKind::ThreadCreated {
                 title: "新会话".to_string(),
+                in_project,
             },
         ))
         .await?;
@@ -362,6 +382,11 @@ impl JsonlThreadRepository {
     ) -> Result<ThreadSummary, StorageError> {
         let _binding_guard = self.workspace_binding_lock.lock().await;
         let detail = self.read_thread(thread_id).await?;
+        if !detail.summary.in_project {
+            return Err(StorageError::InvalidData(format!(
+                "standalone thread {thread_id} cannot be bound to a workspace"
+            )));
+        }
         let path = workspace_root.to_string_lossy().into_owned();
         if let Some(bound) = &detail.summary.workspace_path {
             if bound == &path {
@@ -519,9 +544,13 @@ impl JsonlThreadRepository {
             }
             None => events.len(),
         };
-        let destination = match source.summary.workspace_path.as_deref() {
-            Some(path) => self.create_thread_in_workspace(Path::new(path)).await?,
-            None => self.create_thread().await?,
+        let destination = match (
+            source.summary.in_project,
+            source.summary.workspace_path.as_deref(),
+        ) {
+            (false, _) => self.create_standalone_thread().await?,
+            (true, Some(path)) => self.create_thread_in_workspace(Path::new(path)).await?,
+            (true, None) => self.create_thread().await?,
         };
         self.append(StoredEvent::new(
             &destination.id,
@@ -896,7 +925,9 @@ fn project_thread(thread_id: &str, events: &[StoredEvent]) -> Result<ThreadDetai
     let created = events
         .iter()
         .find_map(|event| match &event.kind {
-            StoredEventKind::ThreadCreated { title } => Some((title.clone(), event.created_at_ms)),
+            StoredEventKind::ThreadCreated { title, in_project } => {
+                Some((title.clone(), event.created_at_ms, *in_project))
+            }
             _ => None,
         })
         .ok_or_else(|| StorageError::InvalidData("thread_created event is missing".to_string()))?;
@@ -907,6 +938,7 @@ fn project_thread(thread_id: &str, events: &[StoredEvent]) -> Result<ThreadDetai
     let mut turn_user_message_ids = HashMap::new();
     let mut latest_user_message_id: Option<String> = None;
     let mut archived = false;
+    let in_project = created.2;
     let mut workspace_path = None;
     let mut last_turn = None;
     let mut tool_activities: Vec<ToolActivitySnapshot> = Vec::new();
@@ -947,6 +979,11 @@ fn project_thread(thread_id: &str, events: &[StoredEvent]) -> Result<ThreadDetai
             }
             StoredEventKind::ItemCompleted { .. } => {}
             StoredEventKind::ThreadWorkspaceBound { path } => {
+                if !in_project {
+                    return Err(StorageError::InvalidData(
+                        "standalone thread contains a workspace binding".into(),
+                    ));
+                }
                 if workspace_path
                     .as_ref()
                     .is_some_and(|bound: &String| bound != path)
@@ -1119,9 +1156,10 @@ fn project_thread(thread_id: &str, events: &[StoredEvent]) -> Result<ThreadDetai
                         "已手动压缩上下文"
                     },
                     Some(format!(
-                        "压缩了 {} 条历史消息，保留 {} 项用户约束和 {} 项近期工具结果",
+                        "压缩了 {} 条历史消息，保留 {} 项用户约束、{} 项近期用户请求和 {} 项近期工具结果",
                         summary.compacted_message_count,
                         summary.user_constraints.len(),
+                        summary.recent_user_messages.len(),
                         summary.recent_tool_results.len()
                     )),
                 );
@@ -1352,6 +1390,7 @@ fn project_thread(thread_id: &str, events: &[StoredEvent]) -> Result<ThreadDetai
             created_at_ms: created.1,
             updated_at_ms,
             archived,
+            in_project,
             workspace_path,
         },
         messages,
@@ -1723,6 +1762,7 @@ fn project_thread_history(
                         compacted_message_count: summary.compacted_message_count,
                         user_constraint_count: summary.user_constraints.len(),
                         recent_tool_result_count: summary.recent_tool_results.len(),
+                        recent_user_message_count: summary.recent_user_messages.len(),
                     },
                     timeline_items,
                 );
@@ -2602,6 +2642,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn persists_standalone_threads_and_rejects_workspace_binding() {
+        let data = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let repository = JsonlThreadRepository::new(data.path()).unwrap();
+
+        let thread = repository.create_standalone_thread().await.unwrap();
+        assert!(!thread.in_project);
+        assert!(thread.workspace_path.is_none());
+        assert!(
+            repository
+                .bind_thread_workspace(&thread.id, workspace.path())
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("standalone thread")
+        );
+
+        let listed = repository.list_threads().await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert!(!listed[0].in_project);
+        assert!(listed[0].workspace_path.is_none());
+
+        let fork = repository.fork_thread(&thread.id, None).await.unwrap();
+        assert!(!fork.in_project);
+        assert!(fork.workspace_path.is_none());
+    }
+
+    #[tokio::test]
     async fn serializes_concurrent_workspace_binding_attempts() {
         let data = tempfile::tempdir().unwrap();
         let first_workspace = tempfile::tempdir().unwrap();
@@ -3458,10 +3526,12 @@ mod tests {
             None,
             StoredEventKind::ThreadCreated {
                 title: "legacy".into(),
+                in_project: true,
             },
         );
         let mut value = serde_json::to_value(event).unwrap();
         value["schemaVersion"] = serde_json::json!(1);
+        value["data"].as_object_mut().unwrap().remove("in_project");
         fs::write(
             sessions.join(format!("{thread_id}.jsonl")),
             format!("{}\n", value),
@@ -3473,7 +3543,9 @@ mod tests {
             repository.load(&thread_id).await.unwrap()[0].schema_version,
             EVENT_SCHEMA_VERSION
         );
-        assert_eq!(repository.list_threads().await.unwrap()[0].title, "legacy");
+        let migrated = &repository.list_threads().await.unwrap()[0];
+        assert_eq!(migrated.title, "legacy");
+        assert!(migrated.in_project);
         drop(repository);
         fs::remove_file(directory.path().join("k-coder.db")).unwrap();
         let rebuilt = JsonlThreadRepository::new(directory.path()).unwrap();

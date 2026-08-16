@@ -2,6 +2,7 @@ import {
   Activity,
   Check,
   ChevronDown,
+  ChevronRight,
   Circle,
   CircleAlert,
   CircleCheck,
@@ -14,7 +15,6 @@ import {
   LoaderCircle,
   RotateCcw,
   SquareTerminal,
-  Wrench,
 } from "lucide-react";
 import { lazy, memo, Suspense, useEffect, useRef, useState, type ReactNode } from "react";
 import type {
@@ -40,6 +40,8 @@ const HIDDEN_PROCESS_EVENT_KINDS = new Set<TimelineEventKind>([
 ]);
 const GENERIC_REASONING_NOTE_PATTERN = /^(?:(?:planning|preparing|checking|reviewing|inspecting|running|reading|analyzing|investigating|updating|implementing|verifying|testing|searching|exploring|gathering|examining|assessing|comparing|confirming|fixing|editing|applying|building|waiting)\b|(?:(?:正在|准备|计划|将要)?(?:规划|计划|准备|检查|查看|读取|运行|执行|验证|测试|搜索|分析|调查|更新|修改|修复|构建|等待)))/i;
 const REASONING_INSIGHT_PATTERN = /(?:found|confirmed|because|therefore|however|mismatch|failed|failure|risk|requires?|needs?|发现|确认|原因|因此|由于|但是|不一致|失败|风险|需要)/i;
+const HAN_SCRIPT_PATTERN = /[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]/g;
+const LATIN_SCRIPT_PATTERN = /[a-z]/gi;
 
 export const ConversationTurnActivity = memo(function ConversationTurnActivity({
   activities,
@@ -134,7 +136,6 @@ export const ConversationTurnActivity = memo(function ConversationTurnActivity({
               <ReasoningGroup
                 items={entry.items}
                 renderText={renderText}
-                activeTurn={visuallyStreaming}
                 key={`reasoning-group-${entry.items.map((item) => item.itemId).join("-")}`}
               />
             ) : entry.type === "tool_group" ? (
@@ -147,7 +148,6 @@ export const ConversationTurnActivity = memo(function ConversationTurnActivity({
                 item={entry.item}
                 changes={changes}
                 renderText={renderText}
-                activeTurn={visuallyStreaming}
                 typing={entry.item.type === "text" && paced.pendingTextIds.has(entry.item.id)}
                 key={timelineItemKey(entry.item)}
               />
@@ -208,7 +208,7 @@ export const ConversationTurnActivity = memo(function ConversationTurnActivity({
       ) : null}
       {finalResponse ? (
         <div className="turn-final-response">
-          <TimelineItem item={finalResponse} changes={changes} renderText={renderText} activeTurn={false} typing={false} />
+          <TimelineItem item={finalResponse} changes={changes} renderText={renderText} typing={false} />
         </div>
       ) : null}
       {plan?.steps.length ? (
@@ -236,21 +236,26 @@ export function isVisibleConversationTimelineItem(item: TurnTimelineItem) {
 function isDisplayableReasoningSummary(summary: string) {
   const normalized = summary.replace(/\s+/g, " ").trim().replace(/^[#>*_`\-\s]+/, "");
   if (!normalized) return false;
+  if (!usesChineseSummaryLanguage(normalized)) return false;
   if (summary.includes("\n") || normalized.length > 160 || REASONING_INSIGHT_PATTERN.test(normalized)) return true;
   return !GENERIC_REASONING_NOTE_PATTERN.test(normalized);
+}
+
+function usesChineseSummaryLanguage(summary: string) {
+  const hanCount = summary.match(HAN_SCRIPT_PATTERN)?.length ?? 0;
+  const latinCount = summary.match(LATIN_SCRIPT_PATTERN)?.length ?? 0;
+  return hanCount >= 2 && hanCount * 4 >= latinCount;
 }
 
 function TimelineItem({
   item,
   changes,
   renderText,
-  activeTurn,
   typing = false,
 }: {
   item: TurnTimelineItem;
   changes: ChangeSet[];
   renderText?: (text: string) => ReactNode;
-  activeTurn: boolean;
   typing?: boolean;
 }) {
   if (item.type === "text") {
@@ -261,7 +266,7 @@ function TimelineItem({
     );
   }
   if (item.type === "reasoning") {
-    return <ReasoningGroup items={[item]} renderText={renderText} activeTurn={activeTurn} />;
+    return <ReasoningGroup items={[item]} renderText={renderText} />;
   }
   if (item.type === "event") {
     return <TimelineEventRow item={item} changes={changes} />;
@@ -458,8 +463,7 @@ function groupConsecutiveTimeline(items: TurnTimelineItem[]): TimelineRenderEntr
   for (const item of items) {
     const previous = grouped[grouped.length - 1];
     if (item.type === "reasoning") {
-      if (previous?.type === "reasoning_group"
-        && Boolean(previous.items[0]?.complete) === Boolean(item.complete)) previous.items.push(item);
+      if (previous?.type === "reasoning_group") previous.items.push(item);
       else grouped.push({ type: "reasoning_group", items: [item] });
     } else if (item.type === "tool") {
       if (previous?.type === "tool_group") previous.activities.push(item.activity);
@@ -474,36 +478,24 @@ function groupConsecutiveTimeline(items: TurnTimelineItem[]): TimelineRenderEntr
 function ReasoningGroup({
   items,
   renderText,
-  activeTurn,
 }: {
   items: ReasoningTimelineItem[];
   renderText?: (text: string) => ReactNode;
-  activeTurn: boolean;
 }) {
-  const complete = items.every((item) => item.complete);
-  const status = complete && items.length > 1
-    ? `${items.length} 段`
-    : complete
-      ? "已完成"
-      : activeTurn ? "生成中" : "已结束";
   return (
-    <details className="turn-disclosure turn-reasoning" open={activeTurn && !complete ? true : undefined}>
-      <summary>
+    <div className="turn-reasoning" role="group" aria-label="思考摘要">
+      <div className="turn-reasoning-heading">
         <Lightbulb size={15} aria-hidden="true" />
-        <span className="turn-disclosure-title">思考摘要</span>
-        <span className="turn-disclosure-status">{status}</span>
-        <ChevronDown className="turn-disclosure-chevron" size={15} aria-hidden="true" />
-      </summary>
-      <div className="turn-disclosure-panel">
-        <div className="turn-reasoning-content">
-          {items.map((item) => (
-            <div className="turn-reasoning-segment" key={`${item.turnId}-${item.itemId}`}>
-              {renderText ? renderText(item.summary) : item.summary}
-            </div>
-          ))}
-        </div>
+        <span>思考摘要</span>
       </div>
-    </details>
+      <div className="turn-reasoning-content">
+        {items.map((item) => (
+          <div className="turn-reasoning-segment" key={`${item.turnId}-${item.itemId}`}>
+            {renderText ? renderText(item.summary) : item.summary}
+          </div>
+        ))}
+      </div>
+    </div>
   );
 }
 
@@ -523,21 +515,26 @@ function ToolActivityGroup({ activities }: { activities: ToolActivity[] }) {
         : state === "pending"
           ? "等待执行"
           : "已完成";
-  const Icon = state === "failed"
-    ? CircleX
-    : state === "cancelled" || state === "pending"
-      ? Circle
-      : state === "running"
-        ? LoaderCircle
-        : allCommands ? SquareTerminal : Wrench;
   const active = state === "running" || state === "pending";
+  const [open, setOpen] = useState(false);
+  const expanded = active || open;
   return (
-    <details className={`turn-disclosure turn-tool-group turn-tool-group--${state}`} open={active || undefined}>
-      <summary>
-        <Icon className={state === "running" ? "turn-tool-running" : undefined} size={15} aria-hidden="true" />
-        <span className="turn-disclosure-title">{title}</span>
-        <span className="turn-disclosure-status">{status}</span>
-        <ChevronDown className="turn-disclosure-chevron" size={15} aria-hidden="true" />
+    <details
+      className={`turn-disclosure turn-tool-group turn-tool-group--${state}${allCommands ? " turn-tool-group--commands" : ""}${allCommands && count > 1 ? " turn-tool-group--multiple-commands" : ""}`}
+      open={active || undefined}
+      onToggle={(event) => setOpen(!active && event.currentTarget.open)}
+    >
+      <summary className="turn-tool-group-summary">
+        <span className="turn-tool-group-marker" aria-hidden="true"><span /></span>
+        <span className="turn-tool-group-copy">
+          <span className="turn-disclosure-title">{title}</span>
+          {expanded ? (
+            <ChevronDown className="turn-tool-group-chevron" size={15} aria-hidden="true" />
+          ) : (
+            <ChevronRight className="turn-tool-group-chevron" size={15} aria-hidden="true" />
+          )}
+          {state !== "completed" ? <span className="turn-disclosure-status">{status}</span> : null}
+        </span>
       </summary>
       <div className="turn-disclosure-panel">
         <div className="turn-tool-group-content">
@@ -558,20 +555,25 @@ function toolGroupState(activities: ToolActivity[]): ToolActivity["state"] {
 
 
 function ToolActivityRow({ activity }: { activity: ToolActivity }) {
-  const outputChunks = visibleOutput(activity);
-  const elapsedMs = useActivityDuration(activity);
-  const command = activity.call.name === "run_command" ? commandDetails(activity) : null;
-  const fileDetails = command ? null : fileActivityDetails(activity);
+  const isCommand = activity.call.name === "run_command";
+  const command = isCommand ? commandText(activity) : "";
+  const outputChunks = isCommand ? [] : visibleOutput(activity);
+  const elapsedMs = useActivityDuration(activity, !isCommand);
+  const fileDetails = isCommand ? null : fileActivityDetails(activity);
   const isPending = activity.state === "pending";
   const isRunning = activity.state === "running";
   const failed = activity.state === "failed";
-  const target = failed ? "" : toolTarget(activity);
+  const target = isCommand ? command : failed ? "" : toolTarget(activity);
   const title = target || (isRunning ? runningToolLabel(activity.call.name) : toolLabel(activity.call.name));
-  const meta = failed && activity.result?.output
-    ? truncate(activity.result.output, 120)
-    : activityStateLabel(activity);
+  const meta = isCommand
+    ? failed
+      ? commandFailureSummary(activity)
+      : commandActivityStateLabel(activity.state)
+    : failed && activity.result?.output
+      ? truncate(activity.result.output, 120)
+      : activityStateLabel(activity);
   return (
-    <div className={`turn-timeline-tool turn-timeline-tool--${activity.state}`}>
+    <div className={`turn-timeline-tool turn-timeline-tool--${activity.state}${isCommand ? " turn-timeline-tool--command" : ""}`}>
       {activity.state === "completed" ? (
         <CircleCheck size={15} aria-hidden="true" />
       ) : activity.state === "failed" ? (
@@ -581,14 +583,13 @@ function ToolActivityRow({ activity }: { activity: ToolActivity }) {
       ) : (
         <LoaderCircle className="turn-tool-running" size={15} aria-hidden="true" />
       )}
-      <span>
-        <strong>{title}</strong>
-        <small className="turn-tool-meta">
+      <span className={isCommand ? "turn-command-summary" : undefined}>
+        <strong title={isCommand && command ? command : undefined}>{title}</strong>
+        <small className="turn-tool-meta" title={isCommand && failed ? meta : undefined}>
           <span>{meta}</span>
           {elapsedMs !== null ? <span className="turn-tool-duration"><Clock3 size={12} aria-hidden="true" />耗时 {formatDuration(elapsedMs)}</span> : null}
         </small>
       </span>
-      {command ? <CommandDetails command={command} /> : null}
       {fileDetails ? <FileActivityDetails details={fileDetails} /> : null}
       {outputChunks.length ? (
         <details className="turn-tool-output" open={isRunning || undefined}>
@@ -653,25 +654,6 @@ function FileActivityDetails({ details }: { details: FileActivityDetailsValue })
         ) : null}
       </div> : null}
     </details>
-  );
-}
-
-function CommandDetails({ command }: { command: CommandDetailsValue }) {
-  return (
-    <div className="turn-command-inline">
-      <div className="turn-command-editor-header turn-command-inline-header">
-        <span><SquareTerminal size={13} aria-hidden="true" />命令</span>
-        <small>{command.shellLabel}</small>
-      </div>
-      <pre>{command.text}</pre>
-      {command.cwd || command.timeoutMs ? (
-        <small className="turn-command-editor-meta">
-          {command.cwd ? `工作目录：${command.cwd}` : ""}
-          {command.cwd && command.timeoutMs ? " · " : ""}
-          {command.timeoutMs ? `超时：${formatDuration(command.timeoutMs)}` : ""}
-        </small>
-      ) : null}
-    </div>
   );
 }
 
@@ -751,47 +733,16 @@ function findChange(item: Extract<TurnTimelineItem, { type: "event" }>, changes:
   ) ?? null;
 }
 
-interface CommandDetailsValue {
-  text: string;
-  cwd: string;
-  timeoutMs: number | null;
-  shellLabel: string;
-}
-
-function commandDetails(activity: ToolActivity): CommandDetailsValue | null {
+function commandText(activity: ToolActivity) {
   const argumentsValue = activity.call.arguments;
-  const shell = typeof activity.result?.metadata.shell === "string" ? activity.result.metadata.shell : "";
   const command = typeof argumentsValue.command === "string" ? argumentsValue.command.trim() : "";
-  if (command) {
-    return {
-      text: command,
-      cwd: typeof argumentsValue.cwd === "string" ? argumentsValue.cwd : "",
-      timeoutMs: typeof argumentsValue.timeoutMs === "number" ? argumentsValue.timeoutMs : null,
-      shellLabel: shellLabel(shell),
-    };
-  }
+  if (command) return command;
   const program = typeof argumentsValue.program === "string" ? argumentsValue.program.trim() : "";
-  if (!program) return null;
+  if (!program) return "";
   const args = Array.isArray(argumentsValue.args)
     ? argumentsValue.args.filter((arg): arg is string => typeof arg === "string")
     : [];
-  const text = [program, ...args].map(shellQuote).join(" ");
-  return {
-    text,
-    cwd: typeof argumentsValue.cwd === "string" ? argumentsValue.cwd : "",
-    timeoutMs: typeof argumentsValue.timeoutMs === "number" ? argumentsValue.timeoutMs : null,
-    shellLabel: shellLabel(shell),
-  };
-}
-
-function shellLabel(shell: string) {
-  const value = shell.toLowerCase();
-  if (value.includes("cmd")) return "命令提示符 · CMD";
-  if (value.includes("powershell") || value.includes("pwsh")) return "PowerShell";
-  if (value.includes("zsh")) return "Zsh";
-  if (value.includes("bash")) return "Bash";
-  if (value.includes("sh")) return "Shell";
-  return "Shell";
+  return [program, ...args].map(shellQuote).join(" ");
 }
 
 function fileDetailEditorHeight(content: string) {
@@ -903,13 +854,14 @@ function changeOperationLabel(operation: ChangeSet["files"][number]["operation"]
   return ({ add: "新增", modify: "已编辑", delete: "删除", move: "移动" })[operation];
 }
 
-function useActivityDuration(activity: ToolActivity): number | null {
+function useActivityDuration(activity: ToolActivity, enabled = true): number | null {
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
-    if (activity.state !== "running" || !activity.startedAtMs) return undefined;
+    if (!enabled || activity.state !== "running" || !activity.startedAtMs) return undefined;
     const timer = window.setInterval(() => setNow(Date.now()), 250);
     return () => window.clearInterval(timer);
-  }, [activity.state, activity.startedAtMs]);
+  }, [activity.state, activity.startedAtMs, enabled]);
+  if (!enabled) return null;
   if (typeof activity.durationMs === "number") return activity.durationMs;
   if (activity.startedAtMs) return Math.max(0, now - activity.startedAtMs);
   return null;
@@ -938,9 +890,6 @@ function visibleOutput(activity: ToolActivity): ToolOutputDelta[] {
       return [{ stream: value.stream, cursor: value.cursor, text: value.text }];
     });
     if (chunks.length) return chunks;
-  }
-  if (activity.call.name === "run_command" && activity.result?.output) {
-    return [{ stream: "stdout", cursor: 0, text: activity.result.output.slice(-64 * 1024) }];
   }
   return [];
 }
@@ -1006,10 +955,6 @@ function toolTarget(activity: ToolActivity) {
   if (activity.call.name === "write_file" && typeof args.path === "string") {
     return truncate(`写入 ${args.path}`, 120);
   }
-  if (activity.call.name === "run_command") {
-    const command = commandDetails(activity);
-    if (command) return truncate(`执行 ${command.text}`, 120);
-  }
   if (activity.call.name === "apply_patch" && typeof args.patch === "string") {
     const paths = patchFilePaths(args.patch);
     if (paths.length) return truncate(`应用补丁 ${paths.join("、")}`, 120);
@@ -1033,6 +978,26 @@ function activityStateLabel(activity: ToolActivity) {
   if (activity.state === "failed") return "执行失败";
   if (activity.state === "cancelled") return "已取消";
   return "已完成";
+}
+
+function commandActivityStateLabel(state: ToolActivity["state"]) {
+  if (state === "pending") return "等待运行";
+  if (state === "running") return "运行中";
+  if (state === "failed") return "运行失败";
+  if (state === "cancelled") return "已取消";
+  return "已运行";
+}
+
+function commandFailureSummary(activity: ToolActivity) {
+  const recoveryHint = activity.result?.metadata?.recoveryHint;
+  if (typeof recoveryHint === "string" && recoveryHint.trim()) {
+    return `运行失败：${truncate(recoveryHint.replace(/\s+/g, " ").trim(), 180)}`;
+  }
+  const firstLine = activity.result?.output
+    ?.split(/\r?\n/)
+    .map((line) => line.trim())
+    .find(Boolean);
+  return firstLine ? `运行失败：${truncate(firstLine, 180)}` : "运行失败";
 }
 
 function truncate(value: string, max: number) {

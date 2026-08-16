@@ -5,7 +5,9 @@ test.beforeEach(async ({ page }) => {
     const callbacks = new Map<number, (...args: unknown[]) => void>();
     let callbackId = 1;
     let agentEventCallbackId: number | null = null;
-    const thread = { schemaVersion: 1, id: "thread-1", title: "Phase 6 workbench", createdAtMs: 1, updatedAtMs: 2, archived: false, workspacePath: "D:\\code\\k-coder" };
+    const threadFixture = { schemaVersion: 1, id: "thread-1", title: "Phase 6 workbench", createdAtMs: 1, updatedAtMs: 2, archived: false, inProject: true, workspacePath: "D:\\code\\k-coder" };
+    const threadOverride = localStorage.getItem("kcoder_e2e_thread_override");
+    const thread = threadOverride ? { ...threadFixture, ...JSON.parse(threadOverride) } : threadFixture;
     const secondThread = { schemaVersion: 1, id: "thread-2", title: "Parallel conversation", createdAtMs: 3, updatedAtMs: 3, archived: false };
     const openAiProvider = { schemaVersion: 1, id: "openai", kind: "open_ai_compatible", transport: "open_ai_chat_completions", name: "OpenAI", baseUrl: "https://api.openai.com/v1", model: "gpt-4.1", models: [{ id: "gpt-4.1", displayName: "GPT-4.1", contextWindow: 128000, fallback: false }, { id: "gpt-4o", displayName: "GPT-4 Omni", contextWindow: 64000, fallback: false }], endpoints: [], hasApiKey: true };
     const ziccProvider = { schemaVersion: 1, id: "zicc", kind: "open_ai_compatible", transport: "open_ai_responses", name: "zicc", baseUrl: "https://zicc.example.com/v1", model: "gpt-5.6-terra", models: [{ id: "gpt-5.6-terra", displayName: "gpt-5.6-terra", contextWindow: 128000, fallback: false }, { id: "gpt-5.5", displayName: "gpt-5.5", contextWindow: 128000, fallback: false }], endpoints: [], hasApiKey: true };
@@ -180,6 +182,14 @@ test.beforeEach(async ({ page }) => {
             workspaceState = { current, recent: [current, ...workspaceState.recent] };
             localStorage.setItem("kcoder_e2e_workspace_path", path);
             return current;
+          }
+          if (command === "create_thread") {
+            const inProject = args?.inProject !== false;
+            return {
+              ...secondThread,
+              inProject,
+              workspacePath: inProject ? workspaceState.current.path : null,
+            };
           }
           if (command === "get_provider_catalog") return providerCatalog;
           if (command === "turn_start") {
@@ -470,6 +480,12 @@ test.beforeEach(async ({ page }) => {
             return undefined;
           }
           if (command === "resize_pty" || command === "close_pty") return undefined;
+          if (
+            (command === "open_workspace_file" || command === "reveal_workspace_file")
+            && localStorage.getItem("kcoder_e2e_external_open_error")
+          ) {
+            throw new Error(localStorage.getItem("kcoder_e2e_external_open_error") ?? "external open failed");
+          }
           return responses[command] ?? null;
         },
       },
@@ -497,6 +513,15 @@ test.beforeEach(async ({ page }) => {
       },
     });
   });
+});
+
+test("closes the composer mode menu when clicking outside", async ({ page }) => {
+  await page.goto("/");
+  await page.getByRole("button", { name: "选择模式" }).click();
+  await expect(page.locator(".mode-menu")).toBeVisible();
+
+  await page.getByRole("heading", { name: "Phase 6 workbench" }).click();
+  await expect(page.locator(".mode-menu")).toBeHidden();
 });
 
 test("supports the primary workbench inspection flow", async ({ page }, testInfo) => {
@@ -535,22 +560,16 @@ test("supports the primary workbench inspection flow", async ({ page }, testInfo
   await page.keyboard.press("Escape");
   await expect(planPopover).toBeHidden();
   await expect(page.getByText("我先检查相关文件并修改实现。", { exact: true })).toBeVisible();
-  const inkColor = await page.evaluate(() => {
-    const probe = document.createElement("span");
-    probe.style.color = "var(--color-ink)";
-    document.body.append(probe);
-    const color = getComputedStyle(probe).color;
-    probe.remove();
-    return color;
-  });
   const inspectionGroup = page.locator(".turn-tool-group").filter({ hasText: "执行了多个操作" });
   await expect(inspectionGroup).toBeVisible();
-  const inspectionIcon = inspectionGroup.locator(":scope > summary > svg.lucide-wrench");
-  await expect(inspectionIcon).toHaveCount(1);
-  await expect(inspectionIcon).toHaveCSS("color", inkColor);
-  await inspectionGroup.locator(":scope > summary").screenshot({ path: testInfo.outputPath("operation-group-icon.png") });
+  const inspectionSummary = inspectionGroup.locator(":scope > summary");
+  await expect(inspectionSummary.locator("svg.lucide-wrench, svg.lucide-square-terminal")).toHaveCount(0);
+  await expect(inspectionSummary.locator(".turn-tool-group-copy > svg.turn-tool-group-chevron.lucide-chevron-right")).toHaveCount(1);
+  await inspectionSummary.screenshot({ path: testInfo.outputPath("operation-group-chevron.png") });
   await expect(page.locator(".turn-timeline-tool").getByText("应用补丁 src/App.css", { exact: true })).toBeHidden();
-  await inspectionGroup.locator(":scope > summary").click();
+  await inspectionSummary.click();
+  await expect(inspectionSummary.locator(".turn-tool-group-copy > svg.turn-tool-group-chevron.lucide-chevron-down")).toHaveCount(1);
+  await expect(inspectionSummary.locator(".turn-tool-group-copy > svg.turn-tool-group-chevron.lucide-chevron-right")).toHaveCount(0);
   await expect(page.locator(".turn-timeline-tool").getByText("应用补丁 src/App.css", { exact: true })).toBeVisible();
   await page.getByText("查看补丁", { exact: true }).click();
   const patchEditor = page.locator(".turn-tool-details--file").filter({ hasText: "查看补丁" });
@@ -567,23 +586,31 @@ test("supports the primary workbench inspection flow", async ({ page }, testInfo
   await expect(page.getByText("修改完成，接着运行验证。", { exact: true })).toBeVisible();
   const commandGroup = page.locator(".turn-tool-group").filter({ hasText: "运行了命令" }).first();
   await expect(commandGroup).toBeVisible();
-  const commandIcon = commandGroup.locator(":scope > summary > svg.lucide-square-terminal");
-  await expect(commandIcon).toHaveCount(1);
-  await expect(commandIcon).toHaveCSS("color", inkColor);
-  await expect(page.locator(".turn-timeline-tool").getByText("执行 pnpm build", { exact: true })).toBeHidden();
-  await commandGroup.locator(":scope > summary").click();
-  await expect(page.locator(".turn-timeline-tool").getByText("执行 pnpm build", { exact: true })).toBeVisible();
+  const commandSummary = commandGroup.locator(":scope > summary");
+  await expect(commandSummary.locator("svg.lucide-wrench, svg.lucide-square-terminal")).toHaveCount(0);
+  await expect(commandSummary.locator(".turn-tool-group-copy > svg.turn-tool-group-chevron.lucide-chevron-right")).toHaveCount(1);
+  await expect(page.locator(".turn-timeline-tool--command").getByText("pnpm build", { exact: true })).toBeHidden();
+  await commandSummary.click();
+  await expect(commandSummary.locator(".turn-tool-group-copy > svg.turn-tool-group-chevron.lucide-chevron-down")).toHaveCount(1);
+  await expect(commandSummary.locator(".turn-tool-group-copy > svg.turn-tool-group-chevron.lucide-chevron-right")).toHaveCount(0);
+  const commandRow = page.locator(".turn-timeline-tool--command").filter({ hasText: "pnpm build" }).last();
+  await expect(commandRow.getByText("pnpm build", { exact: true })).toBeVisible();
+  await expect(commandRow.getByText("已运行", { exact: true })).toBeVisible();
+  await expect(commandRow.locator(".turn-command-inline, .turn-tool-output")).toHaveCount(0);
   await expect(page.getByText("3 个操作", { exact: true })).toBeVisible();
   await page.screenshot({ path: testInfo.outputPath("inline-plan-and-tools.png"), fullPage: true });
   await page.evaluate(() => localStorage.setItem("kcoder_theme", "dark"));
   await page.reload();
-  await expect(page.locator(".turn-timeline-tool").getByText("执行 pnpm build", { exact: true })).toBeHidden();
+  await expect(page.locator(".turn-timeline-tool--command").getByText("pnpm build", { exact: true })).toBeHidden();
   await page.getByText("执行了 1.8s", { exact: true }).click();
-  await page.locator(".turn-tool-group").filter({ hasText: "运行了命令" }).first().locator(":scope > summary").click();
-  await expect(page.locator(".turn-timeline-tool").getByText("执行 pnpm build", { exact: true })).toBeVisible();
-  const commandDetails = page.locator(".turn-command-inline").last();
-  await expect(commandDetails.locator(".turn-command-inline-header")).toContainText("PowerShell");
-  await expect(commandDetails.locator("pre")).toContainText("pnpm build");
+  const restoredCommandSummary = page.locator(".turn-tool-group").filter({ hasText: "运行了命令" }).first().locator(":scope > summary");
+  await expect(restoredCommandSummary.locator(".turn-tool-group-copy > svg.lucide-chevron-right")).toHaveCount(1);
+  await restoredCommandSummary.click();
+  await expect(restoredCommandSummary.locator(".turn-tool-group-copy > svg.lucide-chevron-down")).toHaveCount(1);
+  const restoredCommandRow = page.locator(".turn-timeline-tool--command").filter({ hasText: "pnpm build" }).last();
+  await expect(restoredCommandRow.getByText("pnpm build", { exact: true })).toBeVisible();
+  await expect(restoredCommandRow.getByText("已运行", { exact: true })).toBeVisible();
+  await expect(restoredCommandRow.locator(".turn-command-inline, .turn-tool-output")).toHaveCount(0);
   await page.screenshot({ path: testInfo.outputPath("inline-plan-and-tools-dark.png"), fullPage: true });
   await page.getByRole("button", { name: "工作台", exact: true }).click();
   const readmeRow = page.getByRole("button", { name: /README.md/ });
@@ -806,6 +833,93 @@ test("selects the active workspace project from the composer", async ({ page }, 
   await page.screenshot({ path: testInfo.outputPath("composer-project-selector.png"), fullPage: true });
 });
 
+test("reports system opener failures inside the file preview", async ({ page }) => {
+  await page.goto("/");
+  await page.evaluate(() => localStorage.setItem("kcoder_e2e_external_open_error", "系统无法打开该文件"));
+  await page.getByRole("button", { name: "工作台", exact: true }).click();
+  await page.getByRole("button", { name: /README\.md/ }).click();
+
+  const preview = page.getByRole("dialog", { name: "预览 README.md" });
+  await preview.getByRole("button", { name: "使用系统编辑器打开" }).click();
+  await expect(preview.getByRole("alert")).toContainText("系统无法打开该文件");
+
+  await page.evaluate(() => localStorage.removeItem("kcoder_e2e_external_open_error"));
+  await preview.getByRole("button", { name: "在资源管理器中定位" }).click();
+  await expect.poll(() => page.evaluate(() => (
+    window as unknown as { __invoked: string[] }
+  ).__invoked.filter((command) => command === "reveal_workspace_file").length)).toBe(1);
+});
+
+test("creates a standalone conversation from the lower-left project menu", async ({ page }, testInfo) => {
+  await page.goto("/");
+  const composer = page.locator(".composer");
+  await composer.getByRole("button", { name: "当前项目 k-coder" }).click();
+
+  const dialog = page.getByRole("dialog", { name: "选择项目" });
+  const standalone = dialog.getByRole("button", { name: "不在项目中", exact: true });
+  await expect(standalone).toBeVisible();
+  await expect(standalone).toHaveAttribute("aria-pressed", "false");
+  const [dialogBox, standaloneBox] = await Promise.all([dialog.boundingBox(), standalone.boundingBox()]);
+  expect(dialogBox).not.toBeNull();
+  expect(standaloneBox).not.toBeNull();
+  expect((standaloneBox?.x ?? 0) - (dialogBox?.x ?? 0)).toBeLessThanOrEqual(12);
+  expect(
+    (dialogBox?.y ?? 0) + (dialogBox?.height ?? 0)
+      - ((standaloneBox?.y ?? 0) + (standaloneBox?.height ?? 0)),
+  ).toBeLessThanOrEqual(12);
+  await dialog.screenshot({ path: testInfo.outputPath("project-menu-standalone-option.png") });
+
+  await page.evaluate(() => {
+    (window as unknown as { __invoked: string[] }).__invoked.length = 0;
+  });
+  await standalone.click();
+
+  await expect(composer.getByRole("button", { name: "当前不在项目中" })).toContainText("不在项目中");
+  await expect.poll(() => page.evaluate(() => (
+    window as unknown as { __invocationArgs: Record<string, unknown> }
+  ).__invocationArgs.create_thread)).toEqual({ inProject: false });
+  const calls = await page.evaluate(() => (window as unknown as { __invoked: string[] }).__invoked);
+  expect(calls).toContain("create_thread");
+  expect(calls).not.toContain("switch_workspace");
+
+  await composer.getByRole("button", { name: "当前不在项目中" }).click();
+  await expect(page.getByRole("dialog", { name: "选择项目" }).getByRole("button", { name: "不在项目中", exact: true }))
+    .toHaveAttribute("aria-pressed", "true");
+  await page.screenshot({ path: testInfo.outputPath("standalone-conversation-selected.png"), fullPage: true });
+
+  await page.keyboard.press("Escape");
+  await page.evaluate(() => {
+    (window as unknown as { __invoked: string[] }).__invoked.length = 0;
+  });
+  const message = composer.getByRole("textbox", { name: "消息" });
+  await message.fill("@src/");
+  await expect(page.locator(".composer-suggestions")).toHaveCount(0);
+  await message.fill("/review");
+  await expect(page.locator(".composer-suggestions")).toHaveCount(0);
+  const standaloneCalls = await page.evaluate(() => (window as unknown as { __invoked: string[] }).__invoked);
+  expect(standaloneCalls).not.toContain("search_workspace_files");
+  expect(standaloneCalls).not.toContain("get_extension_overview");
+});
+
+test("keeps a migrated unbound project thread in the current project", async ({ page }) => {
+  await page.goto("/");
+  await page.evaluate(() => {
+    localStorage.setItem("kcoder_e2e_thread_override", JSON.stringify({
+      title: "Legacy project conversation",
+      inProject: true,
+      workspacePath: null,
+    }));
+    localStorage.removeItem("kcoder_thread_project_map");
+  });
+  await page.reload();
+
+  await expect(page.locator(".composer").getByRole("button", { name: "当前项目 k-coder" })).toBeVisible();
+  await expect.poll(() => page.evaluate(() => {
+    const raw = localStorage.getItem("kcoder_thread_project_map");
+    return raw ? (JSON.parse(raw) as Record<string, string>)["thread-1"] : null;
+  })).toBe("D:\\code\\k-coder");
+});
+
 test("keeps the sidebar and composer project selection in sync", async ({ page }, testInfo) => {
   await page.addInitScript(() => {
     const currentPath = "D:\\code\\k-coder";
@@ -878,7 +992,7 @@ test("selects and persists the global reasoning effort", async ({ page }) => {
   await expect.poll(() => page.evaluate(() => (window as unknown as { __invoked: string[] }).__invoked.filter((command) => command === "set_reasoning_effort").length)).toBe(1);
 });
 
-test("streams thinking, safe reasoning summaries, command output, and file diffs inline", async ({ page, context }, testInfo) => {
+test("streams thinking, safe reasoning summaries, compact command states, and file diffs inline", async ({ page, context }, testInfo) => {
   await context.grantPermissions(["clipboard-read", "clipboard-write"]);
   await page.goto("/");
   await expect(page.getByRole("heading", { name: "Phase 6 workbench" })).toBeVisible();
@@ -893,10 +1007,10 @@ test("streams thinking, safe reasoning summaries, command output, and file diffs
     emit({ ...base, type: "turn_started", phase: "exploring" });
     emit({ ...base, type: "activity_status_changed", phase: "exploring", status: "thinking" });
     emit({ ...base, type: "item_started", phase: "planning", itemId: "rs-live", itemType: "reasoning" });
-    emit({ ...base, type: "reasoning_summary_delta", phase: "planning", itemId: "rs-live", delta: "Planning parallel cargo check and test" });
+    emit({ ...base, type: "reasoning_summary_delta", phase: "planning", itemId: "rs-live", delta: "**Fixing context mismatch in patch**" });
   });
   await expect(page.getByText("思考中", { exact: true })).toBeVisible();
-  await expect(page.getByText("Planning parallel cargo check and test", { exact: true })).toHaveCount(0);
+  await expect(page.getByText("Fixing context mismatch in patch", { exact: true })).toHaveCount(0);
   await expect(page.locator(".turn-reasoning")).toHaveCount(0);
   await expect(page.getByText("等待工具调用…", { exact: true })).toHaveCount(0);
   await expect(page.locator(".turn-timeline--empty")).toHaveCount(0);
@@ -907,12 +1021,18 @@ test("streams thinking, safe reasoning summaries, command output, and file diffs
   await page.evaluate(() => {
     const emit = (window as unknown as { __emitAgentEvent: (event: unknown) => void }).__emitAgentEvent;
     const base = { schemaVersion: 1, threadId: "thread-1", turnId: "turn-live" };
-    emit({ ...base, type: "reasoning_summary_completed", phase: "planning", itemId: "rs-live", summary: "Planning parallel cargo check and test" });
+    emit({ ...base, type: "reasoning_summary_completed", phase: "planning", itemId: "rs-live", summary: "**Fixing context mismatch in patch**" });
     emit({ ...base, type: "item_completed", phase: "planning", itemId: "rs-live", itemType: "reasoning", status: "completed" });
+    emit({ ...base, type: "item_started", phase: "planning", itemId: "rs-live-mixed", itemType: "reasoning" });
+    emit({ ...base, type: "reasoning_summary_delta", phase: "planning", itemId: "rs-live-mixed", delta: "The user asked why 思考摘要 is visible, so I should explain the provider response." });
+    emit({ ...base, type: "reasoning_summary_completed", phase: "planning", itemId: "rs-live-mixed", summary: "The user asked why 思考摘要 is visible, so I should explain the provider response." });
+    emit({ ...base, type: "item_completed", phase: "planning", itemId: "rs-live-mixed", itemType: "reasoning", status: "completed" });
     emit({ ...base, type: "item_started", phase: "planning", itemId: "rs-live-2", itemType: "reasoning" });
     emit({ ...base, type: "reasoning_summary_delta", phase: "planning", itemId: "rs-live-2", delta: "已确认工具输出按游标去重，下一步核对脱敏边界。" });
     emit({ ...base, type: "reasoning_summary_completed", phase: "planning", itemId: "rs-live-2", summary: "已确认工具输出按游标去重，下一步核对脱敏边界。" });
     emit({ ...base, type: "item_completed", phase: "planning", itemId: "rs-live-2", itemType: "reasoning", status: "completed" });
+    emit({ ...base, type: "item_started", phase: "planning", itemId: "rs-live-3", itemType: "reasoning" });
+    emit({ ...base, type: "reasoning_summary_delta", phase: "planning", itemId: "rs-live-3", delta: "已完成扁平布局，正在核对窄屏边界。" });
     emit({ ...base, type: "item_started", phase: "executing", itemId: "call-live", itemType: "tool" });
     emit({ ...base, type: "tool_started", phase: "executing", call: { id: "call-live", name: "run_command", arguments: { command: "pnpm build" }, metadata: {} } });
     emit({ ...base, type: "tool_output_delta", phase: "executing", callId: "call-live", stream: "stdout", cursor: 0, delta: "building client\n" });
@@ -921,7 +1041,7 @@ test("streams thinking, safe reasoning summaries, command output, and file diffs
     emit({ ...base, type: "item_completed", phase: "executing", itemId: "call-live", itemType: "tool", status: "completed" });
     emit({ ...base, type: "item_started", phase: "executing", itemId: "compaction-live", itemType: "context_compaction" });
     emit({ ...base, type: "context_compacted", phase: "executing", itemId: "compaction-live", automatic: true,
-      compactedMessageCount: 18, userConstraintCount: 1, recentToolResultCount: 1 });
+      compactedMessageCount: 18, userConstraintCount: 1, recentUserMessageCount: 2, recentToolResultCount: 1 });
     emit({ ...base, type: "item_completed", phase: "executing", itemId: "compaction-live", itemType: "context_compaction", status: "completed" });
     emit({ ...base, type: "item_started", phase: "executing", itemId: "change-live", itemType: "change" });
     emit({ ...base, type: "change_applied", phase: "executing", changeSet: {
@@ -936,14 +1056,16 @@ test("streams thinking, safe reasoning summaries, command output, and file diffs
 
   const reasoning = page.locator(".turn-reasoning").last();
   await expect(page.getByText("思考摘要", { exact: true })).toHaveCount(1);
-  await expect(reasoning.locator(":scope > summary > svg.lucide-lightbulb")).toHaveCount(1);
+  await expect(reasoning.locator(":scope > .turn-reasoning-heading > svg.lucide-lightbulb")).toHaveCount(1);
   await expect(page.getByText("思考内容", { exact: true })).toHaveCount(0);
-  await expect(reasoning.locator(".turn-reasoning-segment")).toHaveCount(1);
-  await expect(reasoning.getByText("已完成", { exact: true })).toBeVisible();
-  await expect(reasoning).not.toHaveAttribute("open", "");
-  await reasoning.locator(":scope > summary").click();
-  await expect(page.getByText("Planning parallel cargo check and test", { exact: true })).toHaveCount(0);
+  await expect(reasoning.locator(".turn-reasoning-segment")).toHaveCount(2);
+  await expect(reasoning.locator(":scope > summary, .turn-disclosure-status, .turn-disclosure-chevron")).toHaveCount(0);
+  await expect(reasoning).toHaveCSS("border-top-width", "0px");
+  await expect(reasoning).toHaveCSS("background-color", "rgba(0, 0, 0, 0)");
+  await expect(page.getByText("Fixing context mismatch in patch", { exact: true })).toHaveCount(0);
+  await expect(page.getByText("The user asked why 思考摘要 is visible, so I should explain the provider response.", { exact: true })).toHaveCount(0);
   await expect(page.getByText("已确认工具输出按游标去重，下一步核对脱敏边界。", { exact: true })).toBeVisible();
+  await expect(page.getByText("已完成扁平布局，正在核对窄屏边界。", { exact: true })).toBeVisible();
   const liveExecution = page.locator(".message--assistant").last().locator(".turn-execution--live");
   await expect(liveExecution.locator(":scope > summary .turn-disclosure-chevron")).toHaveCount(0);
   await expect.poll(async () => {
@@ -955,21 +1077,16 @@ test("streams thinking, safe reasoning summaries, command output, and file diffs
   const liveCommandGroup = liveExecution.locator(".turn-tool-group").filter({ hasText: "运行了命令" });
   await expect(liveCommandGroup).not.toHaveAttribute("open", "");
   await liveCommandGroup.locator(":scope > summary").click();
-  const liveCommandOutput = page.locator(".turn-tool-output").last();
-  await expect(liveCommandOutput).not.toHaveAttribute("open", "");
-  await liveCommandOutput.locator(":scope > summary").click();
-  await expect(page.locator(".turn-tool-output-line--stdout").filter({ hasText: "building client" })).toBeVisible();
-  await expect(page.locator(".turn-tool-output-line--stderr").filter({ hasText: "warning: fixture" })).toBeVisible();
-  await expect(page.getByText("耗时 1.2s", { exact: true })).toBeVisible();
+  const liveCommandRow = liveCommandGroup.locator(".turn-timeline-tool--command").filter({ hasText: "pnpm build" });
+  await expect(liveCommandRow.getByText("pnpm build", { exact: true })).toBeVisible();
+  await expect(liveCommandRow.getByText("已运行", { exact: true })).toBeVisible();
+  await expect(liveCommandRow.locator(".turn-command-inline, .turn-tool-output, .turn-tool-duration")).toHaveCount(0);
   const compactionStep = liveExecution.locator(".turn-event-step--compacted");
   await expect(compactionStep.getByText("已自动压缩上下文", { exact: true })).toBeVisible();
   await expect(compactionStep).not.toHaveAttribute("open", "");
   await compactionStep.locator(":scope > summary").click();
-  await expect(compactionStep.getByText("压缩了 18 条历史消息，保留 1 项用户约束和 1 项近期工具结果", { exact: true })).toBeVisible();
-  const commandDetails = page.locator(".turn-command-inline").last();
-  await expect(commandDetails.locator(".turn-command-inline-header")).toContainText("PowerShell");
-  await expect(commandDetails.locator("pre")).toContainText("pnpm build");
-  await commandDetails.screenshot({ path: testInfo.outputPath("command-inline.png") });
+  await expect(compactionStep.getByText("压缩了 18 条历史消息，保留 1 项用户约束、2 项近期用户请求和 1 项近期工具结果", { exact: true })).toBeVisible();
+  await liveCommandRow.screenshot({ path: testInfo.outputPath("command-summary.png") });
   const changeStep = liveExecution.locator(".turn-event-step--change_applied");
   await expect(changeStep.getByText("编辑了文件", { exact: true })).toBeVisible();
   await expect(changeStep).not.toHaveAttribute("open", "");
@@ -991,7 +1108,7 @@ test("streams thinking, safe reasoning summaries, command output, and file diffs
   const boundedChangeFile = page.locator(".turn-change-file").filter({ hasText: "src/large.ts" });
   await expect(boundedChangeFile.locator('.code-editor[data-language="diff"] .monaco-editor')).toBeVisible();
   await expect(boundedChangeFile.locator(".view-lines")).toContainText("+const newLarge = true;");
-  await page.locator(".turn-tool-output").last().scrollIntoViewIfNeeded();
+  await liveCommandGroup.scrollIntoViewIfNeeded();
   await page.screenshot({ path: testInfo.outputPath("live-agent-timeline.png"), fullPage: true });
 });
 
@@ -1172,6 +1289,72 @@ test("keeps the active tool open and folds it as soon as it finishes", async ({ 
   });
   await expect(group).not.toHaveAttribute("open", "");
   await expect(page.locator(".message--assistant").last().locator(".turn-execution")).not.toHaveAttribute("open", "");
+});
+
+test("uses an unframed disclosure and scrolls long multi-command groups", async ({ page }, testInfo) => {
+  await page.goto("/");
+  await page.evaluate(() => {
+    const emit = (window as unknown as { __emitAgentEvent: (value: unknown) => void }).__emitAgentEvent;
+    const base = { schemaVersion: 1, threadId: "thread-1", turnId: "turn-command-scroll" };
+    emit({ ...base, type: "turn_started", phase: "exploring" });
+    for (let index = 0; index < 8; index += 1) {
+      const callId = `call-command-scroll-${index}`;
+      const command = `pnpm exec playwright test e2e/workbench.spec.ts --project command-scroll-${index} --grep a-very-long-command-name-that-wraps-in-narrow-layouts`;
+      emit({
+        ...base,
+        type: "tool_started",
+        phase: "executing",
+        call: { id: callId, name: "run_command", arguments: { command }, metadata: {} },
+      });
+      emit({
+        ...base,
+        type: "tool_completed",
+        phase: "executing",
+        callId,
+        name: "run_command",
+        result: { success: true, output: "done", metadata: { durationMs: 120 } },
+      });
+    }
+  });
+
+  const group = page.locator(".turn-tool-group--multiple-commands").last();
+  const summary = group.locator(":scope > summary");
+  await expect(summary.getByText("运行了多个命令", { exact: true })).toBeVisible();
+  await expect(summary.locator("svg.lucide-wrench, svg.lucide-square-terminal")).toHaveCount(0);
+  await expect(summary.locator(".turn-tool-group-copy > svg.turn-tool-group-chevron.lucide-chevron-right")).toHaveCount(1);
+  const summaryAlignment = await summary.evaluate((element) => {
+    const title = element.querySelector<HTMLElement>(".turn-disclosure-title")?.getBoundingClientRect();
+    const arrow = element.querySelector<SVGElement>(".turn-tool-group-copy > .turn-tool-group-chevron")?.getBoundingClientRect();
+    if (!title || !arrow) return null;
+    return {
+      gap: arrow.left - title.right,
+      centerDelta: Math.abs((arrow.top + arrow.height / 2) - (title.top + title.height / 2)),
+    };
+  });
+  expect(summaryAlignment).not.toBeNull();
+  expect(summaryAlignment!.gap).toBeGreaterThanOrEqual(0);
+  expect(summaryAlignment!.gap).toBeLessThanOrEqual(16);
+  expect(summaryAlignment!.centerDelta).toBeLessThanOrEqual(4);
+  await expect(summary).toHaveCSS("border-top-width", "0px");
+  await expect(summary).toHaveCSS("background-color", "rgba(0, 0, 0, 0)");
+  await group.screenshot({ path: testInfo.outputPath("unframed-collapsed-command-group.png") });
+  await summary.click();
+  await expect(summary.locator(".turn-tool-group-copy > svg.turn-tool-group-chevron.lucide-chevron-down")).toHaveCount(1);
+  await expect(summary.locator(".turn-tool-group-copy > svg.turn-tool-group-chevron.lucide-chevron-right")).toHaveCount(0);
+
+  const content = group.locator(".turn-tool-group-content");
+  await expect(content.locator(".turn-timeline-tool--command")).toHaveCount(8);
+  const scrollState = await content.evaluate((element) => ({
+    clientHeight: element.clientHeight,
+    scrollHeight: element.scrollHeight,
+    overflowY: getComputedStyle(element).overflowY,
+  }));
+  expect(scrollState.clientHeight).toBeLessThanOrEqual(168);
+  expect(scrollState.scrollHeight).toBeGreaterThan(scrollState.clientHeight);
+  expect(scrollState.overflowY).toBe("auto");
+  await content.evaluate((element) => { element.scrollTop = element.scrollHeight; });
+  await expect.poll(() => content.evaluate((element) => element.scrollTop)).toBeGreaterThan(0);
+  await group.screenshot({ path: testInfo.outputPath("unframed-scrollable-command-group.png") });
 });
 
 test("follows streamed growth only while the conversation remains near the latest content", async ({ page }) => {
@@ -1824,7 +2007,11 @@ test("completes and restores an approved edit test repair workflow", async ({ pa
   await expect(liveMessage.locator(".turn-event-step--approval_requested")).toHaveCount(0);
   await expect(liveMessage.locator(".turn-event-step--approval_resolved")).toHaveCount(0);
   await expect(liveMessage.getByText("测试失败，修正实现后重新验证。", { exact: true })).toBeVisible();
-  await expect(liveMessage.locator(".turn-tool-output-line--stderr")).toHaveText("test failed\n");
+  await expect(liveMessage.locator(".turn-tool-output")).toHaveCount(0);
+  await expect(liveMessage.locator(".turn-command-summary")).toHaveCount(2);
+  await expect(liveMessage.locator(".turn-command-summary").filter({ hasText: "运行失败" })).toHaveCount(1);
+  await expect(liveMessage.locator(".turn-command-summary").filter({ hasText: "test failed" })).toHaveCount(1);
+  await expect(liveMessage.locator(".turn-command-summary").filter({ hasText: "已运行" })).toHaveCount(1);
   await expect(liveMessage.getByText("修复完成，测试已经通过。", { exact: true })).toHaveCount(1);
   await expect(liveMessage.locator(".changes-toggle")).toContainText("2 个文件");
 
@@ -1864,7 +2051,11 @@ test("completes and restores an approved edit test repair workflow", async ({ pa
   await restoredMessage.getByText("执行了 2分05秒", { exact: true }).click();
   await expect(restoredMessage.locator(".turn-event-step--approval_requested")).toHaveCount(0);
   await expect(restoredMessage.locator(".turn-event-step--approval_resolved")).toHaveCount(0);
-  await expect(restoredMessage.locator(".turn-tool-output-line--stderr")).toHaveText("test failed\n");
+  await expect(restoredMessage.locator(".turn-tool-output")).toHaveCount(0);
+  await expect(restoredMessage.locator(".turn-command-summary")).toHaveCount(2);
+  await expect(restoredMessage.locator(".turn-command-summary").filter({ hasText: "运行失败" })).toHaveCount(1);
+  await expect(restoredMessage.locator(".turn-command-summary").filter({ hasText: "test failed" })).toHaveCount(1);
+  await expect(restoredMessage.locator(".turn-command-summary").filter({ hasText: "已运行" })).toHaveCount(1);
   await expect(restoredMessage.getByText("修复完成，测试已经通过。", { exact: true })).toHaveCount(1);
   await expect(restoredMessage.locator(".changes-toggle")).toContainText("2 个文件");
   await restoredMessage.scrollIntoViewIfNeeded();
@@ -1885,6 +2076,11 @@ test("keeps a cancelled turn busy until the terminal event and then retries", as
       call: { id: "call-cancel", name: "run_command", arguments: { command: "pnpm build" }, metadata: {} },
     });
   });
+
+  const runningCommandRow = page.locator(".message--assistant").last().locator(".turn-timeline-tool--command");
+  await expect(runningCommandRow.getByText("pnpm build", { exact: true })).toBeVisible();
+  await expect(runningCommandRow.getByText("运行中", { exact: true })).toBeVisible();
+  await expect(runningCommandRow.locator(".turn-command-inline, .turn-tool-output, .turn-tool-duration")).toHaveCount(0);
 
   await page.getByRole("button", { name: "停止生成" }).click();
   await expect(page.getByRole("button", { name: "正在停止" })).toBeVisible();
@@ -1911,7 +2107,9 @@ test("keeps a cancelled turn busy until the terminal event and then retries", as
   await cancelledExecution.locator(":scope > summary").click();
   await expect(cancelledToolGroup).not.toHaveAttribute("open", "");
   await cancelledToolGroup.locator(":scope > summary").click();
-  await expect(cancelledMessage.locator(".turn-timeline-tool--cancelled")).toContainText("已取消");
+  const cancelledCommandRow = cancelledMessage.locator(".turn-timeline-tool--cancelled");
+  await expect(cancelledCommandRow).toContainText("已取消");
+  await expect(cancelledCommandRow.locator(".turn-command-inline, .turn-tool-output, .turn-tool-duration")).toHaveCount(0);
   await expect(cancelledExecution.getByRole("button", { name: "重试" })).toBeVisible();
   await cancelledExecution.getByRole("button", { name: "重试" }).click();
   await expect.poll(() => page.evaluate(() => (window as unknown as { __invoked: string[] }).__invoked.filter((command) => command === "turn_retry").length)).toBe(1);

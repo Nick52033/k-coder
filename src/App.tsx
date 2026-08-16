@@ -56,7 +56,7 @@ import { ImagePreviewDialog } from "./components/ImagePreviewDialog";
 import { cn } from "./lib/cn";
 import { open } from "@tauri-apps/plugin-dialog";
 import { readFile } from "@tauri-apps/plugin-fs";
-import type { AttachmentContent, FileEntry, GoalView, ImageAttachment, ProjectRecord, RuntimeStatus, WorkspaceState } from "./types/runtime";
+import type { AttachmentContent, FileEntry, GoalView, ImageAttachment, ProjectRecord, RuntimeStatus, ThreadSummary, WorkspaceState } from "./types/runtime";
 import { ComposerSuggestionMenu, type ComposerSuggestion } from "./components/ComposerSuggestionMenu";
 import { ProjectSelector } from "./components/ProjectSelector";
 import { findComposerTrigger, type ComposerTrigger } from "./lib/composerTrigger";
@@ -126,6 +126,14 @@ function mergeWorkspacePaths(current: string[], additions: string[]): string[] {
   return [...paths.values()];
 }
 
+function threadProjectPath(
+  thread: ThreadSummary,
+  legacyBindings: Record<string, string>,
+): string | undefined {
+  if (thread.inProject === false) return undefined;
+  return thread.workspacePath ?? legacyBindings[thread.id];
+}
+
 function toReadableError(reason: unknown): string {
   if (typeof reason === "string") return reason;
   if (reason instanceof Error) return reason.message;
@@ -180,6 +188,7 @@ function App() {
   const [queueExpanded, setQueueExpanded] = useState(false);
   const messageAreaRef = useRef<HTMLDivElement>(null);
   const composerRef = useRef<HTMLTextAreaElement>(null);
+  const modeMenuRef = useRef<HTMLDivElement>(null);
   const composerSearchRequestRef = useRef(0);
   const followLatestRef = useRef(true);
   const scrollFrameRef = useRef<number | null>(null);
@@ -248,7 +257,12 @@ function App() {
   const currentThreadQueue = messageQueue.filter((message) => message.threadId === activeThreadId);
   const pendingQueueCount = currentThreadQueue.filter((message) => message.status === "pending").length;
   // 普通会话列表只展示未绑定到项目的会话；持久化绑定优先于旧的本地展示映射。
-  const standaloneThreads = threads.filter((thread) => !(thread.workspacePath ?? threadProjectMap[thread.id]));
+  const standaloneThreads = threads.filter((thread) => !threadProjectPath(thread, threadProjectMap));
+  const activeThread = threads.find((thread) => thread.id === activeThreadId) ?? null;
+  const activeThreadWorkspacePath = activeThread
+    ? threadProjectPath(activeThread, threadProjectMap) ?? null
+    : null;
+  const activeThreadIsStandalone = activeThread?.inProject === false;
 
   useEffect(() => {
     let disposed = false;
@@ -415,7 +429,7 @@ function App() {
   };
 
   const selectSessionThread = async (thread: (typeof threads)[number]) => {
-    const targetWorkspace = thread.workspacePath ?? threadProjectMap[thread.id];
+    const targetWorkspace = threadProjectPath(thread, threadProjectMap);
     try {
       if (targetWorkspace) await ensureProjectWorkspace(targetWorkspace);
       await selectThread(thread.id);
@@ -425,13 +439,12 @@ function App() {
   };
 
   // 在指定项目（路径）下创建一个新会话。
-  // "会话"tab 调用时不传项目路径，会话保持"未分类"；"项目"tab 调用时传入项目路径，
-  // store 创建线程后立即把 threadId 关联到该项目，避免被自动绑定到当前工作区。
+  // 不传项目路径时创建显式无项目会话；传入路径时先切换工作区，再创建不可变绑定的项目会话。
   const createSessionUnderProject = async (projectPath: string | null) => {
     let newThreadId: string;
     try {
       if (projectPath) await ensureProjectWorkspace(projectPath);
-      newThreadId = await createThread();
+      newThreadId = await createThread(Boolean(projectPath));
     } catch {
       return;
     }
@@ -489,19 +502,22 @@ function App() {
     }
   };
 
-  // 仅在初始启动时（没有任何线程和映射时）把第一个会话归到当前工作区，
-  // 后续用户在"会话"tab 下新建的会话都不自动归到工作区。
+  // 仅为没有新版 inProject 事实的旧线程补展示映射；显式无项目线程绝不自动归入工作区。
   const bootstrappedRef = useRef(false);
   useEffect(() => {
     if (bootstrappedRef.current) return;
     if (!threads.length || !workspacePath) return;
     const map = readThreadProjectMap();
-    const hasAnyBinding = threads.some((t) => Boolean(map[t.id]));
+    const hasAnyBinding = threads.some((thread) => Boolean(threadProjectPath(thread, map)));
     if (hasAnyBinding) {
       bootstrappedRef.current = true;
       return;
     }
-    const first = threads[0];
+    const first = threads.find((thread) => thread.inProject !== false);
+    if (!first) {
+      bootstrappedRef.current = true;
+      return;
+    }
     const next = { ...map, [first.id]: workspacePath };
     setThreadProjectMap(next);
     saveThreadProjectMap(next);
@@ -535,7 +551,7 @@ function App() {
     const requestId = ++composerSearchRequestRef.current;
     setComposerSuggestionIndex(0);
     setComposerSuggestionsError("");
-    if (!trigger) {
+    if (!trigger || activeThreadIsStandalone) {
       setComposerSuggestions([]);
       setComposerSuggestionsLoading(false);
       return;
@@ -587,7 +603,7 @@ function App() {
       .finally(() => {
         if (requestId === composerSearchRequestRef.current) setComposerSuggestionsLoading(false);
       });
-  }, [composerTrigger, workspaceRevision]);
+  }, [activeThreadIsStandalone, composerTrigger, workspaceRevision]);
 
   // 点击外部关闭项目菜单
   useEffect(() => {
@@ -599,6 +615,16 @@ function App() {
     document.addEventListener("mousedown", handler);
     return () => document.removeEventListener("mousedown", handler);
   }, [projectMenuOpen]);
+
+  useEffect(() => {
+    if (!modeMenuOpen) return;
+    const handler = (event: MouseEvent) => {
+      if (!(event.target instanceof Node)) return;
+      if (!modeMenuRef.current?.contains(event.target)) setModeMenuOpen(false);
+    };
+    document.addEventListener("mousedown", handler);
+    return () => document.removeEventListener("mousedown", handler);
+  }, [modeMenuOpen]);
 
   const togglePinProject = (projectPath: string) => {
     setPinnedProjects((prev) => {
@@ -616,11 +642,9 @@ function App() {
     try { localStorage.setItem(STORAGE_THEME, next); } catch { /* noop */ }
   };
 
-  const activeThread = threads.find((thread) => thread.id === activeThreadId) ?? null;
-  const activeThreadWorkspacePath = activeThread
-    ? activeThread.workspacePath ?? threadProjectMap[activeThread.id]
-    : null;
-  const effectiveWorkspacePath = activeThreadWorkspacePath ?? workspacePath;
+  const effectiveWorkspacePath = activeThreadIsStandalone
+    ? null
+    : activeThreadWorkspacePath ?? workspacePath;
   const projectsWithThreads = useMemo(() => {
     type ProjectGroup = {
       key: string;
@@ -660,7 +684,7 @@ function App() {
 
     // 持久化会话工作区是项目归属的首要事实；旧本地映射只服务尚未迁移的会话。
     for (const thread of threads) {
-      const projectPath = thread.workspacePath ?? threadProjectMap[thread.id];
+      const projectPath = threadProjectPath(thread, threadProjectMap);
       if (!projectPath) continue;
       const project = ensureProject(projectPath);
       project.threads.push(thread);
@@ -702,6 +726,10 @@ function App() {
   const selectComposerProject = async (project: ProjectRecord) => {
     if (activeProject && workspacePathsEqual(project.path, activeProject.path)) return;
     await createSessionUnderProject(project.path);
+  };
+  const selectComposerStandalone = async () => {
+    if (activeThreadIsStandalone) return;
+    await createSessionUnderProject(null);
   };
   useEffect(() => {
     if (!activeThreadWorkspacePath) return;
@@ -960,7 +988,9 @@ function App() {
   function handleComposerChange(event: React.ChangeEvent<HTMLTextAreaElement>) {
     const value = event.currentTarget.value;
     setDraft(value);
-    setComposerTrigger(findComposerTrigger(value, event.currentTarget.selectionStart ?? value.length));
+    setComposerTrigger(activeThreadIsStandalone
+      ? null
+      : findComposerTrigger(value, event.currentTarget.selectionStart ?? value.length));
   }
 
   function insertComposerSuggestion(suggestion: ComposerSuggestion) {
@@ -1938,10 +1968,12 @@ function App() {
             <ProjectSelector
               projects={selectableProjects}
               activeProject={activeProject}
+              standalone={activeThreadIsStandalone}
               disabled={anyTurnBusy}
               switching={workspaceSwitching}
               onSelect={selectComposerProject}
               onCreateProject={pickProjectForComposer}
+              onSelectStandalone={selectComposerStandalone}
             />
             <button
               type="button"
@@ -1961,7 +1993,7 @@ function App() {
                 cursor: "pointer",
               }}
             ><ImageIcon size={18} /></button>
-            <div className="composer-mode-selector">
+            <div ref={modeMenuRef} className="composer-mode-selector">
               <button
                 type="button"
                 className="mode-toggle"

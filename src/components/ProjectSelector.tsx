@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Check, ChevronDown, Folder, FolderPlus, Loader2, Search } from "lucide-react";
+import { Check, ChevronDown, Folder, FolderPlus, FolderX, Loader2, Search } from "lucide-react";
 import type { ProjectRecord } from "../types/runtime";
 import { cn } from "../lib/cn";
 import { toUserFacingPath, workspacePathsEqual } from "../lib/path";
@@ -7,19 +7,23 @@ import { toUserFacingPath, workspacePathsEqual } from "../lib/path";
 interface ProjectSelectorProps {
   projects: ProjectRecord[];
   activeProject: ProjectRecord | null;
+  standalone: boolean;
   disabled?: boolean;
   switching?: boolean;
   onSelect: (project: ProjectRecord) => Promise<void> | void;
   onCreateProject: () => Promise<void> | void;
+  onSelectStandalone: () => Promise<void> | void;
 }
 
 export function ProjectSelector({
   projects,
   activeProject,
+  standalone,
   disabled = false,
   switching = false,
   onSelect,
   onCreateProject,
+  onSelectStandalone,
 }: ProjectSelectorProps) {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
@@ -62,15 +66,21 @@ export function ProjectSelector({
       <button
         type="button"
         className="project-selector-trigger"
-        aria-label={activeProject ? `当前项目 ${activeProject.name}` : "选择项目"}
+        aria-label={standalone ? "当前不在项目中" : activeProject ? `当前项目 ${activeProject.name}` : "选择项目"}
         aria-expanded={open}
         aria-haspopup="dialog"
-        title={activeProject ? toUserFacingPath(activeProject.path) : "选择当前对话的项目"}
+        title={standalone ? "当前会话不使用项目工作区" : activeProject ? toUserFacingPath(activeProject.path) : "选择当前对话的项目"}
         disabled={unavailable}
         onClick={() => setOpen((value) => !value)}
       >
-        {switching || selecting ? <Loader2 className="spin" size={15} /> : <Folder size={15} />}
-        <span>{activeProject?.name ?? "选择项目"}</span>
+        {switching || selecting ? (
+          <Loader2 className="spin" size={15} />
+        ) : standalone ? (
+          <FolderX size={15} />
+        ) : (
+          <Folder size={15} />
+        )}
+        <span>{standalone ? "不在项目中" : activeProject?.name ?? "选择项目"}</span>
         <ChevronDown className="project-selector-chevron" size={13} />
       </button>
 
@@ -142,6 +152,29 @@ export function ProjectSelector({
             >
               <FolderPlus size={15} aria-hidden="true" />
               <span>新建项目</span>
+            </button>
+            <button
+              type="button"
+              className={cn(standalone && "project-selector-footer-option--active")}
+              aria-pressed={standalone}
+              disabled={unavailable}
+              onClick={async () => {
+                if (standalone) {
+                  close();
+                  return;
+                }
+                close();
+                setSelecting(true);
+                try {
+                  await onSelectStandalone();
+                } finally {
+                  setSelecting(false);
+                }
+              }}
+            >
+              <FolderX size={15} aria-hidden="true" />
+              <span>不在项目中</span>
+              {standalone ? <Check className="project-selector-footer-check" size={15} aria-hidden="true" /> : null}
             </button>
           </div>
         </div>

@@ -282,7 +282,7 @@ export function reduceAgentEvent(
             event.turnId,
             "compacted",
             event.automatic ? "已自动压缩上下文" : "已手动压缩上下文",
-            `压缩了 ${event.compactedMessageCount} 条历史消息，保留 ${event.userConstraintCount} 项用户约束和 ${event.recentToolResultCount} 项近期工具结果`,
+            `压缩了 ${event.compactedMessageCount} 条历史消息，保留 ${event.userConstraintCount} 项用户约束、${event.recentUserMessageCount ?? 0} 项近期用户请求和 ${event.recentToolResultCount} 项近期工具结果`,
           ),
         },
       };

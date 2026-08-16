@@ -46,7 +46,7 @@ const MAX_RESPONSE_BYTES: usize = 512 * 1024;
 const MAX_RESPONSE_IMAGE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_REASONING_SUMMARY_BYTES: usize = 64 * 1024;
 const MAX_PROVIDER_CONTEXT_BYTES: usize = 512 * 1024;
-const MAX_TOOL_OUTPUT_BYTES: usize = 256 * 1024;
+const MAX_TOOL_OUTPUT_BYTES: usize = 128 * 1024;
 const MAX_IDENTICAL_TOOL_CALLS: usize = 2;
 const PROGRESS_CHECK_WINDOW: usize = 5;
 const MAX_NO_PROGRESS_WINDOWS: usize = 3;
@@ -233,6 +233,7 @@ pub struct AgentRuntime {
     max_total_tokens: Option<u64>,
     soft_turn_limits: Option<SoftTurnLimits>,
     context_limit: usize,
+    working_context_limit: usize,
     metrics: Option<RuntimeMetrics>,
     reasoning_effort: ReasoningEffort,
     supports_vision: bool,
@@ -280,6 +281,7 @@ impl AgentRuntime {
             max_total_tokens: None,
             soft_turn_limits: None,
             context_limit: DEFAULT_CONTEXT_LIMIT,
+            working_context_limit: context::default_working_context_limit(DEFAULT_CONTEXT_LIMIT),
             metrics: None,
             reasoning_effort: ReasoningEffort::default(),
             supports_vision: false,
@@ -314,6 +316,13 @@ impl AgentRuntime {
 
     pub fn with_context_limit(mut self, context_limit: usize) -> Self {
         self.context_limit = context_limit.max(1_024);
+        self.working_context_limit = context::default_working_context_limit(self.context_limit);
+        self
+    }
+
+    pub fn with_working_context_limit(mut self, working_context_limit: usize) -> Self {
+        self.working_context_limit =
+            context::normalize_working_context_limit(self.context_limit, working_context_limit);
         self
     }
 
@@ -560,7 +569,8 @@ impl AgentRuntime {
     ) -> Result<CompactionSummary, AgentRuntimeError> {
         let history =
             provider_history(self.repository.load(thread_id).await?, self.supports_vision);
-        let (summary, _) = context::compact(&history, self.context_limit);
+        let (summary, _) =
+            context::compact(&history, self.working_context_limit.min(self.context_limit));
         if summary.compacted_message_count > 0 {
             let compaction_event = StoredEvent::new(
                 thread_id,
@@ -582,6 +592,14 @@ impl AgentRuntime {
                 ))
                 .await?;
             self.repository.append(compaction_event).await?;
+            if let Some(metrics) = &self.metrics {
+                metrics.compaction(
+                    summary.estimated_before_tokens,
+                    summary.estimated_after_tokens,
+                    summary.compacted_message_count,
+                    false,
+                );
+            }
             self.repository
                 .append(StoredEvent::new(
                     thread_id,
@@ -668,6 +686,7 @@ impl AgentRuntime {
             .soft_turn_limits
             .map(|_| SoftTurnSegment::new(provider_call_index, total_usage.total_tokens));
         let mut force_compaction = false;
+        let tool_definitions = self.tools.provider_definitions();
 
         // 进展检测变量
         let mut no_progress_count = 0usize;
@@ -774,13 +793,24 @@ impl AgentRuntime {
             let last_context_usage = last_active_context_usage(&events);
             let mut history = provider_history(events, self.supports_vision);
             if force_compaction
-                || context::needs_compaction(&history, self.context_limit)
+                || context::needs_compaction_for_request(
+                    &history,
+                    &self.runtime_instructions,
+                    &tool_definitions,
+                    self.working_context_limit.min(self.context_limit),
+                )
                 || last_context_usage.is_some_and(|usage| {
-                    context::needs_compaction_for_usage(usage.total_tokens, self.context_limit)
+                    context::needs_compaction_for_usage(
+                        usage.total_tokens,
+                        self.working_context_limit.min(self.context_limit),
+                    )
                 })
             {
                 force_compaction = false;
-                let (summary, compacted) = context::compact(&history, self.context_limit);
+                let (summary, compacted) = context::compact(
+                    &history,
+                    self.working_context_limit.min(self.context_limit),
+                );
                 if summary.compacted_message_count > 0 {
                     let compaction_event = StoredEvent::new(
                         &thread_id,
@@ -802,6 +832,14 @@ impl AgentRuntime {
                     self.repository
                         .append(compaction_event)
                         .await?;
+                    if let Some(metrics) = &self.metrics {
+                        metrics.compaction(
+                            summary.estimated_before_tokens,
+                            summary.estimated_after_tokens,
+                            summary.compacted_message_count,
+                            true,
+                        );
+                    }
                     publisher.publish(AgentEventEnvelope::new(AgentEvent::ContextCompacted {
                         thread_id: thread_id.clone(),
                         turn_id: turn_id.clone(),
@@ -810,6 +848,7 @@ impl AgentRuntime {
                         compacted_message_count: summary.compacted_message_count,
                         user_constraint_count: summary.user_constraints.len(),
                         recent_tool_result_count: summary.recent_tool_results.len(),
+                        recent_user_message_count: summary.recent_user_messages.len(),
                     }));
                     self.complete_item(
                         &thread_id,
@@ -837,7 +876,7 @@ impl AgentRuntime {
                 model: model.clone(),
                 reasoning_effort: self.reasoning_effort,
                 messages: history,
-                tools: self.tools.definitions(),
+                tools: tool_definitions.clone(),
             };
             publisher.publish(AgentEventEnvelope::new(AgentEvent::ActivityStatusChanged {
                 thread_id: thread_id.clone(),
@@ -2788,15 +2827,36 @@ fn bound_tool_result(mut result: ToolResult) -> ToolResult {
     if result.output.len() <= MAX_TOOL_OUTPUT_BYTES {
         return result;
     }
-    let mut end = MAX_TOOL_OUTPUT_BYTES;
-    while end > 0 && !result.output.is_char_boundary(end) {
-        end -= 1;
+    let original_bytes = result.output.len();
+    let marker = format!(
+        "\n...[tool output truncated: omitted {} bytes]...\n",
+        original_bytes.saturating_sub(MAX_TOOL_OUTPUT_BYTES)
+    );
+    let available = MAX_TOOL_OUTPUT_BYTES.saturating_sub(marker.len());
+    let head_budget = available / 2;
+    let tail_budget = available.saturating_sub(head_budget);
+    let mut head_end = head_budget.min(result.output.len());
+    while head_end > 0 && !result.output.is_char_boundary(head_end) {
+        head_end -= 1;
     }
-    result.output.truncate(end);
+    let mut tail_start = result.output.len().saturating_sub(tail_budget);
+    while tail_start < result.output.len() && !result.output.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+    let original = std::mem::take(&mut result.output);
+    result.output = format!(
+        "{}{}{}",
+        &original[..head_end],
+        marker,
+        &original[tail_start..]
+    );
     if !result.metadata.is_object() {
         result.metadata = json!({});
     }
     result.metadata["outputTruncated"] = Value::Bool(true);
+    result.metadata["originalOutputBytes"] = Value::from(original_bytes as u64);
+    result.metadata["omittedOutputBytes"] =
+        Value::from(original_bytes.saturating_sub(result.output.len()) as u64);
     result
 }
 
@@ -3279,7 +3339,35 @@ mod tests {
     async fn runtime_uses_the_configured_model_context_limit() {
         let (_directory, _repository, runtime, _thread_id) = runtime_fixture().await;
 
-        assert_eq!(runtime.with_context_limit(32_000).context_limit, 32_000);
+        let configured = runtime.with_context_limit(128_000);
+        assert_eq!(configured.context_limit, 128_000);
+        assert_eq!(
+            configured.working_context_limit,
+            context::DEFAULT_WORKING_CONTEXT_LIMIT
+        );
+        assert_eq!(
+            configured
+                .with_working_context_limit(64_000)
+                .working_context_limit,
+            64_000
+        );
+    }
+
+    #[test]
+    fn oversized_tool_results_keep_head_tail_and_metadata() {
+        let original = format!("HEAD\n{}\nTAIL", "x".repeat(MAX_TOOL_OUTPUT_BYTES));
+        let result = bound_tool_result(ToolResult {
+            success: true,
+            output: original,
+            metadata: json!({}),
+        });
+
+        assert!(result.output.len() <= MAX_TOOL_OUTPUT_BYTES);
+        assert!(result.output.starts_with("HEAD"));
+        assert!(result.output.contains("tool output truncated"));
+        assert!(result.output.ends_with("TAIL"));
+        assert_eq!(result.metadata["outputTruncated"], Value::Bool(true));
+        assert!(result.metadata["omittedOutputBytes"].as_u64().unwrap() > 0);
     }
 
     #[tokio::test]
@@ -5115,9 +5203,12 @@ mod tests {
     #[test]
     fn restored_compaction_renders_recent_tools_as_text() {
         let summary = CompactionSummary {
-            contract_version: 1,
+            contract_version: 2,
             summary: "repository inspected".to_string(),
             user_constraints: Vec::new(),
+            recent_user_messages: Vec::new(),
+            current_user_request: String::new(),
+            important_tool_observations: Vec::new(),
             recent_tool_results: vec![ProviderMessage::ToolResult {
                 call_id: "orphaned-call".to_string(),
                 name: "read_file".to_string(),
@@ -5125,6 +5216,8 @@ mod tests {
                 output: "important result".to_string(),
             }],
             compacted_message_count: 10,
+            estimated_before_tokens: 0,
+            estimated_after_tokens: 0,
         };
         let history = provider_history(
             vec![StoredEvent::new(

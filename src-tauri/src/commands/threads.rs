@@ -11,14 +11,20 @@ use crate::storage::{ThreadDetail, ThreadSummary};
 
 use super::{CommandError, CommandResult};
 
-#[tauri::command]
-pub async fn create_thread(state: State<'_, AppState>) -> CommandResult<ThreadSummary> {
-    let workspace_root = state.workspace_root();
-    state
-        .repository()
-        .create_thread_in_workspace(&workspace_root)
-        .await
-        .map_err(|error| CommandError::new("storage", error))
+#[tauri::command(rename_all = "camelCase")]
+pub async fn create_thread(
+    state: State<'_, AppState>,
+    in_project: Option<bool>,
+) -> CommandResult<ThreadSummary> {
+    let repository = state.repository();
+    if in_project.unwrap_or(true) {
+        repository
+            .create_thread_in_workspace(&state.workspace_root())
+            .await
+    } else {
+        repository.create_standalone_thread().await
+    }
+    .map_err(|error| CommandError::new("storage", error))
 }
 
 #[tauri::command]
@@ -169,20 +175,31 @@ pub async fn compact_thread(
             "stop the active turn before compacting",
         ));
     }
-    let workspace_root = state
-        .ensure_thread_workspace(&thread_id)
+    let project_workspace = state
+        .resolve_thread_workspace(&thread_id)
         .await
         .map_err(|error| CommandError::new("workspace_mismatch", error))?;
+    let workspace_root = project_workspace
+        .clone()
+        .unwrap_or_else(|| state.workspace_root());
     let context_limit = state
         .provider_context_limit()
         .map_err(|error| CommandError::new("provider_config", error))?;
     let runtime = AgentRuntime::with_tools_and_approvals(
         state.runtime_repository(),
-        state.tool_registry(),
+        if project_workspace.is_some() {
+            state.tool_registry()
+        } else {
+            state
+                .tool_registry()
+                .restricted_to(&[])
+                .map_err(|error| CommandError::new("workspace_tools", error))?
+        },
         workspace_root,
         state.approvals(),
     )
     .with_context_limit(context_limit);
+    let runtime = runtime.with_metrics(state.advanced().metrics.clone());
     runtime
         .compact_thread(&thread_id)
         .await

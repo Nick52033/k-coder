@@ -11,7 +11,7 @@ use uuid::Uuid;
 use crate::advanced::AdvancedServices;
 use crate::agent::mailbox::{MailboxTurn, QueuedTurnSteerError, ThreadMailbox, TurnControl};
 use crate::agent::thread_operation::{ThreadOperationGate, ThreadOperationGuard};
-use crate::execution::{CommandRuntime, ExecutionError, NativePtyRuntime};
+use crate::execution::{BundledTools, CommandRuntime, ExecutionError, NativePtyRuntime};
 use crate::extensions::mcp::OsMcpSecretStore;
 use crate::extensions::{ExtensionError, ExtensionOverview, ExtensionService};
 use crate::logging::StructuredLogger;
@@ -50,6 +50,7 @@ pub struct AppState {
     user_inputs: Arc<UserInputManager>,
     command_runtime: RwLock<CommandRuntime>,
     pty_runtime: RwLock<NativePtyRuntime>,
+    bundled_tools: Option<BundledTools>,
     logger: StructuredLogger,
     active_turns: Mutex<HashMap<String, ActiveTurn>>,
     thread_mailbox: ThreadMailbox,
@@ -81,6 +82,20 @@ impl AppState {
             data_root,
             Arc::new(OsCredentialStore::new()),
             Some(builtin_skills_root.as_ref().to_path_buf()),
+            None,
+        )
+    }
+
+    pub fn new_with_builtin_resources(
+        data_root: impl AsRef<Path>,
+        builtin_skills_root: impl AsRef<Path>,
+        bundled_tools_root: Option<PathBuf>,
+    ) -> Result<Self, AppStateError> {
+        Self::with_credentials_and_builtin_skills(
+            data_root,
+            Arc::new(OsCredentialStore::new()),
+            Some(builtin_skills_root.as_ref().to_path_buf()),
+            bundled_tools_root,
         )
     }
 
@@ -88,13 +103,14 @@ impl AppState {
         data_root: impl AsRef<Path>,
         credentials: Arc<dyn CredentialStore>,
     ) -> Result<Self, AppStateError> {
-        Self::with_credentials_and_builtin_skills(data_root, credentials, None)
+        Self::with_credentials_and_builtin_skills(data_root, credentials, None, None)
     }
 
     fn with_credentials_and_builtin_skills(
         data_root: impl AsRef<Path>,
         credentials: Arc<dyn CredentialStore>,
         builtin_skills_root: Option<PathBuf>,
+        bundled_tools_root: Option<PathBuf>,
     ) -> Result<Self, AppStateError> {
         let data_root = data_root.as_ref().to_path_buf();
         let fallback =
@@ -112,6 +128,7 @@ impl AppState {
             workspace_root,
             credentials,
             builtin_skills_root,
+            bundled_tools_root,
         )
     }
 
@@ -125,6 +142,7 @@ impl AppState {
             workspace_root,
             credentials,
             None,
+            None,
         )
     }
 
@@ -133,6 +151,7 @@ impl AppState {
         workspace_root: impl AsRef<Path>,
         credentials: Arc<dyn CredentialStore>,
         builtin_skills_root: Option<PathBuf>,
+        bundled_tools_root: Option<PathBuf>,
     ) -> Result<Self, AppStateError> {
         let data_root = data_root.as_ref().to_path_buf();
         let workspace_root = workspace_root
@@ -145,8 +164,14 @@ impl AppState {
             ));
         }
         let patch_service = PatchService::new();
-        let command_runtime = CommandRuntime::with_recovery(&workspace_root, &data_root)?;
-        let pty_runtime = NativePtyRuntime::new(&workspace_root)?;
+        let bundled_tools = bundled_tools_root.map(BundledTools::new).transpose()?;
+        let command_runtime = CommandRuntime::with_recovery_and_bundled_tools(
+            &workspace_root,
+            &data_root,
+            bundled_tools.clone(),
+        )?;
+        let pty_runtime =
+            NativePtyRuntime::new_with_bundled_tools(&workspace_root, bundled_tools.clone())?;
         let repository = Arc::new(JsonlThreadRepository::new(&data_root)?);
         let approval_mode = repository
             .projection()
@@ -193,6 +218,7 @@ impl AppState {
             user_inputs: Arc::new(UserInputManager::new(Duration::from_secs(10 * 60))),
             command_runtime: RwLock::new(command_runtime),
             pty_runtime: RwLock::new(pty_runtime),
+            bundled_tools,
             logger,
             active_turns: Mutex::new(HashMap::new()),
             thread_mailbox: ThreadMailbox::default(),
@@ -364,8 +390,12 @@ impl AppState {
                 "workspace root is not a directory".into(),
             ));
         }
-        let command = CommandRuntime::with_recovery(&path, &self.data_root)?;
-        let pty = NativePtyRuntime::new(&path)?;
+        let command = CommandRuntime::with_recovery_and_bundled_tools(
+            &path,
+            &self.data_root,
+            self.bundled_tools.clone(),
+        )?;
+        let pty = NativePtyRuntime::new_with_bundled_tools(&path, self.bundled_tools.clone())?;
         let (advanced_handlers, advanced_risks) = self.advanced.tool_handlers(&path);
         let tool_registry = ToolRegistry::workspace_tools_with_execution(
             self.patch_service.clone(),
@@ -815,14 +845,20 @@ impl AppState {
         self.read_thread_history(thread_id).await
     }
 
-    pub async fn ensure_thread_workspace(&self, thread_id: &str) -> Result<PathBuf, AppStateError> {
+    pub async fn resolve_thread_workspace(
+        &self,
+        thread_id: &str,
+    ) -> Result<Option<PathBuf>, AppStateError> {
         let current_workspace = self.workspace_root();
         let detail = self.repository.read_thread(thread_id).await?;
+        if !detail.summary.in_project {
+            return Ok(None);
+        }
         let Some(bound_path) = detail.summary.workspace_path else {
             self.repository
                 .bind_thread_workspace(thread_id, &current_workspace)
                 .await?;
-            return Ok(current_workspace);
+            return Ok(Some(current_workspace));
         };
         let bound_workspace = PathBuf::from(&bound_path).canonicalize().map_err(|error| {
             AppStateError::Workspace(format!(
@@ -836,7 +872,13 @@ impl AppState {
                 actual: current_workspace,
             });
         }
-        Ok(current_workspace)
+        Ok(Some(current_workspace))
+    }
+
+    pub async fn ensure_thread_workspace(&self, thread_id: &str) -> Result<PathBuf, AppStateError> {
+        self.resolve_thread_workspace(thread_id)
+            .await?
+            .ok_or_else(|| AppStateError::ThreadHasNoWorkspace(thread_id.to_string()))
     }
 
     pub async fn finish_turn(&self, thread_id: &str) {
@@ -1245,6 +1287,8 @@ pub enum AppStateError {
         expected: PathBuf,
         actual: PathBuf,
     },
+    #[error("thread {0} is not associated with a project workspace")]
+    ThreadHasNoWorkspace(String),
     #[error("stop active turns and subagents before changing the approval mode")]
     ApprovalModeBusy,
     #[error("approval mode lock poisoned")]
@@ -1864,6 +1908,38 @@ mod tests {
             Err(AppStateError::ThreadWorkspaceMismatch { .. })
         ));
         assert!(!state.is_turn_active(&thread.id).await);
+    }
+
+    #[tokio::test]
+    async fn leaves_standalone_threads_without_a_workspace() {
+        let data = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let state = AppState::with_workspace_and_credentials(
+            data.path(),
+            workspace.path(),
+            Arc::new(FakeCredentials::default()),
+        )
+        .unwrap();
+        let thread = state.repository().create_standalone_thread().await.unwrap();
+
+        assert_eq!(
+            state.resolve_thread_workspace(&thread.id).await.unwrap(),
+            None
+        );
+        assert!(matches!(
+            state.ensure_thread_workspace(&thread.id).await,
+            Err(AppStateError::ThreadHasNoWorkspace(_))
+        ));
+        assert!(
+            state
+                .repository()
+                .read_thread(&thread.id)
+                .await
+                .unwrap()
+                .summary
+                .workspace_path
+                .is_none()
+        );
     }
 
     #[tokio::test]

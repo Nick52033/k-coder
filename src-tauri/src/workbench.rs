@@ -428,38 +428,36 @@ pub fn extract_attachment(
 
 pub fn open_external(root: &Path, relative: &str, reveal: bool) -> Result<(), WorkbenchError> {
     let path = resolve(root, relative, false)?;
-    #[cfg(target_os = "windows")]
-    let status = {
-        let mut command = if reveal {
-            let mut command = Command::new("explorer");
-            command.arg(format!("/select,{}", path.display()));
-            command
-        } else {
-            let mut command = Command::new("cmd");
-            command.args(["/C", "start", "", &path.to_string_lossy()]);
-            command
-        };
-        hide_console_window(&mut command);
-        command.status()
-    };
-    #[cfg(target_os = "macos")]
-    let status = if reveal {
-        Command::new("open")
-            .args(["-R", &path.to_string_lossy()])
-            .status()
+    let shell_path = shell_compatible_path(&path);
+    let result = if reveal {
+        tauri_plugin_opener::reveal_item_in_dir(&shell_path)
     } else {
-        Command::new("open").arg(&path).status()
+        tauri_plugin_opener::open_path(&shell_path, None::<&str>)
     };
-    #[cfg(all(unix, not(target_os = "macos")))]
-    let status = Command::new("xdg-open")
-        .arg(if reveal {
-            path.parent().unwrap_or(root)
-        } else {
-            &path
-        })
-        .status();
-    status.map_err(|error| WorkbenchError::Io(error.to_string()))?;
-    Ok(())
+    result.map_err(|error| WorkbenchError::Io(error.to_string()))
+}
+
+fn shell_compatible_path(path: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        use std::ffi::OsString;
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+
+        const VERBATIM_PREFIX: &[u16] = &[92, 92, 63, 92];
+        const VERBATIM_UNC_PREFIX: &[u16] = &[92, 92, 63, 92, 85, 78, 67, 92];
+
+        let wide = path.as_os_str().encode_wide().collect::<Vec<_>>();
+        if wide.starts_with(VERBATIM_UNC_PREFIX) {
+            let mut shell_path = Vec::with_capacity(wide.len() - 6);
+            shell_path.extend_from_slice(&[92, 92]);
+            shell_path.extend_from_slice(&wide[VERBATIM_UNC_PREFIX.len()..]);
+            return PathBuf::from(OsString::from_wide(&shell_path));
+        }
+        if wide.starts_with(VERBATIM_PREFIX) {
+            return PathBuf::from(OsString::from_wide(&wide[VERBATIM_PREFIX.len()..]));
+        }
+    }
+    path.to_path_buf()
 }
 
 pub fn git_status(root: &Path) -> Result<GitStatusView, WorkbenchError> {
@@ -802,6 +800,43 @@ mod tests {
         git(root, &["init"]).unwrap();
         git(root, &["config", "user.email", "test@example.com"]).unwrap();
         git(root, &["config", "user.name", "k-Coder Tests"]).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn prepares_windows_shell_paths_without_verbatim_prefixes() {
+        use std::ffi::OsString;
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+
+        assert_eq!(
+            shell_compatible_path(Path::new(r"\\?\D:\code\k-coder\README.md")),
+            PathBuf::from(r"D:\code\k-coder\README.md")
+        );
+        assert_eq!(
+            shell_compatible_path(Path::new(r"\\?\UNC\server\share\README.md")),
+            PathBuf::from(r"\\server\share\README.md")
+        );
+        assert_eq!(
+            shell_compatible_path(Path::new(r"D:\code\k-coder\README.md")),
+            PathBuf::from(r"D:\code\k-coder\README.md")
+        );
+
+        let non_unicode =
+            OsString::from_wide(&[92, 92, 63, 92, 68, 58, 92, 0xd800, 46, 116, 120, 116]);
+        assert_eq!(
+            shell_compatible_path(Path::new(&non_unicode))
+                .as_os_str()
+                .encode_wide()
+                .collect::<Vec<_>>(),
+            vec![68, 58, 92, 0xd800, 46, 116, 120, 116]
+        );
+    }
+
+    #[test]
+    fn external_open_rejects_workspace_escape_before_launching() {
+        let root = tempfile::tempdir().unwrap();
+        let result = open_external(root.path(), "../outside.txt", false);
+        assert!(matches!(result, Err(WorkbenchError::Invalid(_))));
     }
 
     #[test]

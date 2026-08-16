@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
@@ -23,6 +23,12 @@ const TOOL_PROGRESS_CHANNEL_CAPACITY: usize = 64;
 const TOOL_PROGRESS_BATCH_BYTES: usize = 16 * 1024;
 const TOOL_PROGRESS_READ_LIMIT: usize = 200;
 const MAX_PERSISTED_TOOL_PROGRESS_BYTES: usize = 64 * 1024;
+const MAX_PROVIDER_TOOL_DESCRIPTION_BYTES: usize = 2 * 1024;
+const MAX_PATH_SUGGESTION_SIBLING_ENTRIES: usize = 500;
+const MAX_PATH_SUGGESTION_SCAN_ENTRIES: usize = 2_000;
+const MAX_PATH_SUGGESTION_DEPTH: usize = 8;
+const POWERSHELL_RG_GLOB_RECOVERY_HINT: &str = "PowerShell 不会展开传给原生 rg 的路径通配符。请把文件通配符放到 rg 的 --glob 选项并传目录，例如 `rg --glob 'index-*.js' -n 'CodeEditor' dist/assets`；其他模式同理（如 `rg --glob 'CodeEditor-*.js' ... dist/assets`），也可以先用 `Get-ChildItem` 获取精确 `.FullName`。";
+const WINDOWS_POWERSHELL_RG_CRLF_RECOVERY_HINT: &str = "Windows PowerShell 会把原生命令管道重新编码为 CRLF，所以下游 rg 的 `$` 行尾锚点可能得到空结果。请给接收管道输入的 rg 添加 `--crlf`，例如 `rg --files path | rg --crlf 'name\\.js$'`；或改用 `Select-String`。";
 
 #[derive(Debug, Clone)]
 pub struct ToolProgress {
@@ -343,6 +349,19 @@ impl ToolRegistry {
         definitions
     }
 
+    /// Build the provider-facing schema without allowing an extension's prose
+    /// description to consume an unbounded amount of every request context.
+    /// Validation and local tool dispatch continue to use the full definition.
+    pub fn provider_definitions(&self) -> Vec<ToolDefinition> {
+        self.definitions()
+            .into_iter()
+            .map(|mut definition| {
+                definition.description = bound_provider_description(&definition.description);
+                definition
+            })
+            .collect()
+    }
+
     /// 返回所有已注册工具的名称（排序后），用于 system prompt 中的工具列表。
     pub fn definition_names(&self) -> Vec<String> {
         let mut names = self
@@ -477,9 +496,66 @@ impl ToolRegistry {
     }
 }
 
+fn bound_provider_description(description: &str) -> String {
+    if description.len() <= MAX_PROVIDER_TOOL_DESCRIPTION_BYTES {
+        return description.to_string();
+    }
+    let mut end = MAX_PROVIDER_TOOL_DESCRIPTION_BYTES;
+    while end > 0 && !description.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut body_end = end.saturating_sub(3);
+    while body_end > 0 && !description.is_char_boundary(body_end) {
+        body_end -= 1;
+    }
+    format!("{}...", &description[..body_end])
+}
+
 #[derive(Debug, Clone)]
 struct Workspace {
     root: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkspaceEntryKind {
+    Directory,
+    File,
+}
+
+impl WorkspaceEntryKind {
+    fn noun(self) -> &'static str {
+        match self {
+            Self::Directory => "directory",
+            Self::File => "file",
+        }
+    }
+
+    fn matches(self, path: &Path) -> bool {
+        match self {
+            Self::Directory => path.is_dir(),
+            Self::File => path.is_file(),
+        }
+    }
+
+    fn type_mismatch(self, display_path: &str, path: &Path) -> ToolError {
+        let actual = if path.is_dir() {
+            "a directory"
+        } else if path.is_file() {
+            "a regular file"
+        } else {
+            "an unsupported filesystem entry"
+        };
+        let recovery = match self {
+            Self::Directory => "use read_file for a file, or list_directory on its parent",
+            Self::File => {
+                "use list_directory to inspect this directory and then pass one exact file path"
+            }
+        };
+        ToolError::InvalidArguments(format!(
+            "workspace path {display_path:?} is {actual}, not the requested {}; {recovery}",
+            self.noun()
+        ))
+    }
 }
 
 impl Workspace {
@@ -495,8 +571,13 @@ impl Workspace {
         Ok(Self { root })
     }
 
-    fn resolve_existing(&self, relative: &str) -> Result<PathBuf, ToolError> {
+    fn resolve_existing(
+        &self,
+        relative: &str,
+        expected_kind: WorkspaceEntryKind,
+    ) -> Result<PathBuf, ToolError> {
         let relative = Path::new(relative);
+        let display_path = relative.to_string_lossy().replace('\\', "/");
         if relative.is_absolute()
             || relative.components().any(|component| {
                 matches!(
@@ -509,17 +590,274 @@ impl Workspace {
                 "path must be relative and must not contain parent traversal".to_string(),
             ));
         }
-        let target =
-            self.root.join(relative).canonicalize().map_err(|error| {
-                ToolError::Execution(format!("path cannot be resolved: {error}"))
-            })?;
+        if contains_path_glob(relative) {
+            return Err(ToolError::InvalidArguments(format!(
+                "workspace {} path {display_path:?} must name exactly one existing entry; wildcard patterns (*, ?, [...]) are not supported. Use list_directory or search_repository to discover an exact path.",
+                expected_kind.noun()
+            )));
+        }
+        let target = match self.root.join(relative).canonicalize() {
+            Ok(target) => target,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let suggestion = sibling_path_suggestion(&self.root, relative, expected_kind)
+                    .map(|value| format!(" Possible existing path: {value}."))
+                    .unwrap_or_default();
+                return Err(ToolError::InvalidArguments(format!(
+                    "workspace {} path {display_path:?} does not exist.{suggestion} Use list_directory on the parent directory or search_repository before retrying.",
+                    expected_kind.noun()
+                )));
+            }
+            Err(error) => {
+                return Err(ToolError::Execution(format!(
+                    "path cannot be resolved for workspace path {display_path:?}: {error}"
+                )));
+            }
+        };
         if !target.starts_with(&self.root) {
             return Err(ToolError::Denied(
                 "path resolves outside the workspace".to_string(),
             ));
         }
+        if !expected_kind.matches(&target) {
+            return Err(expected_kind.type_mismatch(&display_path, &target));
+        }
         Ok(target)
     }
+}
+
+fn contains_path_glob(path: &Path) -> bool {
+    path.to_string_lossy()
+        .chars()
+        .any(|character| matches!(character, '*' | '?' | '[' | ']'))
+}
+
+/// Return bounded, workspace-relative suggestions for a misspelled path.
+///
+/// The fast path only inspects the requested parent. If that parent is itself
+/// misspelled (for example `src/store/workbench.ts` when the real path is
+/// `src/stores/workbenchStore.ts`), a bounded breadth-first scan can find a
+/// close path elsewhere in the workspace. Every candidate is canonicalized and
+/// checked against the workspace root, and symlinks are ignored.
+fn sibling_path_suggestion(
+    root: &Path,
+    relative: &Path,
+    expected_kind: WorkspaceEntryKind,
+) -> Option<String> {
+    let parent = relative.parent().unwrap_or_else(|| Path::new(""));
+    let wanted = relative.file_name()?.to_string_lossy().to_lowercase();
+    if wanted.is_empty() {
+        return None;
+    }
+
+    let mut candidates = Vec::new();
+    if let Ok(parent_path) = root.join(parent).canonicalize() {
+        if parent_path.starts_with(root) && parent_path.is_dir() {
+            collect_direct_path_suggestions(
+                root,
+                relative,
+                parent,
+                &parent_path,
+                expected_kind,
+                &mut candidates,
+            );
+        }
+    }
+    if candidates.is_empty() {
+        collect_workspace_path_suggestions(root, relative, expected_kind, &mut candidates);
+    }
+
+    candidates.sort_by(|left, right| {
+        right
+            .0
+            .cmp(&left.0)
+            .then_with(|| left.1.to_lowercase().cmp(&right.1.to_lowercase()))
+    });
+    let mut seen = HashSet::new();
+    let suggestions = candidates
+        .into_iter()
+        .filter_map(|(_, path)| seen.insert(path.to_lowercase()).then_some(path))
+        .take(3)
+        .collect::<Vec<_>>();
+    (!suggestions.is_empty()).then(|| suggestions.join(", "))
+}
+
+fn collect_direct_path_suggestions(
+    root: &Path,
+    requested: &Path,
+    parent: &Path,
+    parent_path: &Path,
+    expected_kind: WorkspaceEntryKind,
+    candidates: &mut Vec<(i32, String)>,
+) {
+    let Ok(entries) = std::fs::read_dir(parent_path) else {
+        return;
+    };
+    for entry in entries.take(MAX_PATH_SUGGESTION_SIBLING_ENTRIES).flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        let name = entry.file_name().to_string_lossy().to_string();
+        if IGNORED_NAMES.contains(&name.as_str()) {
+            continue;
+        }
+        let candidate = parent.join(&name);
+        add_path_suggestion(
+            root,
+            requested,
+            &candidate,
+            &entry.path(),
+            file_type,
+            expected_kind,
+            candidates,
+        );
+    }
+}
+
+fn collect_workspace_path_suggestions(
+    root: &Path,
+    requested: &Path,
+    expected_kind: WorkspaceEntryKind,
+    candidates: &mut Vec<(i32, String)>,
+) {
+    let mut pending = VecDeque::from([(root.to_path_buf(), PathBuf::new(), 0usize)]);
+    let mut scanned = 0usize;
+
+    'directories: while let Some((directory, relative_directory, depth)) = pending.pop_front() {
+        if depth > MAX_PATH_SUGGESTION_DEPTH {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(&directory) else {
+            continue;
+        };
+        for entry in entries {
+            if scanned >= MAX_PATH_SUGGESTION_SCAN_ENTRIES {
+                break 'directories;
+            }
+            scanned += 1;
+            let Ok(entry) = entry else {
+                continue;
+            };
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            let name = entry.file_name().to_string_lossy().to_string();
+            if IGNORED_NAMES.contains(&name.as_str()) {
+                continue;
+            }
+            let candidate = relative_directory.join(&name);
+            add_path_suggestion(
+                root,
+                requested,
+                &candidate,
+                &entry.path(),
+                file_type,
+                expected_kind,
+                candidates,
+            );
+            if file_type.is_dir() && depth < MAX_PATH_SUGGESTION_DEPTH {
+                let Ok(canonical) = entry.path().canonicalize() else {
+                    continue;
+                };
+                if canonical.starts_with(root) {
+                    pending.push_back((canonical, candidate, depth + 1));
+                }
+            }
+        }
+    }
+}
+
+fn add_path_suggestion(
+    root: &Path,
+    requested: &Path,
+    candidate: &Path,
+    candidate_absolute: &Path,
+    file_type: std::fs::FileType,
+    expected_kind: WorkspaceEntryKind,
+    candidates: &mut Vec<(i32, String)>,
+) {
+    if file_type.is_symlink() {
+        return;
+    }
+    let Ok(canonical) = candidate_absolute.canonicalize() else {
+        return;
+    };
+    if !canonical.starts_with(root) {
+        return;
+    }
+    let kind_matches = match expected_kind {
+        WorkspaceEntryKind::Directory => canonical.is_dir(),
+        WorkspaceEntryKind::File => canonical.is_file(),
+    };
+    if !kind_matches {
+        return;
+    }
+
+    let wanted_name = requested
+        .file_name()
+        .map(|value| value.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    let candidate_name = candidate
+        .file_name()
+        .map(|value| value.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    let name_score = path_suggestion_score(&wanted_name, &candidate_name);
+    let requested_path = requested
+        .to_string_lossy()
+        .replace('\\', "/")
+        .to_lowercase();
+    let candidate_path = candidate
+        .to_string_lossy()
+        .replace('\\', "/")
+        .to_lowercase();
+    let path_score = path_suggestion_score(&requested_path, &candidate_path);
+    let score = name_score.saturating_mul(4).saturating_add(path_score);
+    if name_score > 0 {
+        candidates.push((score, candidate.to_string_lossy().replace('\\', "/")));
+    }
+}
+
+fn path_suggestion_score(wanted: &str, candidate: &str) -> i32 {
+    let common_prefix = wanted
+        .chars()
+        .zip(candidate.chars())
+        .take_while(|(left, right)| left == right)
+        .count() as i32;
+    let same_extension = Path::new(wanted).extension() == Path::new(candidate).extension();
+    let wanted_numeric_prefix = wanted.chars().take(4).collect::<String>();
+    let numeric_prefix = wanted_numeric_prefix.len() == 4
+        && wanted_numeric_prefix
+            .chars()
+            .all(|character| character.is_ascii_digit())
+        && wanted.chars().take(4).eq(candidate.chars().take(4));
+    let distance = edit_distance(wanted, candidate) as i32;
+    let score = common_prefix * 4
+        + if same_extension { 4 } else { 0 }
+        + if numeric_prefix { 12 } else { 0 }
+        - distance;
+    if common_prefix >= 3 || numeric_prefix || distance <= 3 {
+        score.max(1)
+    } else {
+        0
+    }
+}
+
+fn edit_distance(left: &str, right: &str) -> usize {
+    let right = right.chars().collect::<Vec<_>>();
+    let mut previous = (0..=right.len()).collect::<Vec<_>>();
+    for (left_index, left_character) in left.chars().enumerate() {
+        let mut current = vec![left_index + 1; right.len() + 1];
+        for (right_index, right_character) in right.iter().enumerate() {
+            current[right_index + 1] = if left_character == *right_character {
+                previous[right_index]
+            } else {
+                1 + previous[right_index]
+                    .min(previous[right_index + 1])
+                    .min(current[right_index])
+            };
+        }
+        previous = current;
+    }
+    previous[right.len()]
 }
 
 const DEFAULT_DIRECTORY_LIMIT: usize = 200;
@@ -531,7 +869,9 @@ const MAX_READ_LINES: usize = 2_000;
 const MAX_FILE_SIZE_BYTES: u64 = 4 * 1024 * 1024;
 const COMMAND_CANCEL_GRACE_MS: u64 = 2_000;
 const IGNORED_NAMES: &[&str] = &[".git", "node_modules", "target", "dist", "build"];
-const WORKSPACE_RELATIVE_PATH_DESCRIPTION: &str = "Workspace-relative path only. Use '.' for workspace root. Absolute paths and parent traversal are rejected.";
+const WORKSPACE_RELATIVE_PATH_DESCRIPTION: &str = "Exact workspace-relative path only. Use '.' for the workspace root. Absolute paths, parent traversal, directories/files in the wrong tool, and wildcard patterns are rejected.";
+const DIRECTORY_PATH_DESCRIPTION: &str = "Existing workspace-relative directory path only. Use '.' for the workspace root. Absolute paths, files, guessed paths, and wildcards are rejected.";
+const FILE_PATH_DESCRIPTION: &str = "Existing workspace-relative regular file path only. Absolute paths, directories, guessed paths, and wildcards are rejected; discover the exact path with list_directory or search_repository first.";
 
 struct ListDirectoryTool;
 
@@ -540,12 +880,12 @@ impl ToolHandler for ListDirectoryTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "list_directory".to_string(),
-            description: "List direct children of a directory inside the current workspace. The path must be workspace-relative; use '.' for the workspace root."
+            description: "List direct children of one existing directory inside the current workspace. Use '.' for the workspace root. Do not guess directory names or use wildcard paths; after a path error, inspect the parent directory before retrying."
                 .to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string", "description": WORKSPACE_RELATIVE_PATH_DESCRIPTION },
+                    "path": { "type": "string", "minLength": 1, "description": DIRECTORY_PATH_DESCRIPTION },
                     "limit": { "type": "integer", "minimum": 1, "maximum": MAX_DIRECTORY_LIMIT }
                 },
                 "required": ["path"],
@@ -563,12 +903,7 @@ impl ToolHandler for ListDirectoryTool {
         let path = required_string(&arguments, "path")?;
         let limit = optional_usize(&arguments, "limit")?.unwrap_or(DEFAULT_DIRECTORY_LIMIT);
         let workspace = Workspace::new(&context.workspace_root)?;
-        let directory = workspace.resolve_existing(path)?;
-        if !directory.is_dir() {
-            return Err(ToolError::InvalidArguments(
-                "path is not a directory".to_string(),
-            ));
-        }
+        let directory = workspace.resolve_existing(path, WorkspaceEntryKind::Directory)?;
 
         let mut reader = tokio::fs::read_dir(&directory)
             .await
@@ -623,12 +958,12 @@ impl ToolHandler for ReadFileTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "read_file".to_string(),
-            description: "Read a bounded text range from a file inside the current workspace. The path must be workspace-relative. Prefer startLine/lineCount for code inspection. When either line-range field is present, the line range takes precedence and offset/limit are ignored; otherwise offset/limit remain available for byte-precise reads."
+            description: "Read a bounded text range from one existing regular file inside the current workspace. The path must be an exact workspace-relative file path: directories, guessed names, and wildcard patterns are rejected. Use list_directory or search_repository first. Prefer startLine/lineCount for code inspection. When either line-range field is present, the line range takes precedence and offset/limit are ignored; otherwise offset/limit remain available for byte-precise reads."
                 .to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string", "minLength": 1, "description": WORKSPACE_RELATIVE_PATH_DESCRIPTION },
+                    "path": { "type": "string", "minLength": 1, "description": FILE_PATH_DESCRIPTION },
                     "offset": { "type": "integer", "minimum": 0, "description": "Zero-based byte offset. Ignored when startLine or lineCount is present." },
                     "limit": { "type": "integer", "minimum": 1, "maximum": MAX_READ_BYTES, "description": "Maximum bytes for a byte-range read. Ignored when startLine or lineCount is present." },
                     "startLine": { "type": "integer", "minimum": 1, "description": "One-based starting line. Takes precedence over offset/limit." },
@@ -653,12 +988,7 @@ impl ToolHandler for ReadFileTool {
         let requested_line_count = optional_usize(&arguments, "lineCount")?;
         let uses_line_range = requested_start_line.is_some() || requested_line_count.is_some();
         let workspace = Workspace::new(&context.workspace_root)?;
-        let file = workspace.resolve_existing(path)?;
-        if !file.is_file() {
-            return Err(ToolError::InvalidArguments(
-                "path is not a file".to_string(),
-            ));
-        }
+        let file = workspace.resolve_existing(path, WorkspaceEntryKind::File)?;
         let file_size = tokio::fs::metadata(&file)
             .await
             .map_err(|error| ToolError::Execution(error.to_string()))?
@@ -848,11 +1178,23 @@ fn default_command_timeout_ms() -> u64 {
 #[async_trait]
 impl ToolHandler for RunCommandTool {
     fn definition(&self) -> ToolDefinition {
-        let description = match self.runtime.default_shell_name() {
-            "powershell" => {
-                "Run a PowerShell command in the workspace and return its output. Use PowerShell syntax such as Get-Content, Get-ChildItem, Select-String, and $env:NAME. The runtime prefers pwsh and falls back to Windows PowerShell."
+        let description = match (
+            self.runtime.default_shell_name(),
+            self.runtime.uses_windows_powershell_native_pipeline(),
+        ) {
+            ("powershell", true) if self.runtime.has_bundled_ripgrep() => {
+                "Run a Windows PowerShell command in the workspace and return its output. k-Coder provides bundled ripgrep 15.2.0, so rg is available without a system installation. Use PowerShell syntax such as Get-Content, Get-ChildItem, Select-String, and $env:NAME for other shell operations. PowerShell does not expand wildcard paths for native rg arguments: use rg --glob 'index-*.js' ... dist/assets or resolve an exact .FullName with Get-ChildItem. Windows PowerShell re-encodes native pipeline input as CRLF, so a receiving rg command with a $ line anchor must use --crlf, for example: rg --files path | rg --crlf 'name\\.js$'."
             }
-            "cmd" => "Run a Command Prompt command in the workspace and return its output.",
+            ("powershell", _) if self.runtime.has_bundled_ripgrep() => {
+                "Run a PowerShell command in the workspace and return its output. k-Coder provides bundled ripgrep 15.2.0, so rg is available without a system installation. Use PowerShell syntax such as Get-Content, Get-ChildItem, Select-String, and $env:NAME for other shell operations. PowerShell does not expand wildcard paths for native rg arguments: use rg --glob 'CodeEditor-*.js' ... dist/assets or resolve an exact .FullName with Get-ChildItem. The runtime prefers pwsh and falls back to Windows PowerShell."
+            }
+            ("powershell", true) => {
+                "Run a Windows PowerShell command in the workspace and return its output. Use PowerShell syntax such as Get-Content, Get-ChildItem, Select-String, and $env:NAME. Do not assume rg or other Unix utilities are installed; use Select-String unless their availability has been confirmed. If rg is available, use --glob instead of wildcard path arguments. Windows PowerShell re-encodes native pipeline input as CRLF, so a receiving rg command with a $ line anchor must use --crlf."
+            }
+            ("powershell", _) => {
+                "Run a PowerShell command in the workspace and return its output. Use PowerShell syntax such as Get-Content, Get-ChildItem, Select-String, and $env:NAME. Do not assume rg or other Unix utilities are installed; use Select-String unless their availability has been confirmed. If rg is available, PowerShell does not expand wildcard paths for native rg arguments: use rg --glob 'CodeEditor-*.js' ... dist/assets or resolve an exact .FullName with Get-ChildItem. The runtime prefers pwsh and falls back to Windows PowerShell."
+            }
+            ("cmd", _) => "Run a Command Prompt command in the workspace and return its output.",
             _ => {
                 "Run a command in the user's default shell inside the workspace and return its output."
             }
@@ -950,17 +1292,31 @@ impl ToolHandler for RunCommandTool {
             .read(&id, 0, 1000)
             .await
             .map_err(|error| ToolError::Execution(error.to_string()))?;
-        let text = output
+        let success = matches!(status.state, CommandState::Exited { code: 0 });
+        let mut text = output
             .chunks
             .iter()
             .map(|chunk| chunk.text.as_str())
             .collect::<String>();
+        let recovery_hint = command_recovery_hint(
+            shell,
+            self.runtime.uses_windows_powershell_native_pipeline(),
+            &arguments.command,
+            &status.state,
+            text.trim().is_empty(),
+        );
+        if let Some(hint) = recovery_hint {
+            if !text.ends_with('\n') && !text.is_empty() {
+                text.push('\n');
+            }
+            text.push_str("[提示] ");
+            text.push_str(hint);
+        }
         let output_chunks = bounded_command_output_chunks(&output.chunks);
-        let success = matches!(status.state, CommandState::Exited { code: 0 });
         let duration_ms = status
             .finished_at_ms
             .map(|finished| finished.saturating_sub(status.started_at_ms));
-        let metadata = json!({
+        let mut metadata = json!({
             "sessionId": id,
             "state": status.state,
             "startedAtMs": status.started_at_ms,
@@ -971,6 +1327,9 @@ impl ToolHandler for RunCommandTool {
             "nextCursor": output.next_cursor,
             "outputChunks": output_chunks
         });
+        if let Some(hint) = recovery_hint {
+            metadata["recoveryHint"] = Value::String(hint.to_string());
+        }
         self.runtime
             .close(&id)
             .await
@@ -981,6 +1340,141 @@ impl ToolHandler for RunCommandTool {
             metadata,
         })
     }
+}
+
+fn command_recovery_hint(
+    shell: &str,
+    uses_windows_powershell_native_pipeline: bool,
+    command: &str,
+    state: &CommandState,
+    output_is_empty: bool,
+) -> Option<&'static str> {
+    let CommandState::Exited { code } = state else {
+        return None;
+    };
+    if *code == 0 || shell != "powershell" || !contains_rg_command(command) {
+        return None;
+    }
+
+    let has_wildcard_path = command.split_whitespace().any(|token| {
+        let token = token.trim_matches(|character: char| {
+            matches!(character, '\'' | '"' | '(' | ')' | ';' | '|')
+        });
+        !token.starts_with('-')
+            && (token.contains('/') || token.contains('\\'))
+            && !token.contains('|')
+            && !token.contains("\\.")
+            && token
+                .chars()
+                .any(|character| matches!(character, '*' | '?' | '[' | ']'))
+    });
+    if has_wildcard_path {
+        Some(POWERSHELL_RG_GLOB_RECOVERY_HINT)
+    } else if *code == 1
+        && output_is_empty
+        && uses_windows_powershell_native_pipeline
+        && powershell_pipeline_has_anchored_rg_receiver(command)
+    {
+        Some(WINDOWS_POWERSHELL_RG_CRLF_RECOVERY_HINT)
+    } else {
+        None
+    }
+}
+
+fn contains_rg_command(command: &str) -> bool {
+    command.split_whitespace().any(|token| {
+        let token = token.trim_matches(|character: char| {
+            matches!(character, '\'' | '"' | '(' | ')' | ';' | '|' | '&')
+        });
+        let executable = token.rsplit(['/', '\\']).next().unwrap_or(token);
+        executable.eq_ignore_ascii_case("rg") || executable.eq_ignore_ascii_case("rg.exe")
+    })
+}
+
+fn powershell_pipeline_has_anchored_rg_receiver(command: &str) -> bool {
+    #[derive(Clone, Copy)]
+    enum Quote {
+        Single,
+        Double,
+    }
+
+    let mut quote = None;
+    let mut escaped = false;
+    let mut segment_start = 0;
+    let mut has_upstream = false;
+
+    for (index, character) in command.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match quote {
+            Some(Quote::Single) => {
+                if character == '\'' {
+                    quote = None;
+                }
+            }
+            Some(Quote::Double) => match character {
+                '`' => escaped = true,
+                '"' => quote = None,
+                _ => {}
+            },
+            None => match character {
+                '`' => escaped = true,
+                '\'' => quote = Some(Quote::Single),
+                '"' => quote = Some(Quote::Double),
+                '|' => {
+                    if has_upstream
+                        && is_anchored_rg_pipeline_receiver(&command[segment_start..index])
+                    {
+                        return true;
+                    }
+                    has_upstream = true;
+                    segment_start = index + character.len_utf8();
+                }
+                _ => {}
+            },
+        }
+    }
+
+    has_upstream && is_anchored_rg_pipeline_receiver(&command[segment_start..])
+}
+
+fn is_anchored_rg_pipeline_receiver(segment: &str) -> bool {
+    let mut tokens = segment.split_whitespace();
+    let mut executable = tokens.next().unwrap_or_default();
+    if executable == "&" {
+        executable = tokens.next().unwrap_or_default();
+    }
+    let executable = executable
+        .trim_matches(|character: char| matches!(character, '\'' | '"' | '(' | ')' | ';'));
+    let executable = executable.rsplit(['/', '\\']).next().unwrap_or(executable);
+    let invokes_rg =
+        executable.eq_ignore_ascii_case("rg") || executable.eq_ignore_ascii_case("rg.exe");
+    invokes_rg
+        && !segment.split_whitespace().any(|token| {
+            token
+                .trim_matches(|character: char| matches!(character, '\'' | '"' | '(' | ')' | ';'))
+                .eq_ignore_ascii_case("--crlf")
+        })
+        && contains_regex_eol_anchor(segment)
+}
+
+fn contains_regex_eol_anchor(segment: &str) -> bool {
+    let characters = segment.chars().collect::<Vec<_>>();
+    characters.iter().enumerate().any(|(index, character)| {
+        if *character != '$'
+            || index
+                .checked_sub(1)
+                .and_then(|previous| characters.get(previous))
+                .is_some_and(|previous| matches!(previous, '\\' | '`'))
+        {
+            return false;
+        }
+        characters
+            .get(index + 1)
+            .is_none_or(|next| next.is_whitespace() || matches!(next, '\'' | '"' | '|' | ')' | ']'))
+    })
 }
 
 fn bounded_command_output_chunks(chunks: &[crate::execution::OutputChunk]) -> Vec<Value> {
@@ -1286,7 +1780,22 @@ mod tests {
     #[test]
     fn run_command_schema_exposes_the_default_shell_contract() {
         let directory = tempfile::tempdir().unwrap();
+        #[cfg(windows)]
+        let runtime = CommandRuntime::new_with_bundled_tools(
+            directory.path(),
+            Some(
+                crate::execution::BundledTools::new(
+                    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                        .join("../src/resources/tools/windows-x86_64"),
+                )
+                .unwrap(),
+            ),
+        )
+        .unwrap();
+        #[cfg(not(windows))]
         let runtime = CommandRuntime::new(directory.path()).unwrap();
+        let uses_windows_powershell_native_pipeline =
+            runtime.uses_windows_powershell_native_pipeline();
         let definition = RunCommandTool { runtime }.definition();
         let validator = jsonschema::validator_for(&definition.input_schema).unwrap();
 
@@ -1303,7 +1812,151 @@ mod tests {
         assert!(validator.validate(&json!({ "command": "   " })).is_err());
         if cfg!(windows) {
             assert!(definition.description.contains("PowerShell"));
+            assert!(definition.description.contains("bundled ripgrep 15.2.0"));
+            assert!(definition.description.contains("rg is available"));
+            assert!(
+                definition
+                    .description
+                    .contains("does not expand wildcard paths")
+            );
+            assert!(definition.description.contains("rg --glob"));
+            if uses_windows_powershell_native_pipeline {
+                assert!(definition.description.contains("CRLF"));
+                assert!(definition.description.contains("rg --crlf"));
+            }
         }
+    }
+
+    #[test]
+    fn powershell_rg_failures_get_specific_recovery_hints() {
+        let wildcard_command = r#"rg -o "vs/[A-Za-z0-9_./-]+\.js|languages/definitions/[A-Za-z0-9_./-]+" dist/assets/CodeEditor-*.js | Select-Object -First 100"#;
+        assert_eq!(
+            command_recovery_hint(
+                "powershell",
+                true,
+                wildcard_command,
+                &CommandState::Exited { code: 1 },
+                false,
+            ),
+            Some(POWERSHELL_RG_GLOB_RECOVERY_HINT)
+        );
+        assert_eq!(
+            command_recovery_hint(
+                "powershell",
+                true,
+                r#"rg -o "vs/[A-Za-z]+\.js" dist/assets/CodeEditor-exact.js | Select-Object -First 100"#,
+                &CommandState::Exited { code: 1 },
+                false,
+            ),
+            None
+        );
+        assert_eq!(
+            command_recovery_hint(
+                "powershell",
+                true,
+                r#"rg --glob 'CodeEditor-*.js' -o "vs/[A-Za-z]+\.js" dist/assets"#,
+                &CommandState::Exited { code: 1 },
+                false,
+            ),
+            None
+        );
+        assert_eq!(
+            command_recovery_hint(
+                "powershell",
+                true,
+                wildcard_command,
+                &CommandState::Exited { code: 0 },
+                true,
+            ),
+            None
+        );
+        assert_eq!(
+            command_recovery_hint(
+                "bash",
+                false,
+                wildcard_command,
+                &CommandState::Exited { code: 1 },
+                true,
+            ),
+            None
+        );
+        assert_eq!(
+            command_recovery_hint(
+                "powershell",
+                true,
+                wildcard_command,
+                &CommandState::TimedOut,
+                true,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn windows_powershell_rg_pipeline_failures_explain_crlf_anchors() {
+        let anchored_pipeline = r#"rg --files node_modules/monaco-editor | rg "typescript(\.contribution)?\.js$|javascript(\.contribution)?\.js$|json(\.contribution)?\.js$|markdown(\.contribution)?\.js$|toml(\.contribution)?\.js$""#;
+        assert_eq!(
+            command_recovery_hint(
+                "powershell",
+                true,
+                anchored_pipeline,
+                &CommandState::Exited { code: 1 },
+                true,
+            ),
+            Some(WINDOWS_POWERSHELL_RG_CRLF_RECOVERY_HINT)
+        );
+        assert_eq!(
+            command_recovery_hint(
+                "powershell",
+                false,
+                anchored_pipeline,
+                &CommandState::Exited { code: 1 },
+                true,
+            ),
+            None,
+            "pwsh preserves native pipeline bytes and must not receive the legacy hint"
+        );
+        assert_eq!(
+            command_recovery_hint(
+                "powershell",
+                true,
+                anchored_pipeline,
+                &CommandState::Exited { code: 1 },
+                false,
+            ),
+            None,
+            "a real error message is more useful than a speculative CRLF hint"
+        );
+        assert_eq!(
+            command_recovery_hint(
+                "powershell",
+                true,
+                r#"rg --files path | rg --crlf 'name\.js$'"#,
+                &CommandState::Exited { code: 1 },
+                true,
+            ),
+            None
+        );
+        assert_eq!(
+            command_recovery_hint(
+                "powershell",
+                true,
+                r#"rg --files path | rg 'typescript\.js'"#,
+                &CommandState::Exited { code: 1 },
+                true,
+            ),
+            None
+        );
+        assert_eq!(
+            command_recovery_hint(
+                "powershell",
+                true,
+                r#"rg --files path | Select-String 'typescript\.js$'"#,
+                &CommandState::Exited { code: 1 },
+                true,
+            ),
+            None
+        );
     }
 
     #[tokio::test]
@@ -1363,6 +2016,59 @@ mod tests {
                 .iter()
                 .any(|event| event.delta.contains("secret"))
         );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn run_command_explains_and_recovers_from_powershell_rg_path_globs() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir(directory.path().join("assets")).unwrap();
+        std::fs::write(
+            directory.path().join("assets/CodeEditor-test.js"),
+            "const marker = 'workspace-glob-test';\n",
+        )
+        .unwrap();
+        let runtime = CommandRuntime::new_with_bundled_tools(
+            directory.path(),
+            Some(
+                crate::execution::BundledTools::new(
+                    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                        .join("../src/resources/tools/windows-x86_64"),
+                )
+                .unwrap(),
+            ),
+        )
+        .unwrap();
+        let tool = RunCommandTool { runtime };
+
+        let failed = tool
+            .execute(
+                &context(directory.path()),
+                json!({ "command": "rg workspace-glob-test assets/CodeEditor-*.js" }),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(!failed.success);
+        assert!(failed.output.contains("[提示]"));
+        assert!(failed.output.contains("rg --glob 'CodeEditor-*.js'"));
+        assert!(
+            failed.metadata["recoveryHint"]
+                .as_str()
+                .is_some_and(|hint| hint.contains("rg --glob"))
+        );
+
+        let recovered = tool
+            .execute(
+                &context(directory.path()),
+                json!({ "command": "rg --glob 'CodeEditor-*.js' workspace-glob-test assets" }),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(recovered.success);
+        assert!(recovered.output.contains("workspace-glob-test"));
+        assert!(recovered.metadata.get("recoveryHint").is_none());
     }
 
     #[tokio::test]
@@ -1490,18 +2196,38 @@ mod tests {
     #[test]
     fn workspace_file_tool_schemas_explain_relative_paths() {
         let registry = ToolRegistry::read_only();
-        for name in ["list_directory", "read_file"] {
-            let definition = registry
-                .definitions()
-                .into_iter()
-                .find(|definition| definition.name == name)
-                .expect("workspace file tool should be registered");
-            let description = definition.input_schema["properties"]["path"]["description"]
+        let definitions = registry
+            .definitions()
+            .into_iter()
+            .map(|definition| (definition.name.clone(), definition))
+            .collect::<HashMap<_, _>>();
+        let directory =
+            definitions["list_directory"].input_schema["properties"]["path"]["description"]
                 .as_str()
-                .expect("workspace path should have a schema description");
-            assert!(description.contains("Workspace-relative path only"));
+                .expect("directory path should have a schema description");
+        let file = definitions["read_file"].input_schema["properties"]["path"]["description"]
+            .as_str()
+            .expect("file path should have a schema description");
+
+        assert!(directory.contains("Existing workspace-relative directory"));
+        assert!(file.contains("Existing workspace-relative regular file"));
+        for description in [directory, file] {
             assert!(description.contains("Absolute paths"));
+            assert!(description.contains("wildcard"));
         }
+    }
+
+    #[test]
+    fn provider_definitions_bound_verbose_extension_descriptions() {
+        let description = "描述".repeat(2_000);
+        let bounded = bound_provider_description(&description);
+        assert!(bounded.len() <= MAX_PROVIDER_TOOL_DESCRIPTION_BYTES);
+        assert!(bounded.ends_with("..."));
+
+        let registry = ToolRegistry::read_only();
+        let full = registry.definitions();
+        let provider = registry.provider_definitions();
+        assert_eq!(full, provider);
     }
 
     #[tokio::test]
@@ -1546,6 +2272,120 @@ mod tests {
             )
             .await;
         assert!(matches!(result, Err(ToolError::Denied(_))));
+    }
+
+    #[tokio::test]
+    async fn workspace_path_diagnostics_are_actionable_and_kind_aware() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::create_dir(workspace.path().join("src")).unwrap();
+        std::fs::create_dir(workspace.path().join("src/module")).unwrap();
+        std::fs::create_dir(workspace.path().join("src/stores")).unwrap();
+        std::fs::write(workspace.path().join("src/main.rs"), "fn main() {}\n").unwrap();
+        std::fs::write(
+            workspace.path().join("src/stores/workbenchStore.ts"),
+            "export const workbenchStore = {};\n",
+        )
+        .unwrap();
+        let registry = ToolRegistry::read_only();
+
+        let missing_file = registry
+            .dispatch(
+                &context(workspace.path()),
+                "read_file",
+                json!({ "path": "src/mian.rs" }),
+                CancellationToken::new(),
+            )
+            .await;
+        let Err(ToolError::InvalidArguments(missing_file)) = missing_file else {
+            panic!("missing file should be a recoverable argument error");
+        };
+        assert!(missing_file.contains("workspace file path \"src/mian.rs\" does not exist"));
+        assert!(missing_file.contains("Possible existing path: src/main.rs"));
+        assert!(!missing_file.contains("src/module"));
+        assert!(missing_file.contains("list_directory"));
+
+        let missing_nested_file = registry
+            .dispatch(
+                &context(workspace.path()),
+                "read_file",
+                json!({ "path": "src/store/workbench.ts" }),
+                CancellationToken::new(),
+            )
+            .await;
+        let Err(ToolError::InvalidArguments(missing_nested_file)) = missing_nested_file else {
+            panic!("missing nested file should be a recoverable argument error");
+        };
+        assert!(
+            missing_nested_file.contains("Possible existing path: src/stores/workbenchStore.ts")
+        );
+        assert!(missing_nested_file.contains("search_repository"));
+
+        let missing_directory = registry
+            .dispatch(
+                &context(workspace.path()),
+                "list_directory",
+                json!({ "path": "src/moduel" }),
+                CancellationToken::new(),
+            )
+            .await;
+        let Err(ToolError::InvalidArguments(missing_directory)) = missing_directory else {
+            panic!("missing directory should be a recoverable argument error");
+        };
+        assert!(missing_directory.contains("workspace directory path"));
+        assert!(missing_directory.contains("Possible existing path: src/module"));
+        assert!(!missing_directory.contains("src/main.rs"));
+
+        let directory_as_file = registry
+            .dispatch(
+                &context(workspace.path()),
+                "read_file",
+                json!({ "path": "src" }),
+                CancellationToken::new(),
+            )
+            .await;
+        let Err(ToolError::InvalidArguments(directory_as_file)) = directory_as_file else {
+            panic!("reading a directory should be a recoverable argument error");
+        };
+        assert!(directory_as_file.contains("is a directory, not the requested file"));
+        assert!(directory_as_file.contains("list_directory"));
+
+        let file_as_directory = registry
+            .dispatch(
+                &context(workspace.path()),
+                "list_directory",
+                json!({ "path": "src/main.rs" }),
+                CancellationToken::new(),
+            )
+            .await;
+        let Err(ToolError::InvalidArguments(file_as_directory)) = file_as_directory else {
+            panic!("listing a file should be a recoverable argument error");
+        };
+        assert!(file_as_directory.contains("is a regular file, not the requested directory"));
+        assert!(file_as_directory.contains("read_file"));
+
+        let wildcard = registry
+            .dispatch(
+                &context(workspace.path()),
+                "read_file",
+                json!({ "path": "src/*.rs" }),
+                CancellationToken::new(),
+            )
+            .await;
+        let Err(ToolError::InvalidArguments(wildcard)) = wildcard else {
+            panic!("wildcard file path should be a recoverable argument error");
+        };
+        assert!(wildcard.contains("wildcard patterns"));
+        assert!(wildcard.contains("search_repository"));
+
+        let traversal = registry
+            .dispatch(
+                &context(workspace.path()),
+                "read_file",
+                json!({ "path": "../*.rs" }),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(matches!(traversal, Err(ToolError::Denied(_))));
     }
 
     #[tokio::test]

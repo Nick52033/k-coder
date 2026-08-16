@@ -108,8 +108,8 @@ export function deleteProviderApiKey(providerId: string) {
   return invoke<void>("delete_provider_api_key", { providerId });
 }
 
-export function createThread() {
-  return invoke<ThreadSummary>("create_thread");
+export function createThread(inProject = true) {
+  return invoke<ThreadSummary>("create_thread", { inProject });
 }
 
 export function listThreads() {

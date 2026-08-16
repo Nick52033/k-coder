@@ -51,6 +51,22 @@ impl DetectedShell {
         self.shell_type.name()
     }
 
+    pub(super) fn uses_windows_powershell_native_pipeline(&self) -> bool {
+        #[cfg(windows)]
+        {
+            self.shell_type == ShellType::PowerShell
+                && self
+                    .program
+                    .file_stem()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.eq_ignore_ascii_case("powershell"))
+        }
+        #[cfg(not(windows))]
+        {
+            false
+        }
+    }
+
     pub(super) fn request(
         &self,
         command: &str,
@@ -353,6 +369,69 @@ mod tests {
                 ["-c", "printf hello"]
             );
         }
+    }
+
+    #[test]
+    fn distinguishes_windows_powershell_from_pwsh_native_pipelines() {
+        #[cfg(windows)]
+        {
+            let windows_powershell = DetectedShell {
+                shell_type: ShellType::PowerShell,
+                program: PathBuf::from("powershell.exe"),
+            };
+            let pwsh = DetectedShell {
+                shell_type: ShellType::PowerShell,
+                program: PathBuf::from("pwsh.exe"),
+            };
+
+            assert!(windows_powershell.uses_windows_powershell_native_pipeline());
+            assert!(!pwsh.uses_windows_powershell_native_pipeline());
+        }
+
+        #[cfg(not(windows))]
+        {
+            let shell = DetectedShell {
+                shell_type: ShellType::Bash,
+                program: PathBuf::from("/bin/bash"),
+            };
+            assert!(!shell.uses_windows_powershell_native_pipeline());
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_powershell_native_rg_pipeline_requires_crlf_for_eol_anchors() {
+        use std::os::windows::process::CommandExt;
+
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("fixture.js"), "fixture\n").unwrap();
+        let rg = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../src/resources/tools/windows-x86_64/rg.exe")
+            .canonicalize()
+            .unwrap();
+        let rg = rg.to_string_lossy().replace('\'', "''");
+        let powershell =
+            PathBuf::from(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe");
+        let run = |command: &str| {
+            std::process::Command::new(&powershell)
+                .args(["-NoProfile", "-Command", command])
+                .current_dir(directory.path())
+                .creation_flags(CREATE_NO_WINDOW)
+                .output()
+                .unwrap()
+        };
+
+        let failed = run(&format!("& '{rg}' --files . | & '{rg}' 'fixture\\.js$'"));
+        assert_eq!(failed.status.code(), Some(1));
+        assert!(failed.stdout.is_empty());
+        assert!(failed.stderr.is_empty());
+
+        let recovered = run(&format!(
+            "& '{rg}' --files . | & '{rg}' --crlf 'fixture\\.js$'"
+        ));
+        assert!(recovered.status.success());
+        assert!(String::from_utf8_lossy(&recovered.stdout).contains("fixture.js"));
     }
 
     #[test]

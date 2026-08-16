@@ -127,7 +127,7 @@ interface WorkbenchState {
   searchThreadHistory: (query: string) => Promise<void>;
   renameConversation: (threadId: string, title: string) => Promise<void>;
   deleteConversation: (threadId: string) => Promise<void>;
-  createThread: () => Promise<string>;
+  createThread: (inProject?: boolean) => Promise<string>;
   selectThread: (threadId: string) => Promise<void>;
   loadOlderHistory: () => Promise<void>;
   archiveActiveThread: () => Promise<void>;
@@ -470,9 +470,9 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
     } catch (error) { set({ error: errorMessage(error) }); }
   },
 
-  createThread: async () => {
+  createThread: async (inProject = true) => {
     try {
-      const thread = await createThreadCommand();
+      const thread = await createThreadCommand(inProject);
       set((state) => ({
         threads: [thread, ...state.threads],
         activeThreadId: thread.id,

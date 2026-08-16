@@ -175,6 +175,17 @@ function FilesView({ onAttach }: { onAttach: (attachment: AttachmentContent) => 
     if (preview) onAttach(await extractAttachment(preview.path));
   }, [preview, onAttach]);
 
+  const openExternal = useCallback(async (reveal: boolean) => {
+    if (!preview) return;
+    setError("");
+    try {
+      if (reveal) await revealWorkspaceFile(preview.path);
+      else await openWorkspaceFile(preview.path);
+    } catch (reason) {
+      setError(toReadableError(reason));
+    }
+  }, [preview]);
+
   useEffect(() => {
     if (!preview) return;
     function handleKeyDown(event: globalThis.KeyboardEvent) {
@@ -225,7 +236,7 @@ function FilesView({ onAttach }: { onAttach: (attachment: AttachmentContent) => 
         <button type="submit" aria-label="执行搜索"><Search size={13} /></button>
       </form>
       {results.length > 0 ? <div className="repository-results">{results.map((result) => <button type="button" key={`${result.path}:${result.line}`} onClick={() => void select(result.path)}><strong>{result.path}:{result.line}</strong><span>{result.preview}</span></button>)}</div> : <div className="file-tree" key={revision}><DirectoryNode path="" depth={0} selectedPath={preview?.path ?? null} onSelect={(path) => void select(path)} /></div>}
-      {error && <div className="panel-error">{error}</div>}
+      {error && !preview && <div className="panel-error" role="alert">{error}</div>}
       {preview && (
         <div className="file-preview-backdrop" onMouseDown={closePreview}>
           <section className="file-preview file-preview-dialog" role="dialog" aria-modal="true" aria-label={`预览 ${preview.name}`} onMouseDown={(event) => event.stopPropagation()}>
@@ -233,13 +244,14 @@ function FilesView({ onAttach }: { onAttach: (attachment: AttachmentContent) => 
           {preview.dataUrl ? <img src={preview.dataUrl} alt={preview.name} /> : showMarkdownPreview ? <div className="markdown-preview-body"><MarkdownContent text={draft} /></div> : <Suspense fallback={<div className="code-editor-loading">正在载入编辑器...</div>}><CodeEditor key={preview.path} path={preview.path} language={preview.language} value={draft} readOnly={!preview.editable} onChange={setDraft} onSave={save} /></Suspense>}
           {preview.truncated && <small>文件超过 256 KiB，已截断并以只读方式打开</small>}
           {!preview.dataUrl && !preview.truncated && !preview.editable && <small>该文件不是 UTF-8 文本，仅支持查看</small>}
+          {error && <div className="panel-error" role="alert">{error}</div>}
           {notice && <div className="preview-notice" role="status">{notice}</div>}
           <div className="preview-actions">
             <button className="preview-save-action" type="button" disabled={!dirty || saving} title="保存 (Ctrl+S)" onClick={() => void save()}><Save size={14} />{saving ? "保存中" : "保存"}</button>
             <button type="button" disabled={!dirty || saving} title="放弃未保存的修改" onClick={() => setDraft(preview.content ?? "")}><RotateCcw size={14} />放弃</button>
             <button type="button" title="附加到消息" onClick={() => void attach()}><Paperclip size={14} />附加</button>
-            <button className="preview-icon-action" type="button" aria-label="使用系统编辑器打开" title="使用系统编辑器打开" onClick={() => void openWorkspaceFile(preview.path)}><Upload size={14} /></button>
-            <button className="preview-icon-action" type="button" aria-label="在资源管理器中定位" title="在资源管理器中定位" onClick={() => void revealWorkspaceFile(preview.path)}><LocateFixed size={14} /></button>
+            <button className="preview-icon-action" type="button" aria-label="使用系统编辑器打开" title="使用系统编辑器打开" onClick={() => void openExternal(false)}><Upload size={14} /></button>
+            <button className="preview-icon-action" type="button" aria-label="在资源管理器中定位" title="在资源管理器中定位" onClick={() => void openExternal(true)}><LocateFixed size={14} /></button>
           </div>
           </section>
         </div>

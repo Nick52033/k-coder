@@ -8,7 +8,8 @@
     "build": "tsc && vite build",
     "test:e2e": "playwright test",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "build:deploy": "pnpm tauri build && powershell -NoProfile -ExecutionPolicy Bypass -File scripts/deploy.ps1"
   },
   "dependencies": {
     "@monaco-editor/react": "^4.7.0",

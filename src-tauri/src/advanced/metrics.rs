@@ -16,6 +16,13 @@ enum MetricEvent {
         input_tokens: u64,
         output_tokens: u64,
     },
+    Compaction {
+        timestamp_ms: u64,
+        before_tokens: u64,
+        after_tokens: u64,
+        compacted_messages: u64,
+        automatic: bool,
+    },
     Tool {
         timestamp_ms: u64,
         success: bool,
@@ -37,6 +44,9 @@ pub struct MetricsSnapshot {
     pub average_provider_latency_ms: u64,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    pub compaction_count: u64,
+    pub compacted_messages: u64,
+    pub estimated_context_tokens_saved: u64,
     pub tool_calls: u64,
     pub tool_success_rate: f64,
     pub fallback_count: u64,
@@ -70,6 +80,21 @@ impl RuntimeMetrics {
             success,
             input_tokens,
             output_tokens,
+        });
+    }
+    pub fn compaction(
+        &self,
+        before_tokens: usize,
+        after_tokens: usize,
+        compacted_messages: usize,
+        automatic: bool,
+    ) {
+        self.record(MetricEvent::Compaction {
+            timestamp_ms: now_ms(),
+            before_tokens: before_tokens as u64,
+            after_tokens: after_tokens as u64,
+            compacted_messages: compacted_messages as u64,
+            automatic,
         });
     }
     pub fn tool(&self, success: bool) {
@@ -111,6 +136,18 @@ impl RuntimeMetrics {
                     result.input_tokens += input_tokens;
                     result.output_tokens += output_tokens;
                 }
+                MetricEvent::Compaction {
+                    before_tokens,
+                    after_tokens,
+                    compacted_messages,
+                    automatic: _,
+                    ..
+                } => {
+                    result.compaction_count += 1;
+                    result.compacted_messages += compacted_messages;
+                    result.estimated_context_tokens_saved +=
+                        before_tokens.saturating_sub(after_tokens);
+                }
                 MetricEvent::Tool { success, .. } => {
                     result.tool_calls += 1;
                     if success {
@@ -146,6 +183,7 @@ mod tests {
         let metrics = RuntimeMetrics::new(dir.path()).unwrap();
         metrics.provider(100, true, 10, 4);
         metrics.provider(300, false, 2, 0);
+        metrics.compaction(10_000, 2_500, 12, true);
         metrics.tool(true);
         metrics.tool(false);
         metrics.fallback();
@@ -155,5 +193,8 @@ mod tests {
         assert_eq!(snapshot.provider_failures, 1);
         assert_eq!(snapshot.tool_success_rate, 0.5);
         assert_eq!(snapshot.fallback_count, 1);
+        assert_eq!(snapshot.compaction_count, 1);
+        assert_eq!(snapshot.compacted_messages, 12);
+        assert_eq!(snapshot.estimated_context_tokens_saved, 7_500);
     }
 }

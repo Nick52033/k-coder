@@ -1,4 +1,6 @@
 use std::collections::{HashMap, VecDeque};
+use std::env;
+use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
@@ -262,6 +264,68 @@ pub enum ExecutionError {
     Io(String),
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct BundledTools {
+    directory: PathBuf,
+}
+
+impl BundledTools {
+    pub(crate) fn new(directory: impl AsRef<Path>) -> Result<Self, ExecutionError> {
+        let directory = directory.as_ref().canonicalize().map_err(|error| {
+            ExecutionError::Invalid(format!("bundled tools directory is unavailable: {error}"))
+        })?;
+        if !directory.is_dir() {
+            return Err(ExecutionError::Invalid(
+                "bundled tools path is not a directory".into(),
+            ));
+        }
+        let ripgrep = directory.join(if cfg!(windows) { "rg.exe" } else { "rg" });
+        if !ripgrep.is_file() {
+            return Err(ExecutionError::Invalid(format!(
+                "bundled ripgrep executable is unavailable: {}",
+                ripgrep.display()
+            )));
+        }
+        Ok(Self {
+            directory: strip_verbatim_prefix(&directory),
+        })
+    }
+
+    fn path_for(&self, request_env: &HashMap<String, String>) -> OsString {
+        let existing_path = request_env
+            .iter()
+            .find(|(key, _)| is_path_key(key))
+            .map(|(_, value)| OsString::from(value))
+            .or_else(|| env::var_os("PATH"));
+        prepend_path_entry(&self.directory, existing_path)
+    }
+}
+
+fn prepend_path_entry(path_entry: &Path, existing_path: Option<OsString>) -> OsString {
+    #[cfg(unix)]
+    const PATH_SEPARATOR: &str = ":";
+    #[cfg(windows)]
+    const PATH_SEPARATOR: &str = ";";
+
+    let mut path = path_entry.as_os_str().to_os_string();
+    if let Some(existing_path) = existing_path.filter(|value| !value.is_empty()) {
+        path.push(PATH_SEPARATOR);
+        path.push(existing_path);
+    }
+    path
+}
+
+fn is_path_key(key: &str) -> bool {
+    #[cfg(windows)]
+    {
+        key.eq_ignore_ascii_case("PATH")
+    }
+    #[cfg(not(windows))]
+    {
+        key == "PATH"
+    }
+}
+
 #[derive(Clone)]
 pub struct CommandRuntime {
     workspace_root: PathBuf,
@@ -269,6 +333,7 @@ pub struct CommandRuntime {
     grants: Arc<RwLock<Vec<ReusableAuthorization>>>,
     recovery_dir: Option<PathBuf>,
     default_shell: shell::DetectedShell,
+    bundled_tools: Option<BundledTools>,
 }
 
 /// Host-owned reusable authorization. It is intentionally not deserializable, so a
@@ -330,6 +395,13 @@ impl CommandRuntime {
     }
 
     pub fn new(workspace_root: impl AsRef<Path>) -> Result<Self, ExecutionError> {
+        Self::new_with_bundled_tools(workspace_root, None)
+    }
+
+    pub(crate) fn new_with_bundled_tools(
+        workspace_root: impl AsRef<Path>,
+        bundled_tools: Option<BundledTools>,
+    ) -> Result<Self, ExecutionError> {
         let workspace_root = workspace_root
             .as_ref()
             .canonicalize()
@@ -345,6 +417,7 @@ impl CommandRuntime {
             grants: Arc::new(RwLock::new(Vec::new())),
             recovery_dir: None,
             default_shell: shell::default_user_shell(),
+            bundled_tools,
         })
     }
 
@@ -352,7 +425,15 @@ impl CommandRuntime {
         workspace_root: impl AsRef<Path>,
         data_root: impl AsRef<Path>,
     ) -> Result<Self, ExecutionError> {
-        let mut runtime = Self::new(workspace_root)?;
+        Self::with_recovery_and_bundled_tools(workspace_root, data_root, None)
+    }
+
+    pub(crate) fn with_recovery_and_bundled_tools(
+        workspace_root: impl AsRef<Path>,
+        data_root: impl AsRef<Path>,
+        bundled_tools: Option<BundledTools>,
+    ) -> Result<Self, ExecutionError> {
+        let mut runtime = Self::new_with_bundled_tools(workspace_root, bundled_tools)?;
         let recovery_dir = data_root.as_ref().join("command-sessions");
         std::fs::create_dir_all(&recovery_dir)
             .map_err(|error| ExecutionError::Io(error.to_string()))?;
@@ -430,6 +511,14 @@ impl CommandRuntime {
         self.default_shell.name()
     }
 
+    pub(crate) fn uses_windows_powershell_native_pipeline(&self) -> bool {
+        self.default_shell.uses_windows_powershell_native_pipeline()
+    }
+
+    pub(crate) fn has_bundled_ripgrep(&self) -> bool {
+        self.bundled_tools.is_some()
+    }
+
     pub fn assess_shell_command(
         &self,
         command: &str,
@@ -503,14 +592,23 @@ impl CommandRuntime {
             changed: Notify::new(),
         });
         let mut command = Command::new(&request.program);
+        let bundled_path = self
+            .bundled_tools
+            .as_ref()
+            .map(|tools| tools.path_for(&request.env));
         command
             .args(&request.args)
             .current_dir(&cwd_for_shell)
-            .envs(request.env.iter().filter(|(key, _)| !is_sensitive_key(key)))
+            .envs(request.env.iter().filter(|(key, _)| {
+                !is_sensitive_key(key) && (bundled_path.is_none() || !is_path_key(key))
+            }))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        if let Some(bundled_path) = bundled_path {
+            command.env("PATH", bundled_path);
+        }
         configure_process_group(&mut command);
         let mut child = command
             .spawn()
@@ -942,6 +1040,7 @@ pub struct PtyOutputPage {
 pub struct NativePtyRuntime {
     workspace_root: PathBuf,
     sessions: Arc<Mutex<HashMap<String, Arc<PtySession>>>>,
+    bundled_tools: Option<BundledTools>,
 }
 
 struct PtySession {
@@ -974,6 +1073,13 @@ impl NativePtyRuntime {
     }
 
     pub fn new(workspace_root: impl AsRef<Path>) -> Result<Self, ExecutionError> {
+        Self::new_with_bundled_tools(workspace_root, None)
+    }
+
+    pub(crate) fn new_with_bundled_tools(
+        workspace_root: impl AsRef<Path>,
+        bundled_tools: Option<BundledTools>,
+    ) -> Result<Self, ExecutionError> {
         let workspace_root = workspace_root
             .as_ref()
             .canonicalize()
@@ -986,6 +1092,7 @@ impl NativePtyRuntime {
         Ok(Self {
             workspace_root,
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            bundled_tools,
         })
     }
 
@@ -1019,8 +1126,17 @@ impl NativePtyRuntime {
         let mut command = CommandBuilder::new(&program);
         command.args(&args);
         command.cwd(&cwd_for_shell);
-        for (key, value) in request.env.iter().filter(|(key, _)| !is_sensitive_key(key)) {
+        let bundled_path = self
+            .bundled_tools
+            .as_ref()
+            .map(|tools| tools.path_for(&request.env));
+        for (key, value) in request.env.iter().filter(|(key, _)| {
+            !is_sensitive_key(key) && (bundled_path.is_none() || !is_path_key(key))
+        }) {
             command.env(key, value);
+        }
+        if let Some(bundled_path) = bundled_path {
+            command.env("PATH", bundled_path);
         }
         let mut child = pair
             .slave
@@ -1300,6 +1416,39 @@ mod tests {
     }
 
     #[test]
+    fn bundled_tools_require_the_ripgrep_executable() {
+        let directory = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            BundledTools::new(directory.path()),
+            Err(ExecutionError::Invalid(message))
+                if message.contains("bundled ripgrep executable is unavailable")
+        ));
+    }
+
+    #[test]
+    fn bundled_tools_prepend_their_directory_to_a_requested_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory
+            .path()
+            .join(if cfg!(windows) { "rg.exe" } else { "rg" });
+        std::fs::write(executable, b"test executable").unwrap();
+        let tools = BundledTools::new(directory.path()).unwrap();
+        let existing = tempfile::tempdir().unwrap();
+        let mut request_env = HashMap::new();
+        request_env.insert(
+            if cfg!(windows) { "Path" } else { "PATH" }.to_string(),
+            existing.path().to_string_lossy().into_owned(),
+        );
+
+        let entries = env::split_paths(&tools.path_for(&request_env)).collect::<Vec<_>>();
+        assert_eq!(
+            entries[0],
+            strip_verbatim_prefix(&directory.path().canonicalize().unwrap())
+        );
+        assert_eq!(entries[1], existing.path());
+    }
+
+    #[test]
     fn risk_is_derived_from_program_and_arguments() {
         assert_eq!(
             assess_command("cargo", &["test".into()]).risk,
@@ -1336,6 +1485,38 @@ mod tests {
             timeout_ms: Some(timeout_ms),
             buffer_bytes: Some(4096),
         }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn bundled_ripgrep_runs_when_the_requested_path_is_empty() {
+        let workspace = tempfile::tempdir().unwrap();
+        let tools = BundledTools::new(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../src/resources/tools/windows-x86_64"),
+        )
+        .unwrap();
+        let runtime =
+            CommandRuntime::new_with_bundled_tools(workspace.path(), Some(tools)).unwrap();
+        let mut command = runtime.shell_request("rg --version", String::new(), 5_000);
+        command.env.insert("PATH".into(), String::new());
+
+        let session = runtime.start(command).await.unwrap();
+        assert_eq!(
+            runtime.wait(&session.id).await.unwrap().state,
+            CommandState::Exited { code: 0 }
+        );
+        let output = runtime
+            .read(&session.id, 0, 100)
+            .await
+            .unwrap()
+            .chunks
+            .into_iter()
+            .map(|chunk| chunk.text)
+            .collect::<String>();
+        assert!(
+            output.contains("ripgrep 15.2.0"),
+            "bundled rg output was {output:?}"
+        );
     }
 
     #[cfg(windows)]
