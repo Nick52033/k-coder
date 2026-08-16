@@ -5,7 +5,7 @@ use crate::storage::{
 };
 
 pub const PROTOCOL_VERSION: u32 = 1;
-pub const AGENT_EVENT_SCHEMA_VERSION: u32 = 4;
+pub const AGENT_EVENT_SCHEMA_VERSION: u32 = 5;
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -127,6 +127,8 @@ pub struct QueuedTurn {
     pub kind: QueuedTurnKind,
     pub input: String,
     pub agent_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_id: Option<String>,
     pub attachments: Vec<ImageAttachment>,
 }
 
@@ -219,6 +221,8 @@ pub struct ThreadHistorySnapshot {
     pub last_turn: Option<TurnSnapshot>,
     pub todos: Vec<TodoItem>,
     pub last_usage: Option<TokenUsage>,
+    #[serde(default)]
+    pub context_usage: Option<TokenUsage>,
     pub turns: ThreadTurnsPage,
     pub unscoped_items: Vec<ThreadItem>,
 }
@@ -326,6 +330,50 @@ pub enum ToolRisk {
     Write,
     Delete,
     External,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginState {
+    Disabled,
+    Loaded,
+    Degraded,
+    Blocked,
+    Invalid,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginComponentSummary {
+    pub skill_count: usize,
+    pub mcp_server_count: usize,
+    pub mcp_tool_count: usize,
+    pub unsupported_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginDiagnostic {
+    pub id: String,
+    pub name: String,
+    pub version: String,
+    pub description: String,
+    pub path: String,
+    pub enabled: bool,
+    pub state: PluginState,
+    pub deletable: bool,
+    pub components: PluginComponentSummary,
+    pub warnings: Vec<String>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginOverview {
+    pub schema_version: u32,
+    pub root_path: String,
+    pub plugins: Vec<PluginDiagnostic>,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -800,6 +848,7 @@ pub enum AgentEvent {
         thread_id: String,
         turn_id: String,
         usage: TokenUsage,
+        context_usage: TokenUsage,
     },
     ContextCompacted {
         thread_id: String,
@@ -925,6 +974,8 @@ impl AgentMode {
         const READ_ONLY: &[&str] = &[
             "list_directory",
             "read_file",
+            "plugin_skill_read",
+            "plugin_resource_read",
             "search_repository",
             "recall_memory",
             "request_user_input",
@@ -933,6 +984,8 @@ impl AgentMode {
         const PLAN_ONLY: &[&str] = &[
             "list_directory",
             "read_file",
+            "plugin_skill_read",
+            "plugin_resource_read",
             "search_repository",
             "recall_memory",
             "request_user_input",
@@ -1103,6 +1156,41 @@ mod tests {
     }
 
     #[test]
+    fn plugin_overview_uses_the_versioned_public_contract() {
+        let overview = PluginOverview {
+            schema_version: 1,
+            root_path: r"D:\data\runtime-data\plugins".into(),
+            plugins: vec![PluginDiagnostic {
+                id: "review-tools@local".into(),
+                name: "review-tools".into(),
+                version: "1.2.3".into(),
+                description: "Review helpers".into(),
+                path: r"D:\data\runtime-data\plugins\review-tools".into(),
+                enabled: true,
+                state: PluginState::Degraded,
+                deletable: true,
+                components: PluginComponentSummary {
+                    skill_count: 1,
+                    mcp_server_count: 1,
+                    mcp_tool_count: 2,
+                    unsupported_count: 1,
+                },
+                warnings: vec!["Apps are not supported".into()],
+                error: None,
+            }],
+            error: None,
+        };
+
+        let value = serde_json::to_value(overview).expect("plugin overview should serialize");
+
+        assert_eq!(value["schemaVersion"], 1);
+        assert_eq!(value["plugins"][0]["state"], "degraded");
+        assert_eq!(value["plugins"][0]["components"]["skillCount"], 1);
+        assert_eq!(value["plugins"][0]["components"]["mcpToolCount"], 2);
+        assert!(value["plugins"][0].get("schema_version").is_none());
+    }
+
+    #[test]
     fn turn_handle_uses_the_public_async_start_contract() {
         let handle = TurnHandle {
             schema_version: PROTOCOL_VERSION,
@@ -1138,6 +1226,31 @@ mod tests {
         assert_eq!(value["startedAtMs"], 10);
         assert_eq!(value["completedAtMs"], 25);
         assert_eq!(value["durationMs"], 15);
+    }
+
+    #[test]
+    fn usage_event_separates_turn_totals_from_the_active_context_window() {
+        let event = AgentEventEnvelope::new(AgentEvent::UsageUpdated {
+            thread_id: "thread-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            usage: TokenUsage {
+                input_tokens: 90_000,
+                output_tokens: 10_000,
+                total_tokens: 100_000,
+            },
+            context_usage: TokenUsage {
+                input_tokens: 14_000,
+                output_tokens: 1_360,
+                total_tokens: 15_360,
+            },
+        });
+
+        let value = serde_json::to_value(event).expect("usage event should serialize");
+
+        assert_eq!(value["schemaVersion"], 5);
+        assert_eq!(value["type"], "usage_updated");
+        assert_eq!(value["usage"]["totalTokens"], 100_000);
+        assert_eq!(value["contextUsage"]["totalTokens"], 15_360);
     }
 
     #[test]
@@ -1263,6 +1376,7 @@ mod tests {
                 kind: QueuedTurnKind::Message,
                 input: "next".into(),
                 agent_mode: None,
+                workflow_id: Some("quality-assurance".into()),
                 attachments: Vec::new(),
             }],
         })
@@ -1283,8 +1397,21 @@ mod tests {
         assert_eq!(mailbox["revision"], 7);
         assert_eq!(mailbox["pending"][0]["schemaVersion"], PROTOCOL_VERSION);
         assert_eq!(mailbox["pending"][0]["kind"], "message");
+        assert_eq!(mailbox["pending"][0]["workflowId"], "quality-assurance");
         assert_eq!(mailbox["activeTurnId"], "turn-1");
         assert_eq!(steer_response["schemaVersion"], PROTOCOL_VERSION);
         assert_eq!(steer_response["threadId"], "thread-1");
+
+        let legacy_queued: QueuedTurn = serde_json::from_value(serde_json::json!({
+            "schemaVersion": PROTOCOL_VERSION,
+            "turnId": "legacy-turn",
+            "threadId": "thread-1",
+            "kind": "message",
+            "input": "legacy",
+            "agentMode": null,
+            "attachments": []
+        }))
+        .unwrap();
+        assert_eq!(legacy_queued.workflow_id, None);
     }
 }

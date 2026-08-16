@@ -52,6 +52,8 @@ pub struct HistoryIndexMetadata {
     pub last_turn: Option<TurnSnapshot>,
     pub todos: Vec<TodoItem>,
     pub last_usage: Option<TokenUsage>,
+    #[serde(default)]
+    pub context_usage: Option<TokenUsage>,
     pub unscoped_items: Vec<ThreadItem>,
 }
 
@@ -569,6 +571,14 @@ impl ProjectionDb {
             .optional()?)
     }
 
+    pub fn delete_setting(&self, key: &str) -> Result<(), ProjectionError> {
+        self.connection
+            .lock()
+            .map_err(|_| ProjectionError::Poisoned)?
+            .execute("DELETE FROM settings WHERE key=?1", [key])?;
+        Ok(())
+    }
+
     pub fn upsert_project(&self, project: &ProjectRecord) -> Result<(), ProjectionError> {
         self.connection.lock().map_err(|_| ProjectionError::Poisoned)?.execute(
             "INSERT INTO projects(id,name,path,trusted,last_opened_at_ms) VALUES(?1,?2,?3,?4,?5)
@@ -782,6 +792,42 @@ fn migrate(connection: &Connection) -> Result<(), rusqlite::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_history_metadata_defaults_the_context_usage_baseline() {
+        let metadata = HistoryIndexMetadata {
+            summary: ThreadSummary {
+                schema_version: 1,
+                id: "thread-1".to_string(),
+                title: "Legacy thread".to_string(),
+                created_at_ms: 1,
+                updated_at_ms: 2,
+                archived: false,
+                in_project: true,
+                workspace_path: None,
+            },
+            last_turn: None,
+            todos: Vec::new(),
+            last_usage: Some(TokenUsage {
+                input_tokens: 10,
+                output_tokens: 2,
+                total_tokens: 12,
+            }),
+            context_usage: Some(TokenUsage {
+                input_tokens: 8,
+                output_tokens: 2,
+                total_tokens: 10,
+            }),
+            unscoped_items: Vec::new(),
+        };
+        let mut legacy = serde_json::to_value(metadata).unwrap();
+        legacy.as_object_mut().unwrap().remove("contextUsage");
+
+        let restored: HistoryIndexMetadata = serde_json::from_value(legacy).unwrap();
+
+        assert_eq!(restored.context_usage, None);
+        assert_eq!(restored.last_usage.unwrap().total_tokens, 12);
+    }
 
     #[test]
     fn migrates_every_published_database_version_forward() {

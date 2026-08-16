@@ -63,6 +63,55 @@ pub struct CompactionSummary {
     pub estimated_after_tokens: usize,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// User intent reconstructed only from persisted `UserMessage` events.
+/// Rendered compaction summaries must never be observed by this accumulator.
+pub struct CompactionUserContext {
+    current_user_request: String,
+    recent_user_messages: Vec<String>,
+    user_constraints: Vec<String>,
+}
+
+impl CompactionUserContext {
+    pub fn from_messages(messages: &[ProviderMessage]) -> Self {
+        let mut context = Self::default();
+        for message in messages {
+            if let Some(text) = user_message_text(message) {
+                context.observe(text);
+            }
+        }
+        context
+    }
+
+    pub fn observe(&mut self, text: String) {
+        if text.trim().is_empty() {
+            return;
+        }
+        self.current_user_request = bound(&text, CURRENT_USER_REQUEST_BYTES);
+        self.recent_user_messages
+            .push(bound(&text, RECENT_USER_MESSAGE_BYTES));
+        if self.recent_user_messages.len() > RECENT_USER_MESSAGE_LIMIT {
+            self.recent_user_messages
+                .drain(..self.recent_user_messages.len() - RECENT_USER_MESSAGE_LIMIT);
+        }
+        if is_constraint(&text) {
+            self.user_constraints = merge_string_history(
+                self.user_constraints
+                    .iter()
+                    .cloned()
+                    .chain(std::iter::once(bound(&text, 600))),
+                8,
+            );
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.current_user_request.is_empty()
+            && self.recent_user_messages.is_empty()
+            && self.user_constraints.is_empty()
+    }
+}
+
 pub fn default_working_context_limit(hard_limit: usize) -> usize {
     let hard_limit = hard_limit.max(1_024);
     hard_limit
@@ -121,46 +170,46 @@ pub fn needs_compaction_for_request(
 pub fn compact(
     messages: &[ProviderMessage],
     limit: usize,
+    previous_summary: Option<&CompactionSummary>,
+    authoritative_user_context: &CompactionUserContext,
 ) -> (CompactionSummary, Vec<ProviderMessage>) {
     let budget = ContextBudget::for_limit(limit);
-    let recent_tool_results = messages
-        .iter()
-        .rev()
+    let observed_user_context;
+    let user_context = if authoritative_user_context.is_empty() {
+        observed_user_context = CompactionUserContext::from_messages(messages);
+        &observed_user_context
+    } else {
+        authoritative_user_context
+    };
+    let previous_summary = previous_summary
+        .cloned()
+        .map(|summary| normalize_compaction_summary(summary, user_context));
+    let previous_summary = previous_summary.as_ref();
+    let recent_tool_results = previous_summary
+        .into_iter()
+        .flat_map(|summary| summary.recent_tool_results.iter())
+        .chain(messages.iter())
         .filter(|message| matches!(message, ProviderMessage::ToolResult { .. }))
-        .take(RECENT_TOOL_RESULT_LIMIT)
         .map(summarize_large_tool_result)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
         .collect::<Vec<_>>();
-    let user_constraints = messages
-        .iter()
-        .filter_map(|message| match message {
-            ProviderMessage::Text {
-                role: MessageRole::User,
-                text,
-            } if is_constraint(text) => Some(bound(text, 600)),
-            ProviderMessage::UserContent { text, .. } if is_constraint(text) => {
-                Some(bound(text, 600))
-            }
-            _ => None,
-        })
-        .rev()
-        .take(8)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect();
-    let recent_user_messages = messages
-        .iter()
-        .filter_map(user_message_text)
-        .rev()
-        .take(RECENT_USER_MESSAGE_LIMIT)
-        .map(|text| bound(&text, RECENT_USER_MESSAGE_BYTES))
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect();
+    let recent_tool_results = recent_tool_results[recent_tool_results
+        .len()
+        .saturating_sub(RECENT_TOOL_RESULT_LIMIT)..]
+        .to_vec();
+    let user_constraints = merge_string_history(
+        previous_summary
+            .into_iter()
+            .flat_map(|summary| summary.user_constraints.iter().cloned())
+            .chain(user_context.user_constraints.iter().cloned()),
+        8,
+    );
+    let recent_user_messages = if user_context.recent_user_messages.is_empty() {
+        previous_summary
+            .map(|summary| summary.recent_user_messages.clone())
+            .unwrap_or_default()
+    } else {
+        user_context.recent_user_messages.clone()
+    };
     // Leave a low-water mark after compaction. Keeping only a quarter of the
     // history budget leaves room for the summary, system instructions, tools,
     // and the next response without immediately retriggering compaction.
@@ -177,14 +226,21 @@ pub fn compact(
     }
     kept.reverse();
     let compacted_count = messages.len().saturating_sub(kept.len());
-    let current_user_request = messages
-        .iter()
-        .filter_map(user_message_text)
-        .next_back()
-        .map(|text| bound(&text, CURRENT_USER_REQUEST_BYTES))
-        .unwrap_or_default();
-    let important_tool_observations = important_tool_observations(&messages[..compacted_count]);
-    let summary_text = messages[..compacted_count]
+    let current_user_request = if user_context.current_user_request.is_empty() {
+        previous_summary
+            .map(|summary| summary.current_user_request.clone())
+            .unwrap_or_default()
+    } else {
+        user_context.current_user_request.clone()
+    };
+    let important_tool_observations = merge_string_history(
+        previous_summary
+            .into_iter()
+            .flat_map(|summary| summary.important_tool_observations.iter().cloned())
+            .chain(important_tool_observations(&messages[..compacted_count])),
+        IMPORTANT_TOOL_OBSERVATION_LIMIT,
+    );
+    let new_summary_text = messages[..compacted_count]
         .iter()
         .filter_map(|message| match message {
             ProviderMessage::Text { role, text } => {
@@ -205,8 +261,14 @@ pub fn compact(
         })
         .collect::<Vec<_>>()
         .join("\n");
+    let summary_text = previous_summary
+        .and_then(stable_previous_summary_text)
+        .into_iter()
+        .chain((!new_summary_text.is_empty()).then_some(new_summary_text.as_str()))
+        .collect::<Vec<_>>()
+        .join("\n");
     let mut summary = CompactionSummary {
-        contract_version: 3,
+        contract_version: 4,
         summary: bound(&summary_text, budget.history * CHARS_PER_TOKEN / 4),
         user_constraints,
         recent_user_messages,
@@ -214,20 +276,90 @@ pub fn compact(
         important_tool_observations,
         recent_tool_results,
         compacted_message_count: compacted_count,
-        estimated_before_tokens: estimate_tokens(messages),
+        estimated_before_tokens: estimate_tokens(&render_provider_history(
+            previous_summary,
+            messages,
+        )),
         estimated_after_tokens: 0,
     };
-    let mut result = Vec::new();
-    if compacted_count > 0 {
-        result.push(ProviderMessage::Text {
-            role: MessageRole::User,
-            text: render_summary(&summary),
-        });
-    }
-    result.extend(kept);
-    let result = repair_tool_history(result);
+    let result = render_provider_history(Some(&summary), &kept);
     summary.estimated_after_tokens = estimate_tokens(&result);
     (summary, result)
+}
+
+pub(crate) fn render_provider_history(
+    summary: Option<&CompactionSummary>,
+    messages: &[ProviderMessage],
+) -> Vec<ProviderMessage> {
+    let mut result = Vec::with_capacity(messages.len() + usize::from(summary.is_some()));
+    if let Some(summary) = summary {
+        result.push(ProviderMessage::Text {
+            role: MessageRole::User,
+            text: render_summary(summary),
+        });
+    }
+    result.extend_from_slice(messages);
+    repair_tool_history(result)
+}
+
+pub(crate) fn normalize_compaction_summary(
+    mut summary: CompactionSummary,
+    user_context: &CompactionUserContext,
+) -> CompactionSummary {
+    let recursive_legacy_summary = summary.contract_version < 4
+        && (summary.summary.contains("[Compacted context v")
+            || summary
+                .current_user_request
+                .contains("[Compacted context v")
+            || summary
+                .recent_user_messages
+                .iter()
+                .any(|message| message.contains("[Compacted context v"))
+            || summary
+                .user_constraints
+                .iter()
+                .any(|constraint| constraint.contains("[Compacted context v")));
+    if !user_context.current_user_request.is_empty() {
+        summary.current_user_request = user_context.current_user_request.clone();
+    }
+    if !user_context.recent_user_messages.is_empty() {
+        summary.recent_user_messages = user_context.recent_user_messages.clone();
+    }
+    if !user_context.is_empty() && recursive_legacy_summary {
+        summary.summary.clear();
+        summary.user_constraints = user_context.user_constraints.clone();
+    } else {
+        summary.user_constraints = merge_string_history(
+            summary
+                .user_constraints
+                .into_iter()
+                .chain(user_context.user_constraints.iter().cloned()),
+            8,
+        );
+    }
+    summary
+}
+
+fn stable_previous_summary_text(summary: &CompactionSummary) -> Option<&str> {
+    let text = summary.summary.trim();
+    (!text.is_empty()).then_some(text)
+}
+
+fn merge_string_history(values: impl IntoIterator<Item = String>, limit: usize) -> Vec<String> {
+    let mut result = Vec::new();
+    for value in values {
+        if value.trim().is_empty() {
+            continue;
+        }
+        if let Some(index) = result.iter().position(|current| current == &value) {
+            result.remove(index);
+        }
+        result.push(value);
+        if result.len() > limit {
+            result.remove(0);
+        }
+    }
+    result
 }
 
 fn important_tool_observations(messages: &[ProviderMessage]) -> Vec<String> {
@@ -386,7 +518,7 @@ pub fn render_summary(summary: &CompactionSummary) -> String {
     )
 }
 
-fn user_message_text(message: &ProviderMessage) -> Option<String> {
+pub(crate) fn user_message_text(message: &ProviderMessage) -> Option<String> {
     match message {
         ProviderMessage::Text {
             role: MessageRole::User,
@@ -452,6 +584,14 @@ fn bound(value: &str, max: usize) -> String {
 mod tests {
     use super::*;
 
+    fn compact_once(
+        messages: &[ProviderMessage],
+        limit: usize,
+    ) -> (CompactionSummary, Vec<ProviderMessage>) {
+        let user_context = CompactionUserContext::from_messages(messages);
+        compact(messages, limit, None, &user_context)
+    }
+
     #[test]
     fn compaction_keeps_constraints_and_recent_tool_results() {
         let mut messages = vec![ProviderMessage::Text {
@@ -468,7 +608,7 @@ mod tests {
             success: true,
             output: "important".into(),
         });
-        let (summary, compacted) = compact(&messages, 2_000);
+        let (summary, compacted) = compact_once(&messages, 2_000);
         assert!(
             summary
                 .user_constraints
@@ -501,7 +641,7 @@ mod tests {
             },
         ]);
 
-        let (summary, compacted) = compact(&messages, 2_000);
+        let (summary, compacted) = compact_once(&messages, 2_000);
 
         assert_eq!(
             summary.recent_user_messages,
@@ -541,7 +681,7 @@ mod tests {
             }],
         }];
 
-        let (summary, _) = compact(&messages, 2_000);
+        let (summary, _) = compact_once(&messages, 2_000);
 
         assert_eq!(
             summary.recent_user_messages,
@@ -604,8 +744,8 @@ mod tests {
             role: MessageRole::Assistant,
             text: format!("历史 {index} {}", "x".repeat(500)),
         }));
-        let (summary, compacted) = compact(&messages, 1_024);
-        assert_eq!(summary.contract_version, 3);
+        let (summary, compacted) = compact_once(&messages, 1_024);
+        assert_eq!(summary.contract_version, 4);
         assert_eq!(summary.current_user_request, "请修复并运行测试");
         assert!(
             summary
@@ -613,7 +753,10 @@ mod tests {
                 .iter()
                 .any(|line| line.contains("test failed"))
         );
-        assert_eq!(summary.estimated_before_tokens, estimate_tokens(&messages));
+        assert_eq!(
+            summary.estimated_before_tokens,
+            estimate_tokens(&render_provider_history(None, &messages))
+        );
         assert_eq!(summary.estimated_after_tokens, estimate_tokens(&compacted));
     }
 
@@ -630,23 +773,34 @@ mod tests {
 
         let replay = |working_limit| {
             let instructions = "stable runtime rules ".repeat(200);
-            let mut history = vec![ProviderMessage::Text {
+            let mut messages = vec![ProviderMessage::Text {
                 role: MessageRole::User,
                 text: "请完成一个多步骤检查任务".into(),
             }];
+            let user_context = CompactionUserContext::from_messages(&messages);
+            let mut summary = None;
             let mut total_estimated_input = 0usize;
             let mut compactions = 0usize;
             for index in 0..19 {
-                if needs_compaction_for_request(&history, &instructions, &tools, working_limit) {
-                    let (summary, compacted) = compact(&history, working_limit);
-                    if summary.compacted_message_count > 0 {
+                let mut request_history = render_provider_history(summary.as_ref(), &messages);
+                if needs_compaction_for_request(
+                    &request_history,
+                    &instructions,
+                    &tools,
+                    working_limit,
+                ) {
+                    let (next_summary, compacted) =
+                        compact(&messages, working_limit, summary.as_ref(), &user_context);
+                    if next_summary.compacted_message_count > 0 {
                         compactions += 1;
-                        history = compacted;
+                        summary = Some(next_summary);
+                        messages.clear();
+                        request_history = compacted;
                     }
                 }
                 total_estimated_input +=
-                    estimate_provider_request_tokens(&history, &instructions, &tools);
-                history.push(ProviderMessage::AssistantToolCalls {
+                    estimate_provider_request_tokens(&request_history, &instructions, &tools);
+                messages.push(ProviderMessage::AssistantToolCalls {
                     text: format!("checking step {index}"),
                     calls: vec![crate::protocol::ToolCall {
                         id: format!("call-{index}"),
@@ -655,7 +809,7 @@ mod tests {
                         metadata: serde_json::Value::Null,
                     }],
                 });
-                history.push(ProviderMessage::ToolResult {
+                messages.push(ProviderMessage::ToolResult {
                     call_id: format!("call-{index}"),
                     name: "read_file".into(),
                     success: true,
@@ -669,6 +823,69 @@ mod tests {
         let (working_window_total, compactions) = replay(DEFAULT_WORKING_CONTEXT_LIMIT);
         assert!(compactions > 0);
         assert!(working_window_total < hard_window_total);
+    }
+
+    #[test]
+    fn repeated_compaction_preserves_the_real_request_without_recursive_summaries() {
+        let request = "请设计 workflow 设置并对照参考实现";
+        let mut user_context = CompactionUserContext::default();
+        user_context.observe(request.to_string());
+        let mut previous_summary = None;
+        let mut messages = vec![ProviderMessage::Text {
+            role: MessageRole::User,
+            text: request.to_string(),
+        }];
+
+        for cycle in 0..16 {
+            messages.extend((0..12).map(|index| ProviderMessage::Text {
+                role: MessageRole::Assistant,
+                text: format!("cycle {cycle} observation {index} {}", "x".repeat(600)),
+            }));
+            let (summary, rendered) =
+                compact(&messages, 2_000, previous_summary.as_ref(), &user_context);
+
+            assert!(summary.compacted_message_count > 0);
+            assert_eq!(summary.current_user_request, request);
+            assert_eq!(summary.recent_user_messages, [request]);
+            assert!(!summary.summary.contains("[Compacted context v"));
+            let rendered = match rendered.first() {
+                Some(ProviderMessage::Text { text, .. }) => text,
+                other => panic!("expected rendered compaction summary, got {other:?}"),
+            };
+            assert_eq!(rendered.matches("[Compacted context v4]").count(), 1);
+
+            previous_summary = Some(summary);
+            messages.clear();
+        }
+    }
+
+    #[test]
+    fn legacy_recursive_summary_uses_authoritative_user_events_for_recovery() {
+        let mut user_context = CompactionUserContext::default();
+        user_context.observe("原始 workflow 请求".to_string());
+        let summary = CompactionSummary {
+            contract_version: 3,
+            summary: "User: [Compacted context v3]\nSummary:\nrecursive".to_string(),
+            user_constraints: vec!["[Compacted context v3]\n必须递归".to_string()],
+            recent_user_messages: vec!["[Compacted context v3]".to_string()],
+            current_user_request: "[Compacted context v3]".to_string(),
+            important_tool_observations: vec!["tool read_file: useful".to_string()],
+            recent_tool_results: Vec::new(),
+            compacted_message_count: 12,
+            estimated_before_tokens: 10_000,
+            estimated_after_tokens: 2_000,
+        };
+
+        let normalized = normalize_compaction_summary(summary, &user_context);
+
+        assert!(normalized.summary.is_empty());
+        assert_eq!(normalized.current_user_request, "原始 workflow 请求");
+        assert_eq!(normalized.recent_user_messages, ["原始 workflow 请求"]);
+        assert!(normalized.user_constraints.is_empty());
+        assert_eq!(
+            normalized.important_tool_observations,
+            ["tool read_file: useful"]
+        );
     }
 
     #[test]
@@ -686,7 +903,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
 
-        let (summary, _) = compact(&messages, 2_000);
+        let (summary, _) = compact_once(&messages, 2_000);
 
         assert_eq!(summary.recent_tool_results.len(), 2);
         assert!(matches!(
@@ -729,7 +946,7 @@ mod tests {
             success: true,
             output: "ok".into(),
         });
-        let (_, compacted) = compact(&messages, 4_000);
+        let (_, compacted) = compact_once(&messages, 4_000);
         let mut iter = compacted.iter();
         while let Some(msg) = iter.next() {
             if let ProviderMessage::AssistantToolCalls { calls, .. } = msg {

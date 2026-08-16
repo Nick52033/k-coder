@@ -35,6 +35,7 @@ export interface ConversationProjectionState {
   error: string;
   lastTurn: TurnSnapshot | null;
   usage: TokenUsage | null;
+  contextUsage: TokenUsage | null;
   todos: Map<string, TodoItem[]>;
 }
 
@@ -272,10 +273,16 @@ export function reduceAgentEvent(
       };
     }
     case "usage_updated":
-      return { state: { usage: event.usage } };
+      return {
+        state: {
+          usage: event.usage,
+          contextUsage: event.contextUsage,
+        },
+      };
     case "context_compacted":
       return {
         state: {
+          contextUsage: null,
           turnTimeline: appendTimelineEvent(
             state.turnTimeline,
             event.itemId,

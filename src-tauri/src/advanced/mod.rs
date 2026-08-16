@@ -9,6 +9,7 @@ mod request_user_input;
 mod search;
 mod store;
 mod todo;
+mod workflow;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -29,6 +30,10 @@ pub use request_user_input::{
 };
 pub use search::{RepositorySearchIndex, SearchResult};
 pub use todo::{TODO_WRITE_TOOL_NAME, TodoWriteArgs, TodoWriteToolHandler};
+pub use workflow::{
+    COMPLETE_WORKFLOW_NODE_TOOL_NAME, CancelWorkflowRunRequest, WorkflowDefinitionView,
+    WorkflowNodeCompletion, WorkflowNodeView, WorkflowRunState, WorkflowRunView, WorkflowStore,
+};
 
 #[derive(Clone)]
 pub struct AdvancedServices {
@@ -37,6 +42,7 @@ pub struct AdvancedServices {
     pub browser: BrowserService,
     pub memory: MemoryStore,
     pub metrics: RuntimeMetrics,
+    pub workflows: WorkflowStore,
 }
 
 impl AdvancedServices {
@@ -47,6 +53,7 @@ impl AdvancedServices {
             browser: BrowserService::new(data_root)?,
             memory: MemoryStore::new(data_root)?,
             metrics: RuntimeMetrics::new(data_root)?,
+            workflows: WorkflowStore::new(data_root)?,
         })
     }
 
@@ -69,6 +76,9 @@ impl AdvancedServices {
             Arc::new(browser::BrowserTool::screenshot(self.browser.clone())),
             Arc::new(browser::BrowserTool::close(self.browser.clone())),
             Arc::new(todo::TodoWriteToolHandler),
+            Arc::new(workflow::CompleteWorkflowNodeTool::new(
+                self.workflows.clone(),
+            )),
         ];
         let mut risks = HashMap::new();
         for handler in &handlers {
@@ -101,6 +111,7 @@ impl AdvancedServices {
                 ));
             }
         }
+        instructions.push_str(&self.workflows.runtime_instructions(thread_id)?);
         Ok(instructions)
     }
 }

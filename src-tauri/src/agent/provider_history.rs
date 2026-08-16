@@ -1,19 +1,49 @@
-use crate::context;
-use crate::protocol::{MessageRole, TokenUsage};
+use crate::context::{self, CompactionSummary, CompactionUserContext};
+use crate::protocol::TokenUsage;
 use crate::providers::ProviderMessage;
 use crate::storage::{StoredEvent, StoredEventKind};
 
 use super::input::chat_to_provider;
 
-pub(super) fn provider_history(
-    events: Vec<StoredEvent>,
-    supports_vision: bool,
-) -> Vec<ProviderMessage> {
+/// Keeps structured compaction state separate from real post-compaction messages.
+pub(super) struct ProviderHistory {
+    summary: Option<CompactionSummary>,
+    messages: Vec<ProviderMessage>,
+    user_context: CompactionUserContext,
+}
+
+impl ProviderHistory {
+    pub(super) fn request_messages(&self) -> Vec<ProviderMessage> {
+        context::render_provider_history(self.summary.as_ref(), &self.messages)
+    }
+
+    pub(super) fn messages(&self) -> &[ProviderMessage] {
+        &self.messages
+    }
+
+    pub(super) fn summary(&self) -> Option<&CompactionSummary> {
+        self.summary.as_ref()
+    }
+
+    pub(super) fn user_context(&self) -> &CompactionUserContext {
+        &self.user_context
+    }
+}
+
+pub(super) fn provider_history(events: Vec<StoredEvent>, supports_vision: bool) -> ProviderHistory {
     let mut history = Vec::new();
+    let mut summary = None;
+    let mut user_context = CompactionUserContext::default();
     for event in events {
         let message = match event.kind {
-            StoredEventKind::UserMessage { message }
-            | StoredEventKind::AssistantMessage { message } => {
+            StoredEventKind::UserMessage { message } => {
+                let message = chat_to_provider(message, supports_vision);
+                if let Some(text) = message.as_ref().and_then(context::user_message_text) {
+                    user_context.observe(text);
+                }
+                message
+            }
+            StoredEventKind::AssistantMessage { message } => {
                 chat_to_provider(message, supports_vision)
             }
             StoredEventKind::AssistantToolCalls { text, calls, .. } => {
@@ -32,12 +62,11 @@ pub(super) fn provider_history(
             StoredEventKind::ProviderContext { provider, item } => {
                 Some(ProviderMessage::ProviderContext { provider, item })
             }
-            StoredEventKind::ContextCompacted { summary, .. } => {
+            StoredEventKind::ContextCompacted {
+                summary: compacted, ..
+            } => {
                 history.clear();
-                history.push(ProviderMessage::Text {
-                    role: MessageRole::User,
-                    text: context::render_summary(&summary),
-                });
+                summary = Some(compacted);
                 None
             }
             _ => None,
@@ -46,7 +75,12 @@ pub(super) fn provider_history(
             history.push(message);
         }
     }
-    context::repair_tool_history(history)
+    ProviderHistory {
+        summary: summary
+            .map(|summary| context::normalize_compaction_summary(summary, &user_context)),
+        messages: context::repair_tool_history(history),
+        user_context,
+    }
 }
 
 pub(super) fn last_active_context_usage(events: &[StoredEvent]) -> Option<TokenUsage> {

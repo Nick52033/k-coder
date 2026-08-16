@@ -1,4 +1,5 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -23,6 +24,13 @@ const MAX_MCP_TOOLS: usize = 256;
 const MAX_TOOL_DESCRIPTION_BYTES: usize = 4096;
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 const MAX_TIMEOUT_MS: u64 = 300_000;
+
+#[derive(Debug, Clone, Default)]
+pub struct McpLaunchOptions {
+    pub cwd: Option<PathBuf>,
+    pub environment: HashMap<String, String>,
+    pub secret_header_prefixes: HashMap<String, String>,
+}
 
 pub trait McpSecretStore: Send + Sync {
     fn get(&self, server: &str, name: &str) -> Result<Option<String>, McpError>;
@@ -119,8 +127,8 @@ pub enum McpTransportConfig {
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct McpServerConfig {
     pub id: String,
     #[serde(default = "default_true")]
@@ -129,6 +137,72 @@ pub struct McpServerConfig {
     pub timeout_ms: u64,
     #[serde(flatten)]
     pub transport: McpTransportConfig,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "transport", rename_all = "snake_case", deny_unknown_fields)]
+enum McpServerConfigWire {
+    Stdio {
+        id: String,
+        #[serde(default = "default_true")]
+        enabled: bool,
+        #[serde(default = "default_timeout", rename = "timeoutMs")]
+        timeout_ms: u64,
+        command: Vec<String>,
+        #[serde(default)]
+        secret_env: HashMap<String, String>,
+    },
+    StreamableHttp {
+        id: String,
+        #[serde(default = "default_true")]
+        enabled: bool,
+        #[serde(default = "default_timeout", rename = "timeoutMs")]
+        timeout_ms: u64,
+        url: String,
+        #[serde(default)]
+        secret_headers: HashMap<String, String>,
+    },
+}
+
+impl<'de> Deserialize<'de> for McpServerConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = McpServerConfigWire::deserialize(deserializer)?;
+        Ok(match wire {
+            McpServerConfigWire::Stdio {
+                id,
+                enabled,
+                timeout_ms,
+                command,
+                secret_env,
+            } => Self {
+                id,
+                enabled,
+                timeout_ms,
+                transport: McpTransportConfig::Stdio {
+                    command,
+                    secret_env,
+                },
+            },
+            McpServerConfigWire::StreamableHttp {
+                id,
+                enabled,
+                timeout_ms,
+                url,
+                secret_headers,
+            } => Self {
+                id,
+                enabled,
+                timeout_ms,
+                transport: McpTransportConfig::StreamableHttp {
+                    url,
+                    secret_headers,
+                },
+            },
+        })
+    }
 }
 
 fn default_true() -> bool {
@@ -168,7 +242,7 @@ impl McpServerConfig {
                     )));
                 }
                 for (environment, credential) in secret_env {
-                    if !valid_environment_name(environment) || credential.trim().is_empty() {
+                    if !valid_environment_name(environment) || !valid_credential_name(credential) {
                         return Err(McpError::Config(format!(
                             "MCP server {} has an invalid secret environment mapping",
                             self.id
@@ -188,9 +262,9 @@ impl McpServerConfig {
                             self.id
                         ))
                     })?;
-                    if credential.trim().is_empty() {
+                    if !valid_credential_name(credential) {
                         return Err(McpError::Config(format!(
-                            "MCP server {} has an empty credential name",
+                            "MCP server {} has an invalid credential name",
                             self.id
                         )));
                     }
@@ -260,6 +334,16 @@ impl DiscoveredMcpTool {
             client: self.client.clone(),
         })
     }
+
+    pub fn shutdown_on(&self, cancellation: CancellationToken) {
+        let client = Arc::downgrade(&self.client);
+        tokio::spawn(async move {
+            cancellation.cancelled().await;
+            if let Some(client) = client.upgrade() {
+                client.shutdown().await;
+            }
+        });
+    }
 }
 
 #[async_trait]
@@ -270,6 +354,8 @@ trait McpClient: Send + Sync + std::fmt::Debug {
         params: Value,
         cancellation: CancellationToken,
     ) -> Result<Value, McpError>;
+
+    async fn shutdown(&self) {}
 }
 
 #[derive(Debug)]
@@ -312,13 +398,30 @@ pub async fn connect(
     secrets: Arc<dyn McpSecretStore>,
     cancellation: CancellationToken,
 ) -> Result<Vec<DiscoveredMcpTool>, McpError> {
+    connect_with_options(config, secrets, McpLaunchOptions::default(), cancellation).await
+}
+
+pub async fn connect_with_options(
+    config: &McpServerConfig,
+    secrets: Arc<dyn McpSecretStore>,
+    options: McpLaunchOptions,
+    cancellation: CancellationToken,
+) -> Result<Vec<DiscoveredMcpTool>, McpError> {
     config.validate()?;
     let client: Arc<dyn McpClient> = match &config.transport {
         McpTransportConfig::Stdio {
             command,
             secret_env,
         } => Arc::new(
-            StdioClient::start(&config.id, command, secret_env, secrets, config.timeout_ms).await?,
+            StdioClient::start(
+                &config.id,
+                command,
+                secret_env,
+                &options,
+                secrets,
+                config.timeout_ms,
+            )
+            .await?,
         ),
         McpTransportConfig::StreamableHttp {
             url,
@@ -327,6 +430,7 @@ pub async fn connect(
             &config.id,
             url,
             secret_headers,
+            &options.secret_header_prefixes,
             secrets,
             config.timeout_ms,
         )?),
@@ -377,6 +481,7 @@ async fn list_tools(
 ) -> Result<Vec<DiscoveredMcpTool>, McpError> {
     let mut cursor = None::<String>;
     let mut discovered = Vec::new();
+    let mut tool_names = HashSet::new();
     for _ in 0..20 {
         let params = cursor
             .as_ref()
@@ -400,6 +505,12 @@ async fn list_tools(
                 .and_then(Value::as_str)
                 .ok_or_else(|| McpError::Protocol("MCP tool omitted name".into()))?;
             let safe_name = sanitize_tool_name(remote_name)?;
+            let namespaced_name = format!("mcp__{}__{}", server.replace('-', "_"), safe_name);
+            if !tool_names.insert(namespaced_name.clone()) {
+                return Err(McpError::Protocol(format!(
+                    "MCP server {server} tool names collide after namespace normalization"
+                )));
+            }
             let input_schema = tool
                 .get("inputSchema")
                 .cloned()
@@ -410,7 +521,7 @@ async fn list_tools(
                 ))
             })?;
             discovered.push(DiscoveredMcpTool {
-                name: format!("mcp__{}__{}", server.replace('-', "_"), safe_name),
+                name: namespaced_name,
                 remote_name: remote_name.to_string(),
                 description: bound_text(
                     tool.get("description")
@@ -455,10 +566,19 @@ impl StdioClient {
         server: &str,
         command: &[String],
         secret_env: &HashMap<String, String>,
+        options: &McpLaunchOptions,
         secrets: Arc<dyn McpSecretStore>,
         timeout_ms: u64,
     ) -> Result<Self, McpError> {
         let mut environment = safe_process_environment();
+        for (key, value) in &options.environment {
+            if !valid_environment_name(key) || value.contains('\0') || value.len() > 32 * 1024 {
+                return Err(McpError::Config(format!(
+                    "MCP server {server} has an invalid fixed environment mapping"
+                )));
+            }
+            environment.insert(key.clone(), value.clone());
+        }
         for (key, credential) in secret_env {
             let value = secrets.get(server, credential)?.ok_or_else(|| {
                 McpError::Secret(format!(
@@ -468,8 +588,16 @@ impl StdioClient {
             environment.insert(key.clone(), value);
         }
         let mut process = Command::new(&command[0]);
+        process.args(&command[1..]);
+        if let Some(cwd) = &options.cwd {
+            if !cwd.is_dir() {
+                return Err(McpError::Config(format!(
+                    "MCP server {server} working directory is unavailable"
+                )));
+            }
+            process.current_dir(cwd);
+        }
         process
-            .args(&command[1..])
             .env_clear()
             .envs(environment)
             .stdin(std::process::Stdio::piped())
@@ -546,6 +674,12 @@ impl McpClient for StdioClient {
             }
         }
     }
+
+    async fn shutdown(&self) {
+        let mut session = self.session.lock().await;
+        let _ = session._child.start_kill();
+        let _ = session._child.wait().await;
+    }
 }
 
 async fn read_stdio_response(
@@ -598,6 +732,7 @@ impl HttpClient {
         server: &str,
         url: &str,
         secret_headers: &HashMap<String, String>,
+        secret_header_prefixes: &HashMap<String, String>,
         secrets: Arc<dyn McpSecretStore>,
         timeout_ms: u64,
     ) -> Result<Self, McpError> {
@@ -609,6 +744,17 @@ impl HttpClient {
                     "MCP server {server} requires credential {credential}"
                 ))
             })?;
+            let prefix = secret_header_prefixes
+                .iter()
+                .find(|(header, _)| header.eq_ignore_ascii_case(name))
+                .map(|(_, prefix)| prefix.as_str())
+                .unwrap_or_default();
+            if prefix.contains(['\r', '\n', '\0']) || prefix.len() > 64 {
+                return Err(McpError::Config(format!(
+                    "MCP server {server} has an invalid secret header prefix"
+                )));
+            }
+            let value = format!("{prefix}{value}");
             headers.insert(
                 HeaderName::from_bytes(name.as_bytes())
                     .map_err(|error| McpError::Config(error.to_string()))?,
@@ -886,6 +1032,14 @@ fn valid_environment_name(value: &str) -> bool {
         })
 }
 
+fn valid_credential_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.')
+        })
+}
+
 fn validate_http_url(value: &str) -> Result<(), McpError> {
     let url = url::Url::parse(value).map_err(|error| McpError::Config(error.to_string()))?;
     let secure = url.scheme() == "https";
@@ -936,8 +1090,49 @@ fn bound_text(value: &str, limit: usize) -> String {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     struct FakeSecrets(HashMap<(String, String), String>);
+
+    #[derive(Debug)]
+    struct DuplicateToolsClient;
+
+    #[derive(Debug)]
+    struct ShutdownClient(Arc<AtomicBool>);
+
+    #[async_trait::async_trait]
+    impl McpClient for DuplicateToolsClient {
+        async fn request(
+            &self,
+            method: &str,
+            _params: Value,
+            _cancellation: CancellationToken,
+        ) -> Result<Value, McpError> {
+            assert_eq!(method, "tools/list");
+            Ok(json!({
+                "tools": [
+                    { "name": "Read-One", "inputSchema": { "type": "object" } },
+                    { "name": "Read_One", "inputSchema": { "type": "object" } }
+                ]
+            }))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl McpClient for ShutdownClient {
+        async fn request(
+            &self,
+            _method: &str,
+            _params: Value,
+            _cancellation: CancellationToken,
+        ) -> Result<Value, McpError> {
+            Ok(json!({}))
+        }
+
+        async fn shutdown(&self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
 
     impl McpSecretStore for FakeSecrets {
         fn get(&self, server: &str, name: &str) -> Result<Option<String>, McpError> {
@@ -968,6 +1163,44 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn rejects_tools_that_collide_after_namespace_normalization() {
+        let error = list_tools(
+            "plugin_server",
+            Arc::new(DuplicateToolsClient),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("collide"));
+    }
+
+    #[tokio::test]
+    async fn discovered_tool_shutdown_hook_closes_the_shared_client() {
+        let stopped = Arc::new(AtomicBool::new(false));
+        let tool = DiscoveredMcpTool {
+            name: "mcp__plugin__read".into(),
+            remote_name: "read".into(),
+            description: "Read".into(),
+            input_schema: json!({ "type": "object" }),
+            risk: ToolRisk::Read,
+            client: Arc::new(ShutdownClient(stopped.clone())),
+        };
+        let cancellation = CancellationToken::new();
+        tool.shutdown_on(cancellation.clone());
+
+        cancellation.cancel();
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !stopped.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
     #[test]
     fn validates_http_and_stdio_configuration() {
         assert!(validate_http_url("https://example.com/mcp").is_ok());
@@ -983,6 +1216,28 @@ mod tests {
             },
         };
         assert!(config.validate().is_ok());
+
+        let invalid_credential = McpServerConfig {
+            id: "local".into(),
+            enabled: true,
+            timeout_ms: 1000,
+            transport: McpTransportConfig::Stdio {
+                command: vec!["server".into()],
+                secret_env: HashMap::from([("TOKEN".into(), "secret alias".into())]),
+            },
+        };
+        assert!(invalid_credential.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_unknown_server_configuration_fields() {
+        let result = serde_json::from_value::<McpServerConfig>(json!({
+            "id": "local",
+            "transport": "stdio",
+            "command": ["server"],
+            "shell": true
+        }));
+        assert!(result.is_err());
     }
 
     #[test]
@@ -1042,6 +1297,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn plugin_launch_options_set_stdio_cwd_and_fixed_environment() {
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("test-fixtures")
+            .join("plugin-mcp-server.mjs");
+        let plugin_root = tempfile::tempdir().unwrap();
+        let root = plugin_root.path().canonicalize().unwrap();
+        let root_text = root.to_string_lossy();
+        let process_root = root_text
+            .strip_prefix(r"\\?\UNC\")
+            .map(|value| format!(r"\\{value}"))
+            .or_else(|| root_text.strip_prefix(r"\\?\").map(str::to_owned))
+            .unwrap_or_else(|| root_text.into_owned());
+        let config = McpServerConfig {
+            id: "plugin__review_tools__local".into(),
+            enabled: true,
+            timeout_ms: 10_000,
+            transport: McpTransportConfig::Stdio {
+                command: vec![
+                    "node".into(),
+                    fixture.to_string_lossy().into_owned(),
+                    process_root.clone(),
+                ],
+                secret_env: HashMap::from([("TEST_SECRET".into(), "TEST_SECRET".into())]),
+            },
+        };
+        let secrets = Arc::new(FakeSecrets(HashMap::from([(
+            ("plugin__review_tools__local".into(), "TEST_SECRET".into()),
+            "hidden-value".into(),
+        )])));
+        let tools = connect_with_options(
+            &config,
+            secrets,
+            McpLaunchOptions {
+                cwd: Some(root.clone()),
+                environment: HashMap::from([("CODEX_PLUGIN_ROOT".into(), process_root)]),
+                secret_header_prefixes: HashMap::new(),
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(tools.len(), 1);
+        assert_eq!(
+            tools[0].name,
+            "mcp__plugin__review_tools__local__plugin_read"
+        );
+    }
+
+    #[tokio::test]
     async fn streamable_http_initializes_and_calls_with_secret_headers() {
         let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("test-fixtures")
@@ -1069,11 +1374,20 @@ mod tests {
         };
         let secrets = Arc::new(FakeSecrets(HashMap::from([(
             ("remote".into(), "token".into()),
-            "Bearer hidden-value".into(),
+            "hidden-value".into(),
         )])));
-        let tools = connect(&config, secrets, CancellationToken::new())
-            .await
-            .unwrap();
+        let tools = connect_with_options(
+            &config,
+            secrets,
+            McpLaunchOptions {
+                cwd: None,
+                environment: HashMap::new(),
+                secret_header_prefixes: HashMap::from([("Authorization".into(), "Bearer ".into())]),
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].name, "mcp__remote__remote_read");
         assert_eq!(tools[0].risk, ToolRisk::External);

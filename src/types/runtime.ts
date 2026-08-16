@@ -38,6 +38,34 @@ export interface McpDiagnostic { id: string; transport: string; enabled: boolean
 export interface HookDiagnostic { id: string; phase: string; tool: string; enabled: boolean; }
 export interface ExtensionAudit { timestampMs: number; event: string; kind: string; id: string; success: boolean; detail: string; }
 export interface ExtensionOverview { schemaVersion: number; configPaths: string[]; instructions: InstructionSource[]; skills: SkillDiagnostic[]; mcpServers: McpDiagnostic[]; hooks: HookDiagnostic[]; audit: ExtensionAudit[]; error: string | null; }
+export interface McpConfigDocumentView { scope: "global" | "project"; path: string; exists: boolean; content: string; error: string | null; }
+export interface McpConfigView { schemaVersion: number; global: McpConfigDocumentView; project: McpConfigDocumentView; overview: ExtensionOverview; }
+export type PluginState = "disabled" | "loaded" | "degraded" | "blocked" | "invalid";
+export interface PluginComponentSummary {
+  skillCount: number;
+  mcpServerCount: number;
+  mcpToolCount: number;
+  unsupportedCount: number;
+}
+export interface PluginDiagnostic {
+  id: string;
+  name: string;
+  version: string;
+  description: string;
+  path: string;
+  enabled: boolean;
+  state: PluginState;
+  deletable: boolean;
+  components: PluginComponentSummary;
+  warnings: string[];
+  error: string | null;
+}
+export interface PluginOverview {
+  schemaVersion: number;
+  rootPath: string;
+  plugins: PluginDiagnostic[];
+  error: string | null;
+}
 
 export type SubagentState = "queued" | "running" | "blocked" | "completed" | "failed" | "cancelled" | "timed_out";
 export interface CreateSubagentRequest {
@@ -242,6 +270,7 @@ export interface ThreadDetail {
   changes: ChangeSet[];
   todos: TodoItem[];
   lastUsage: TokenUsage | null;
+  contextUsage: TokenUsage | null;
 }
 
 export type HistorySortDirection = "asc" | "desc";
@@ -313,6 +342,7 @@ export interface ThreadHistorySnapshot {
   lastTurn: TurnSnapshot | null;
   todos: TodoItem[];
   lastUsage: TokenUsage | null;
+  contextUsage: TokenUsage | null;
   turns: ThreadTurnsPage;
   unscopedItems: ThreadItem[];
 }
@@ -504,6 +534,42 @@ export interface GoalView {
 }
 export interface CreateGoalRequest { threadId: string; objective: string; tokenBudget: number | null; timeBudgetMs: number; }
 
+export type WorkflowRunState = "active" | "completed" | "cancelled";
+export interface WorkflowNodeView {
+  id: string;
+  title: string;
+  description: string;
+}
+export interface WorkflowDefinitionView {
+  schemaVersion: number;
+  id: string;
+  name: string;
+  description: string;
+  nodes: WorkflowNodeView[];
+}
+export interface WorkflowNodeCompletion {
+  nodeId: string;
+  summary: string;
+  evidence: string[];
+  completedAtMs: number;
+}
+export interface WorkflowRunView {
+  schemaVersion: number;
+  id: string;
+  threadId: string;
+  workflowId: string;
+  objective: string;
+  state: WorkflowRunState;
+  currentNodeId: string | null;
+  currentNodeIndex: number;
+  nodeCount: number;
+  completedNodes: WorkflowNodeCompletion[];
+  createdAtMs: number;
+  updatedAtMs: number;
+  revision: number;
+}
+export interface CancelWorkflowRunRequest { threadId: string; runId: string; }
+
 export interface SearchResult { path: string; line: number; column: number; preview: string; score: number; }
 export interface MemorySettings { enabled: boolean; }
 export interface MemoryView { schemaVersion: number; id: string; content: string; source: string; expiresAtMs: number; createdAtMs: number; updatedAtMs: number; deleted: boolean; revision: number; }
@@ -540,6 +606,7 @@ export interface QueuedTurn {
   kind: "message" | "retry";
   input: string;
   agentMode: string | null;
+  workflowId?: string | null;
   attachments: ImageAttachment[];
 }
 
@@ -594,7 +661,11 @@ export type AgentEvent =
   | (EventBase & { type: "text_delta"; itemId: string; delta: string })
   | (EventBase & { type: "reasoning_summary_delta"; itemId: string; delta: string })
   | (EventBase & { type: "reasoning_summary_completed"; itemId: string; summary: string })
-  | (EventBase & { type: "usage_updated"; usage: TokenUsage })
+  | (EventBase & {
+      type: "usage_updated";
+      usage: TokenUsage;
+      contextUsage: TokenUsage;
+    })
   | (EventBase & {
       type: "context_compacted";
       itemId: string;

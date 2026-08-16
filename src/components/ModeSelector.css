@@ -26,6 +26,11 @@
   border-color: var(--color-border-strong);
 }
 
+.mode-toggle:disabled {
+  opacity: 0.58;
+  cursor: default;
+}
+
 .mode-toggle span {
   font-weight: 500;
 }

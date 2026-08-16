@@ -6,7 +6,6 @@ import {
   Check,
   CircleAlert,
   Bot,
-  Code2,
   Copy,
   FileDiff,
   Folder,
@@ -35,7 +34,6 @@ import {
   Undo2,
   X,
   Target,
-  ImageIcon,
 } from "lucide-react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { getRuntimeStatus, getWorkspaceState, switchWorkspace, subscribeToAgentEvents, subscribeToMailboxEvents, listSubagents, getExtensionOverview, searchWorkspaceFiles } from "./api/runtime";
@@ -47,6 +45,7 @@ import { LogViewerDialog } from "./components/LogViewerDialog";
 import { WorkbenchPanel } from "./components/WorkbenchPanel";
 import { AgentActivityPanel } from "./components/AgentActivityPanel";
 import { ModelSelector } from "./components/ModelSelector";
+import { ContextProgress } from "./components/ContextProgress";
 import { ApprovalModeSelector } from "./components/ApprovalModeSelector";
 import { ReasoningSelector } from "./components/ReasoningSelector";
 import { TodoList } from "./components/TodoList";
@@ -58,7 +57,10 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { readFile } from "@tauri-apps/plugin-fs";
 import type { AttachmentContent, FileEntry, GoalView, ImageAttachment, ProjectRecord, RuntimeStatus, ThreadSummary, WorkspaceState } from "./types/runtime";
 import { ComposerSuggestionMenu, type ComposerSuggestion } from "./components/ComposerSuggestionMenu";
+import { ComposerAddMenu } from "./components/ComposerAddMenu";
 import { ProjectSelector } from "./components/ProjectSelector";
+import { WorkflowControl } from "./components/WorkflowControl";
+import { WorkflowSelector } from "./components/WorkflowSelector";
 import { findComposerTrigger, type ComposerTrigger } from "./lib/composerTrigger";
 import { workspacePathKey, workspacePathsEqual } from "./lib/path";
 import "./App.css";
@@ -67,11 +69,54 @@ import "./components/ModeSelector.css";
 
 function BrandGlyph({ size = 20 }: { size?: number }) {
   return (
-    <svg viewBox="0 0 32 32" width={size} height={size} fill="none" xmlns="http://www.w3.org/2000/svg">
-      <rect width="32" height="32" rx="8" fill="currentColor" />
+    <svg
+      data-brand-mark="k-letter"
+      viewBox="0 0 512 512"
+      width={size}
+      height={size}
+      fill="none"
+      aria-hidden="true"
+      xmlns="http://www.w3.org/2000/svg"
+    >
+      <rect width="512" height="512" rx="104" fill="currentColor" />
       <path
-        d="M10 10.5h4.4v6.6L19 10.5h5L16.6 17 24 21.5h-5L14.4 17.1l-2.4 2.7v1.7h-2V10.5Z"
+        d="M154 112h72v119l104-119h88L298 247l128 153h-91L250 294l-24 27v79h-72V112Z"
         fill="var(--color-surface)"
+      />
+    </svg>
+  );
+}
+
+function WelcomeGlyph({ size = 48 }: { size?: number }) {
+  return (
+    <svg
+      data-welcome-mark="command-pulse"
+      viewBox="0 0 32 32"
+      width={size}
+      height={size}
+      fill="none"
+      aria-hidden="true"
+      xmlns="http://www.w3.org/2000/svg"
+    >
+      <rect x="1" y="1" width="30" height="30" rx="8" fill="currentColor" />
+      <path
+        d="M8.5 11.5h8.75M8.5 20.5h8.75"
+        stroke="var(--color-brand-light)"
+        strokeWidth="1.75"
+        strokeLinecap="round"
+      />
+      <path
+        d="M12 9.5v13"
+        stroke="var(--color-surface)"
+        strokeWidth="2.75"
+        strokeLinecap="round"
+      />
+      <path
+        d="m18.25 10.75 4.25 5.25-4.25 5.25"
+        stroke="var(--color-surface)"
+        strokeWidth="2.75"
+        strokeLinecap="round"
+        strokeLinejoin="round"
       />
     </svg>
   );
@@ -183,6 +228,7 @@ function App() {
     } catch { return new Set<string>(); }
   });
   const [agentMode, setAgentMode] = useState<"craft" | "ask" | "plan">("craft");
+  const [selectedWorkflowId, setSelectedWorkflowId] = useState<string | null>(null);
   const [modeMenuOpen, setModeMenuOpen] = useState(false);
   const [expandedChangeSets, setExpandedChangeSets] = useState<Set<string>>(new Set());
   const [queueExpanded, setQueueExpanded] = useState(false);
@@ -202,6 +248,7 @@ function App() {
     restoredActiveTurns,
     cancellingTurns,
     usage,
+    contextUsage,
     turnTimeline,
     turnUserMessageIds,
     activityStatus,
@@ -216,6 +263,8 @@ function App() {
     reasoningEffort,
     plan,
     goal,
+    workflows,
+    workflowRun,
     todos,
     historyNextCursor,
     historyLoading,
@@ -237,6 +286,7 @@ function App() {
     deleteProvider,
     setApprovalMode,
     setReasoningEffort,
+    cancelActiveWorkflow,
     handleAgentEvent,
     handleMailboxChanged,
     clearError,
@@ -263,6 +313,22 @@ function App() {
     ? threadProjectPath(activeThread, threadProjectMap) ?? null
     : null;
   const activeThreadIsStandalone = activeThread?.inProject === false;
+  const activeWorkflow = workflowRun?.state === "active" ? workflowRun : null;
+  const queuedWorkflowId = currentThreadQueue.find((message) => message.workflowId)?.workflowId ?? null;
+  const selectedWorkflow = workflows.find((workflow) => workflow.id === selectedWorkflowId) ?? null;
+  const activeWorkflowDefinition = activeWorkflow
+    ? workflows.find((workflow) => workflow.id === activeWorkflow.workflowId) ?? null
+    : null;
+  const workflowModeLocked = Boolean(activeWorkflow || selectedWorkflow);
+
+  useEffect(() => {
+    const workflowId = workflowRun?.state === "active" ? workflowRun.workflowId : queuedWorkflowId;
+    setSelectedWorkflowId(workflowId);
+    if (workflowId) {
+      setAgentMode("craft");
+      setModeMenuOpen(false);
+    }
+  }, [activeThreadId, queuedWorkflowId, workflowRun?.id, workflowRun?.state, workflowRun?.workflowId]);
 
   useEffect(() => {
     let disposed = false;
@@ -749,6 +815,9 @@ function App() {
   );
   const anyTurnBusy = Object.keys(activeTurns).length > 0;
   const retryable = !currentThreadBusy && ["failed", "cancelled"].includes(lastTurn?.state ?? "");
+  const activeModelContextWindow = providerConfig?.models.find(
+    (model) => model.id === providerConfig.model,
+  )?.contextWindow ?? null;
   const toolActivities = useMemo(
     () => turnTimeline.flatMap((item) => item.type === "tool" ? [item.activity] : []),
     [turnTimeline],
@@ -1011,6 +1080,22 @@ function App() {
     });
   }
 
+  function openComposerSkillPicker() {
+    if (activeThreadIsStandalone) return;
+    const separator = draft.length > 0 && !/\s$/.test(draft) ? " " : "";
+    const triggerStart = draft.length + separator.length;
+    const nextDraft = `${draft}${separator}/`;
+    const nextCursor = nextDraft.length;
+    setDraft(nextDraft);
+    setComposerTrigger({ kind: "skill", start: triggerStart, end: nextCursor, query: "" });
+    setComposerSuggestionIndex(0);
+    requestAnimationFrame(() => {
+      const textarea = composerRef.current;
+      textarea?.focus();
+      textarea?.setSelectionRange(nextCursor, nextCursor);
+    });
+  }
+
   async function submitMessage(event: FormEvent) {
     event.preventDefault();
     const message = draft.trim();
@@ -1035,7 +1120,12 @@ function App() {
     setComposerTrigger(null);
     setAttachments([]);
     if (currentThreadBusy) setQueueExpanded(true);
-    void sendMessage(message + attachmentContext, imageAttachments, agentMode);
+    void sendMessage(
+      message + attachmentContext,
+      imageAttachments,
+      agentMode,
+      selectedWorkflowId ?? undefined,
+    );
   }
 
   function handleComposerKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
@@ -1236,17 +1326,20 @@ function App() {
     }
   }
 
-  function openSettings() {
+  function openSettingsSection(section: SettingsSection) {
     clearError();
     setWorkbenchOpen(false);
     setAgentPanelOpen(false);
-    setSettingsSection("providers");
+    setSettingsSection(section);
     setSettingsOpen(true);
   }
 
+  function openSettings() {
+    openSettingsSection("providers");
+  }
+
   function openGoalSettings() {
-    setSettingsSection("goal");
-    setSettingsOpen(true);
+    openSettingsSection("goal");
   }
 
   return (
@@ -1816,9 +1909,13 @@ function App() {
               )}
             </div>
           ) : (
-            <div className="empty-thread">
-              <Code2 size={26} />
-              <p>开始对话 — 输入消息与 AI 协作</p>
+            <div className="empty-thread empty-thread--welcome">
+              <div className="empty-thread__signal" aria-hidden="true">
+                <WelcomeGlyph size={48} />
+              </div>
+              <h2>从一个明确的任务开始</h2>
+              <p>描述你想完成的工作，k-Coder 会在当前项目中协作推进。</p>
+              <span className="empty-thread__status">等待你的第一条请求</span>
             </div>
           )}
         </div>
@@ -1888,7 +1985,8 @@ function App() {
                           <button
                             type="button"
                             aria-label={`加入当前对话 ${queueItem.input || "图片消息"}`}
-                            title="加入当前对话"
+                            title={queueItem.workflowId ? "机器人工作流必须作为独立 Turn 启动" : "加入当前对话"}
+                            disabled={Boolean(queueItem.workflowId)}
                             onClick={() => void sendQueuedMessageNow(queueItem.id)}
                           >
                             <ArrowUp size={16} strokeWidth={2.2} />
@@ -1921,6 +2019,12 @@ function App() {
         )}
 
         <GoalControl goal={goal} onManage={openGoalSettings} />
+        <WorkflowControl
+          definition={activeWorkflowDefinition}
+          run={activeWorkflow}
+          turnBusy={currentThreadBusy}
+          onCancel={cancelActiveWorkflow}
+        />
         <form
           className="composer"
           onSubmit={submitMessage}
@@ -1975,31 +2079,32 @@ function App() {
               onCreateProject={pickProjectForComposer}
               onSelectStandalone={selectComposerStandalone}
             />
-            <button
-              type="button"
-              className="composer-pick-image"
-              aria-label="从本地选取图片"
-              title="从本地选取图片"
-              onClick={() => void handlePickImages()}
-              style={{
-                display: "flex",
-                alignItems: "center",
-                justifyContent: "center",
-                height: 32,
-                padding: 0,
-                border: "1px solid transparent",
-                borderRadius: "var(--radius-sm)",
-                background: "transparent",
-                cursor: "pointer",
+            <ComposerAddMenu
+              skillDisabled={activeThreadIsStandalone}
+              onAddAttachment={() => void handlePickImages()}
+              onAddSkill={openComposerSkillPicker}
+              onOpenSettings={openSettingsSection}
+            />
+            <WorkflowSelector
+              definitions={workflows}
+              run={workflowRun}
+              selectedWorkflowId={selectedWorkflowId}
+              standalone={activeThreadIsStandalone}
+              disabled={currentThreadBusy || Boolean(queuedWorkflowId)}
+              onSelect={(workflowId) => {
+                setSelectedWorkflowId(workflowId);
+                if (workflowId) setAgentMode("craft");
+                setModeMenuOpen(false);
               }}
-            ><ImageIcon size={18} /></button>
+            />
             <div ref={modeMenuRef} className="composer-mode-selector">
               <button
                 type="button"
                 className="mode-toggle"
                 onClick={() => setModeMenuOpen(!modeMenuOpen)}
                 aria-label="选择模式"
-                title="选择交互模式"
+                title={workflowModeLocked ? "机器人工作流固定使用 Craft 模式" : "选择交互模式"}
+                disabled={workflowModeLocked}
               >
                 {agentMode === "craft" && (
                   <>
@@ -2022,7 +2127,7 @@ function App() {
                   </>
                 )}
               </button>
-              {modeMenuOpen && (
+              {modeMenuOpen && !workflowModeLocked && (
                 <div className="mode-menu">
                   <button
                     type="button"
@@ -2088,6 +2193,10 @@ function App() {
               onActivateProvider={activateProvider}
             />
             <div className="composer-actions">
+              <ContextProgress
+                usage={contextUsage}
+                contextWindow={activeModelContextWindow}
+              />
               {currentThreadBusy && (
                 <button
                   className="stop-button"
@@ -2199,6 +2308,8 @@ function App() {
           providers={providerConfigs}
           activeThreadId={activeThreadId}
           goal={goal}
+          workflows={workflows}
+          workflowRun={workflowRun}
           activeProviderId={activeProviderId}
           error={error}
           themeMode={themeMode}

@@ -218,6 +218,7 @@ pub struct ThreadDetail {
     pub changes: Vec<ChangeSet>,
     pub todos: Vec<TodoItem>,
     pub last_usage: Option<TokenUsage>,
+    pub context_usage: Option<TokenUsage>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -440,6 +441,7 @@ impl JsonlThreadRepository {
             last_turn: metadata.last_turn,
             todos: metadata.todos,
             last_usage: metadata.last_usage,
+            context_usage: metadata.context_usage,
             turns,
             unscoped_items: metadata.unscoped_items,
         })
@@ -699,6 +701,7 @@ impl JsonlThreadRepository {
             last_turn: detail.last_turn.clone(),
             todos: detail.todos.clone(),
             last_usage: detail.last_usage,
+            context_usage: detail.context_usage,
             unscoped_items: history
                 .items
                 .iter()
@@ -948,6 +951,7 @@ fn project_thread(thread_id: &str, events: &[StoredEvent]) -> Result<ThreadDetai
     let mut changes: Vec<ChangeSet> = Vec::new();
     let mut todos: Vec<TodoItem> = Vec::new();
     let mut last_usage: Option<TokenUsage> = None;
+    let mut context_usage: Option<TokenUsage> = None;
     let mut turn_started_at_ms = HashMap::<String, u64>::new();
     let mut updated_at_ms = created.1;
 
@@ -1134,6 +1138,7 @@ fn project_thread(thread_id: &str, events: &[StoredEvent]) -> Result<ThreadDetai
             }
             StoredEventKind::ProviderCallUsage { call_index, usage } => {
                 last_usage = Some(add_token_usage(last_usage.unwrap_or_default(), *usage));
+                context_usage = Some(*usage);
                 push_timeline_event(
                     &mut turn_timeline,
                     event,
@@ -1146,6 +1151,7 @@ fn project_thread(thread_id: &str, events: &[StoredEvent]) -> Result<ThreadDetai
                 );
             }
             StoredEventKind::ContextCompacted { summary, automatic } => {
+                context_usage = None;
                 push_timeline_event(
                     &mut turn_timeline,
                     event,
@@ -1404,6 +1410,7 @@ fn project_thread(thread_id: &str, events: &[StoredEvent]) -> Result<ThreadDetai
         changes,
         todos,
         last_usage,
+        context_usage,
     })
 }
 
@@ -2509,6 +2516,99 @@ mod tests {
             .await
             .expect("thread should archive");
         assert!(repository.list_threads().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn context_usage_recovers_the_latest_provider_call_and_resets_after_compaction() {
+        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        let repository =
+            JsonlThreadRepository::new(directory.path()).expect("repository should be created");
+        let thread = repository.create_thread().await.unwrap();
+        let first_usage = TokenUsage {
+            input_tokens: 8_000,
+            output_tokens: 1_000,
+            total_tokens: 9_000,
+        };
+        let latest_usage = TokenUsage {
+            input_tokens: 14_000,
+            output_tokens: 1_360,
+            total_tokens: 15_360,
+        };
+
+        for kind in [
+            StoredEventKind::TurnStarted,
+            StoredEventKind::ProviderCallUsage {
+                call_index: 0,
+                usage: first_usage,
+            },
+            StoredEventKind::ProviderCallUsage {
+                call_index: 1,
+                usage: latest_usage,
+            },
+        ] {
+            repository
+                .append(StoredEvent::new(
+                    &thread.id,
+                    Some("turn-1".to_string()),
+                    kind,
+                ))
+                .await
+                .unwrap();
+        }
+
+        let detail = repository.read_thread(&thread.id).await.unwrap();
+        assert_eq!(detail.context_usage, Some(latest_usage));
+        assert_eq!(
+            detail.last_usage,
+            Some(TokenUsage {
+                input_tokens: 22_000,
+                output_tokens: 2_360,
+                total_tokens: 24_360,
+            })
+        );
+        assert_eq!(
+            repository
+                .read_thread_history(&thread.id)
+                .await
+                .unwrap()
+                .context_usage,
+            Some(latest_usage)
+        );
+
+        repository
+            .append(StoredEvent::new(
+                &thread.id,
+                Some("turn-1".to_string()),
+                StoredEventKind::ContextCompacted {
+                    summary: CompactionSummary {
+                        contract_version: 4,
+                        summary: "保留当前任务".to_string(),
+                        user_constraints: Vec::new(),
+                        recent_user_messages: Vec::new(),
+                        current_user_request: "继续当前任务".to_string(),
+                        important_tool_observations: Vec::new(),
+                        recent_tool_results: Vec::new(),
+                        compacted_message_count: 12,
+                        estimated_before_tokens: 15_360,
+                        estimated_after_tokens: 2_000,
+                    },
+                    automatic: true,
+                },
+            ))
+            .await
+            .unwrap();
+
+        let compacted_detail = repository.read_thread(&thread.id).await.unwrap();
+        assert_eq!(compacted_detail.context_usage, None);
+        assert_eq!(compacted_detail.last_usage, detail.last_usage);
+        assert_eq!(
+            repository
+                .read_thread_history(&thread.id)
+                .await
+                .unwrap()
+                .context_usage,
+            None
+        );
     }
 
     #[tokio::test]

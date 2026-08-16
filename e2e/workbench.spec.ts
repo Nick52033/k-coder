@@ -1,4 +1,5 @@
 import { expect, test } from "@playwright/test";
+import { readFileSync } from "node:fs";
 
 test.beforeEach(async ({ page }) => {
   await page.addInitScript(() => {
@@ -12,6 +13,62 @@ test.beforeEach(async ({ page }) => {
     const openAiProvider = { schemaVersion: 1, id: "openai", kind: "open_ai_compatible", transport: "open_ai_chat_completions", name: "OpenAI", baseUrl: "https://api.openai.com/v1", model: "gpt-4.1", models: [{ id: "gpt-4.1", displayName: "GPT-4.1", contextWindow: 128000, fallback: false }, { id: "gpt-4o", displayName: "GPT-4 Omni", contextWindow: 64000, fallback: false }], endpoints: [], hasApiKey: true };
     const ziccProvider = { schemaVersion: 1, id: "zicc", kind: "open_ai_compatible", transport: "open_ai_responses", name: "zicc", baseUrl: "https://zicc.example.com/v1", model: "gpt-5.6-terra", models: [{ id: "gpt-5.6-terra", displayName: "gpt-5.6-terra", contextWindow: 128000, fallback: false }, { id: "gpt-5.5", displayName: "gpt-5.5", contextWindow: 128000, fallback: false }], endpoints: [], hasApiKey: true };
     const pendingProvider = { schemaVersion: 1, id: "pending", kind: "open_ai_compatible", transport: "anthropic_messages", name: "待配置供应商", baseUrl: "https://pending.example.com/v1", model: "claude-test", models: [{ id: "claude-test", displayName: "Claude Test", contextWindow: 128000, fallback: false }], endpoints: [], hasApiKey: false };
+    const workflowDefinitions = [
+      {
+        schemaVersion: 1,
+        id: "fullstack-delivery",
+        name: "全栈开发",
+        description: "从仓库探索、方案、实现到验证和交付的完整开发流程。",
+        nodes: [
+          ["repository-discovery", "仓库探索", "确认项目约束、现状、影响范围和验收入口。"],
+          ["solution-plan", "方案与计划", "形成符合现有架构的实施方案和可验证计划。"],
+          ["implementation", "实现", "按仓库惯例完成代码与必要文档变更。"],
+          ["verification", "验证", "执行针对性和仓库规定的验证命令。"],
+          ["review-handoff", "审查与交付", "复查差异、安全边界和交付说明。"],
+        ].map(([id, title, description]) => ({ id, title, description })),
+      },
+      {
+        schemaVersion: 1,
+        id: "quality-assurance",
+        name: "质量保障",
+        description: "面向风险的测试设计、执行、分析和报告流程。",
+        nodes: [
+          ["scope-confirmation", "范围确认", "确认测试对象、风险、环境和验收口径。"],
+          ["test-design", "测试设计", "设计正常、边界、失败和恢复路径。"],
+          ["test-execution", "测试执行", "执行测试并保留可复核结果。"],
+          ["result-analysis", "结果分析", "定位失败根因并判断回归风险。"],
+          ["test-report", "测试报告", "输出结构化测试结论和残余风险。"],
+        ].map(([id, title, description]) => ({ id, title, description })),
+      },
+      {
+        schemaVersion: 1,
+        id: "requirements-design",
+        name: "需求设计",
+        description: "把需求与仓库约束转化为可实施、可验收的详细设计。",
+        nodes: [
+          ["context-collection", "上下文收集", "收集需求来源、仓库现状和既有约束。"],
+          ["requirement-clarification", "需求澄清", "消除会改变方案或验收结果的歧义。"],
+          ["architecture-impact", "架构影响", "映射模块边界、数据契约和安全影响。"],
+          ["detailed-design", "详细设计", "形成可直接实施的版本化设计。"],
+          ["acceptance-definition", "验收定义", "给出可执行的验收条件和后续任务。"],
+        ].map(([id, title, description]) => ({ id, title, description })),
+      },
+    ];
+    let workflowRun = JSON.parse(localStorage.getItem("kcoder_e2e_workflow_run") ?? "null") as null | {
+      schemaVersion: number;
+      id: string;
+      threadId: string;
+      workflowId: string;
+      objective: string;
+      state: "active" | "completed" | "cancelled";
+      currentNodeId: string | null;
+      currentNodeIndex: number;
+      nodeCount: number;
+      completedNodes: unknown[];
+      createdAtMs: number;
+      updatedAtMs: number;
+      revision: number;
+    };
     let providerCatalog: { schemaVersion: number; activeProviderId: string | null; providers: Array<typeof openAiProvider> } = { schemaVersion: 1, activeProviderId: "openai", providers: [openAiProvider, ziccProvider, pendingProvider] };
     let approvalMode: "ask" | "full_access" = "ask";
     let reasoningEffort: "off" | "minimal" | "low" | "medium" | "high" | "x_high" = "medium";
@@ -32,10 +89,151 @@ test.beforeEach(async ({ page }) => {
       input: string;
       agentMode: string | null;
       attachments: unknown[];
+      workflowId?: string | null;
     }>>();
+    function restoreMailboxFixture() {
+      const restoredMailbox = JSON.parse(localStorage.getItem("kcoder_e2e_mailbox") ?? "null") as null | {
+        threadId: string;
+        activeTurnId?: string | null;
+        pending: Array<{
+          turnId: string;
+          threadId: string;
+          kind: "message" | "retry";
+          input: string;
+          agentMode: string | null;
+          attachments: unknown[];
+          workflowId?: string | null;
+        }>;
+      };
+      if (!restoredMailbox) return;
+      mailboxByThread.set(restoredMailbox.threadId, restoredMailbox.pending);
+      if (restoredMailbox.activeTurnId) {
+        activeTurnIds.set(restoredMailbox.threadId, restoredMailbox.activeTurnId);
+      }
+      localStorage.removeItem("kcoder_e2e_mailbox");
+    }
+    restoreMailboxFixture();
     const invocationArgs: Record<string, unknown> = {};
     const ptyStartRequests: unknown[] = [];
     const ptyWrites: string[] = [];
+    const extensionOverview = {
+      schemaVersion: 1,
+      configPaths: [
+        "C:\\Users\\demo\\AppData\\Local\\k-coder\\runtime-data\\extensions.json",
+        "C:\\Users\\demo\\AppData\\Local\\k-coder\\runtime-data\\mcp.json",
+        "D:\\code\\k-coder\\.k-coder\\extensions.json",
+        "D:\\code\\k-coder\\.k-coder\\mcp.json",
+      ],
+      instructions: [{ path: "D:\\code\\k-coder\\AGENTS.md", scope: "project", priority: 200, bytes: 120 }],
+      skills: [
+        { name: "workspace-review", description: "Built-in workspace review", path: "D:\\apps\\k-coder\\resources\\skills\\workspace-review\\SKILL.md", scope: "builtin", risk: "read", triggers: ["workspace review"], enabled: true },
+        { name: "review", description: "Review code safely", path: "D:\\code\\k-coder\\.k-coder\\skills\\review\\SKILL.md", scope: "project", risk: "read", triggers: ["review"], enabled: true },
+      ],
+      mcpServers: [{ id: "local", transport: "stdio", enabled: true, state: "ready", toolCount: 2, credentials: [], error: null }],
+      hooks: [{ id: "guard", phase: "before", tool: "mcp__local__*", enabled: true }],
+      audit: [{ timestampMs: 2, event: "extensions_ready", kind: "runtime", id: "all", success: true, detail: "extensions loaded" }],
+      error: null,
+    };
+    let mcpConfig = {
+      schemaVersion: 1,
+      global: {
+        scope: "global",
+        path: "C:\\Users\\demo\\AppData\\Local\\k-coder\\runtime-data\\mcp.json",
+        exists: true,
+        content: `${JSON.stringify({
+          mcpServers: [{
+            id: "local",
+            enabled: true,
+            timeoutMs: 30_000,
+            transport: "stdio",
+            command: ["npx", "-y", "@modelcontextprotocol/server-filesystem", "D:\\code\\k-coder"],
+            secret_env: {},
+          }],
+        }, null, 2)}\n`,
+        error: null,
+      },
+      project: {
+        scope: "project",
+        path: "D:\\code\\k-coder\\.k-coder\\mcp.json",
+        exists: false,
+        content: `${JSON.stringify({ mcpServers: [] }, null, 2)}\n`,
+        error: null,
+      },
+      overview: extensionOverview,
+    };
+    const pluginRootPath = "C:\\Users\\demo\\AppData\\Local\\k-coder\\runtime-data\\plugins";
+    let pluginOverview = {
+      schemaVersion: 1,
+      rootPath: pluginRootPath,
+      plugins: [
+        {
+          id: "review-tools@local",
+          name: "review-tools",
+          version: "1.2.3",
+          description: "Review the workspace with indexed guidance",
+          path: `${pluginRootPath}\\review-package-with-a-very-long-folder-name-that-must-wrap`,
+          enabled: false,
+          state: "disabled",
+          deletable: true,
+          components: { skillCount: 2, mcpServerCount: 0, mcpToolCount: 0, unsupportedCount: 0 },
+          warnings: [],
+          error: null,
+        },
+        {
+          id: "ready-tools@local",
+          name: "ready-tools",
+          version: "2.0.0",
+          description: "Ready plugin",
+          path: `${pluginRootPath}\\ready`,
+          enabled: true,
+          state: "loaded",
+          deletable: true,
+          components: { skillCount: 1, mcpServerCount: 1, mcpToolCount: 2, unsupportedCount: 0 },
+          warnings: [],
+          error: null,
+        },
+        {
+          id: "partial-tools@local",
+          name: "partial-tools",
+          version: "1.0.0",
+          description: "Skill available while Apps remain unsupported",
+          path: `${pluginRootPath}\\partial`,
+          enabled: true,
+          state: "degraded",
+          deletable: true,
+          components: { skillCount: 1, mcpServerCount: 0, mcpToolCount: 0, unsupportedCount: 1 },
+          warnings: ["1 declared plugin component(s) are not supported and will not run"],
+          error: null,
+        },
+        {
+          id: "blocked-tools@local",
+          name: "blocked-tools",
+          version: "1.0.0",
+          description: "Runtime dependency is unavailable",
+          path: `${pluginRootPath}\\blocked`,
+          enabled: true,
+          state: "blocked",
+          deletable: true,
+          components: { skillCount: 0, mcpServerCount: 1, mcpToolCount: 0, unsupportedCount: 0 },
+          warnings: [],
+          error: "MCP runtime failed to start",
+        },
+        {
+          id: "invalid:broken-package",
+          name: "broken-package",
+          version: "",
+          description: "",
+          path: `${pluginRootPath}\\broken-package`,
+          enabled: false,
+          state: "invalid",
+          deletable: true,
+          components: { skillCount: 0, mcpServerCount: 0, mcpToolCount: 0, unsupportedCount: 0 },
+          warnings: [],
+          error: "plugin manifest JSON is invalid",
+        },
+      ],
+      error: null,
+    };
     const responses: Record<string, unknown> = {
       runtime_status: { ready: true, phase: "advanced-agent", version: "0.10.0", uptimeSeconds: 12, capabilities: ["skills", "mcp-stdio", "tool-hooks", "persistent-plans", "budgeted-goals"] },
       get_approval_mode: "ask",
@@ -108,19 +306,7 @@ test.beforeEach(async ({ page }) => {
       save_workspace_file: { path: "README.md", name: "README.md", language: "markdown", content: "# k-Coder\n\nEdited", dataUrl: null, size: 17, truncated: false, editable: true, contentHash: "hash-edited" },
       git_status: { isRepository: true, branch: "main", upstream: "origin/main", ahead: 0, behind: 0, files: [{ path: "src/App.tsx", indexStatus: " ", worktreeStatus: "M" }] },
       git_branches: { current: "main", branches: ["main", "feature/workbench"] },
-      extension_overview: {
-        schemaVersion: 1,
-        configPaths: ["D:\\code\\k-coder\\.k-coder\\extensions.json"],
-        instructions: [{ path: "D:\\code\\k-coder\\AGENTS.md", scope: "project", priority: 200, bytes: 120 }],
-        skills: [
-          { name: "workspace-review", description: "Built-in workspace review", path: "D:\\apps\\k-coder\\resources\\skills\\workspace-review\\SKILL.md", scope: "builtin", risk: "read", triggers: ["workspace review"], enabled: true },
-          { name: "review", description: "Review code safely", path: "D:\\code\\k-coder\\.k-coder\\skills\\review\\SKILL.md", scope: "project", risk: "read", triggers: ["review"], enabled: true },
-        ],
-        mcpServers: [{ id: "local", transport: "stdio", enabled: true, state: "ready", toolCount: 2, credentials: [], error: null }],
-        hooks: [{ id: "guard", phase: "before", tool: "mcp__local__*", enabled: true }],
-        audit: [{ timestampMs: 2, event: "extensions_ready", kind: "runtime", id: "all", success: true, detail: "extensions loaded" }],
-        error: null,
-      },
+      extension_overview: extensionOverview,
       list_subagents: [{
         schemaVersion: 1, id: "agent-1", parentAgentId: null, parentThreadId: "thread-1", threadId: "thread-agent-1",
         label: "检查后端", task: "分析后端接口", state: "completed", depth: 1, workspaceRoot: "D:\\code\\k-coder",
@@ -192,6 +378,25 @@ test.beforeEach(async ({ page }) => {
             };
           }
           if (command === "get_provider_catalog") return providerCatalog;
+          if (command === "list_builtin_workflows") return workflowDefinitions;
+          if (command === "get_workflow_run") {
+            const restored = localStorage.getItem("kcoder_e2e_workflow_run");
+            if (restored) workflowRun = JSON.parse(restored);
+            return workflowRun?.threadId === args?.threadId ? workflowRun : null;
+          }
+          if (command === "cancel_workflow_run") {
+            const request = args?.request as { threadId?: string; runId?: string } | undefined;
+            if (!workflowRun || workflowRun.threadId !== request?.threadId || workflowRun.id !== request?.runId) {
+              throw new Error("workflow run was not found for this thread");
+            }
+            workflowRun = {
+              ...workflowRun,
+              state: "cancelled",
+              updatedAtMs: Date.now(),
+              revision: workflowRun.revision + 1,
+            };
+            return workflowRun;
+          }
           if (command === "turn_start") {
             runTurnCalls.push(args ?? null);
             startedTurnCount += 1;
@@ -199,6 +404,7 @@ test.beforeEach(async ({ page }) => {
             const threadId = String(request?.threadId ?? "thread-1");
             const turnId = `turn-start-${startedTurnCount}`;
             const queued = activeTurnIds.has(threadId);
+            const workflowId = typeof args?.workflowId === "string" ? args.workflowId : null;
             const attachments = (args?.attachments as Array<{
               name: string;
               dataUrl: string;
@@ -214,10 +420,30 @@ test.beforeEach(async ({ page }) => {
                   kind: "message",
                   input: String(request?.input ?? ""),
                   agentMode: request?.agentMode ?? null,
+                  workflowId,
                   attachments,
                 },
               ]);
             } else {
+              if (workflowId && workflowRun?.state !== "active") {
+                const definition = workflowDefinitions.find((item) => item.id === workflowId);
+                if (!definition) throw new Error(`unknown built-in workflow: ${workflowId}`);
+                workflowRun = {
+                  schemaVersion: 1,
+                  id: `workflow-run-${startedTurnCount}`,
+                  threadId,
+                  workflowId,
+                  objective: String(request?.input ?? ""),
+                  state: "active",
+                  currentNodeId: definition.nodes[0]?.id ?? null,
+                  currentNodeIndex: 0,
+                  nodeCount: definition.nodes.length,
+                  completedNodes: [],
+                  createdAtMs: Date.now(),
+                  updatedAtMs: Date.now(),
+                  revision: 1,
+                };
+              }
               activeTurnIds.set(threadId, turnId);
               const input = String(request?.input ?? "").trim();
               const content: Array<Record<string, unknown>> = input
@@ -292,6 +518,7 @@ test.beforeEach(async ({ page }) => {
             };
           }
           if (command === "read_thread_mailbox") {
+            restoreMailboxFixture();
             const threadId = String(args?.threadId ?? "thread-1");
             return {
               schemaVersion: 1,
@@ -328,6 +555,9 @@ test.beforeEach(async ({ page }) => {
             const queued = pending.find((item) => item.turnId === request.queuedTurnId);
             if (!queued || queued.kind !== "message") {
               throw new Error("queued turn is not an available message");
+            }
+            if (queued.workflowId) {
+              throw new Error("a queued workflow start must begin as its own turn");
             }
             mailboxByThread.set(
               request.threadId,
@@ -430,6 +660,60 @@ test.beforeEach(async ({ page }) => {
             };
             return providerCatalog;
           }
+          if (command === "mcp_config") return mcpConfig;
+          if (command === "plugin_overview") {
+            if (localStorage.getItem("kcoder_e2e_plugin_empty") === "true") {
+              return { ...pluginOverview, plugins: [] };
+            }
+            return pluginOverview;
+          }
+          if (command === "set_plugin_enabled") {
+            const pluginId = String(args?.pluginId ?? "");
+            if (localStorage.getItem("kcoder_e2e_plugin_toggle_error") === pluginId) {
+              throw new Error("plugin runtime refresh failed");
+            }
+            pluginOverview = {
+              ...pluginOverview,
+              plugins: pluginOverview.plugins.map((plugin) => plugin.id === pluginId
+                ? {
+                    ...plugin,
+                    enabled: Boolean(args?.enabled),
+                    state: args?.enabled ? "loaded" : "disabled",
+                    error: null,
+                  }
+                : plugin),
+            };
+            return pluginOverview;
+          }
+          if (command === "delete_plugin") {
+            const pluginId = String(args?.pluginId ?? "");
+            pluginOverview = {
+              ...pluginOverview,
+              plugins: pluginOverview.plugins.filter((plugin) => plugin.id !== pluginId),
+            };
+            return pluginOverview;
+          }
+          if (command === "save_mcp_config") {
+            const configScope = args?.scope === "project" ? "project" : "global";
+            const content = String(args?.content ?? "");
+            if (configScope === "project") {
+              mcpConfig = {
+                ...mcpConfig,
+                project: { ...mcpConfig.project, exists: true, content, error: null },
+              };
+            } else {
+              mcpConfig = {
+                ...mcpConfig,
+                global: { ...mcpConfig.global, exists: true, content, error: null },
+              };
+            }
+            return mcpConfig;
+          }
+          if (
+            command === "set_extension_enabled"
+            || command === "save_mcp_secret"
+            || command === "delete_mcp_secret"
+          ) return mcpConfig.overview;
           if (command === "get_approval_mode") return approvalMode;
           if (command === "set_approval_mode") {
             approvalMode = args?.mode as "ask" | "full_access";
@@ -522,6 +806,232 @@ test("closes the composer mode menu when clicking outside", async ({ page }) => 
 
   await page.getByRole("heading", { name: "Phase 6 workbench" }).click();
   await expect(page.locator(".mode-menu")).toBeHidden();
+});
+
+test("starts a built-in robot workflow from the composer and cancels it after the turn", async ({ page }, testInfo) => {
+  await page.goto("/");
+  const robotSelector = page.getByRole("button", { name: "选择机器人" });
+  await robotSelector.click();
+  const robotMenu = page.getByRole("menu", { name: "机器人列表" });
+  await expect(robotMenu.getByRole("menuitemradio")).toHaveCount(4);
+  await robotMenu.getByRole("menuitemradio", { name: /质量保障/ }).click();
+  await expect(robotSelector).toContainText("质量保障");
+  await expect(page.getByRole("button", { name: "选择模式" })).toBeDisabled();
+
+  await page.getByRole("textbox", { name: "消息" }).fill("验证机器人工作流");
+  await page.getByRole("button", { name: "发送消息", exact: true }).click();
+  await expect.poll(() => page.evaluate(() => {
+    const call = (window as unknown as {
+      __invocationArgs: Record<string, { workflowId?: string; request?: { agentMode?: string; input?: string } }>;
+    }).__invocationArgs.turn_start;
+    return { workflowId: call?.workflowId, agentMode: call?.request?.agentMode, input: call?.request?.input };
+  })).toEqual({
+    workflowId: "quality-assurance",
+    agentMode: "craft",
+    input: "验证机器人工作流",
+  });
+
+  const control = page.getByLabel("机器人工作流 质量保障");
+  await expect(control).toBeVisible();
+  await expect(control).toContainText("范围确认");
+  await expect(control).toContainText("1 / 5");
+  await expect(control.getByRole("progressbar", { name: "工作流进度" })).toHaveAttribute("aria-valuenow", "0");
+  await page.screenshot({ path: testInfo.outputPath("builtin-robot-running.png"), fullPage: true });
+
+  await page.evaluate(() => {
+    (window as unknown as { __emitAgentEvent: (event: unknown) => void }).__emitAgentEvent({
+      schemaVersion: 5,
+      threadId: "thread-1",
+      turnId: "turn-start-1",
+      type: "turn_completed",
+      phase: "complete",
+      message: { schemaVersion: 1, id: "workflow-answer", role: "assistant", content: [{ type: "text", text: "本轮完成" }], createdAtMs: 20 },
+      usage: null,
+      startedAtMs: 10,
+      completedAtMs: 20,
+      durationMs: 10,
+    });
+  });
+  await control.getByRole("button", { name: "停止机器人工作流" }).click();
+  await expect.poll(() => page.evaluate(() => (
+    window as unknown as { __invocationArgs: Record<string, unknown> }
+  ).__invocationArgs.cancel_workflow_run)).toEqual({
+    request: { threadId: "thread-1", runId: "workflow-run-1" },
+  });
+  await expect(control).toHaveCount(0);
+  await expect(robotSelector).toContainText("普通智能体");
+});
+
+test("restores persisted robot node progress and lists built-in definitions", async ({ page }, testInfo) => {
+  await page.addInitScript(() => {
+    localStorage.setItem("kcoder_e2e_workflow_run", JSON.stringify({
+      schemaVersion: 1,
+      id: "workflow-restored",
+      threadId: "thread-1",
+      workflowId: "requirements-design",
+      objective: "形成设计",
+      state: "active",
+      currentNodeId: "architecture-impact",
+      currentNodeIndex: 2,
+      nodeCount: 5,
+      completedNodes: [
+        { nodeId: "context-collection", summary: "done", evidence: ["docs"], completedAtMs: 2 },
+        { nodeId: "requirement-clarification", summary: "done", evidence: ["scope"], completedAtMs: 3 },
+      ],
+      createdAtMs: 1,
+      updatedAtMs: 3,
+      revision: 3,
+    }));
+  });
+  await page.goto("/");
+
+  const control = page.getByLabel("机器人工作流 需求设计");
+  await expect(control).toContainText("架构影响");
+  await expect(control).toContainText("3 / 5");
+  await expect(control.getByRole("progressbar", { name: "工作流进度" })).toHaveAttribute("aria-valuenow", "2");
+  await expect(page.getByRole("button", { name: "选择机器人" })).toBeDisabled();
+  await expect(page.getByRole("button", { name: "选择模式" })).toBeDisabled();
+
+  await page.locator('button[aria-label="设置"]:visible').click();
+  await page.getByRole("button", { name: "机器人", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "内置机器人" })).toBeVisible();
+  await expect(page.locator(".robot-row")).toHaveCount(3);
+  await expect(page.locator(".robot-row--active")).toContainText("架构影响");
+  await page.screenshot({ path: testInfo.outputPath("builtin-robots-settings.png"), fullPage: true });
+});
+
+test("restores a queued robot identity from the mailbox snapshot", async ({ page }) => {
+  await page.addInitScript(() => {
+    localStorage.setItem("kcoder_e2e_mailbox", JSON.stringify({
+      threadId: "thread-1",
+      activeTurnId: null,
+      pending: [{
+        schemaVersion: 1,
+        turnId: "turn-workflow-queued",
+        threadId: "thread-1",
+        kind: "message",
+        input: "执行回归测试",
+        agentMode: "craft",
+        workflowId: "quality-assurance",
+        attachments: [],
+      }],
+    }));
+  });
+  await page.goto("/");
+
+  const selector = page.getByRole("button", { name: "选择机器人" });
+  await expect(selector).toContainText("质量保障");
+  await expect(selector).toBeDisabled();
+  await expect(page.getByRole("button", { name: "选择模式" })).toBeDisabled();
+  await page.getByRole("button", { name: "队列 (1)" }).click();
+  await expect(page.getByText("执行回归测试")).toBeVisible();
+});
+
+test("uses the composer add menu for attachments, Skills, and extension entry points", async ({ page }, testInfo) => {
+  await page.goto("/");
+  const trigger = page.getByRole("button", { name: "添加", exact: true });
+  const composer = page.getByRole("textbox", { name: "消息" });
+
+  await expect(page.getByRole("button", { name: "从本地选取图片" })).toHaveCount(0);
+  await trigger.click();
+  const menu = page.getByRole("menu", { name: "添加内容" });
+  await expect(menu).toBeVisible();
+  await expect(menu.getByRole("menuitem")).toHaveText([
+    "添加附件",
+    "添加 Skill",
+    "添加插件",
+    "添加 MCP",
+    "添加小程序",
+    "添加 Workflow",
+  ]);
+  await expect(menu.getByRole("menuitem", { name: "添加附件" })).toBeFocused();
+
+  const [menuBox, triggerBox] = await Promise.all([menu.boundingBox(), trigger.boundingBox()]);
+  expect(menuBox).not.toBeNull();
+  expect(triggerBox).not.toBeNull();
+  expect(menuBox!.x).toBeGreaterThanOrEqual(0);
+  expect(menuBox!.x + menuBox!.width).toBeLessThanOrEqual(page.viewportSize()!.width);
+  expect(menuBox!.y).toBeGreaterThanOrEqual(0);
+  expect(menuBox!.y + menuBox!.height).toBeLessThanOrEqual(triggerBox!.y);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+  await page.screenshot({ path: testInfo.outputPath(`composer-add-menu-${testInfo.project.name}.png`), fullPage: true });
+
+  await page.keyboard.press("End");
+  await expect(menu.getByRole("menuitem", { name: "添加 Workflow" })).toBeFocused();
+  await page.keyboard.press("ArrowDown");
+  await expect(menu.getByRole("menuitem", { name: "添加附件" })).toBeFocused();
+  await page.keyboard.press("Escape");
+  await expect(menu).toBeHidden();
+  await expect(trigger).toBeFocused();
+
+  await trigger.click();
+  await menu.getByRole("menuitem", { name: "添加 Skill" }).click();
+  const skillSuggestions = page.getByRole("listbox", { name: "Skills" });
+  await expect(skillSuggestions).toBeVisible();
+  await expect(composer).toHaveValue("/");
+  await skillSuggestions.getByRole("option", { name: /\/workspace-review/ }).click();
+  await expect(composer).toHaveValue("/workspace-review ");
+
+  await trigger.click();
+  await menu.getByRole("menuitem", { name: "添加附件" }).click();
+  await expect.poll(() => page.evaluate(() => (
+    window as unknown as { __invoked: string[] }
+  ).__invoked.includes("plugin:dialog|open"))).toBe(true);
+
+  for (const entry of [
+    { menuLabel: "添加 MCP", heading: "MCP 配置", pending: false },
+    { menuLabel: "添加插件", heading: "本地插件", pending: false },
+    { menuLabel: "添加小程序", heading: "小程序", pending: true },
+    { menuLabel: "添加 Workflow", heading: "Workflows", pending: true },
+  ]) {
+    await trigger.click();
+    await menu.getByRole("menuitem", { name: entry.menuLabel }).click();
+    const settings = page.getByRole("dialog", { name: "设置" });
+    await expect(settings.getByRole("heading", { name: entry.heading, exact: true })).toBeVisible();
+    if (entry.pending) await expect(settings.getByText("尚未接入", { exact: true })).toBeVisible();
+    await settings.getByRole("button", { name: "关闭设置" }).click();
+  }
+});
+
+test("disables the composer Skill entry outside a project", async ({ page }) => {
+  await page.goto("/");
+  await page.evaluate(() => localStorage.setItem("kcoder_e2e_thread_override", JSON.stringify({
+    inProject: false,
+    workspacePath: null,
+  })));
+  await page.reload();
+
+  await page.getByRole("button", { name: "添加", exact: true }).click();
+  const skillItem = page.getByRole("menuitem", { name: "添加 Skill" });
+  await expect(skillItem).toBeDisabled();
+  await expect(skillItem).toHaveAttribute("title", "不在项目中的会话不能使用 Skill");
+});
+
+test("renders the composer add menu in dark mode", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== "desktop", "One dark-theme visual check is sufficient");
+  await page.goto("/");
+  await page.evaluate(() => localStorage.setItem("kcoder_theme", "dark"));
+  await page.reload();
+  await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
+
+  await page.getByRole("button", { name: "添加", exact: true }).click();
+  const menu = page.getByRole("menu", { name: "添加内容" });
+  await expect(menu).toBeVisible();
+  const colors = await menu.evaluate((element) => {
+    const probe = document.createElement("span");
+    probe.style.color = "var(--color-ink)";
+    document.body.appendChild(probe);
+    const expectedText = getComputedStyle(probe).color;
+    probe.remove();
+    return {
+      background: getComputedStyle(element).backgroundColor,
+      text: getComputedStyle(element.querySelector("button")!).color,
+      expectedText,
+    };
+  });
+  expect(colors.background).not.toBe("rgba(0, 0, 0, 0)");
+  expect(colors.text).toBe(colors.expectedText);
+  await page.screenshot({ path: testInfo.outputPath("composer-add-menu-dark.png"), fullPage: true });
 });
 
 test("supports the primary workbench inspection flow", async ({ page }, testInfo) => {
@@ -672,10 +1182,251 @@ test("supports the primary workbench inspection flow", async ({ page }, testInfo
   await expect(page.getByText("Built-in workspace review")).toBeVisible();
   await expect(page.getByText("内置 · workspace review")).toBeVisible();
   await expect(page.getByText("Review code safely")).toBeVisible();
-  await page.getByRole("button", { name: /MCP 与 Hooks/ }).click();
-  await expect(page.getByText("local", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "MCP", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "MCP 配置", exact: true })).toBeVisible();
+  await expect(page.locator(".mcp-runtime-server").filter({ hasText: "local" })).toBeVisible();
   await page.getByRole("button", { name: /规则与审计/ }).click();
   await expect(page.getByText("extensions_ready", { exact: true })).toBeVisible();
+});
+
+test("edits global and project mcp.json directly", async ({ page }, testInfo) => {
+  await page.goto("/");
+  await page.locator('button[aria-label="设置"]:visible').click();
+  const dialog = page.getByRole("dialog");
+  await dialog.getByRole("button", { name: "MCP", exact: true }).click();
+
+  await expect(dialog.getByRole("heading", { name: "MCP 配置" })).toBeVisible();
+  await expect(dialog.getByRole("button", { name: "全局", exact: true })).toHaveAttribute("aria-pressed", "true");
+  await expect(dialog.getByText("runtime-data\\mcp.json", { exact: false })).toBeVisible();
+  await expect(dialog.getByRole("button", { name: "新增服务器", exact: true })).toHaveCount(0);
+  await expect(dialog.getByRole("button", { name: "可视化", exact: true })).toHaveCount(0);
+  await expect(dialog.locator(".mcp-runtime-server").filter({ hasText: "local" })).toContainText("2 个工具");
+
+  const globalEditor = dialog.getByLabel(/runtime-data\\mcp\.json JSON$/);
+  await globalEditor.fill(JSON.stringify({
+    mcpServers: [
+      {
+        id: "local",
+        transport: "stdio",
+        command: ["npx", "-y", "@modelcontextprotocol/server-filesystem", "D:\\code\\k-coder"],
+      },
+      {
+        id: "github",
+        enabled: true,
+        timeoutMs: 45000,
+        transport: "streamable_http",
+        url: "https://example.com/mcp",
+        secret_headers: { Authorization: "github-token" },
+      },
+    ],
+  }));
+  await dialog.getByRole("button", { name: "格式化 JSON", exact: true }).click();
+  await expect(globalEditor).toHaveValue(/"github"/);
+  await dialog.getByRole("button", { name: "保存 JSON", exact: true }).click();
+
+  await expect(page.getByText("全局 MCP 配置已保存", { exact: true })).toBeVisible();
+  await expect.poll(() => page.evaluate(() => {
+    const args = (window as unknown as {
+      __invocationArgs: Record<string, { scope?: string; content?: string }>;
+    }).__invocationArgs.save_mcp_config;
+    const document = JSON.parse(args?.content ?? "{}") as {
+      mcpServers?: Array<Record<string, unknown>>;
+    };
+    return { scope: args?.scope, server: document.mcpServers?.find((item) => item.id === "github") };
+  })).toEqual({
+    scope: "global",
+    server: {
+      id: "github",
+      enabled: true,
+      timeoutMs: 45000,
+      transport: "streamable_http",
+      url: "https://example.com/mcp",
+      secret_headers: { Authorization: "github-token" },
+    },
+  });
+
+  const workspaceBox = await dialog.locator(".mcp-json-workspace").boundingBox();
+  const dialogBox = await dialog.boundingBox();
+  expect(workspaceBox).not.toBeNull();
+  expect(dialogBox).not.toBeNull();
+  expect((workspaceBox?.x ?? 0) + (workspaceBox?.width ?? 0)).toBeLessThanOrEqual(
+    (dialogBox?.x ?? 0) + (dialogBox?.width ?? 0) + 1,
+  );
+  await page.screenshot({ path: testInfo.outputPath(`mcp-settings-${testInfo.project.name}.png`), fullPage: true });
+
+  await dialog.getByRole("button", { name: "当前项目", exact: true }).click();
+  const projectPath = dialog.locator(".mcp-config-path");
+  await expect(projectPath).toHaveAttribute("title", /\.k-coder\\mcp\.json$/);
+  await expect(projectPath).toContainText("尚未创建");
+  const jsonEditor = dialog.getByLabel(/\.k-coder\\mcp\.json JSON$/);
+  await expect(jsonEditor).toHaveValue(/"mcpServers": \[\]/);
+  await jsonEditor.fill("{");
+  await expect(dialog.locator(".mcp-json-error")).toBeVisible();
+  await expect(dialog.getByRole("button", { name: "保存 JSON", exact: true })).toBeDisabled();
+});
+
+test("keeps the MCP settings layout bounded at responsive breakpoints", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== "desktop", "One responsive sweep is sufficient");
+  await page.goto("/");
+  await page.locator('button[aria-label="设置"]:visible').click();
+  const dialog = page.getByRole("dialog");
+  await dialog.getByRole("button", { name: "MCP", exact: true }).click();
+  await expect(dialog.getByRole("heading", { name: "MCP 配置" })).toBeVisible();
+
+  for (const viewport of [
+    { width: 375, height: 812 },
+    { width: 768, height: 900 },
+    { width: 1024, height: 800 },
+    { width: 1440, height: 900 },
+  ]) {
+    await page.setViewportSize(viewport);
+    const bounds = await dialog.evaluate((element) => {
+      const box = element.getBoundingClientRect();
+      return {
+        left: box.left,
+        right: box.right,
+        clientWidth: element.clientWidth,
+        scrollWidth: element.scrollWidth,
+        pageClientWidth: document.documentElement.clientWidth,
+        pageScrollWidth: document.documentElement.scrollWidth,
+      };
+    });
+    expect(bounds.left).toBeGreaterThanOrEqual(-1);
+    expect(bounds.right).toBeLessThanOrEqual(viewport.width + 1);
+    expect(bounds.scrollWidth).toBeLessThanOrEqual(bounds.clientWidth + 1);
+    expect(bounds.pageScrollWidth).toBeLessThanOrEqual(bounds.pageClientWidth + 1);
+    if (viewport.width === 375) {
+      await page.screenshot({ path: testInfo.outputPath("mcp-settings-phone.png") });
+    }
+  }
+});
+
+test("renders the MCP settings tool in dark mode", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== "desktop", "One dark-theme visual check is sufficient");
+  await page.goto("/");
+  await page.evaluate(() => localStorage.setItem("kcoder_theme", "dark"));
+  await page.reload();
+  await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
+  await page.locator('button[aria-label="设置"]:visible').click();
+  const dialog = page.getByRole("dialog");
+  await dialog.getByRole("button", { name: "MCP", exact: true }).click();
+  await expect(dialog.getByRole("heading", { name: "MCP 配置" })).toBeVisible();
+  await expect.poll(() => dialog.locator(".mcp-json-workspace").evaluate((element) => ({
+    background: getComputedStyle(element).backgroundColor,
+    surface: getComputedStyle(document.documentElement).getPropertyValue("--color-surface").trim(),
+  }))).toEqual({ background: "rgb(27, 32, 48)", surface: "#1B2030" });
+  await page.screenshot({ path: testInfo.outputPath("mcp-settings-dark.png") });
+});
+
+test("manages local plugins from backend facts", async ({ page }, testInfo) => {
+  await page.goto("/");
+  await page.locator('button[aria-label="设置"]:visible').click();
+  const settings = page.getByRole("dialog", { name: "设置" });
+  await settings.getByRole("button", { name: "插件管理" }).click();
+
+  await expect(settings.getByRole("heading", { name: "本地插件" })).toBeVisible();
+  await expect.poll(() => page.evaluate(() => (
+    window as unknown as { __invocationArgs: Record<string, unknown> }
+  ).__invocationArgs.plugin_overview)).toEqual({ refresh: true });
+  await expect(settings.locator(".plugin-root")).toContainText(/runtime-data\\plugins/);
+  for (const state of ["未启用", "已加载", "部分可用", "已阻止", "无效"]) {
+    await expect(settings.getByText(state, { exact: true }).first()).toBeVisible();
+  }
+
+  const invalid = settings.locator(".plugin-row").filter({ hasText: "broken-package" });
+  await expect(invalid.getByRole("checkbox", { name: "启用 broken-package" })).toBeDisabled();
+  const review = settings.locator(".plugin-row").filter({ hasText: "review-tools" });
+  await review.getByRole("checkbox", { name: "启用 review-tools" }).click();
+  await expect.poll(() => page.evaluate(() => (
+    window as unknown as { __invocationArgs: Record<string, unknown> }
+  ).__invocationArgs.set_plugin_enabled)).toEqual({
+    pluginId: "review-tools@local",
+    enabled: true,
+  });
+  await expect(review.getByRole("checkbox", { name: "启用 review-tools" })).toBeChecked();
+  await expect(review.getByText("已加载", { exact: true })).toBeVisible();
+
+  await review.getByRole("button", { name: "删除 review-tools" }).click();
+  const confirm = page.getByRole("dialog", { name: "删除插件" });
+  await expect(confirm.getByText("review-tools", { exact: true })).toBeVisible();
+  await confirm.getByRole("button", { name: "取消", exact: true }).click();
+  expect(await page.evaluate(() => (
+    window as unknown as { __invoked: string[] }
+  ).__invoked.filter((command) => command === "delete_plugin").length)).toBe(0);
+
+  await review.getByRole("button", { name: "删除 review-tools" }).click();
+  await page.getByRole("dialog", { name: "删除插件" }).getByRole("button", { name: "删除", exact: true }).click();
+  await expect.poll(() => page.evaluate(() => (
+    window as unknown as { __invocationArgs: Record<string, unknown> }
+  ).__invocationArgs.delete_plugin)).toEqual({ pluginId: "review-tools@local" });
+  await expect(settings.locator(".plugin-row").filter({ hasText: "review-tools" })).toHaveCount(0);
+  await page.screenshot({ path: testInfo.outputPath(`plugin-settings-${testInfo.project.name}.png`), fullPage: true });
+});
+
+test("restores local plugin facts after a rejected toggle", async ({ page }) => {
+  await page.addInitScript(() => {
+    localStorage.setItem("kcoder_e2e_plugin_toggle_error", "review-tools@local");
+  });
+  await page.goto("/");
+  await page.locator('button[aria-label="设置"]:visible').click();
+  const settings = page.getByRole("dialog", { name: "设置" });
+  await settings.getByRole("button", { name: "插件管理" }).click();
+  const review = settings.locator(".plugin-row").filter({ hasText: "review-tools" });
+
+  await review.getByRole("checkbox", { name: "启用 review-tools" }).click();
+
+  await expect(settings.getByRole("alert")).toContainText("plugin runtime refresh failed");
+  await expect(review.getByRole("checkbox", { name: "启用 review-tools" })).not.toBeChecked();
+  await expect.poll(() => page.evaluate(() => (
+    window as unknown as { __invoked: string[] }
+  ).__invoked.filter((command) => command === "plugin_overview").length)).toBeGreaterThanOrEqual(2);
+});
+
+test("keeps local plugin settings bounded and renders the empty state", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== "desktop", "One responsive sweep is sufficient");
+  await page.goto("/");
+  await page.locator('button[aria-label="设置"]:visible').click();
+  const settings = page.getByRole("dialog", { name: "设置" });
+  await settings.getByRole("button", { name: "插件管理" }).click();
+  await expect(settings.getByRole("heading", { name: "本地插件" })).toBeVisible();
+
+  for (const viewport of [
+    { width: 375, height: 812 },
+    { width: 768, height: 900 },
+    { width: 1024, height: 800 },
+    { width: 1440, height: 900 },
+  ]) {
+    await page.setViewportSize(viewport);
+    const bounds = await settings.evaluate((element) => ({
+      clientWidth: element.clientWidth,
+      scrollWidth: element.scrollWidth,
+      pageClientWidth: document.documentElement.clientWidth,
+      pageScrollWidth: document.documentElement.scrollWidth,
+    }));
+    expect(bounds.scrollWidth).toBeLessThanOrEqual(bounds.clientWidth + 1);
+    expect(bounds.pageScrollWidth).toBeLessThanOrEqual(bounds.pageClientWidth + 1);
+  }
+
+  await page.evaluate(() => localStorage.setItem("kcoder_e2e_plugin_empty", "true"));
+  await settings.getByRole("button", { name: "刷新插件" }).click();
+  await expect(settings.getByText("未发现插件", { exact: true })).toBeVisible();
+});
+
+test("renders local plugin settings in dark mode", async ({ page }, testInfo) => {
+  test.skip(testInfo.project.name !== "desktop", "One dark-theme visual check is sufficient");
+  await page.addInitScript(() => localStorage.setItem("kcoder_theme", "dark"));
+  await page.goto("/");
+  await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
+  await page.locator('button[aria-label="设置"]:visible').click();
+  const settings = page.getByRole("dialog", { name: "设置" });
+  await settings.getByRole("button", { name: "插件管理" }).click();
+
+  await expect(settings.getByRole("heading", { name: "本地插件" })).toBeVisible();
+  await expect.poll(() => settings.locator(".plugin-row-icon").first().evaluate((element) => ({
+    background: getComputedStyle(element).backgroundColor,
+    panel: getComputedStyle(document.documentElement).getPropertyValue("--color-surface-panel").trim(),
+  }))).toEqual({ background: "rgb(22, 26, 38)", panel: "#161A26" });
+  await page.screenshot({ path: testInfo.outputPath("plugin-settings-dark.png") });
 });
 
 test("supports a light CodeBuddy appearance", async ({ page }) => {
@@ -705,6 +1456,60 @@ test("supports a light CodeBuddy appearance", async ({ page }) => {
   await page.getByRole("button", { name: "切换到浅色模式" }).click();
   await expect(page.locator("html")).toHaveAttribute("data-theme", "light");
   await expect.poll(() => page.evaluate(() => getComputedStyle(document.documentElement).getPropertyValue("--color-surface").trim())).toBe("#f8fafc");
+});
+
+test("keeps the K brand and renders a distinct command-pulse welcome mark", async ({ page }, testInfo) => {
+  await page.addInitScript(() => {
+    const emptyThread = {
+      schemaVersion: 1,
+      id: "thread-1",
+      title: "新会话",
+      createdAtMs: 1,
+      updatedAtMs: 1,
+      archived: false,
+    };
+    localStorage.setItem("kcoder_e2e_threads", JSON.stringify([emptyThread]));
+    localStorage.setItem("kcoder_e2e_empty_thread_id", emptyThread.id);
+    localStorage.setItem("kcoder_e2e_read_delay_ms", "900");
+    localStorage.setItem("kcoder_e2e_thread_detail", JSON.stringify({
+      schemaVersion: 1,
+      summary: emptyThread,
+      messages: [],
+      messageTurnIds: {},
+      turnUserMessageIds: {},
+      lastTurn: null,
+      toolActivities: [],
+      turnTimeline: [],
+      approvals: [],
+      userInputs: [],
+      changes: [],
+      todos: [],
+      lastUsage: null,
+    }));
+  });
+  await page.goto("/");
+
+  const welcome = page.locator(".empty-thread--welcome");
+  await expect(page.getByText("正在读取会话", { exact: true })).toBeVisible();
+  await expect(welcome).toHaveCount(0);
+  await expect(welcome).toBeVisible();
+  await expect(page.getByRole("heading", { name: "新会话" })).toBeVisible();
+  await expect(welcome.getByRole("heading", { name: "从一个明确的任务开始" })).toBeVisible();
+  await expect(welcome.locator("svg[data-welcome-mark='command-pulse']")).toHaveCount(1);
+  await expect(welcome.locator("svg[data-brand-mark='k-letter']")).toHaveCount(0);
+  await expect(page.locator(".brand-mark svg[data-brand-mark='k-letter']")).toHaveCount(1);
+  await expect(page.locator("svg[data-brand-mark='command-pulse']")).toHaveCount(0);
+  await expect(page.locator(".message-list")).toHaveCount(0);
+  await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+  await page.screenshot({ path: testInfo.outputPath(`command-pulse-welcome-k-brand-${testInfo.project.name}.png`), fullPage: true });
+});
+
+test("uses the CodeBuddy blue K and rebuilds the native Windows icon resource", () => {
+  const iconSource = readFileSync(new URL("../assets/app-icon.svg", import.meta.url), "utf8");
+  const buildScript = readFileSync(new URL("../src-tauri/build.rs", import.meta.url), "utf8");
+  expect(iconSource).toContain('fill="#2F6FE4"');
+  expect(iconSource).toMatch(/<path\s+d="M154 112h72v119l104-119h88L298 247l128 153h-91L250 294l-24 27v79h-72V112Z"\s+fill="#fff"\s*\/>/);
+  expect(buildScript).toContain('println!("cargo:rerun-if-changed=icons/icon.ico");');
 });
 
 test("keeps the mid-width workbench bounded without toolbar overflow", async ({ page }, testInfo) => {
@@ -875,6 +1680,7 @@ test("creates a standalone conversation from the lower-left project menu", async
   await standalone.click();
 
   await expect(composer.getByRole("button", { name: "当前不在项目中" })).toContainText("不在项目中");
+  await expect(composer.getByRole("button", { name: "选择机器人" })).toBeDisabled();
   await expect.poll(() => page.evaluate(() => (
     window as unknown as { __invocationArgs: Record<string, unknown> }
   ).__invocationArgs.create_thread)).toEqual({ inProject: false });
@@ -2339,7 +3145,7 @@ test("restores a pending user question after reopening the thread", async ({ pag
 });
 
 test("restores a soft turn continuation gate with direct actions", async ({ page }) => {
-  const question = "当前执行段已调用模型 30 次、累计消耗 920000 tokens、运行 480 秒。";
+  const question = "当前执行段已调用模型 100 次、累计消耗 920000 tokens、运行 480 秒。如需继续，请发送“继续”（点击“继续执行”即可）。";
   await page.addInitScript((continuationQuestion) => {
     localStorage.setItem("kcoder_e2e_thread_detail", JSON.stringify({
       schemaVersion: 1,
@@ -2466,6 +3272,95 @@ test("shows unbounded goal token consumption and controls", async ({ page }, tes
   await dialog.getByRole("button", { name: "暂停" }).click();
   await expect.poll(() => page.evaluate(() => (window as unknown as { __invoked: string[] }).__invoked.includes("transition_goal"))).toBe(true);
   await page.screenshot({ path: testInfo.outputPath(`goal-${testInfo.project.name}.png`), fullPage: true });
+});
+
+test("shows recovered and live context-window progress in the composer", async ({ page }, testInfo) => {
+  await page.addInitScript(() => {
+    localStorage.setItem("kcoder_e2e_thread_detail", JSON.stringify({
+      schemaVersion: 1,
+      summary: {
+        schemaVersion: 1,
+        id: "thread-1",
+        title: "Context progress",
+        createdAtMs: 1,
+        updatedAtMs: 2,
+        archived: false,
+        inProject: true,
+        workspacePath: "D:\\code\\k-coder",
+      },
+      messages: [],
+      messageTurnIds: {},
+      turnUserMessageIds: {},
+      lastTurn: null,
+      toolActivities: [],
+      turnTimeline: [],
+      approvals: [],
+      userInputs: [],
+      changes: [],
+      todos: [],
+      lastUsage: { inputTokens: 400_000, outputTokens: 20_000, totalTokens: 420_000 },
+      contextUsage: { inputTokens: 14_000, outputTokens: 1_360, totalTokens: 15_360 },
+    }));
+  });
+  await page.goto("/");
+
+  const trigger = page.locator(".context-progress-trigger");
+  const sendButton = page.getByRole("button", { name: "发送消息" });
+  await expect(trigger).toBeVisible();
+  await expect(trigger).toHaveAttribute("aria-label", "上下文 12%，15K / 128K");
+  await trigger.click();
+
+  const popover = page.getByRole("dialog", { name: "上下文用量" });
+  await expect(popover).toBeVisible();
+  await expect(popover).toContainText("15K / 128K");
+  await expect(popover).toContainText("12%");
+  await expect(popover.getByRole("progressbar", { name: "上下文占用" })).toHaveAttribute("aria-valuenow", "12");
+
+  const geometry = await Promise.all([trigger.boundingBox(), sendButton.boundingBox(), popover.boundingBox()]);
+  expect(geometry.every(Boolean)).toBe(true);
+  expect(geometry[0]!.x + geometry[0]!.width).toBeLessThanOrEqual(geometry[1]!.x);
+  expect(geometry[2]!.x).toBeGreaterThanOrEqual(0);
+  expect(geometry[2]!.x + geometry[2]!.width).toBeLessThanOrEqual(page.viewportSize()!.width);
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+  await page.screenshot({
+    path: testInfo.outputPath(`context-progress-${testInfo.project.name}.png`),
+    fullPage: true,
+  });
+
+  await page.evaluate(() => {
+    (window as unknown as { __emitAgentEvent: (event: unknown) => void }).__emitAgentEvent({
+      schemaVersion: 5,
+      type: "usage_updated",
+      phase: "executing",
+      threadId: "thread-1",
+      turnId: "turn-context",
+      usage: { inputTokens: 230_000, outputTokens: 20_000, totalTokens: 250_000 },
+      contextUsage: { inputTokens: 84_000, outputTokens: 5_600, totalTokens: 89_600 },
+    });
+  });
+  await expect(trigger).toHaveAttribute("aria-label", "上下文 70%，90K / 128K");
+  await expect(popover).toContainText("90K / 128K");
+  await expect(popover.getByRole("progressbar", { name: "上下文占用" })).toHaveAttribute("aria-valuenow", "70");
+
+  await page.evaluate(() => {
+    (window as unknown as { __emitAgentEvent: (event: unknown) => void }).__emitAgentEvent({
+      schemaVersion: 5,
+      type: "context_compacted",
+      phase: "executing",
+      threadId: "thread-1",
+      turnId: "turn-context",
+      itemId: "compaction-context",
+      automatic: true,
+      compactedMessageCount: 12,
+      userConstraintCount: 1,
+      recentToolResultCount: 2,
+      recentUserMessageCount: 2,
+    });
+  });
+  await expect(trigger).toHaveAttribute("aria-label", "上下文用量等待更新");
+  await expect(popover).toContainText("-- / 128K");
+  await expect(popover).toContainText("模型返回下一次用量后更新");
+  await expect(popover.getByRole("progressbar", { name: "上下文占用" })).not.toHaveAttribute("aria-valuenow");
 });
 
 test("switches providers and models from the composer footer", async ({ page }, testInfo) => {

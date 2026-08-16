@@ -50,7 +50,7 @@ const MAX_TOOL_OUTPUT_BYTES: usize = 128 * 1024;
 const MAX_IDENTICAL_TOOL_CALLS: usize = 2;
 const PROGRESS_CHECK_WINDOW: usize = 5;
 const MAX_NO_PROGRESS_WINDOWS: usize = 3;
-pub const DEFAULT_SOFT_TURN_PROVIDER_CALLS: u32 = 30;
+pub const DEFAULT_SOFT_TURN_PROVIDER_CALLS: u32 = 100;
 pub const DEFAULT_SOFT_TURN_TOTAL_TOKENS: u64 = 1_000_000;
 pub const DEFAULT_SOFT_TURN_DURATION_MS: u64 = 10 * 60 * 1_000;
 
@@ -569,8 +569,12 @@ impl AgentRuntime {
     ) -> Result<CompactionSummary, AgentRuntimeError> {
         let history =
             provider_history(self.repository.load(thread_id).await?, self.supports_vision);
-        let (summary, _) =
-            context::compact(&history, self.working_context_limit.min(self.context_limit));
+        let (summary, _) = context::compact(
+            history.messages(),
+            self.working_context_limit.min(self.context_limit),
+            history.summary(),
+            history.user_context(),
+        );
         if summary.compacted_message_count > 0 {
             let compaction_event = StoredEvent::new(
                 thread_id,
@@ -791,7 +795,8 @@ impl AgentRuntime {
 
             let events = self.repository.load(&thread_id).await?;
             let last_context_usage = last_active_context_usage(&events);
-            let mut history = provider_history(events, self.supports_vision);
+            let provider_history = provider_history(events, self.supports_vision);
+            let mut history = provider_history.request_messages();
             if force_compaction
                 || context::needs_compaction_for_request(
                     &history,
@@ -808,8 +813,10 @@ impl AgentRuntime {
             {
                 force_compaction = false;
                 let (summary, compacted) = context::compact(
-                    &history,
+                    provider_history.messages(),
                     self.working_context_limit.min(self.context_limit),
+                    provider_history.summary(),
+                    provider_history.user_context(),
                 );
                 if summary.compacted_message_count > 0 {
                     let compaction_event = StoredEvent::new(
@@ -2032,7 +2039,7 @@ impl AgentRuntime {
             kind: UserInputRequestKind::TurnContinuation,
             questions: vec![UserInputQuestion {
                 question: format!(
-                    "当前执行段已调用模型 {} 次、累计消耗 {} tokens、运行 {} 秒。继续后会获得新一段额度（{} 次调用 / {} tokens / {} 秒）。",
+                    "当前执行段已调用模型 {} 次、累计消耗 {} tokens、运行 {} 秒。继续后会获得新一段额度（{} 次调用 / {} tokens / {} 秒）。如需继续，请发送“继续”（点击“继续执行”即可）；也可以选择“压缩后继续”或“停止执行”。",
                     usage.provider_calls,
                     usage.total_tokens,
                     usage.duration_ms.div_ceil(1_000),
@@ -2681,6 +2688,7 @@ impl AgentRuntime {
             thread_id: thread_id.to_string(),
             turn_id: turn_id.to_string(),
             usage: *total_usage,
+            context_usage: usage,
         }));
         Ok(())
     }
@@ -3782,6 +3790,7 @@ mod tests {
         );
         assert!(
             !provider_history(events, false)
+                .request_messages()
                 .iter()
                 .any(|message| match message {
                     ProviderMessage::Text { text, .. }
@@ -4620,6 +4629,31 @@ mod tests {
         );
     }
 
+    #[test]
+    fn soft_turn_default_requests_continuation_at_100_provider_calls() {
+        let limits = SoftTurnLimits::default();
+
+        assert_eq!(limits.provider_calls, 100);
+        assert_eq!(limits.total_tokens, DEFAULT_SOFT_TURN_TOTAL_TOKENS);
+        assert_eq!(limits.duration_ms, DEFAULT_SOFT_TURN_DURATION_MS);
+        assert!(
+            !SoftTurnSegmentUsage {
+                provider_calls: 99,
+                total_tokens: 0,
+                duration_ms: 0,
+            }
+            .exceeds(limits)
+        );
+        assert!(
+            SoftTurnSegmentUsage {
+                provider_calls: 100,
+                total_tokens: 0,
+                duration_ms: 0,
+            }
+            .exceeds(limits)
+        );
+    }
+
     #[tokio::test]
     async fn soft_turn_limit_can_continue_with_a_fresh_segment() {
         let (_directory, repository, runtime, thread_id) = runtime_fixture().await;
@@ -4670,6 +4704,11 @@ mod tests {
         assert_eq!(
             detail.user_inputs[0].request.kind,
             UserInputRequestKind::TurnContinuation
+        );
+        assert!(
+            detail.user_inputs[0].request.questions[0]
+                .question
+                .contains("请发送“继续”")
         );
         assert_eq!(
             detail.user_inputs[0]
@@ -5229,13 +5268,88 @@ mod tests {
                 },
             )],
             false,
-        );
+        )
+        .request_messages();
 
         assert!(matches!(
             history.as_slice(),
             [ProviderMessage::Text { text, .. }]
                 if text.contains("tool read_file (true): important result")
         ));
+    }
+
+    #[test]
+    fn restored_repeated_compaction_recovers_real_user_events() {
+        let recursive_summary = CompactionSummary {
+            contract_version: 3,
+            summary: "User: [Compacted context v3]\nSummary:\nrecursive".to_string(),
+            user_constraints: vec!["[Compacted context v3]\n必须递归".to_string()],
+            recent_user_messages: vec!["[Compacted context v3]".to_string()],
+            current_user_request: "[Compacted context v3]".to_string(),
+            important_tool_observations: vec!["tool read_file: inspected settings".to_string()],
+            recent_tool_results: Vec::new(),
+            compacted_message_count: 20,
+            estimated_before_tokens: 60_000,
+            estimated_after_tokens: 4_000,
+        };
+        let events = vec![
+            StoredEvent::new(
+                "thread",
+                None,
+                StoredEventKind::UserMessage {
+                    message: user_message(
+                        "请设计 workflow 设置并对照参考实现".to_string(),
+                        Vec::new(),
+                        false,
+                    )
+                    .unwrap(),
+                },
+            ),
+            StoredEvent::new(
+                "thread",
+                Some("turn-1".to_string()),
+                StoredEventKind::ContextCompacted {
+                    summary: recursive_summary.clone(),
+                    automatic: true,
+                },
+            ),
+            StoredEvent::new(
+                "thread",
+                None,
+                StoredEventKind::UserMessage {
+                    message: user_message("怎么停了，继续".to_string(), Vec::new(), false).unwrap(),
+                },
+            ),
+            StoredEvent::new(
+                "thread",
+                Some("turn-2".to_string()),
+                StoredEventKind::ContextCompacted {
+                    summary: recursive_summary,
+                    automatic: true,
+                },
+            ),
+        ];
+
+        let history = provider_history(events, false);
+        let summary = history
+            .summary()
+            .expect("compaction summary should be restored");
+        let request = history.request_messages();
+        let rendered = match request.first() {
+            Some(ProviderMessage::Text { text, .. }) => text,
+            other => panic!("expected rendered compaction summary, got {other:?}"),
+        };
+
+        assert!(summary.summary.is_empty());
+        assert_eq!(summary.current_user_request, "怎么停了，继续");
+        assert_eq!(
+            summary.recent_user_messages,
+            ["请设计 workflow 设置并对照参考实现", "怎么停了，继续"]
+        );
+        assert!(summary.user_constraints.is_empty());
+        assert_eq!(rendered.matches("[Compacted context v3]").count(), 1);
+        assert!(rendered.contains("请设计 workflow 设置并对照参考实现"));
+        assert!(rendered.contains("怎么停了，继续"));
     }
 
     #[test]
@@ -5280,7 +5394,8 @@ mod tests {
                 ),
             ],
             false,
-        );
+        )
+        .request_messages();
 
         assert!(matches!(
             history.as_slice(),

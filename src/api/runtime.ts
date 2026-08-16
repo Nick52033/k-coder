@@ -11,6 +11,8 @@ import type {
   GitStatusView,
   GitBranchView,
   ExtensionOverview,
+  PluginOverview,
+  McpConfigView,
   ImageAttachment,
   ProjectRecord,
   CommandOutputPage,
@@ -60,6 +62,9 @@ import type {
   PlanUpdateRequest,
   PlanView,
   SearchResult,
+  CancelWorkflowRunRequest,
+  WorkflowDefinitionView,
+  WorkflowRunView,
   LogQuery,
   LogQueryResult,
 } from "../types/runtime";
@@ -164,12 +169,24 @@ export function archiveThread(threadId: string) {
   return invoke<void>("archive_thread", { threadId });
 }
 
-export function runTurn(threadId: string, input: string, attachments: ImageAttachment[] = [], agentMode?: string) {
-  return invoke<TurnOutcome>("run_turn", { request: { threadId, input, agentMode }, attachments });
+export function runTurn(threadId: string, input: string, attachments: ImageAttachment[] = [], agentMode?: string, workflowId?: string) {
+  return invoke<TurnOutcome>("run_turn", { request: { threadId, input, agentMode }, attachments, workflowId });
 }
 
-export function startTurn(threadId: string, input: string, attachments: ImageAttachment[] = [], agentMode?: string) {
-  return invoke<TurnHandle>("turn_start", { request: { threadId, input, agentMode }, attachments });
+export function startTurn(threadId: string, input: string, attachments: ImageAttachment[] = [], agentMode?: string, workflowId?: string) {
+  return invoke<TurnHandle>("turn_start", { request: { threadId, input, agentMode }, attachments, workflowId });
+}
+
+export function listBuiltinWorkflows() {
+  return invoke<WorkflowDefinitionView[]>("list_builtin_workflows");
+}
+
+export function getWorkflowRun(threadId: string) {
+  return invoke<WorkflowRunView | null>("get_workflow_run", { threadId });
+}
+
+export function cancelWorkflowRun(request: CancelWorkflowRunRequest) {
+  return invoke<WorkflowRunView>("cancel_workflow_run", { request });
 }
 
 export function readThreadMailbox(threadId: string) {
@@ -295,6 +312,11 @@ export function renameThread(threadId: string, title: string) { return invoke<Th
 export function deleteThread(threadId: string) { return invoke<void>("delete_thread", { threadId }); }
 export function getUsageSummary() { return invoke<UsageSummary>("usage_summary"); }
 export function getExtensionOverview(refresh = false) { return invoke<ExtensionOverview>("extension_overview", { refresh }); }
+export function getPluginOverview(refresh = false) { return invoke<PluginOverview>("plugin_overview", { refresh }); }
+export function setPluginEnabled(pluginId: string, enabled: boolean) { return invoke<PluginOverview>("set_plugin_enabled", { pluginId, enabled }); }
+export function deletePlugin(pluginId: string) { return invoke<PluginOverview>("delete_plugin", { pluginId }); }
+export function getMcpConfig(refresh = false) { return invoke<McpConfigView>("mcp_config", { refresh }); }
+export function saveMcpConfig(scope: "global" | "project", content: string) { return invoke<McpConfigView>("save_mcp_config", { scope, content }); }
 export function setExtensionEnabled(kind: "skill" | "mcp" | "hook", id: string, enabled: boolean) { return invoke<ExtensionOverview>("set_extension_enabled", { kind, id, enabled }); }
 export function saveMcpSecret(server: string, name: string, value: string) { return invoke<ExtensionOverview>("save_mcp_secret", { server, name, value }); }
 export function deleteMcpSecret(server: string, name: string) { return invoke<ExtensionOverview>("delete_mcp_secret", { server, name }); }

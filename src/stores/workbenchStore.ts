@@ -32,6 +32,9 @@ import {
   getGoal,
   getPlan,
   transitionGoal,
+  cancelWorkflowRun as cancelWorkflowRunCommand,
+  getWorkflowRun,
+  listBuiltinWorkflows,
 } from "../api/runtime";
 import type {
   AgentEvent,
@@ -59,6 +62,8 @@ import type {
   PlanView,
   UserInputRequest,
   UserInputResolution,
+  WorkflowDefinitionView,
+  WorkflowRunView,
 
   TodoItem,
   ThreadMailboxChanged,
@@ -84,6 +89,7 @@ interface QueuedMessage {
   input: string;
   attachments: ImageAttachment[];
   agentMode?: string;
+  workflowId?: string;
   status: "pending" | "processing" | "completed" | "failed";
   turnId?: string;
   error?: string;
@@ -102,6 +108,7 @@ interface WorkbenchState {
   mailboxRevisions: Record<string, number>;
   messageQueue: QueuedMessage[];
   usage: TokenUsage | null;
+  contextUsage: TokenUsage | null;
   turnTimeline: TurnTimelineItem[];
   turnUserMessageIds: Record<string, string>;
   activityStatus: { turnId: string; status: AgentActivityStatus } | null;
@@ -117,6 +124,8 @@ interface WorkbenchState {
   reasoningEffort: ReasoningEffort;
   plan: PlanView | null;
   goal: GoalView | null;
+  workflows: WorkflowDefinitionView[];
+  workflowRun: WorkflowRunView | null;
   todos: Map<string, TodoItem[]>; // key: threadId
   historyNextCursor: string | null;
   historyLoading: boolean;
@@ -131,7 +140,7 @@ interface WorkbenchState {
   selectThread: (threadId: string) => Promise<void>;
   loadOlderHistory: () => Promise<void>;
   archiveActiveThread: () => Promise<void>;
-  sendMessage: (input: string, attachments?: ImageAttachment[], agentMode?: string) => Promise<void>;
+  sendMessage: (input: string, attachments?: ImageAttachment[], agentMode?: string, workflowId?: string) => Promise<void>;
   processQueue: (threadId?: string, minimumRevision?: number) => Promise<void>;
   sendQueuedMessageNow: (messageId: string) => Promise<void>;
   removeQueuedMessage: (messageId: string) => void;
@@ -146,6 +155,8 @@ interface WorkbenchState {
   setReasoningEffort: (effort: ReasoningEffort) => Promise<boolean>;
   createActiveGoal: (objective: string, tokenBudget: number | null, timeBudgetMs: number) => Promise<boolean>;
   transitionActiveGoal: (state: GoalState, reason?: string) => Promise<boolean>;
+  loadWorkflowRun: (threadId?: string) => Promise<void>;
+  cancelActiveWorkflow: () => Promise<boolean>;
   resolvePendingApproval: (resolution: ApprovalResolution) => Promise<boolean>;
   resolvePendingUserInput: (resolution: UserInputResolution) => Promise<boolean>;
   undoAppliedChange: (changeId: string) => Promise<boolean>;
@@ -299,6 +310,7 @@ function mailboxMessages(threadId: string, pending: Array<{
   input: string;
   attachments: ImageAttachment[];
   agentMode: string | null;
+  workflowId?: string | null;
 }>): QueuedMessage[] {
   return pending.map((item) => ({
     id: item.turnId,
@@ -308,6 +320,7 @@ function mailboxMessages(threadId: string, pending: Array<{
     input: item.input,
     attachments: item.attachments,
     agentMode: item.agentMode ?? undefined,
+    workflowId: item.workflowId ?? undefined,
     status: "pending",
     turnId: item.turnId,
   }));
@@ -392,6 +405,7 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
   mailboxRevisions: {},
   messageQueue: [],
   usage: null,
+  contextUsage: null,
   turnTimeline: [],
   turnUserMessageIds: {},
   activityStatus: null,
@@ -407,6 +421,8 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
   reasoningEffort: "medium",
   plan: null,
   goal: null,
+  workflows: [],
+  workflowRun: null,
   todos: new Map(),
   historyNextCursor: null,
   historyLoading: false,
@@ -418,13 +434,14 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
     initializationPromise = (async () => {
       set({ loading: true, error: "" });
       try {
-        const [, , approvalMode, reasoningEffort] = await Promise.all([
+        const [, , approvalMode, reasoningEffort, workflows] = await Promise.all([
           get().reloadThreads(),
           get().loadProviderCatalog(),
           getApprovalMode(),
           getReasoningEffort(),
+          listBuiltinWorkflows(),
         ]);
-        set({ approvalMode, reasoningEffort });
+        set({ approvalMode, reasoningEffort, workflows });
         let threadId = get().activeThreadId ?? get().threads[0]?.id ?? null;
         if (!threadId) {
           const thread = await createThreadCommand();
@@ -481,6 +498,7 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
         activeTurnId: null,
         activeTurnThreadId: null,
         usage: null,
+        contextUsage: null,
         turnTimeline: [],
         turnUserMessageIds: {},
         activityStatus: null,
@@ -491,6 +509,7 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
         changes: [],
         plan: null,
         goal: null,
+        workflowRun: null,
         historyNextCursor: null,
         historyLoading: false,
         error: "",
@@ -517,6 +536,7 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
         activeTurnId: null,
         activeTurnThreadId: null,
         usage: null,
+        contextUsage: null,
         turnTimeline: [],
         turnUserMessageIds: {},
         activityStatus: null,
@@ -528,16 +548,18 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
         todos,
         plan: null,
         goal: null,
+        workflowRun: null,
         historyNextCursor: null,
         historyLoading: false,
         messageQueue: state.messageQueue.filter((message) => message.threadId !== threadId),
       };
     });
     try {
-      const [history, plan, goal, mailbox] = await Promise.all([
+      const [history, plan, goal, workflowRun, mailbox] = await Promise.all([
         readThreadHistory(threadId).catch(() => null),
         getPlan(threadId),
         getGoal(threadId),
+        getWorkflowRun(threadId),
         readThreadMailbox(threadId).catch(() => null),
       ]);
       const detail = history ? null : await readThread(threadId);
@@ -600,9 +622,13 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
         changes: projected?.changes ?? detail!.changes,
         todos,
         usage: history ? history.lastUsage : detail!.lastUsage ?? null,
+        contextUsage: history
+          ? history.contextUsage ?? null
+          : detail!.contextUsage ?? null,
         historyNextCursor: history?.turns.nextCursor ?? null,
         plan,
         goal,
+        workflowRun,
         activeTurns,
         restoredActiveTurns,
         cancellingTurns,
@@ -670,13 +696,13 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
     }
   },
 
-  sendMessage: async (input, attachments = [], agentMode) => {
+  sendMessage: async (input, attachments = [], agentMode, workflowId) => {
     const { activeThreadId: threadId } = get();
     const text = input.trim();
     if (!threadId || (!text && attachments.length === 0)) return;
     set({ error: "" });
     try {
-      const handle = await startTurn(threadId, text, attachments, agentMode);
+      const handle = await startTurn(threadId, text, attachments, agentMode, workflowId);
       if (handle.state === "queued") {
         await get().processQueue();
       } else if (!terminalTurnIds.has(handle.turnId)) {
@@ -903,6 +929,33 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
     }
   },
 
+  loadWorkflowRun: async (targetThreadId) => {
+    const threadId = targetThreadId ?? get().activeThreadId;
+    if (!threadId) return;
+    try {
+      const workflowRun = await getWorkflowRun(threadId);
+      if (get().activeThreadId === threadId) set({ workflowRun });
+    } catch (error) {
+      if (get().activeThreadId === threadId) set({ error: errorMessage(error) });
+    }
+  },
+
+  cancelActiveWorkflow: async () => {
+    const run = get().workflowRun;
+    if (!run || run.state !== "active") return false;
+    try {
+      const workflowRun = await cancelWorkflowRunCommand({
+        threadId: run.threadId,
+        runId: run.id,
+      });
+      if (get().activeThreadId === run.threadId) set({ workflowRun, error: "" });
+      return true;
+    } catch (error) {
+      set({ error: errorMessage(error) });
+      return false;
+    }
+  },
+
   resolvePendingApproval: async (resolution) => {
     const approval = get().pendingApproval;
     if (!approval) return false;
@@ -1000,6 +1053,11 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
       }
       return;
     }
+    if (event.type === "turn_started"
+      || terminalEvent
+      || (event.type === "tool_completed" && event.name === "complete_workflow_node")) {
+      void get().loadWorkflowRun(event.threadId);
+    }
 
     const helpers: ReducerHelpers = {
       toConversationMessage,
@@ -1073,6 +1131,7 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
       turnTimeline: [],
       turnUserMessageIds: {},
       activityStatus: null,
+      contextUsage: null,
       error: recoveryError,
       loading: false,
     });

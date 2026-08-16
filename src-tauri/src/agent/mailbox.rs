@@ -14,6 +14,7 @@ pub enum MailboxTurnKind {
     Message {
         request: RunTurnRequest,
         attachments: Vec<ImageAttachment>,
+        workflow_id: Option<String>,
     },
     Retry,
 }
@@ -29,6 +30,7 @@ pub struct MailboxTurn {
 pub struct PendingMailboxMessage {
     pub request: RunTurnRequest,
     pub attachments: Vec<ImageAttachment>,
+    pub workflow_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,18 +99,20 @@ impl ThreadMailbox {
                     .pending
                     .iter()
                     .map(|item| {
-                        let (kind, input, agent_mode, attachments) = match &item.kind {
+                        let (kind, input, agent_mode, workflow_id, attachments) = match &item.kind {
                             MailboxTurnKind::Message {
                                 request,
                                 attachments,
+                                workflow_id,
                             } => (
                                 QueuedTurnKind::Message,
                                 request.input.clone(),
                                 request.agent_mode.clone(),
+                                workflow_id.clone(),
                                 attachments.clone(),
                             ),
                             MailboxTurnKind::Retry => {
-                                (QueuedTurnKind::Retry, String::new(), None, Vec::new())
+                                (QueuedTurnKind::Retry, String::new(), None, None, Vec::new())
                             }
                         };
                         QueuedTurn {
@@ -118,6 +122,7 @@ impl ThreadMailbox {
                             kind,
                             input,
                             agent_mode,
+                            workflow_id,
                             attachments,
                         }
                     })
@@ -180,9 +185,11 @@ impl ThreadMailbox {
             MailboxTurnKind::Message {
                 request,
                 attachments,
+                workflow_id,
             } => Ok(PendingMailboxMessage {
                 request: request.clone(),
                 attachments: attachments.clone(),
+                workflow_id: workflow_id.clone(),
             }),
             MailboxTurnKind::Retry => Err(QueuedTurnSteerError::NotMessage),
         }
@@ -314,6 +321,7 @@ mod tests {
                     agent_mode: None,
                 },
                 attachments: Vec::new(),
+                workflow_id: None,
             },
             started: None,
         }
@@ -330,6 +338,25 @@ mod tests {
         assert_eq!(mailbox.next("a").await.unwrap().handle.turn_id, "2");
         assert!(mailbox.next("a").await.is_none());
         assert_eq!(mailbox.next("b").await.unwrap().handle.turn_id, "3");
+    }
+
+    #[tokio::test]
+    async fn mailbox_snapshot_preserves_workflow_identity() {
+        let mailbox = ThreadMailbox::default();
+        let mut turn = mailbox_turn("thread", "workflow-turn", "run the checks");
+        match &mut turn.kind {
+            MailboxTurnKind::Message { workflow_id, .. } => {
+                *workflow_id = Some("quality-assurance".into());
+            }
+            MailboxTurnKind::Retry => unreachable!("mailbox_turn always creates a message"),
+        }
+        assert!(mailbox.enqueue(turn).await);
+
+        let snapshot = mailbox.snapshot("thread", None).await;
+        assert_eq!(
+            snapshot.pending[0].workflow_id.as_deref(),
+            Some("quality-assurance")
+        );
     }
 
     #[tokio::test]

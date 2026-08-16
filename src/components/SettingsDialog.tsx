@@ -1,9 +1,7 @@
 import { FormEvent, useEffect, useState } from "react";
 import {
-  deleteMcpSecret,
   getExtensionOverview,
   getUsageSummary,
-  saveMcpSecret,
   setExtensionEnabled,
   testProviderConnection,
   deleteMemory,
@@ -69,7 +67,11 @@ import type {
   MetricsSnapshot,
   GoalState,
   GoalView,
+  WorkflowDefinitionView,
+  WorkflowRunView,
 } from "../types/runtime";
+import { McpSettingsPage } from "./McpSettingsPage";
+import { PluginSettingsPage } from "./PluginSettingsPage";
 
 const DEFAULT_BASE_URL = "https://api.openai.com/v1";
 
@@ -133,6 +135,7 @@ export type SettingsSection =
   | "usage"
   | "mcp"
   | "plugins"
+  | "miniapps"
   | "skills"
   | "robots"
   | "workflows"
@@ -159,6 +162,8 @@ interface SettingsDialogProps {
   activeProviderId: string | null;
   activeThreadId: string | null;
   goal: GoalView | null;
+  workflows: WorkflowDefinitionView[];
+  workflowRun: WorkflowRunView | null;
   error: string;
   themeMode: ThemeMode;
   onClose: () => void;
@@ -173,10 +178,11 @@ interface SettingsDialogProps {
 const settingsDefinitions: SettingsDefinition[] = [
   { id: "providers", label: "模型供应商", group: "模型与用量", icon: ServerCog, available: true },
   { id: "usage", label: "用量追踪", group: "模型与用量", icon: BarChart3, available: true },
-  { id: "mcp", label: "MCP 与 Hooks", group: "扩展", icon: Network, available: true },
-  { id: "plugins", label: "插件管理", group: "扩展", icon: Puzzle, available: false },
+  { id: "mcp", label: "MCP", group: "扩展", icon: Network, available: true },
+  { id: "plugins", label: "插件管理", group: "扩展", icon: Puzzle, available: true },
+  { id: "miniapps", label: "小程序", group: "扩展", icon: Boxes, available: false },
   { id: "skills", label: "Skills", group: "扩展", icon: Sparkles, available: true },
-  { id: "robots", label: "机器人", group: "智能体", icon: Bot, available: false },
+  { id: "robots", label: "机器人", group: "智能体", icon: Bot, available: true },
   { id: "workflows", label: "Workflows", group: "智能体", icon: Workflow, available: false },
   { id: "knowledge", label: "记忆", group: "知识与规则", icon: Library, available: true },
   { id: "browser", label: "浏览器自动化", group: "智能体", icon: Globe2, available: true },
@@ -193,6 +199,8 @@ export function SettingsDialog({
   activeProviderId,
   activeThreadId,
   goal,
+  workflows,
+  workflowRun,
   error,
   themeMode,
   onClose,
@@ -297,7 +305,13 @@ export function SettingsDialog({
                 onCreate={onCreateGoal}
                 onTransition={onTransitionGoal}
               />
-            ) : section === "mcp" || section === "skills" || section === "rules" ? (
+            ) : section === "robots" ? (
+              <RobotsPage workflows={workflows} workflowRun={workflowRun} />
+            ) : section === "mcp" ? (
+              <McpSettingsPage />
+            ) : section === "plugins" ? (
+              <PluginSettingsPage />
+            ) : section === "skills" || section === "rules" ? (
               <ExtensionsPage mode={section} />
             ) : (
               <PendingSection definition={activeDefinition} />
@@ -1135,6 +1149,55 @@ function UsagePage() {
   </section>;
 }
 
+function RobotsPage({
+  workflows,
+  workflowRun,
+}: {
+  workflows: WorkflowDefinitionView[];
+  workflowRun: WorkflowRunView | null;
+}) {
+  return (
+    <section className="settings-page" aria-labelledby="robots-page-title">
+      <div className="settings-page-header">
+        <div>
+          <p className="settings-eyebrow">智能体</p>
+          <h3 id="robots-page-title">内置机器人</h3>
+        </div>
+        <span className="settings-count">{workflows.length}</span>
+      </div>
+      <div className="robot-list">
+        {workflows.map((workflow) => {
+          const active = workflowRun?.state === "active" && workflowRun.workflowId === workflow.id;
+          return (
+            <article className={`robot-row ${active ? "robot-row--active" : ""}`} key={workflow.id}>
+              <div className="robot-row-header">
+                <Bot size={17} />
+                <div>
+                  <strong>{workflow.name}</strong>
+                  <span>{workflow.description}</span>
+                </div>
+                {active && <span className="robot-active-state">运行中</span>}
+              </div>
+              <ol className="robot-node-list">
+                {workflow.nodes.map((node, index) => {
+                  const completed = active && index < workflowRun.currentNodeIndex;
+                  const current = active && index === workflowRun.currentNodeIndex;
+                  return (
+                    <li className={completed ? "robot-node--completed" : current ? "robot-node--current" : ""} key={node.id}>
+                      <span>{completed ? <Check size={12} /> : index + 1}</span>
+                      <div><strong>{node.title}</strong><small>{node.description}</small></div>
+                    </li>
+                  );
+                })}
+              </ol>
+            </article>
+          );
+        })}
+      </div>
+    </section>
+  );
+}
+
 function MemoryPage() {
   const [settings, setSettings] = useState<MemorySettings>({ enabled: false });
   const [memories, setMemories] = useState<MemoryView[]>([]);
@@ -1178,7 +1241,7 @@ function BrowserPage() {
   </section>;
 }
 
-function ExtensionsPage({ mode }: { mode: "mcp" | "skills" | "rules" }) {
+function ExtensionsPage({ mode }: { mode: "skills" | "rules" }) {
   const [overview, setOverview] = useState<ExtensionOverview | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
@@ -1197,7 +1260,7 @@ function ExtensionsPage({ mode }: { mode: "mcp" | "skills" | "rules" }) {
 
   useEffect(() => { void load(); }, [mode]);
 
-  async function toggle(kind: "skill" | "mcp" | "hook", id: string, enabled: boolean) {
+  async function toggle(kind: "skill" | "hook", id: string, enabled: boolean) {
     setLoading(true);
     try {
       setOverview(await setExtensionEnabled(kind, id, enabled));
@@ -1209,21 +1272,10 @@ function ExtensionsPage({ mode }: { mode: "mcp" | "skills" | "rules" }) {
     }
   }
 
-  const title = mode === "mcp" ? "MCP 与 Hooks" : mode === "skills" ? "Skills" : "规则与审计";
+  const title = mode === "skills" ? "Skills" : "规则与审计";
   return <section className="settings-page extensions-page" aria-labelledby={`${mode}-page-title`}>
     <div className="settings-page-header"><div><p className="settings-eyebrow">可控扩展</p><h3 id={`${mode}-page-title`}>{title}</h3></div><button className="icon-button" type="button" aria-label="刷新扩展" title="刷新扩展" disabled={loading} onClick={() => void load(true)}><RefreshCw className={loading ? "spin" : ""} size={16} /></button></div>
     {(error || overview?.error) && <div className="settings-error" role="alert">{error || overview?.error}</div>}
-    {mode === "mcp" && <>
-      <div className="extension-section-label">服务器</div>
-      <div className="extension-list">{overview?.mcpServers.length ? overview.mcpServers.map((server) => <div className="extension-row" key={server.id}>
-        <div className={`extension-state extension-state--${server.state}`} aria-hidden="true" />
-        <div className="extension-row-main"><strong>{server.id}</strong><span>{server.transport} · {server.toolCount} 个工具 · {server.state}</span>{server.error && <small>{server.error}</small>}</div>
-        <label className="extension-toggle"><input type="checkbox" checked={server.enabled} disabled={loading} onChange={(event) => void toggle("mcp", server.id, event.target.checked)} /><span>启用</span></label>
-        {server.credentials.length > 0 && <div className="extension-credentials">{server.credentials.map((credential) => <McpCredential key={credential.name} server={server.id} name={credential.name} configured={credential.configured} onUpdated={setOverview} />)}</div>}
-      </div>) : <ExtensionEmpty text="尚未配置 MCP 服务器" />}</div>
-      <div className="extension-section-label">Hooks</div>
-      <div className="extension-list">{overview?.hooks.length ? overview.hooks.map((hook) => <div className="extension-row extension-row--compact" key={hook.id}><div className="extension-row-main"><strong>{hook.id}</strong><span>{hook.phase} · {hook.tool}</span></div><label className="extension-toggle"><input type="checkbox" checked={hook.enabled} disabled={loading} onChange={(event) => void toggle("hook", hook.id, event.target.checked)} /><span>启用</span></label></div>) : <ExtensionEmpty text="尚未配置工具 Hook" />}</div>
-    </>}
     {mode === "skills" && <div className="extension-list">{overview?.skills.length ? overview.skills.map((skill) => <div className="extension-row" key={skill.name}><div className={`skill-risk skill-risk--${skill.risk}`}>{riskText(skill.risk)}</div><div className="extension-row-main"><strong>{skill.name}</strong><span>{skill.description}</span><small>{skillScopeText(skill.scope)} · {skill.triggers.join("、")}</small></div><label className="extension-toggle"><input type="checkbox" checked={skill.enabled} disabled={loading} onChange={(event) => void toggle("skill", skill.name, event.target.checked)} /><span>启用</span></label></div>) : <ExtensionEmpty text="未发现有效的 SKILL.md" />}</div>}
     {mode === "rules" && <>
       <div className="extension-section-label">指令优先级</div>
@@ -1234,22 +1286,6 @@ function ExtensionsPage({ mode }: { mode: "mcp" | "skills" | "rules" }) {
       <div className="audit-list">{overview?.audit.length ? overview.audit.slice().reverse().slice(0, 40).map((record, index) => <div key={`${record.timestampMs}-${index}`}><span className={record.success ? "audit-ok" : "audit-failed"}>{record.success ? "成功" : "失败"}</span><div><strong>{record.event}</strong><small>{record.kind}/{record.id} · {record.detail}</small></div><time>{new Date(record.timestampMs).toLocaleString()}</time></div>) : <ExtensionEmpty text="暂无扩展审计记录" />}</div>
     </>}
   </section>;
-}
-
-function McpCredential({ server, name, configured, onUpdated }: { server: string; name: string; configured: boolean; onUpdated: (overview: ExtensionOverview) => void }) {
-  const [value, setValue] = useState("");
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState("");
-  async function save() {
-    if (!value.trim()) return;
-    setBusy(true);
-    try { onUpdated(await saveMcpSecret(server, name, value)); setValue(""); setError(""); } catch (reason) { setError(String(reason)); } finally { setBusy(false); }
-  }
-  async function remove() {
-    setBusy(true);
-    try { onUpdated(await deleteMcpSecret(server, name)); setError(""); } catch (reason) { setError(String(reason)); } finally { setBusy(false); }
-  }
-  return <div className="credential-row"><div><KeyRound size={13} /><span>{name}</span><small>{configured ? "已配置" : "缺失"}</small></div><input type="password" value={value} onChange={(event) => setValue(event.target.value)} placeholder={configured ? "替换凭据" : "输入凭据"} autoComplete="off" aria-label={`${server} ${name} 凭据`} /><button type="button" disabled={busy || !value.trim()} onClick={() => void save()}>保存</button>{configured && <button type="button" disabled={busy} onClick={() => void remove()}>删除</button>}{error && <small className="credential-error" role="alert">{error}</small>}</div>;
 }
 
 function ExtensionEmpty({ text }: { text: string }) {

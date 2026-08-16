@@ -1,5 +1,6 @@
 pub mod hooks;
 pub mod mcp;
+pub mod plugins;
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
@@ -13,11 +14,12 @@ use tokio_util::sync::CancellationToken;
 
 use crate::logging::StructuredLogger;
 use crate::persistence::ProjectionDb;
-use crate::protocol::ToolRisk;
+use crate::protocol::{PluginOverview, PluginState, ToolRisk};
 use crate::tools::{ToolError, ToolHandler, ToolHookRunner};
 
 use self::hooks::{HookConfig, HookPipeline};
 use self::mcp::{McpSecretStore, McpServerConfig};
+use self::plugins::PluginHost;
 
 const MAX_INSTRUCTION_FILE_BYTES: usize = 256 * 1024;
 const MAX_RUNTIME_INSTRUCTION_BYTES: usize = 48 * 1024;
@@ -26,6 +28,7 @@ const MAX_CONFIG_BYTES: usize = 1024 * 1024;
 const MAX_SELECTED_SKILLS: usize = 4;
 const MAX_AUDIT_RECORDS: usize = 200;
 const MAX_AUDIT_BYTES: u64 = 2 * 1024 * 1024;
+const MCP_CONFIG_FILE_NAME: &str = "mcp.json";
 
 #[derive(Debug, thiserror::Error)]
 pub enum ExtensionError {
@@ -37,6 +40,8 @@ pub enum ExtensionError {
     Skill(String),
     #[error(transparent)]
     Mcp(#[from] mcp::McpError),
+    #[error(transparent)]
+    Plugin(#[from] plugins::PluginError),
     #[error("extension tool registration failed: {0}")]
     Tool(String),
 }
@@ -63,6 +68,32 @@ impl Default for ExtensionConfig {
             hooks: Vec::new(),
         }
     }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct McpConfigFile {
+    #[serde(default)]
+    pub mcp_servers: Vec<McpServerConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpConfigDocumentView {
+    pub scope: String,
+    pub path: String,
+    pub exists: bool,
+    pub content: String,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpConfigView {
+    pub schema_version: u32,
+    pub global: McpConfigDocumentView,
+    pub project: McpConfigDocumentView,
+    pub overview: ExtensionOverview,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -186,6 +217,7 @@ pub struct ExtensionService {
     skills: Arc<RwLock<Vec<LoadedSkill>>>,
     audit: Arc<Mutex<Vec<ExtensionAudit>>>,
     audit_path: PathBuf,
+    plugins: PluginHost,
 }
 
 fn skill_is_selected(lower_input: &str, skill: &LoadedSkill) -> bool {
@@ -218,6 +250,7 @@ impl ExtensionService {
     ) -> Self {
         let audit_path = data_root.join("extension-audit.jsonl");
         let audit = load_audit(&audit_path);
+        let plugins = PluginHost::new(data_root.clone(), projection.clone());
         Self {
             data_root,
             builtin_skills_root,
@@ -233,7 +266,32 @@ impl ExtensionService {
             skills: Arc::new(RwLock::new(Vec::new())),
             audit: Arc::new(Mutex::new(audit)),
             audit_path,
+            plugins,
         }
+    }
+
+    fn config_paths(
+        &self,
+        workspace: &Path,
+    ) -> Result<(Vec<PathBuf>, Vec<PathBuf>, Vec<PathBuf>), ExtensionError> {
+        let global_extensions =
+            resolve_scoped_config_path(&self.data_root, Path::new("extensions.json"), false)?;
+        let global_mcp =
+            resolve_scoped_config_path(&self.data_root, Path::new(MCP_CONFIG_FILE_NAME), false)?;
+        let project_extensions_relative = Path::new(".k-coder").join("extensions.json");
+        let project_mcp_relative = Path::new(".k-coder").join(MCP_CONFIG_FILE_NAME);
+        let project_extensions =
+            resolve_scoped_config_path(workspace, &project_extensions_relative, false)?;
+        let project_mcp = resolve_scoped_config_path(workspace, &project_mcp_relative, false)?;
+        let extension_paths = vec![global_extensions.clone(), project_extensions.clone()];
+        let mcp_paths = vec![global_mcp.clone(), project_mcp.clone()];
+        let ordered_paths = vec![
+            global_extensions,
+            global_mcp,
+            project_extensions,
+            project_mcp,
+        ];
+        Ok((extension_paths, mcp_paths, ordered_paths))
     }
 
     pub async fn prepare(
@@ -244,11 +302,9 @@ impl ExtensionService {
         let workspace = workspace
             .canonicalize()
             .map_err(|error| ExtensionError::Io(error.to_string()))?;
-        let config_paths = vec![
-            self.data_root.join("extensions.json"),
-            workspace.join(".k-coder").join("extensions.json"),
-        ];
-        let config = merge_configs(&config_paths)?;
+        let (extension_config_paths, mcp_config_paths, config_paths) =
+            self.config_paths(&workspace)?;
+        let config = merge_configs(&extension_config_paths, &mcp_config_paths)?;
         let instructions = discover_instructions(&self.data_root, &workspace)?;
         let skills = discover_skills(
             self.builtin_skills_root.as_deref(),
@@ -337,6 +393,46 @@ impl ExtensionService {
             });
         }
 
+        let plugin_prepared = self
+            .plugins
+            .prepare(self.secrets.clone(), cancellation.clone())
+            .await?;
+        self.record_auto_disabled_plugins();
+        for handler in plugin_prepared.handlers {
+            let name = handler.definition().name;
+            if !tool_names.insert(name.clone()) {
+                return Err(ExtensionError::Tool(format!(
+                    "plugin tool conflicts with an existing extension tool: {name}"
+                )));
+            }
+            let risk = plugin_prepared.risks.get(&name).copied().ok_or_else(|| {
+                ExtensionError::Tool(format!("plugin tool is missing risk metadata: {name}"))
+            })?;
+            risks.insert(name, risk);
+            handlers.push(handler);
+        }
+        for plugin in plugin_prepared
+            .overview
+            .plugins
+            .iter()
+            .filter(|plugin| plugin.enabled)
+        {
+            let success = matches!(plugin.state, PluginState::Loaded | PluginState::Degraded);
+            self.record(
+                "plugin_prepared",
+                "plugin",
+                &plugin.id,
+                success,
+                &format!(
+                    "state={:?}, skills={}, mcp_servers={}, mcp_tools={}",
+                    plugin.state,
+                    plugin.components.skill_count,
+                    plugin.components.mcp_server_count,
+                    plugin.components.mcp_tool_count
+                ),
+            );
+        }
+
         let mut enabled_hooks = Vec::new();
         for hook in &config.hooks {
             hook.validate().map_err(ExtensionError::Config)?;
@@ -378,12 +474,11 @@ impl ExtensionService {
     }
 
     pub fn revision(&self, workspace: &Path) -> Result<u64, ExtensionError> {
-        let mut paths = vec![
-            self.data_root.join("extensions.json"),
+        let (_, _, mut paths) = self.config_paths(workspace)?;
+        paths.extend([
             self.data_root.join("AGENTS.md"),
             workspace.join("AGENTS.md"),
-            workspace.join(".k-coder").join("extensions.json"),
-        ];
+        ]);
         if let Some(root) = &self.builtin_skills_root {
             collect_extension_files(root, &mut paths)?;
         }
@@ -409,6 +504,9 @@ impl ExtensionService {
                 Err(error) => return Err(ExtensionError::Io(error.to_string())),
             }
         }
+        let plugin_revision = self.plugins.revision()?;
+        self.record_auto_disabled_plugins();
+        plugin_revision.hash(&mut hasher);
         Ok(hasher.finish())
     }
 
@@ -449,6 +547,11 @@ impl ExtensionService {
                 );
             }
         }
+        let plugin_catalog = self.plugins.runtime_catalog(input);
+        if !plugin_catalog.is_empty() {
+            output.push_str("\n");
+            output.push_str(&plugin_catalog);
+        }
         if output.len() > MAX_RUNTIME_INSTRUCTION_BYTES {
             return Err(ExtensionError::Config(format!(
                 "combined runtime instructions exceed {MAX_RUNTIME_INSTRUCTION_BYTES} bytes"
@@ -465,6 +568,112 @@ impl ExtensionService {
             .clone();
         overview.audit = self.audit.lock().expect("audit lock poisoned").clone();
         overview
+    }
+
+    pub fn plugin_overview(&self, refresh: bool) -> Result<PluginOverview, ExtensionError> {
+        let result = if refresh {
+            self.plugins.scan()
+        } else {
+            Ok(self.plugins.overview())
+        };
+        self.record_auto_disabled_plugins();
+        Ok(result?)
+    }
+
+    pub fn set_plugin_enabled(
+        &self,
+        plugin_id: &str,
+        enabled: bool,
+    ) -> Result<PluginOverview, ExtensionError> {
+        let result = self.plugins.set_enabled(plugin_id, enabled);
+        self.record_auto_disabled_plugins();
+        self.record(
+            "plugin_toggled",
+            "plugin",
+            plugin_id,
+            result.is_ok(),
+            if enabled { "enabled" } else { "disabled" },
+        );
+        Ok(result?)
+    }
+
+    pub fn delete_plugin(&self, plugin_id: &str) -> Result<PluginOverview, ExtensionError> {
+        let result = self.plugins.delete(plugin_id);
+        self.record_auto_disabled_plugins();
+        self.record(
+            "plugin_deleted",
+            "plugin",
+            plugin_id,
+            result.is_ok(),
+            result
+                .as_ref()
+                .map(|_| "deleted")
+                .unwrap_or("filesystem deletion failed"),
+        );
+        Ok(result?)
+    }
+
+    fn record_auto_disabled_plugins(&self) {
+        for plugin_id in self.plugins.take_auto_disabled_ids() {
+            self.record(
+                "plugin_auto_disabled",
+                "plugin",
+                &plugin_id,
+                true,
+                "enabled plugin disappeared or became invalid; persisted state reset",
+            );
+        }
+    }
+
+    pub fn mcp_config_view(&self, workspace: &Path) -> Result<McpConfigView, ExtensionError> {
+        let (_, mcp_paths, _) = self.config_paths(workspace)?;
+        let global = read_mcp_config_document("global", &mcp_paths[0])?;
+        let project = read_mcp_config_document("project", &mcp_paths[1])?;
+        Ok(McpConfigView {
+            schema_version: 1,
+            global,
+            project,
+            overview: self.overview(),
+        })
+    }
+
+    pub fn save_mcp_config(
+        &self,
+        workspace: &Path,
+        scope: &str,
+        content: &str,
+    ) -> Result<(), ExtensionError> {
+        let relative = match scope {
+            "global" => PathBuf::from(MCP_CONFIG_FILE_NAME),
+            "project" => Path::new(".k-coder").join(MCP_CONFIG_FILE_NAME),
+            _ => {
+                return Err(ExtensionError::Config(
+                    "MCP configuration scope must be global or project".into(),
+                ));
+            }
+        };
+        let root = if scope == "global" {
+            self.data_root.as_path()
+        } else {
+            workspace
+        };
+        let display_path = resolve_scoped_config_path(root, &relative, false)?;
+        let config = parse_mcp_config(content.as_bytes(), &display_path)?;
+        let path = resolve_scoped_config_path(root, &relative, true)?;
+        write_mcp_config(&path, &config)?;
+        for server in &config.mcp_servers {
+            self.projection
+                .set_setting(&format!("extension/mcp/{}", server.id), "true")
+                .map_err(|error| ExtensionError::Config(error.to_string()))?;
+        }
+        self.record(
+            "mcp_config_saved",
+            "mcp_config",
+            scope,
+            true,
+            &format!("{} servers", config.mcp_servers.len()),
+        );
+        Ok(())
     }
 
     pub fn set_enabled(&self, kind: &str, id: &str, enabled: bool) -> Result<(), ExtensionError> {
@@ -598,36 +807,35 @@ impl ExtensionService {
     }
 }
 
-fn merge_configs(paths: &[PathBuf]) -> Result<ExtensionConfig, ExtensionError> {
+fn merge_configs(
+    extension_paths: &[PathBuf],
+    mcp_paths: &[PathBuf],
+) -> Result<ExtensionConfig, ExtensionError> {
     let mut servers = HashMap::<String, McpServerConfig>::new();
     let mut hooks = HashMap::<String, HookConfig>::new();
-    for path in paths {
-        let Some(config) = read_config(path)? else {
-            continue;
-        };
-        let mut local_servers = HashSet::new();
-        for server in config.mcp_servers {
-            server.validate()?;
-            if !local_servers.insert(server.id.clone()) {
-                return Err(ExtensionError::Config(format!(
-                    "{} contains duplicate MCP server {}",
-                    user_facing_path(path),
-                    server.id
-                )));
+    let source_count = extension_paths.len().max(mcp_paths.len());
+    for index in 0..source_count {
+        if let Some(path) = extension_paths.get(index) {
+            if let Some(config) = read_config(path)? {
+                merge_mcp_servers(&mut servers, path, config.mcp_servers)?;
+                let mut local_hooks = HashSet::new();
+                for hook in config.hooks {
+                    hook.validate().map_err(ExtensionError::Config)?;
+                    if !local_hooks.insert(hook.id.clone()) {
+                        return Err(ExtensionError::Config(format!(
+                            "{} contains duplicate hook {}",
+                            user_facing_path(path),
+                            hook.id
+                        )));
+                    }
+                    hooks.insert(hook.id.clone(), hook);
+                }
             }
-            servers.insert(server.id.clone(), server);
         }
-        let mut local_hooks = HashSet::new();
-        for hook in config.hooks {
-            hook.validate().map_err(ExtensionError::Config)?;
-            if !local_hooks.insert(hook.id.clone()) {
-                return Err(ExtensionError::Config(format!(
-                    "{} contains duplicate hook {}",
-                    user_facing_path(path),
-                    hook.id
-                )));
+        if let Some(path) = mcp_paths.get(index) {
+            if let Some(config) = read_mcp_config(path)? {
+                merge_mcp_servers(&mut servers, path, config.mcp_servers)?;
             }
-            hooks.insert(hook.id.clone(), hook);
         }
     }
     let mut mcp_servers = servers.into_values().collect::<Vec<_>>();
@@ -637,7 +845,66 @@ fn merge_configs(paths: &[PathBuf]) -> Result<ExtensionConfig, ExtensionError> {
     Ok(ExtensionConfig { mcp_servers, hooks })
 }
 
+fn merge_mcp_servers(
+    servers: &mut HashMap<String, McpServerConfig>,
+    path: &Path,
+    values: Vec<McpServerConfig>,
+) -> Result<(), ExtensionError> {
+    let mut local_servers = HashSet::new();
+    for server in values {
+        server.validate()?;
+        if !local_servers.insert(server.id.clone()) {
+            return Err(ExtensionError::Config(format!(
+                "{} contains duplicate MCP server {}",
+                user_facing_path(path),
+                server.id
+            )));
+        }
+        servers.insert(server.id.clone(), server);
+    }
+    Ok(())
+}
+
 fn read_config(path: &Path) -> Result<Option<ExtensionConfig>, ExtensionError> {
+    let Some(bytes) = read_config_bytes(path)? else {
+        return Ok(None);
+    };
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|error| ExtensionError::Config(format!("{}: {error}", user_facing_path(path))))
+}
+
+fn read_mcp_config(path: &Path) -> Result<Option<McpConfigFile>, ExtensionError> {
+    let Some(bytes) = read_config_bytes(path)? else {
+        return Ok(None);
+    };
+    parse_mcp_config(&bytes, path).map(Some)
+}
+
+fn parse_mcp_config(bytes: &[u8], path: &Path) -> Result<McpConfigFile, ExtensionError> {
+    if bytes.len() > MAX_CONFIG_BYTES {
+        return Err(ExtensionError::Config(format!(
+            "{} must be no larger than {MAX_CONFIG_BYTES} bytes",
+            user_facing_path(path)
+        )));
+    }
+    let config: McpConfigFile = serde_json::from_slice(bytes)
+        .map_err(|error| ExtensionError::Config(format!("{}: {error}", user_facing_path(path))))?;
+    let mut ids = HashSet::new();
+    for server in &config.mcp_servers {
+        server.validate()?;
+        if !ids.insert(server.id.as_str()) {
+            return Err(ExtensionError::Config(format!(
+                "{} contains duplicate MCP server {}",
+                user_facing_path(path),
+                server.id
+            )));
+        }
+    }
+    Ok(config)
+}
+
+fn read_config_bytes(path: &Path) -> Result<Option<Vec<u8>>, ExtensionError> {
     if !path.exists() {
         return Ok(None);
     }
@@ -650,10 +917,136 @@ fn read_config(path: &Path) -> Result<Option<ExtensionConfig>, ExtensionError> {
             user_facing_path(path)
         )));
     }
-    let bytes = fs::read(path).map_err(|error| ExtensionError::Io(error.to_string()))?;
-    serde_json::from_slice(&bytes)
+    fs::read(path)
         .map(Some)
-        .map_err(|error| ExtensionError::Config(format!("{}: {error}", user_facing_path(path))))
+        .map_err(|error| ExtensionError::Io(error.to_string()))
+}
+
+fn read_mcp_config_document(
+    scope: &str,
+    path: &Path,
+) -> Result<McpConfigDocumentView, ExtensionError> {
+    let Some(bytes) = read_config_bytes(path)? else {
+        return Ok(McpConfigDocumentView {
+            scope: scope.into(),
+            path: user_facing_path(path),
+            exists: false,
+            content: default_mcp_config_content(),
+            error: None,
+        });
+    };
+    let content = String::from_utf8_lossy(&bytes).into_owned();
+    let error = String::from_utf8(bytes.clone())
+        .map_err(|_| {
+            ExtensionError::Config(format!(
+                "{} must contain UTF-8 JSON",
+                user_facing_path(path)
+            ))
+        })
+        .and_then(|_| parse_mcp_config(&bytes, path).map(|_| ()))
+        .err()
+        .map(|error| error.to_string());
+    Ok(McpConfigDocumentView {
+        scope: scope.into(),
+        path: user_facing_path(path),
+        exists: true,
+        content,
+        error,
+    })
+}
+
+fn default_mcp_config_content() -> String {
+    "{\n  \"mcpServers\": []\n}\n".into()
+}
+
+fn resolve_scoped_config_path(
+    root: &Path,
+    relative: &Path,
+    create_parent: bool,
+) -> Result<PathBuf, ExtensionError> {
+    if relative.is_absolute()
+        || relative.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        return Err(ExtensionError::Config(
+            "MCP configuration path must remain inside its scope".into(),
+        ));
+    }
+    let root = root
+        .canonicalize()
+        .map_err(|error| ExtensionError::Io(error.to_string()))?;
+    let candidate = root.join(relative);
+    if candidate.exists() {
+        let canonical = candidate
+            .canonicalize()
+            .map_err(|error| ExtensionError::Io(error.to_string()))?;
+        if !canonical.starts_with(&root) {
+            return Err(ExtensionError::Config(format!(
+                "{} escapes its configuration scope",
+                user_facing_path(&candidate)
+            )));
+        }
+        return Ok(candidate);
+    }
+
+    let parent = candidate
+        .parent()
+        .ok_or_else(|| ExtensionError::Config("configuration path has no parent".into()))?;
+    let mut existing = parent;
+    while !existing.exists() {
+        existing = existing.parent().ok_or_else(|| {
+            ExtensionError::Config("configuration parent cannot be resolved".into())
+        })?;
+    }
+    let canonical_existing = existing
+        .canonicalize()
+        .map_err(|error| ExtensionError::Io(error.to_string()))?;
+    if !canonical_existing.starts_with(&root) {
+        return Err(ExtensionError::Config(format!(
+            "{} escapes its configuration scope",
+            user_facing_path(&candidate)
+        )));
+    }
+    if create_parent {
+        fs::create_dir_all(parent).map_err(|error| ExtensionError::Io(error.to_string()))?;
+        let canonical_parent = parent
+            .canonicalize()
+            .map_err(|error| ExtensionError::Io(error.to_string()))?;
+        if !canonical_parent.starts_with(&root) {
+            return Err(ExtensionError::Config(format!(
+                "{} escapes its configuration scope",
+                user_facing_path(&candidate)
+            )));
+        }
+    }
+    Ok(candidate)
+}
+
+fn write_mcp_config(path: &Path, config: &McpConfigFile) -> Result<(), ExtensionError> {
+    let mut serialized = serde_json::to_vec_pretty(config)
+        .map_err(|error| ExtensionError::Config(error.to_string()))?;
+    serialized.push(b'\n');
+    let temporary = path.with_extension("json.tmp");
+    let mut file =
+        fs::File::create(&temporary).map_err(|error| ExtensionError::Io(error.to_string()))?;
+    if let Err(error) = file.write_all(&serialized).and_then(|_| file.sync_all()) {
+        let _ = fs::remove_file(&temporary);
+        return Err(ExtensionError::Io(error.to_string()));
+    }
+    #[cfg(target_os = "windows")]
+    if path.exists() {
+        fs::remove_file(path).map_err(|error| ExtensionError::Io(error.to_string()))?;
+    }
+    fs::rename(&temporary, path).map_err(|error| {
+        let _ = fs::remove_file(&temporary);
+        ExtensionError::Io(error.to_string())
+    })
 }
 
 fn discover_instructions(
@@ -969,6 +1362,29 @@ mod tests {
         .unwrap();
     }
 
+    fn write_test_plugin(data_root: &Path, folder: &str, name: &str) -> PathBuf {
+        let plugin_root = data_root.join("plugins").join(folder);
+        fs::create_dir_all(plugin_root.join(".codex-plugin")).unwrap();
+        fs::write(
+            plugin_root.join(".codex-plugin/plugin.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "name": name,
+                "version": "1.0.0",
+                "description": "Test plugin"
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let skill_root = plugin_root.join("skills/review");
+        fs::create_dir_all(&skill_root).unwrap();
+        fs::write(
+            skill_root.join("SKILL.md"),
+            "---\nname: review\ndescription: Review from a local plugin\n---\nPLUGIN-REVIEW-BODY",
+        )
+        .unwrap();
+        plugin_root
+    }
+
     #[test]
     fn project_instructions_override_global_and_rules_are_last() {
         let data = tempfile::tempdir().unwrap();
@@ -1197,7 +1613,194 @@ mod tests {
         let data = tempfile::tempdir().unwrap();
         let path = data.path().join("extensions.json");
         fs::write(&path, "{broken").unwrap();
-        assert!(merge_configs(&[path]).is_err());
+        assert!(merge_configs(&[path], &[]).is_err());
+    }
+
+    #[test]
+    fn dedicated_mcp_configuration_uses_global_then_project_scope_priority() {
+        let data = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let global_extensions = data.path().join("extensions.json");
+        let global_mcp = data.path().join("mcp.json");
+        let project_extensions = workspace.path().join("extensions.json");
+        let project_mcp = workspace.path().join("mcp.json");
+        fs::write(
+            &global_extensions,
+            r#"{"mcpServers":[{"id":"shared","transport":"stdio","command":["global-legacy"]}],"hooks":[]}"#,
+        )
+        .unwrap();
+        fs::write(
+            &global_mcp,
+            r#"{"mcpServers":[{"id":"shared","transport":"stdio","command":["global-mcp"]}]}"#,
+        )
+        .unwrap();
+        fs::write(
+            &project_extensions,
+            r#"{"mcpServers":[{"id":"shared","transport":"stdio","command":["project-legacy"]}],"hooks":[]}"#,
+        )
+        .unwrap();
+        fs::write(
+            &project_mcp,
+            r#"{"mcpServers":[{"id":"shared","transport":"stdio","command":["project-mcp"]}]}"#,
+        )
+        .unwrap();
+
+        let config = merge_configs(
+            &[global_extensions, project_extensions],
+            &[global_mcp, project_mcp],
+        )
+        .unwrap();
+        assert_eq!(config.mcp_servers.len(), 1);
+        match &config.mcp_servers[0].transport {
+            mcp::McpTransportConfig::Stdio { command, .. } => {
+                assert_eq!(command, &["project-mcp"])
+            }
+            _ => panic!("expected stdio MCP configuration"),
+        }
+    }
+
+    #[test]
+    fn dedicated_mcp_configuration_rejects_duplicates_before_writing() {
+        let data = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let projection = ProjectionDb::memory().unwrap();
+        let logger = StructuredLogger::new(data.path()).unwrap();
+        let service = ExtensionService::new(
+            data.path().into(),
+            projection,
+            Arc::new(mcp::OsMcpSecretStore::new()),
+            logger,
+        );
+        let content = r#"{"mcpServers":[{"id":"local","transport":"stdio","command":["node"]},{"id":"local","transport":"stdio","command":["node"]}]}"#;
+
+        let error = service
+            .save_mcp_config(workspace.path(), "project", content)
+            .unwrap_err();
+
+        assert!(error.to_string().contains("duplicate MCP server local"));
+        assert!(!workspace.path().join(".k-coder/mcp.json").exists());
+    }
+
+    #[test]
+    fn malformed_dedicated_mcp_configuration_is_returned_for_json_repair() {
+        let data = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        fs::write(data.path().join("mcp.json"), "{broken").unwrap();
+        let projection = ProjectionDb::memory().unwrap();
+        let logger = StructuredLogger::new(data.path()).unwrap();
+        let service = ExtensionService::new(
+            data.path().into(),
+            projection,
+            Arc::new(mcp::OsMcpSecretStore::new()),
+            logger,
+        );
+
+        let view = service.mcp_config_view(workspace.path()).unwrap();
+
+        assert!(view.global.exists);
+        assert_eq!(view.global.content, "{broken");
+        assert!(view.global.error.is_some());
+        assert!(merge_configs(&[], &[data.path().join("mcp.json")]).is_err());
+    }
+
+    #[test]
+    fn dedicated_mcp_configuration_rejects_invalid_scope_and_oversized_content() {
+        let data = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let projection = ProjectionDb::memory().unwrap();
+        let logger = StructuredLogger::new(data.path()).unwrap();
+        let service = ExtensionService::new(
+            data.path().into(),
+            projection,
+            Arc::new(mcp::OsMcpSecretStore::new()),
+            logger,
+        );
+
+        assert!(
+            service
+                .save_mcp_config(workspace.path(), "workspace", r#"{"mcpServers":[]}"#)
+                .is_err()
+        );
+        assert!(
+            service
+                .save_mcp_config(
+                    workspace.path(),
+                    "project",
+                    &" ".repeat(MAX_CONFIG_BYTES + 1),
+                )
+                .is_err()
+        );
+        assert!(!workspace.path().join(".k-coder/mcp.json").exists());
+    }
+
+    #[test]
+    fn dedicated_mcp_configuration_is_saved_and_returned_as_utf8_json() {
+        let data = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let projection = ProjectionDb::memory().unwrap();
+        let logger = StructuredLogger::new(data.path()).unwrap();
+        projection
+            .set_setting("extension/mcp/local", "false")
+            .unwrap();
+        let service = ExtensionService::new(
+            data.path().into(),
+            projection.clone(),
+            Arc::new(mcp::OsMcpSecretStore::new()),
+            logger,
+        );
+        let content = r#"{"mcpServers":[{"id":"local","enabled":false,"timeoutMs":45000,"transport":"stdio","command":["node","server.mjs"],"secret_env":{"TOKEN":"local-token"}}]}"#;
+
+        service
+            .save_mcp_config(workspace.path(), "project", content)
+            .unwrap();
+        let view = service.mcp_config_view(workspace.path()).unwrap();
+
+        assert!(view.project.exists);
+        assert!(view.project.error.is_none());
+        assert!(view.project.content.ends_with('\n'));
+        assert!(view.project.content.contains("\"local\""));
+        assert!(workspace.path().join(".k-coder/mcp.json").is_file());
+        assert_eq!(
+            projection
+                .setting("extension/mcp/local")
+                .unwrap()
+                .as_deref(),
+            Some("true")
+        );
+        let audit = fs::read_to_string(data.path().join("extension-audit.jsonl")).unwrap();
+        assert!(audit.contains("1 servers"));
+        assert!(!audit.contains("local-token"));
+    }
+
+    #[test]
+    fn project_mcp_configuration_rejects_link_escape() {
+        let data = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(outside.path(), workspace.path().join(".k-coder")).unwrap();
+        #[cfg(windows)]
+        if std::os::windows::fs::symlink_dir(outside.path(), workspace.path().join(".k-coder"))
+            .is_err()
+        {
+            return;
+        }
+        let projection = ProjectionDb::memory().unwrap();
+        let logger = StructuredLogger::new(data.path()).unwrap();
+        let service = ExtensionService::new(
+            data.path().into(),
+            projection,
+            Arc::new(mcp::OsMcpSecretStore::new()),
+            logger,
+        );
+
+        let error = service.mcp_config_view(workspace.path()).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("escapes its configuration scope")
+        );
     }
 
     #[tokio::test]
@@ -1240,5 +1843,81 @@ mod tests {
                 .unwrap()
                 .contains("DEPLOY-INSTRUCTIONS")
         );
+    }
+
+    #[tokio::test]
+    async fn plugin_skill_handlers_and_catalog_share_the_extension_runtime() {
+        let data = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let plugin_root = write_test_plugin(data.path(), "review-package", "review-tools");
+        let projection = ProjectionDb::memory().unwrap();
+        let logger = StructuredLogger::new(data.path()).unwrap();
+        let service = ExtensionService::new(
+            data.path().into(),
+            projection.clone(),
+            Arc::new(mcp::OsMcpSecretStore::new()),
+            logger,
+        );
+
+        let discovered = service.plugin_overview(true).unwrap();
+        assert!(!discovered.plugins[0].enabled);
+        service
+            .set_plugin_enabled("review-tools@local", true)
+            .unwrap();
+        let prepared = service
+            .prepare(workspace.path(), CancellationToken::new())
+            .await
+            .unwrap();
+
+        let names = prepared
+            .handlers
+            .iter()
+            .map(|handler| handler.definition().name)
+            .collect::<HashSet<_>>();
+        assert!(names.contains("plugin_skill_read"));
+        assert!(names.contains("plugin_resource_read"));
+        let catalog = service.runtime_instructions("use @review-tools").unwrap();
+        assert!(catalog.contains("plugin://review-tools@local"));
+        assert!(catalog.contains("plugin_skill_read"));
+        assert!(!catalog.contains("PLUGIN-REVIEW-BODY"));
+
+        service
+            .set_plugin_enabled("review-tools@local", false)
+            .unwrap();
+        let prepared = service
+            .prepare(workspace.path(), CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(prepared.handlers.iter().all(|handler| {
+            !matches!(
+                handler.definition().name.as_str(),
+                "plugin_skill_read" | "plugin_resource_read"
+            )
+        }));
+        assert!(
+            !service
+                .runtime_instructions("@review-tools")
+                .unwrap()
+                .contains("plugin://review-tools@local")
+        );
+
+        service
+            .set_plugin_enabled("review-tools@local", true)
+            .unwrap();
+        fs::remove_dir_all(plugin_root).unwrap();
+        let missing = service.plugin_overview(true).unwrap();
+        assert!(missing.plugins.is_empty());
+        assert_eq!(
+            projection
+                .setting("extension/plugin/review-tools@local")
+                .unwrap()
+                .as_deref(),
+            Some("false")
+        );
+        assert!(service.overview().audit.iter().any(|entry| {
+            entry.event == "plugin_auto_disabled"
+                && entry.id == "review-tools@local"
+                && entry.success
+        }));
     }
 }

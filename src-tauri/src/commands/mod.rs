@@ -8,9 +8,10 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::advanced::{
-    BrowserArtifact, BrowserAuditEvent, BrowserSettings, CreateGoalRequest, DocumentContent,
-    EvaluationReport, GoalTransitionRequest, GoalView, MemorySettings, MemoryUpsertRequest,
-    MemoryView, MetricsSnapshot, PlanUpdateRequest, PlanView, RepositorySearchIndex, SearchResult,
+    BrowserArtifact, BrowserAuditEvent, BrowserSettings, CancelWorkflowRunRequest,
+    CreateGoalRequest, DocumentContent, EvaluationReport, GoalTransitionRequest, GoalView,
+    MemorySettings, MemoryUpsertRequest, MemoryView, MetricsSnapshot, PlanUpdateRequest, PlanView,
+    RepositorySearchIndex, SearchResult, WorkflowDefinitionView, WorkflowRunState, WorkflowRunView,
     extract_document, run_recorded_evaluation,
 };
 use crate::agent::mailbox::{MailboxTurn, MailboxTurnKind, QueuedTurnSteerError};
@@ -23,7 +24,7 @@ use crate::execution::{
     CommandSessionView, OutputPage, PtyOutputPage, PtySessionView, StartCommandRequest,
     StartPtyRequest,
 };
-use crate::extensions::ExtensionOverview;
+use crate::extensions::{ExtensionOverview, McpConfigView};
 use crate::logging::{LogQuery, LogQueryResult};
 use crate::multi_agent::{
     CreateSubagentRequest, MultiAgentError, SubagentEventPublisher, SubagentExecutionContext,
@@ -33,10 +34,10 @@ use crate::ocr::{self, OcrResult};
 use crate::persistence::ProjectRecord;
 use crate::protocol::{
     AgentEvent, AgentEventEnvelope, AgentMode, ApprovalMode, ApprovalResolution, ChangeSet,
-    ImageAttachment, MessageRole, PROTOCOL_VERSION, PatchPreview, QueuedTurnSteerRequest,
-    ReasoningEffort, RuntimeStatus, ThreadForkRequest, ThreadHistorySnapshot, ThreadMailboxChanged,
-    ThreadMailboxSnapshot, ThreadRollbackRequest, TokenUsage, TurnHandle, TurnState,
-    TurnSteerRequest, TurnSteerResponse, UserInputResolution,
+    ImageAttachment, MessageRole, PROTOCOL_VERSION, PatchPreview, PluginOverview,
+    QueuedTurnSteerRequest, ReasoningEffort, RuntimeStatus, ThreadForkRequest,
+    ThreadHistorySnapshot, ThreadMailboxChanged, ThreadMailboxSnapshot, ThreadRollbackRequest,
+    TokenUsage, TurnHandle, TurnState, TurnSteerRequest, TurnSteerResponse, UserInputResolution,
 };
 use crate::providers::{
     ProviderConfigView, ProviderEvent, ProviderMessage, ProviderRequest, SaveProviderConfigRequest,
@@ -97,9 +98,15 @@ fn tools_for_mode(
     if !mode.is_read_only() {
         return Ok(tools);
     }
+    let registered = tools.definition_names();
     let allowed = mode
         .allowed_tools()
         .iter()
+        .filter(|name| {
+            registered
+                .iter()
+                .any(|registered| registered.as_str() == **name)
+        })
         .map(|name| name.to_string())
         .collect::<Vec<_>>();
     tools
@@ -143,6 +150,52 @@ fn require_project_thread_for_subagent(summary: &ThreadSummary) -> CommandResult
             "standalone_thread",
             "subagents require a project workspace",
         ))
+    }
+}
+
+fn require_project_thread_for_workflow(summary: &ThreadSummary) -> CommandResult<()> {
+    if summary.in_project {
+        Ok(())
+    } else {
+        Err(CommandError::new(
+            "standalone_thread",
+            "built-in workflows require a project thread",
+        ))
+    }
+}
+
+fn validate_workflow_turn_context(
+    has_project: bool,
+    agent_mode: AgentMode,
+    workflow_requested: bool,
+    workflow_active: bool,
+) -> CommandResult<()> {
+    if !(workflow_requested || workflow_active) {
+        return Ok(());
+    }
+    if !has_project {
+        return Err(CommandError::new(
+            "standalone_thread",
+            "built-in workflows require a project thread",
+        ));
+    }
+    if agent_mode != AgentMode::Craft {
+        return Err(CommandError::new(
+            "workflow_mode",
+            "built-in workflows require Craft mode",
+        ));
+    }
+    Ok(())
+}
+
+fn require_queued_workflow_steerable(workflow_id: Option<&str>) -> CommandResult<()> {
+    if workflow_id.is_some() {
+        Err(CommandError::new(
+            "queued_workflow_not_steerable",
+            "a queued workflow start must begin as its own turn",
+        ))
+    } else {
+        Ok(())
     }
 }
 
@@ -202,6 +255,10 @@ impl CommandError {
 }
 
 type CommandResult<T> = Result<T, CommandError>;
+
+fn plugin_command_error(error: impl std::fmt::Display) -> CommandError {
+    CommandError::new("plugins", error)
+}
 
 struct TauriEventPublisher {
     app: AppHandle,
@@ -434,6 +491,7 @@ pub fn runtime_status(state: State<'_, AppState>) -> RuntimeStatus {
             "plan-mode".to_string(),
             "user-input-tool".to_string(),
             "budgeted-goals".to_string(),
+            "builtin-workflows".to_string(),
             "browser-automation".to_string(),
             "repository-search".to_string(),
             "opt-in-memory".to_string(),
@@ -547,6 +605,50 @@ pub fn transition_goal(
         .goals
         .transition(request)
         .map_err(|error| CommandError::new("goal", error))
+}
+
+#[tauri::command]
+pub fn list_builtin_workflows(
+    state: State<'_, AppState>,
+) -> CommandResult<Vec<WorkflowDefinitionView>> {
+    Ok(state.advanced().workflows.definitions())
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub fn get_workflow_run(
+    state: State<'_, AppState>,
+    thread_id: String,
+) -> CommandResult<Option<WorkflowRunView>> {
+    state
+        .advanced()
+        .workflows
+        .current(&thread_id)
+        .map_err(|error| CommandError::new("workflow", error))
+}
+
+#[tauri::command]
+pub async fn cancel_workflow_run(
+    state: State<'_, AppState>,
+    request: CancelWorkflowRunRequest,
+) -> CommandResult<WorkflowRunView> {
+    let detail = state
+        .repository()
+        .read_thread(&request.thread_id)
+        .await
+        .map_err(|error| CommandError::new("storage", error))?;
+    require_project_thread_for_workflow(&detail.summary)?;
+    state
+        .cancel_workflow_run(request)
+        .await
+        .map_err(|error| match error {
+            AppStateError::ThreadOperationBusy(_) | AppStateError::ThreadMailboxNotEmpty(_) => {
+                CommandError::new(
+                    "workflow_busy",
+                    "stop or finish the active and queued turns before cancelling the workflow",
+                )
+            }
+            other => CommandError::new("workflow", other),
+        })
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -803,6 +905,68 @@ pub async fn extension_overview(
     Ok(overview)
 }
 
+#[tauri::command]
+pub async fn plugin_overview(
+    state: State<'_, AppState>,
+    refresh: bool,
+) -> CommandResult<PluginOverview> {
+    Ok(state.plugin_overview(refresh).await)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn set_plugin_enabled(
+    state: State<'_, AppState>,
+    plugin_id: String,
+    enabled: bool,
+) -> CommandResult<PluginOverview> {
+    state
+        .set_plugin_enabled(&plugin_id, enabled)
+        .await
+        .map_err(plugin_command_error)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn delete_plugin(
+    state: State<'_, AppState>,
+    plugin_id: String,
+) -> CommandResult<PluginOverview> {
+    state
+        .delete_plugin(&plugin_id)
+        .await
+        .map_err(plugin_command_error)
+}
+
+#[tauri::command]
+pub async fn mcp_config(state: State<'_, AppState>, refresh: bool) -> CommandResult<McpConfigView> {
+    let prepared = state.prepare_extensions(refresh).await;
+    let mut view = state
+        .mcp_config_view()
+        .map_err(|error| CommandError::new("extensions", error))?;
+    if let Err(error) = prepared {
+        view.overview.error = Some(error.to_string());
+    }
+    Ok(view)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn save_mcp_config(
+    state: State<'_, AppState>,
+    scope: String,
+    content: String,
+) -> CommandResult<McpConfigView> {
+    state
+        .save_mcp_config(&scope, &content)
+        .map_err(|error| CommandError::new("extensions", error))?;
+    let prepared = state.prepare_extensions(true).await;
+    let mut view = state
+        .mcp_config_view()
+        .map_err(|error| CommandError::new("extensions", error))?;
+    if let Err(error) = prepared {
+        view.overview.error = Some(error.to_string());
+    }
+    Ok(view)
+}
+
 #[tauri::command(rename_all = "camelCase")]
 pub async fn set_extension_enabled(
     state: State<'_, AppState>,
@@ -1011,12 +1175,13 @@ pub fn git_action(
     .map_err(|error| CommandError::new("git", error))
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "camelCase")]
 pub async fn run_turn(
     app: AppHandle,
     state: State<'_, AppState>,
     request: RunTurnRequest,
     attachments: Vec<ImageAttachment>,
+    workflow_id: Option<String>,
 ) -> CommandResult<TurnOutcome> {
     let publisher: Arc<dyn EventPublisher> = Arc::new(TauriEventPublisher { app: app.clone() });
     execute_turn(
@@ -1024,6 +1189,7 @@ pub async fn run_turn(
         state.inner(),
         request,
         attachments,
+        workflow_id,
         None,
         None,
         publisher,
@@ -1031,12 +1197,13 @@ pub async fn run_turn(
     .await
 }
 
-#[tauri::command]
+#[tauri::command(rename_all = "camelCase")]
 pub async fn turn_start(
     app: AppHandle,
     state: State<'_, AppState>,
     request: RunTurnRequest,
     attachments: Vec<ImageAttachment>,
+    workflow_id: Option<String>,
 ) -> CommandResult<TurnHandle> {
     let turn_id = Uuid::new_v4().to_string();
     let thread_id = request.thread_id.clone();
@@ -1053,6 +1220,7 @@ pub async fn turn_start(
             kind: MailboxTurnKind::Message {
                 request,
                 attachments,
+                workflow_id,
             },
             started: Some(signal),
         })
@@ -1146,12 +1314,14 @@ async fn drain_thread_mailbox(app: AppHandle, thread_id: String) {
             MailboxTurnKind::Message {
                 request,
                 attachments,
+                workflow_id,
             } => {
                 execute_turn(
                     app.clone(),
                     state.inner(),
                     request,
                     attachments,
+                    workflow_id,
                     Some(handle.turn_id),
                     Some(operation_guard),
                     publisher.clone(),
@@ -1303,6 +1473,7 @@ pub async fn turn_steer_queued(
                 CommandError::new("no_active_turn", "active turn no longer accepts input")
             }
         })?;
+    require_queued_workflow_steerable(pending.workflow_id.as_deref())?;
     let message = prepare_steer_message(
         &app,
         state.inner(),
@@ -1423,6 +1594,7 @@ async fn execute_turn(
     state: &AppState,
     request: RunTurnRequest,
     attachments: Vec<ImageAttachment>,
+    workflow_id: Option<String>,
     assigned_turn_id: Option<String>,
     operation_guard: Option<ThreadOperationGuard>,
     publisher: Arc<dyn EventPublisher>,
@@ -1438,6 +1610,34 @@ async fn execute_turn(
         .clone()
         .unwrap_or_else(|| state.workspace_root());
     let has_project = project_workspace.is_some();
+    let advanced = state.advanced();
+    let agent_mode = request
+        .agent_mode
+        .as_deref()
+        .map(AgentMode::from_str)
+        .unwrap_or_default();
+    let requested_workflow_id = workflow_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if workflow_id.is_some() && requested_workflow_id.is_none() {
+        return Err(CommandError::new(
+            "workflow",
+            "workflowId must not be empty when provided",
+        ));
+    }
+    let current_workflow = advanced
+        .workflows
+        .current(&thread_id)
+        .map_err(|error| CommandError::new("workflow", error))?;
+    validate_workflow_turn_context(
+        has_project,
+        agent_mode,
+        requested_workflow_id.is_some(),
+        current_workflow
+            .as_ref()
+            .is_some_and(|run| run.state == WorkflowRunState::Active),
+    )?;
     let history_has_images = state
         .repository()
         .read_thread(&thread_id)
@@ -1457,7 +1657,6 @@ async fn execute_turn(
             .await
             .map_err(|error| CommandError::new("extensions", error))?;
     }
-    let advanced = state.advanced();
     let extension_instructions = if has_project {
         state
             .extension_instructions(&request.input)
@@ -1465,20 +1664,12 @@ async fn execute_turn(
     } else {
         String::new()
     };
-    let advanced_instructions = advanced
-        .runtime_instructions(&thread_id)
-        .map_err(|error| CommandError::new("advanced_runtime", error))?;
     let memory_instructions = advanced
         .memory
         .context()
         .map_err(|error| CommandError::new("memory", error))?;
 
     // 根据协作模式注入指令并限制可用工具
-    let agent_mode = request
-        .agent_mode
-        .as_deref()
-        .map(AgentMode::from_str)
-        .unwrap_or_default();
     let mode_instructions = instructions_for_mode(agent_mode).to_string();
 
     // Plan/Ask 模式下把工具限制为只读子集（借鉴 Codex 的 plan_mask）。
@@ -1491,17 +1682,7 @@ async fn execute_turn(
             .map_err(|error| CommandError::new("workspace_tools", error))?
     };
 
-    // 分层拼接 system prompt（identity/workspace/mode/tools/memory/context/extension）
     let tool_names = base_tools.definition_names();
-    let runtime_instructions = build_system_prompt(
-        project_workspace.as_deref(),
-        &extension_instructions,
-        &advanced_instructions,
-        &memory_instructions,
-        &mode_instructions,
-        &tool_names,
-    );
-
     let goal_budget = advanced
         .goals
         .turn_budget(&thread_id)
@@ -1534,6 +1715,30 @@ async fn execute_turn(
             state.build_provider()
         }
         .map_err(|error| CommandError::new("provider_config", error))?;
+    if let Some(workflow_id) = requested_workflow_id {
+        let objective = if request.input.trim().is_empty() {
+            "Process the user-provided attachments under this workflow."
+        } else {
+            request.input.as_str()
+        };
+        advanced
+            .workflows
+            .start_or_resume(&thread_id, workflow_id, objective)
+            .map_err(|error| CommandError::new("workflow", error))?;
+    }
+    let advanced_instructions = advanced
+        .runtime_instructions(&thread_id)
+        .map_err(|error| CommandError::new("advanced_runtime", error))?;
+
+    // 分层拼接 system prompt（identity/workspace/mode/tools/memory/context/extension）
+    let runtime_instructions = build_system_prompt(
+        project_workspace.as_deref(),
+        &extension_instructions,
+        &advanced_instructions,
+        &memory_instructions,
+        &mode_instructions,
+        &tool_names,
+    );
     let turn_id = assigned_turn_id.unwrap_or_else(|| Uuid::new_v4().to_string());
     let begin_result = match operation_guard.as_ref() {
         Some(operation_guard) => {
@@ -1711,6 +1916,12 @@ async fn execute_retry(
             .any(|block| matches!(block, crate::protocol::ContentBlock::Image { .. }))
     });
     let advanced = state.advanced();
+    let workflow_active = advanced
+        .workflows
+        .current(&thread_id)
+        .map_err(|error| CommandError::new("workflow", error))?
+        .is_some_and(|run| run.state == WorkflowRunState::Active);
+    validate_workflow_turn_context(has_project, agent_mode, false, workflow_active)?;
     let extension_instructions = if has_project {
         state
             .extension_instructions(&retry_input)
@@ -2284,8 +2495,9 @@ mod tests {
 
     use super::{
         CRAFT_MODE_INSTRUCTIONS, CommandError, TurnStartPublisher, build_system_prompt,
-        ordinary_turn_soft_limits, require_project_thread_for_subagent, retry_mode,
-        tools_without_project,
+        ordinary_turn_soft_limits, plugin_command_error, require_project_thread_for_subagent,
+        require_project_thread_for_workflow, require_queued_workflow_steerable, retry_mode,
+        tools_for_mode, tools_without_project, validate_workflow_turn_context,
     };
     use crate::agent::EventPublisher;
     use crate::protocol::{AgentEvent, AgentEventEnvelope, AgentMode, PROTOCOL_VERSION};
@@ -2295,6 +2507,14 @@ mod tests {
     #[derive(Default)]
     struct RecordingPublisher {
         events: Mutex<Vec<AgentEventEnvelope>>,
+    }
+
+    #[test]
+    fn plugin_command_errors_use_a_stable_public_code() {
+        let error = plugin_command_error("unknown local plugin review-tools@local");
+
+        assert_eq!(error.code, "plugins");
+        assert_eq!(error.message, "unknown local plugin review-tools@local");
     }
 
     impl EventPublisher for RecordingPublisher {
@@ -2417,6 +2637,27 @@ mod tests {
     }
 
     #[test]
+    fn read_only_modes_allow_optional_plugin_read_tools_without_requiring_them() {
+        assert!(
+            crate::protocol::AgentMode::Ask
+                .allowed_tools()
+                .contains(&"plugin_skill_read")
+        );
+        assert!(
+            crate::protocol::AgentMode::Plan
+                .allowed_tools()
+                .contains(&"plugin_resource_read")
+        );
+
+        let tools = tools_for_mode(ToolRegistry::read_only(), crate::protocol::AgentMode::Ask)
+            .expect("optional plugin tools should not be required when no plugin is enabled");
+        assert_eq!(
+            tools.definition_names(),
+            vec!["list_directory", "read_file"]
+        );
+    }
+
+    #[test]
     fn standalone_threads_cannot_create_subagents() {
         let summary = ThreadSummary {
             schema_version: PROTOCOL_VERSION,
@@ -2431,6 +2672,28 @@ mod tests {
 
         let error = require_project_thread_for_subagent(&summary).unwrap_err();
         assert_eq!(error.code, "standalone_thread");
+        let workflow_error = require_project_thread_for_workflow(&summary).unwrap_err();
+        assert_eq!(workflow_error.code, "standalone_thread");
+    }
+
+    #[test]
+    fn workflow_turns_require_a_project_and_craft_mode() {
+        let standalone =
+            validate_workflow_turn_context(false, AgentMode::Craft, true, false).unwrap_err();
+        assert_eq!(standalone.code, "standalone_thread");
+
+        let read_only =
+            validate_workflow_turn_context(true, AgentMode::Ask, false, true).unwrap_err();
+        assert_eq!(read_only.code, "workflow_mode");
+        assert!(validate_workflow_turn_context(true, AgentMode::Craft, true, false).is_ok());
+        assert!(validate_workflow_turn_context(false, AgentMode::Ask, false, false).is_ok());
+    }
+
+    #[test]
+    fn queued_workflow_starts_cannot_be_steered_into_an_active_turn() {
+        let error = require_queued_workflow_steerable(Some("quality-assurance")).unwrap_err();
+        assert_eq!(error.code, "queued_workflow_not_steerable");
+        assert!(require_queued_workflow_steerable(None).is_ok());
     }
 
     #[test]

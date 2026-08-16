@@ -8,12 +8,12 @@ use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::advanced::AdvancedServices;
+use crate::advanced::{AdvancedServices, CancelWorkflowRunRequest, WorkflowRunView};
 use crate::agent::mailbox::{MailboxTurn, QueuedTurnSteerError, ThreadMailbox, TurnControl};
 use crate::agent::thread_operation::{ThreadOperationGate, ThreadOperationGuard};
 use crate::execution::{BundledTools, CommandRuntime, ExecutionError, NativePtyRuntime};
 use crate::extensions::mcp::OsMcpSecretStore;
-use crate::extensions::{ExtensionError, ExtensionOverview, ExtensionService};
+use crate::extensions::{ExtensionError, ExtensionOverview, ExtensionService, McpConfigView};
 use crate::logging::StructuredLogger;
 use crate::multi_agent::MultiAgentCoordinator;
 use crate::patch::{PatchError, PatchService};
@@ -21,8 +21,8 @@ use crate::persistence::ProjectionDb;
 use crate::policy::{ApprovalManager, UserInputManager};
 use crate::protocol::{
     AgentItemStatus, AgentItemType, ApprovalAction, ApprovalMode, ApprovalResolution, ChangeSet,
-    HistorySortDirection, ReasoningEffort, ThreadHistorySnapshot, ThreadItemsPage, ThreadTurnsPage,
-    TurnItemsView, TurnState, UserInputAction, UserInputResolution,
+    HistorySortDirection, PluginOverview, ReasoningEffort, ThreadHistorySnapshot, ThreadItemsPage,
+    ThreadTurnsPage, TurnItemsView, TurnState, UserInputAction, UserInputResolution,
 };
 use crate::providers::{
     AnthropicMessagesProvider, CredentialError, CredentialStore, FallbackProvider, FallbackTarget,
@@ -274,6 +274,34 @@ impl AppState {
         self.thread_mailbox.clear(thread_id).await
     }
 
+    pub async fn cancel_workflow_run(
+        &self,
+        request: CancelWorkflowRunRequest,
+    ) -> Result<WorkflowRunView, AppStateError> {
+        let _operation_guard = self.thread_operations.lock(&request.thread_id).await;
+        if self
+            .active_turns
+            .lock()
+            .await
+            .contains_key(&request.thread_id)
+        {
+            return Err(AppStateError::ThreadOperationBusy(request.thread_id));
+        }
+        if !self
+            .thread_mailbox
+            .snapshot(&request.thread_id, None)
+            .await
+            .pending
+            .is_empty()
+        {
+            return Err(AppStateError::ThreadMailboxNotEmpty(request.thread_id));
+        }
+        self.advanced
+            .workflows
+            .cancel(request)
+            .map_err(AppStateError::Advanced)
+    }
+
     pub fn workspace_root(&self) -> PathBuf {
         self.workspace_root
             .read()
@@ -431,7 +459,14 @@ impl AppState {
 
     pub async fn prepare_extensions(&self, force: bool) -> Result<(), AppStateError> {
         let workspace = self.workspace_root();
-        let revision = self.extensions.revision(&workspace)?;
+        let revision = match self.extensions.revision(&workspace) {
+            Ok(revision) => revision,
+            Err(error) => {
+                *self.extension_workspace.lock().await = None;
+                self.install_base_tool_registry(&workspace)?;
+                return Err(error.into());
+            }
+        };
         let mut prepared_for = self.extension_workspace.lock().await;
         if !force
             && prepared_for
@@ -441,17 +476,18 @@ impl AppState {
             return Ok(());
         }
         *prepared_for = None;
+        let base_registry = self.base_tool_registry(&workspace)?;
+        *self
+            .tool_registry
+            .write()
+            .map_err(|_| AppStateError::Workspace("tool registry lock poisoned".into()))? =
+            base_registry.clone();
         let prepared = self
             .extensions
             .prepare(&workspace, CancellationToken::new())
             .await?;
-        let (advanced_handlers, advanced_risks) = self.advanced.tool_handlers(&workspace);
-        let registry = ToolRegistry::workspace_tools_with_execution(
-            self.patch_service.clone(),
-            self.command_runtime(),
-        )
-        .with_additional_handlers(advanced_handlers, advanced_risks)?
-        .with_extensions(prepared.handlers, prepared.risks, prepared.hooks)?;
+        let registry =
+            base_registry.with_extensions(prepared.handlers, prepared.risks, prepared.hooks)?;
         *self
             .tool_registry
             .write()
@@ -461,12 +497,121 @@ impl AppState {
         Ok(())
     }
 
+    fn base_tool_registry(&self, workspace: &Path) -> Result<ToolRegistry, AppStateError> {
+        let (advanced_handlers, advanced_risks) = self.advanced.tool_handlers(workspace);
+        Ok(ToolRegistry::workspace_tools_with_execution(
+            self.patch_service.clone(),
+            self.command_runtime(),
+        )
+        .with_additional_handlers(advanced_handlers, advanced_risks)?)
+    }
+
+    fn install_base_tool_registry(&self, workspace: &Path) -> Result<(), AppStateError> {
+        let registry = self.base_tool_registry(workspace)?;
+        *self
+            .tool_registry
+            .write()
+            .map_err(|_| AppStateError::Workspace("tool registry lock poisoned".into()))? =
+            registry;
+        Ok(())
+    }
+
     pub fn extension_instructions(&self, input: &str) -> Result<String, AppStateError> {
         Ok(self.extensions.runtime_instructions(input)?)
     }
 
     pub fn extension_overview(&self) -> ExtensionOverview {
         self.extensions.overview()
+    }
+
+    pub async fn plugin_overview(&self, refresh: bool) -> PluginOverview {
+        if refresh && let Err(error) = self.prepare_extensions(true).await {
+            return match self.extensions.plugin_overview(true) {
+                Ok(mut overview) => {
+                    let refresh_error = format!("extension refresh failed: {error}");
+                    overview.error = Some(
+                        overview
+                            .error
+                            .map(|plugin_error| format!("{plugin_error}; {refresh_error}"))
+                            .unwrap_or(refresh_error),
+                    );
+                    overview
+                }
+                Err(plugin_error) => {
+                    let mut overview = self.cached_plugin_overview();
+                    overview.plugins.clear();
+                    overview.error = Some(plugin_error.to_string());
+                    overview
+                }
+            };
+        }
+        match self.extensions.plugin_overview(false) {
+            Ok(overview) => overview,
+            Err(error) => {
+                let mut overview = self.cached_plugin_overview();
+                overview.plugins.clear();
+                overview.error = Some(error.to_string());
+                overview
+            }
+        }
+    }
+
+    fn cached_plugin_overview(&self) -> PluginOverview {
+        self.extensions
+            .plugin_overview(false)
+            .unwrap_or_else(|_| PluginOverview {
+                schema_version: 1,
+                root_path: self
+                    .data_root
+                    .join("plugins")
+                    .to_string_lossy()
+                    .into_owned(),
+                plugins: Vec::new(),
+                error: None,
+            })
+    }
+
+    pub async fn set_plugin_enabled(
+        &self,
+        plugin_id: &str,
+        enabled: bool,
+    ) -> Result<PluginOverview, AppStateError> {
+        self.extensions.set_plugin_enabled(plugin_id, enabled)?;
+        self.prepare_extensions(true).await?;
+        Ok(self.extensions.plugin_overview(false)?)
+    }
+
+    pub async fn delete_plugin(&self, plugin_id: &str) -> Result<PluginOverview, AppStateError> {
+        self.extensions.set_plugin_enabled(plugin_id, false)?;
+        let mut rebuild_errors = Vec::new();
+        if let Err(error) = self.prepare_extensions(true).await {
+            rebuild_errors.push(error.to_string());
+        }
+        self.extensions.delete_plugin(plugin_id)?;
+        if let Err(error) = self.prepare_extensions(true).await {
+            rebuild_errors.push(error.to_string());
+        }
+        let mut overview = self.extensions.plugin_overview(false)?;
+        if !rebuild_errors.is_empty() {
+            let rebuild_error = format!("extension refresh failed: {}", rebuild_errors.join("; "));
+            overview.error = Some(
+                overview
+                    .error
+                    .map(|plugin_error| format!("{plugin_error}; {rebuild_error}"))
+                    .unwrap_or(rebuild_error),
+            );
+        }
+        Ok(overview)
+    }
+
+    pub fn mcp_config_view(&self) -> Result<McpConfigView, AppStateError> {
+        Ok(self.extensions.mcp_config_view(&self.workspace_root())?)
+    }
+
+    pub fn save_mcp_config(&self, scope: &str, content: &str) -> Result<(), AppStateError> {
+        Ok(self
+            .extensions
+            .save_mcp_config(&self.workspace_root(), scope, content)?)
     }
 
     pub async fn set_extension_enabled(
@@ -1550,6 +1695,15 @@ mod tests {
             .expect("a different thread may run concurrently");
         assert!(state.is_turn_active("thread").await);
         assert!(state.is_turn_active("other-thread").await);
+        assert!(matches!(
+            state
+                .cancel_workflow_run(CancelWorkflowRunRequest {
+                    thread_id: "thread".into(),
+                    run_id: "run".into(),
+                })
+                .await,
+            Err(AppStateError::ThreadOperationBusy(thread_id)) if thread_id == "thread"
+        ));
         assert!(state.cancel_turn("thread").await);
         state.finish_turn("thread").await;
         state.finish_turn("other-thread").await;
@@ -1631,6 +1785,15 @@ mod tests {
             state.rollback_thread(&thread.id, 1).await,
             Err(AppStateError::ThreadMailboxNotEmpty(thread_id)) if thread_id == thread.id
         ));
+        assert!(matches!(
+            state
+                .cancel_workflow_run(CancelWorkflowRunRequest {
+                    thread_id: thread.id.clone(),
+                    run_id: "run".into(),
+                })
+                .await,
+            Err(AppStateError::ThreadMailboxNotEmpty(thread_id)) if thread_id == thread.id
+        ));
     }
 
     #[tokio::test]
@@ -1703,6 +1866,7 @@ mod tests {
                         agent_mode: None,
                     },
                     attachments: Vec::new(),
+                    workflow_id: None,
                 },
             ),
             ("queued-retry", MailboxTurnKind::Retry),
@@ -1963,6 +2127,152 @@ mod tests {
         )
         .unwrap();
         state.prepare_extensions(false).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn plugin_lifecycle_rebuilds_the_registry_and_prepare_failures_drop_stale_tools() {
+        let data = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let plugin = data.path().join("plugins/review-package");
+        std::fs::create_dir_all(plugin.join(".codex-plugin")).unwrap();
+        std::fs::write(
+            plugin.join(".codex-plugin/plugin.json"),
+            r#"{"name":"review-tools","version":"1.0.0","description":"Review"}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(plugin.join("skills/review")).unwrap();
+        std::fs::write(
+            plugin.join("skills/review/SKILL.md"),
+            "---\nname: review\ndescription: Review\n---\nReview instructions",
+        )
+        .unwrap();
+        let state = AppState::with_workspace_and_credentials(
+            data.path(),
+            workspace.path(),
+            Arc::new(FakeCredentials::default()),
+        )
+        .unwrap();
+
+        state
+            .set_plugin_enabled("review-tools@local", true)
+            .await
+            .unwrap();
+        assert!(
+            state
+                .tool_registry()
+                .definition_names()
+                .contains(&"plugin_skill_read".to_string())
+        );
+
+        std::fs::write(data.path().join("extensions.json"), "{broken").unwrap();
+        assert!(state.prepare_extensions(true).await.is_err());
+        assert!(
+            !state
+                .tool_registry()
+                .definition_names()
+                .contains(&"plugin_skill_read".to_string())
+        );
+        std::fs::remove_file(data.path().join("extensions.json")).unwrap();
+        state.prepare_extensions(true).await.unwrap();
+        assert!(
+            state
+                .tool_registry()
+                .definition_names()
+                .contains(&"plugin_skill_read".to_string())
+        );
+        std::fs::remove_dir_all(&plugin).unwrap();
+        let overview = state.plugin_overview(true).await;
+        assert!(overview.plugins.is_empty());
+        assert!(
+            !state
+                .tool_registry()
+                .definition_names()
+                .contains(&"plugin_skill_read".to_string())
+        );
+        assert_eq!(
+            state
+                .repository()
+                .projection()
+                .setting("extension/plugin/review-tools@local")
+                .unwrap()
+                .as_deref(),
+            Some("false")
+        );
+
+        std::fs::create_dir_all(plugin.join(".codex-plugin")).unwrap();
+        std::fs::write(
+            plugin.join(".codex-plugin/plugin.json"),
+            r#"{"name":"review-tools","version":"1.0.0","description":"Review"}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(plugin.join("skills/review")).unwrap();
+        std::fs::write(
+            plugin.join("skills/review/SKILL.md"),
+            "---\nname: review\ndescription: Review\n---\nReview instructions",
+        )
+        .unwrap();
+        state.plugin_overview(true).await;
+        state
+            .set_plugin_enabled("review-tools@local", true)
+            .await
+            .unwrap();
+        assert!(
+            state
+                .tool_registry()
+                .definition_names()
+                .contains(&"plugin_skill_read".to_string())
+        );
+
+        let deleted = state.delete_plugin("review-tools@local").await.unwrap();
+
+        assert!(deleted.plugins.is_empty());
+        assert!(!plugin.exists());
+        assert!(
+            !state
+                .tool_registry()
+                .definition_names()
+                .contains(&"plugin_skill_read".to_string())
+        );
+        assert_eq!(
+            state
+                .repository()
+                .projection()
+                .setting("extension/plugin/review-tools@local")
+                .unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn plugin_overview_keeps_discovered_rows_when_other_extension_config_is_invalid() {
+        let data = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let plugin = data.path().join("plugins/review-package");
+        std::fs::create_dir_all(plugin.join(".codex-plugin")).unwrap();
+        std::fs::write(
+            plugin.join(".codex-plugin/plugin.json"),
+            r#"{"name":"review-tools","version":"1.0.0","description":"Review"}"#,
+        )
+        .unwrap();
+        let state = AppState::with_workspace_and_credentials(
+            data.path(),
+            workspace.path(),
+            Arc::new(FakeCredentials::default()),
+        )
+        .unwrap();
+        std::fs::write(data.path().join("extensions.json"), "{broken").unwrap();
+
+        let overview = state.plugin_overview(true).await;
+
+        assert_eq!(overview.plugins.len(), 1);
+        assert_eq!(overview.plugins[0].id, "review-tools@local");
+        assert!(overview.error.as_deref().unwrap().contains("extension"));
+
+        let deleted = state.delete_plugin("review-tools@local").await.unwrap();
+
+        assert!(deleted.plugins.is_empty());
+        assert!(deleted.error.as_deref().unwrap().contains("extension"));
+        assert!(!plugin.exists());
     }
 
     #[tokio::test]
