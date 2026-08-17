@@ -555,13 +555,21 @@ function ToolActivityGroup({ activities }: { activities: ToolActivity[] }) {
 function hideSupersededPatchFailures(activities: ToolActivity[]) {
   const successfulTargets = new Set<string>();
   const supersededCallIds = new Set<string>();
+  let laterSuccessfulPatchCount = 0;
 
   for (let index = activities.length - 1; index >= 0; index -= 1) {
     const activity = activities[index];
+    if (activity.call.name === "apply_patch" && activity.state === "completed") {
+      laterSuccessfulPatchCount += 1;
+      const target = patchRetryTarget(activity);
+      if (target) successfulTargets.add(target);
+      continue;
+    }
+    if (activity.call.name !== "apply_patch" || activity.state !== "failed") continue;
     const target = patchRetryTarget(activity);
-    if (!target) continue;
-    if (activity.state === "completed") successfulTargets.add(target);
-    else if (activity.state === "failed" && successfulTargets.has(target)) supersededCallIds.add(activity.call.id);
+    if (target ? successfulTargets.has(target) : laterSuccessfulPatchCount === 1) {
+      supersededCallIds.add(activity.call.id);
+    }
   }
 
   return supersededCallIds.size

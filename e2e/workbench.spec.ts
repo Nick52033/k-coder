@@ -1237,23 +1237,32 @@ test("supports the primary workbench inspection flow", async ({ page }, testInfo
 test("hides failed patch attempts after a matching retry succeeds", async ({ page }, testInfo) => {
   await page.goto("/");
   const retryPatch = "*** Begin Patch\n*** Update File: src/App.tsx\n@@\n-old\n+new\n*** End Patch";
+  const unparseableRetryPatch = "*** Begin Patch\n@@\n-old\n+new\n*** End Patch";
+  const ambiguousSuccessPatchA = "*** Begin Patch\n*** Update File: src/Alpha.ts\n@@\n-old\n+new\n*** End Patch";
+  const ambiguousSuccessPatchB = "*** Begin Patch\n*** Update File: src/Beta.ts\n@@\n-old\n+new\n*** End Patch";
   const finalFailurePatch = "*** Begin Patch\n*** Update File: src/App.css\n@@\n-old\n+new\n*** End Patch";
   const calls = [
-    { id: "call-patch-invalid", name: "apply_patch", arguments: { patch: retryPatch }, metadata: {} },
+    { id: "call-patch-invalid", name: "apply_patch", arguments: { patch: unparseableRetryPatch }, metadata: {} },
     { id: "call-patch-conflict", name: "apply_patch", arguments: { patch: retryPatch }, metadata: {} },
     { id: "call-patch-success", name: "apply_patch", arguments: { patch: retryPatch }, metadata: {} },
+    { id: "call-patch-ambiguous-failure", name: "apply_patch", arguments: { patch: unparseableRetryPatch }, metadata: {} },
+    { id: "call-patch-ambiguous-success-a", name: "apply_patch", arguments: { patch: ambiguousSuccessPatchA }, metadata: {} },
+    { id: "call-patch-ambiguous-success-b", name: "apply_patch", arguments: { patch: ambiguousSuccessPatchB }, metadata: {} },
     { id: "call-patch-final-failure", name: "apply_patch", arguments: { patch: finalFailurePatch }, metadata: {} },
   ];
   const results = [
     { success: false, output: "patch syntax is invalid", metadata: { error: true } },
     { success: false, output: "patch conflicts with the workspace", metadata: { error: true } },
     { success: true, output: "applied", metadata: {} },
+    { success: false, output: "ambiguous patch failure remains visible", metadata: { error: true } },
+    { success: true, output: "applied alpha", metadata: {} },
+    { success: true, output: "applied beta", metadata: {} },
     { success: false, output: "final patch failure", metadata: { error: true } },
   ];
   const activities = calls.map((call, index) => ({
     turnId: "turn-patch-retry",
     call,
-    state: index === 2 ? "completed" : "failed",
+    state: [2, 4, 5].includes(index) ? "completed" : "failed",
     result: results[index],
     startedAtMs: 1000 + index * 10,
     completedAtMs: 1006 + index * 10,
@@ -1276,21 +1285,33 @@ test("hides failed patch attempts after a matching retry succeeds", async ({ pag
       });
     }
     emit({ ...base, type: "text_delta", phase: "responding", delta: "继续处理另一个文件。" });
-    emit({ ...base, type: "tool_started", phase: "executing", call: eventCalls[3] });
+    for (let index = 3; index < 6; index += 1) {
+      emit({ ...base, type: "tool_started", phase: "executing", call: eventCalls[index] });
+      emit({
+        ...base,
+        type: "tool_completed",
+        phase: "executing",
+        callId: eventCalls[index].id,
+        name: eventCalls[index].name,
+        result: eventResults[index],
+      });
+    }
+    emit({ ...base, type: "text_delta", phase: "responding", delta: "继续验证最终失败。" });
+    emit({ ...base, type: "tool_started", phase: "executing", call: eventCalls[6] });
     emit({
       ...base,
       type: "tool_completed",
       phase: "executing",
-      callId: eventCalls[3].id,
-      name: eventCalls[3].name,
-      result: eventResults[3],
+      callId: eventCalls[6].id,
+      name: eventCalls[6].name,
+      result: eventResults[6],
     });
   }, { calls, results });
 
   const assertProjection = async () => {
     const message = page.locator(".message--assistant").last();
     const groups = message.locator(".turn-tool-group");
-    await expect(groups).toHaveCount(2);
+    await expect(groups).toHaveCount(3);
 
     const successfulGroup = groups.nth(0);
     const successfulSummary = successfulGroup.locator(":scope > summary");
@@ -1303,7 +1324,14 @@ test("hides failed patch attempts after a matching retry succeeds", async ({ pag
     await expect(successfulGroup).not.toContainText("patch syntax is invalid");
     await expect(successfulGroup).not.toContainText("patch conflicts with the workspace");
 
-    const failedGroup = groups.nth(1);
+    const ambiguousGroup = groups.nth(1);
+    const ambiguousSummary = ambiguousGroup.locator(":scope > summary");
+    await expect(ambiguousSummary).toContainText("包含失败");
+    await ambiguousSummary.click();
+    await expect(ambiguousGroup.locator(".turn-timeline-tool")).toHaveCount(3);
+    await expect(ambiguousGroup.locator(".turn-timeline-tool--failed")).toContainText("ambiguous patch failure remains visible");
+
+    const failedGroup = groups.nth(2);
     const failedSummary = failedGroup.locator(":scope > summary");
     await expect(failedSummary).toContainText("包含失败");
     await failedSummary.click();
@@ -1329,7 +1357,9 @@ test("hides failed patch attempts after a matching retry succeeds", async ({ pag
       turnTimeline: [
         ...storedActivities.slice(0, 3).map((activity) => ({ type: "tool", activity })),
         { type: "text", id: "progress-next-file", turnId: "turn-patch-retry", text: "继续处理另一个文件。" },
-        { type: "tool", activity: storedActivities[3] },
+        ...storedActivities.slice(3, 6).map((activity) => ({ type: "tool", activity })),
+        { type: "text", id: "progress-final-failure", turnId: "turn-patch-retry", text: "继续验证最终失败。" },
+        { type: "tool", activity: storedActivities[6] },
         { type: "text", id: "message-patch-final", turnId: "turn-patch-retry", text: "补丁重试处理完成。" },
         { type: "event", itemId: "turn-completed-patch-retry", turnId: "turn-patch-retry", kind: "turn_completed", title: "Turn 已完成", detail: null, durationMs: 36 },
       ],
@@ -1343,7 +1373,7 @@ test("hides failed patch attempts after a matching retry succeeds", async ({ pag
   }, { activities });
   await page.reload();
   await page.getByText("执行了 36ms", { exact: true }).click();
-  await expect(page.getByText("2 个操作", { exact: true })).toBeVisible();
+  await expect(page.getByText("5 个操作", { exact: true })).toBeVisible();
   const restoredMessage = await assertProjection();
   await restoredMessage.screenshot({ path: testInfo.outputPath(`patch-retry-restored-${testInfo.project.name}.png`) });
 });
