@@ -911,25 +911,37 @@ fn is_sensitive_key(key: &str) -> bool {
 }
 
 pub fn redact(text: &str) -> String {
-    text.split_whitespace()
-        .map(|word| {
-            if let Some((key, _)) = word.split_once('=') {
-                if is_sensitive_key(key) {
-                    return format!("{key}=[REDACTED]");
-                }
-            }
-            if word.starts_with("sk-")
-                || word.starts_with("ghp_")
-                || word.starts_with("github_pat_")
-            {
-                "[REDACTED]".into()
-            } else {
-                word.into()
-            }
-        })
-        .collect::<Vec<String>>()
-        .join(" ")
-        + if text.ends_with('\n') { "\n" } else { "" }
+    let mut redacted = String::with_capacity(text.len());
+    let mut token_start = 0;
+
+    for (index, character) in text.char_indices() {
+        if !character.is_whitespace() {
+            continue;
+        }
+        redact_token(&text[token_start..index], &mut redacted);
+        redacted.push(character);
+        token_start = index + character.len_utf8();
+    }
+    redact_token(&text[token_start..], &mut redacted);
+    redacted
+}
+
+fn redact_token(token: &str, output: &mut String) {
+    if token.is_empty() {
+        return;
+    }
+    if let Some((key, _)) = token.split_once('=') {
+        if is_sensitive_key(key) {
+            output.push_str(key);
+            output.push_str("=[REDACTED]");
+            return;
+        }
+    }
+    if token.starts_with("sk-") || token.starts_with("ghp_") || token.starts_with("github_pat_") {
+        output.push_str("[REDACTED]");
+    } else {
+        output.push_str(token);
+    }
 }
 
 fn wait_state(result: std::io::Result<std::process::ExitStatus>) -> CommandState {
@@ -1473,6 +1485,16 @@ mod tests {
     fn secrets_are_redacted() {
         assert!(!redact("API_KEY=secret sk-live-value\n").contains("secret"));
         assert!(!redact("API_KEY=secret sk-live-value\n").contains("sk-live"));
+    }
+
+    #[test]
+    fn redaction_preserves_terminal_layout_and_control_sequences() {
+        let output = "\x1b[32mPS D:\\code\\k-coder>\x1b[0m  pnpm build\r\n\r\nnext\tline\r\n";
+        assert_eq!(redact(output), output);
+        assert_eq!(
+            redact("API_KEY=secret\r\n  ok\tghp_example\r\n"),
+            "API_KEY=[REDACTED]\r\n  ok\t[REDACTED]\r\n"
+        );
     }
 
     fn request(program: &str, args: &[&str], timeout_ms: u64) -> StartCommandRequest {

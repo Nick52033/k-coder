@@ -84,9 +84,16 @@ export const ConversationTurnActivity = memo(function ConversationTurnActivity({
     (item): item is Extract<TurnTimelineItem, { type: "event" }> => item.type === "event" && isTerminalEvent(item.kind),
   );
   const processItems = processTimeline.filter((item) => item !== terminalEvent && isVisibleConversationTimelineItem(item));
+  const groupedProcessTimeline = groupConsecutiveTimeline(processItems);
   const hasItems = Boolean(activities.length || processItems.length);
   const hasProcess = hasItems || Boolean(activityStatus) || terminalEvent?.kind === "turn_failed" || terminalEvent?.kind === "turn_cancelled";
-  const toolCount = processTimeline.filter((item) => item.type === "tool").length || activities.length;
+  const timelineHasTools = processTimeline.some((item) => item.type === "tool");
+  const toolCount = timelineHasTools
+    ? groupedProcessTimeline.reduce(
+      (count, entry) => count + (entry.type === "tool_group" ? hideSupersededPatchFailures(entry.activities).length : 0),
+      0,
+    )
+    : hideSupersededPatchFailures(activities).length;
   const summaryTitle = terminalEvent?.durationMs !== undefined
     ? terminalEvent.kind === "turn_cancelled"
       ? "已停止"
@@ -126,7 +133,6 @@ export const ConversationTurnActivity = memo(function ConversationTurnActivity({
       awaiting_approval: "等待确认",
       finalizing: "整理结果中",
     }[activityStatus] : visuallyStreaming ? "生成回复中" : null;
-  const groupedProcessTimeline = groupConsecutiveTimeline(processItems);
   const processContent = (
     <div className="turn-disclosure-panel">
       <div className={visuallyStreaming ? "turn-execution-live" : "turn-execution-content"}>
@@ -500,9 +506,10 @@ function ReasoningGroup({
 }
 
 function ToolActivityGroup({ activities }: { activities: ToolActivity[] }) {
-  const state = toolGroupState(activities);
-  const allCommands = activities.every((activity) => activity.call.name === "run_command");
-  const count = activities.length;
+  const visibleActivities = hideSupersededPatchFailures(activities);
+  const state = toolGroupState(visibleActivities);
+  const allCommands = visibleActivities.every((activity) => activity.call.name === "run_command");
+  const count = visibleActivities.length;
   const title = allCommands
     ? count === 1 ? "运行了命令" : "运行了多个命令"
     : count === 1 ? "执行了操作" : "执行了多个操作";
@@ -538,11 +545,36 @@ function ToolActivityGroup({ activities }: { activities: ToolActivity[] }) {
       </summary>
       <div className="turn-disclosure-panel">
         <div className="turn-tool-group-content">
-          {activities.map((activity) => <ToolActivityRow activity={activity} key={activity.call.id} />)}
+          {visibleActivities.map((activity) => <ToolActivityRow activity={activity} key={activity.call.id} />)}
         </div>
       </div>
     </details>
   );
+}
+
+function hideSupersededPatchFailures(activities: ToolActivity[]) {
+  const successfulTargets = new Set<string>();
+  const supersededCallIds = new Set<string>();
+
+  for (let index = activities.length - 1; index >= 0; index -= 1) {
+    const activity = activities[index];
+    const target = patchRetryTarget(activity);
+    if (!target) continue;
+    if (activity.state === "completed") successfulTargets.add(target);
+    else if (activity.state === "failed" && successfulTargets.has(target)) supersededCallIds.add(activity.call.id);
+  }
+
+  return supersededCallIds.size
+    ? activities.filter((activity) => !supersededCallIds.has(activity.call.id))
+    : activities;
+}
+
+function patchRetryTarget(activity: ToolActivity) {
+  if (activity.call.name !== "apply_patch" || typeof activity.call.arguments.patch !== "string") return null;
+  const paths = patchFilePaths(activity.call.arguments.patch)
+    .map((path) => path.replace(/\\/g, "/").replace(/^\.\//, ""))
+    .sort();
+  return paths.length ? JSON.stringify(paths) : null;
 }
 
 function toolGroupState(activities: ToolActivity[]): ToolActivity["state"] {

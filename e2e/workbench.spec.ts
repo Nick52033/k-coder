@@ -116,6 +116,7 @@ test.beforeEach(async ({ page }) => {
     const invocationArgs: Record<string, unknown> = {};
     const ptyStartRequests: unknown[] = [];
     const ptyWrites: string[] = [];
+    const ptyWriteMetrics = { active: 0, maxConcurrent: 0 };
     const extensionOverview = {
       schemaVersion: 1,
       configPaths: [
@@ -754,14 +755,38 @@ test.beforeEach(async ({ page }) => {
               outputTruncated: false,
             };
           }
+          if (command === "wait_pty") {
+            const exited = localStorage.getItem("kcoder_e2e_pty_state") === "exited";
+            if (!exited) await new Promise(() => undefined);
+            return {
+              id: String(args?.sessionId ?? "pty-1"),
+              state: { state: "exited", code: 0 },
+              startedAtMs: 1,
+              finishedAtMs: 2,
+              rows: 24,
+              cols: 80,
+              nextCursor: 1,
+              oldestCursor: 0,
+              outputTruncated: false,
+            };
+          }
           if (command === "read_pty_output") {
             const cursor = Number(args?.cursor ?? 0);
-            const chunks = cursor === 0 ? [{ cursor: 0, text: "PS D:\\code\\k-coder> " }] : [];
+            const text = localStorage.getItem("kcoder_e2e_pty_output") ?? "PS D:\\code\\k-coder> ";
+            const chunks = cursor === 0 ? [{ cursor: 0, text }] : [];
             return { chunks, nextCursor: cursor === 0 ? 1 : cursor, oldestCursor: 0, truncatedBeforeCursor: false };
           }
           if (command === "write_pty") {
-            ptyWrites.push(String(args?.input ?? ""));
-            return undefined;
+            ptyWriteMetrics.active += 1;
+            ptyWriteMetrics.maxConcurrent = Math.max(ptyWriteMetrics.maxConcurrent, ptyWriteMetrics.active);
+            try {
+              const delayMs = Number(localStorage.getItem("kcoder_e2e_pty_write_delay_ms") ?? 0);
+              if (delayMs > 0) await new Promise((resolve) => setTimeout(resolve, delayMs));
+              ptyWrites.push(String(args?.input ?? ""));
+              return undefined;
+            } finally {
+              ptyWriteMetrics.active -= 1;
+            }
           }
           if (command === "resize_pty" || command === "close_pty") return undefined;
           if (
@@ -778,6 +803,7 @@ test.beforeEach(async ({ page }) => {
       __invocationArgs: invocationArgs,
       __ptyStartRequests: ptyStartRequests,
       __ptyWrites: ptyWrites,
+      __ptyWriteMetrics: ptyWriteMetrics,
       __runTurnCalls: runTurnCalls,
       __lastProviderRequest: null,
       __lastActivatedProvider: null,
@@ -927,26 +953,56 @@ test("restores a queued robot identity from the mailbox snapshot", async ({ page
   await expect(page.getByText("执行回归测试")).toBeVisible();
 });
 
-test("uses the composer add menu for attachments, Skills, and extension entry points", async ({ page }, testInfo) => {
+test("uses composer quick actions for files, images, Skills, and extension entry points", async ({ page }, testInfo) => {
   await page.goto("/");
-  const trigger = page.getByRole("button", { name: "添加", exact: true });
+  const toolbar = page.getByRole("toolbar", { name: "输入快捷操作" });
+  const fileAction = toolbar.getByRole("button", { name: "引用工作区文件" });
+  const imageAction = toolbar.getByRole("button", { name: "添加图片" });
+  const skillAction = toolbar.getByRole("button", { name: "使用 Skill" });
+  const moreAction = toolbar.getByRole("button", { name: "更多操作" });
+  const agentSelector = toolbar.getByRole("button", { name: "选择机器人" });
   const composer = page.getByRole("textbox", { name: "消息" });
+  const subagentToggle = page.getByRole("button", { name: "子智能体", exact: true });
 
-  await expect(page.getByRole("button", { name: "从本地选取图片" })).toHaveCount(0);
-  await trigger.click();
+  await expect(toolbar.getByRole("button")).toHaveCount(5);
+  await expect(subagentToggle).toHaveClass(/segmented-button--subagent/);
+  await expect(subagentToggle.locator('[data-icon="subagent"]')).toHaveCount(1);
+  await expect(agentSelector).toHaveAttribute("aria-label", "选择机器人");
+  await expect(agentSelector.locator('[data-icon="robot"]')).toHaveCount(1);
+  await expect(toolbar.locator(".workflow-selector--compact")).toHaveCount(1);
+  await expect(page.locator(".composer .project-selector")).toHaveCount(1);
+  await fileAction.click();
+  const fileSuggestions = page.getByRole("listbox", { name: "文件引用" });
+  await expect(fileSuggestions).toBeVisible();
+  await expect(composer).toHaveValue("@");
+  await fileSuggestions.getByRole("option", { name: /src\/App\.tsx/ }).click();
+  await expect(composer).toHaveValue("@src/App.tsx ");
+
+  await composer.fill("");
+  await skillAction.click();
+  const skillSuggestions = page.getByRole("listbox", { name: "Skills" });
+  await expect(skillSuggestions).toBeVisible();
+  await expect(composer).toHaveValue("/");
+  await skillSuggestions.getByRole("option", { name: /\/workspace-review/ }).click();
+  await expect(composer).toHaveValue("/workspace-review ");
+
+  await imageAction.click();
+  await expect.poll(() => page.evaluate(() => (
+    window as unknown as { __invoked: string[] }
+  ).__invoked.includes("plugin:dialog|open"))).toBe(true);
+
+  await moreAction.click();
   const menu = page.getByRole("menu", { name: "添加内容" });
   await expect(menu).toBeVisible();
   await expect(menu.getByRole("menuitem")).toHaveText([
-    "添加附件",
-    "添加 Skill",
     "添加插件",
     "添加 MCP",
     "添加小程序",
     "添加 Workflow",
   ]);
-  await expect(menu.getByRole("menuitem", { name: "添加附件" })).toBeFocused();
+  await expect(menu.getByRole("menuitem", { name: "添加插件" })).toBeFocused();
 
-  const [menuBox, triggerBox] = await Promise.all([menu.boundingBox(), trigger.boundingBox()]);
+  const [menuBox, triggerBox] = await Promise.all([menu.boundingBox(), moreAction.boundingBox()]);
   expect(menuBox).not.toBeNull();
   expect(triggerBox).not.toBeNull();
   expect(menuBox!.x).toBeGreaterThanOrEqual(0);
@@ -959,24 +1015,10 @@ test("uses the composer add menu for attachments, Skills, and extension entry po
   await page.keyboard.press("End");
   await expect(menu.getByRole("menuitem", { name: "添加 Workflow" })).toBeFocused();
   await page.keyboard.press("ArrowDown");
-  await expect(menu.getByRole("menuitem", { name: "添加附件" })).toBeFocused();
+  await expect(menu.getByRole("menuitem", { name: "添加插件" })).toBeFocused();
   await page.keyboard.press("Escape");
   await expect(menu).toBeHidden();
-  await expect(trigger).toBeFocused();
-
-  await trigger.click();
-  await menu.getByRole("menuitem", { name: "添加 Skill" }).click();
-  const skillSuggestions = page.getByRole("listbox", { name: "Skills" });
-  await expect(skillSuggestions).toBeVisible();
-  await expect(composer).toHaveValue("/");
-  await skillSuggestions.getByRole("option", { name: /\/workspace-review/ }).click();
-  await expect(composer).toHaveValue("/workspace-review ");
-
-  await trigger.click();
-  await menu.getByRole("menuitem", { name: "添加附件" }).click();
-  await expect.poll(() => page.evaluate(() => (
-    window as unknown as { __invoked: string[] }
-  ).__invoked.includes("plugin:dialog|open"))).toBe(true);
+  await expect(moreAction).toBeFocused();
 
   for (const entry of [
     { menuLabel: "添加 MCP", heading: "MCP 配置", pending: false },
@@ -984,7 +1026,7 @@ test("uses the composer add menu for attachments, Skills, and extension entry po
     { menuLabel: "添加小程序", heading: "小程序", pending: true },
     { menuLabel: "添加 Workflow", heading: "Workflows", pending: true },
   ]) {
-    await trigger.click();
+    await moreAction.click();
     await menu.getByRole("menuitem", { name: entry.menuLabel }).click();
     const settings = page.getByRole("dialog", { name: "设置" });
     await expect(settings.getByRole("heading", { name: entry.heading, exact: true })).toBeVisible();
@@ -993,7 +1035,7 @@ test("uses the composer add menu for attachments, Skills, and extension entry po
   }
 });
 
-test("disables the composer Skill entry outside a project", async ({ page }) => {
+test("disables project-only composer quick actions outside a project", async ({ page }) => {
   await page.goto("/");
   await page.evaluate(() => localStorage.setItem("kcoder_e2e_thread_override", JSON.stringify({
     inProject: false,
@@ -1001,10 +1043,13 @@ test("disables the composer Skill entry outside a project", async ({ page }) => 
   })));
   await page.reload();
 
-  await page.getByRole("button", { name: "添加", exact: true }).click();
-  const skillItem = page.getByRole("menuitem", { name: "添加 Skill" });
-  await expect(skillItem).toBeDisabled();
-  await expect(skillItem).toHaveAttribute("title", "不在项目中的会话不能使用 Skill");
+  const toolbar = page.getByRole("toolbar", { name: "输入快捷操作" });
+  const fileAction = toolbar.getByRole("button", { name: "引用工作区文件" });
+  const skillAction = toolbar.getByRole("button", { name: "使用 Skill" });
+  await expect(fileAction).toBeDisabled();
+  await expect(fileAction).toHaveAttribute("title", "独立会话不能引用工作区文件");
+  await expect(skillAction).toBeDisabled();
+  await expect(skillAction).toHaveAttribute("title", "独立会话不能使用 Skill");
 });
 
 test("renders the composer add menu in dark mode", async ({ page }, testInfo) => {
@@ -1014,7 +1059,7 @@ test("renders the composer add menu in dark mode", async ({ page }, testInfo) =>
   await page.reload();
   await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
 
-  await page.getByRole("button", { name: "添加", exact: true }).click();
+  await page.getByRole("button", { name: "更多操作" }).click();
   const menu = page.getByRole("menu", { name: "添加内容" });
   await expect(menu).toBeVisible();
   const colors = await menu.evaluate((element) => {
@@ -1187,6 +1232,120 @@ test("supports the primary workbench inspection flow", async ({ page }, testInfo
   await expect(page.locator(".mcp-runtime-server").filter({ hasText: "local" })).toBeVisible();
   await page.getByRole("button", { name: /规则与审计/ }).click();
   await expect(page.getByText("extensions_ready", { exact: true })).toBeVisible();
+});
+
+test("hides failed patch attempts after a matching retry succeeds", async ({ page }, testInfo) => {
+  await page.goto("/");
+  const retryPatch = "*** Begin Patch\n*** Update File: src/App.tsx\n@@\n-old\n+new\n*** End Patch";
+  const finalFailurePatch = "*** Begin Patch\n*** Update File: src/App.css\n@@\n-old\n+new\n*** End Patch";
+  const calls = [
+    { id: "call-patch-invalid", name: "apply_patch", arguments: { patch: retryPatch }, metadata: {} },
+    { id: "call-patch-conflict", name: "apply_patch", arguments: { patch: retryPatch }, metadata: {} },
+    { id: "call-patch-success", name: "apply_patch", arguments: { patch: retryPatch }, metadata: {} },
+    { id: "call-patch-final-failure", name: "apply_patch", arguments: { patch: finalFailurePatch }, metadata: {} },
+  ];
+  const results = [
+    { success: false, output: "patch syntax is invalid", metadata: { error: true } },
+    { success: false, output: "patch conflicts with the workspace", metadata: { error: true } },
+    { success: true, output: "applied", metadata: {} },
+    { success: false, output: "final patch failure", metadata: { error: true } },
+  ];
+  const activities = calls.map((call, index) => ({
+    turnId: "turn-patch-retry",
+    call,
+    state: index === 2 ? "completed" : "failed",
+    result: results[index],
+    startedAtMs: 1000 + index * 10,
+    completedAtMs: 1006 + index * 10,
+    durationMs: 6,
+  }));
+
+  await page.evaluate(({ calls: eventCalls, results: eventResults }) => {
+    const emit = (window as unknown as { __emitAgentEvent: (event: unknown) => void }).__emitAgentEvent;
+    const base = { schemaVersion: 1, threadId: "thread-1", turnId: "turn-patch-retry" };
+    emit({ ...base, type: "turn_started", phase: "executing" });
+    for (let index = 0; index < 3; index += 1) {
+      emit({ ...base, type: "tool_started", phase: "executing", call: eventCalls[index] });
+      emit({
+        ...base,
+        type: "tool_completed",
+        phase: "executing",
+        callId: eventCalls[index].id,
+        name: eventCalls[index].name,
+        result: eventResults[index],
+      });
+    }
+    emit({ ...base, type: "text_delta", phase: "responding", delta: "继续处理另一个文件。" });
+    emit({ ...base, type: "tool_started", phase: "executing", call: eventCalls[3] });
+    emit({
+      ...base,
+      type: "tool_completed",
+      phase: "executing",
+      callId: eventCalls[3].id,
+      name: eventCalls[3].name,
+      result: eventResults[3],
+    });
+  }, { calls, results });
+
+  const assertProjection = async () => {
+    const message = page.locator(".message--assistant").last();
+    const groups = message.locator(".turn-tool-group");
+    await expect(groups).toHaveCount(2);
+
+    const successfulGroup = groups.nth(0);
+    const successfulSummary = successfulGroup.locator(":scope > summary");
+    await expect(successfulSummary).toContainText("执行了操作");
+    await expect(successfulSummary).not.toContainText("包含失败");
+    await successfulSummary.click();
+    await expect(successfulGroup.locator(".turn-timeline-tool")).toHaveCount(1);
+    await expect(successfulGroup.locator(".turn-timeline-tool--completed")).toContainText("应用补丁 src/App.tsx");
+    await expect(successfulGroup.locator(".turn-timeline-tool--failed")).toHaveCount(0);
+    await expect(successfulGroup).not.toContainText("patch syntax is invalid");
+    await expect(successfulGroup).not.toContainText("patch conflicts with the workspace");
+
+    const failedGroup = groups.nth(1);
+    const failedSummary = failedGroup.locator(":scope > summary");
+    await expect(failedSummary).toContainText("包含失败");
+    await failedSummary.click();
+    await expect(failedGroup.locator(".turn-timeline-tool--failed")).toContainText("final patch failure");
+    return message;
+  };
+
+  const liveMessage = await assertProjection();
+  await liveMessage.screenshot({ path: testInfo.outputPath(`patch-retry-live-${testInfo.project.name}.png`) });
+
+  await page.evaluate(({ activities: storedActivities }) => {
+    localStorage.setItem("kcoder_e2e_thread_detail", JSON.stringify({
+      schemaVersion: 1,
+      summary: { schemaVersion: 1, id: "thread-1", title: "Phase 6 workbench", createdAtMs: 1, updatedAtMs: 2, archived: false },
+      messages: [
+        { schemaVersion: 1, id: "message-patch-user", role: "user", content: [{ type: "text", text: "应用补丁" }], createdAtMs: 1 },
+        { schemaVersion: 1, id: "message-patch-final", role: "assistant", content: [{ type: "text", text: "补丁重试处理完成。" }], createdAtMs: 2 },
+      ],
+      messageTurnIds: { "message-patch-final": "turn-patch-retry" },
+      turnUserMessageIds: { "turn-patch-retry": "message-patch-user" },
+      lastTurn: null,
+      toolActivities: storedActivities,
+      turnTimeline: [
+        ...storedActivities.slice(0, 3).map((activity) => ({ type: "tool", activity })),
+        { type: "text", id: "progress-next-file", turnId: "turn-patch-retry", text: "继续处理另一个文件。" },
+        { type: "tool", activity: storedActivities[3] },
+        { type: "text", id: "message-patch-final", turnId: "turn-patch-retry", text: "补丁重试处理完成。" },
+        { type: "event", itemId: "turn-completed-patch-retry", turnId: "turn-patch-retry", kind: "turn_completed", title: "Turn 已完成", detail: null, durationMs: 36 },
+      ],
+      approvals: [],
+      userInputs: [],
+      changes: [],
+      todos: [],
+      lastUsage: null,
+      contextUsage: null,
+    }));
+  }, { activities });
+  await page.reload();
+  await page.getByText("执行了 36ms", { exact: true }).click();
+  await expect(page.getByText("2 个操作", { exact: true })).toBeVisible();
+  const restoredMessage = await assertProjection();
+  await restoredMessage.screenshot({ path: testInfo.outputPath(`patch-retry-restored-${testInfo.project.name}.png`) });
 });
 
 test("edits global and project mcp.json directly", async ({ page }, testInfo) => {
@@ -3276,6 +3435,7 @@ test("shows unbounded goal token consumption and controls", async ({ page }, tes
 
 test("shows recovered and live context-window progress in the composer", async ({ page }, testInfo) => {
   await page.addInitScript(() => {
+    localStorage.setItem("kcoder_theme", "dark");
     localStorage.setItem("kcoder_e2e_thread_detail", JSON.stringify({
       schemaVersion: 1,
       summary: {
@@ -3308,6 +3468,72 @@ test("shows recovered and live context-window progress in the composer", async (
   const sendButton = page.getByRole("button", { name: "发送消息" });
   await expect(trigger).toBeVisible();
   await expect(trigger).toHaveAttribute("aria-label", "上下文 12%，15K / 128K");
+
+  const initialViewport = page.viewportSize()!;
+  const validationWidths = testInfo.project.name === "desktop" ? [1280] : [700, 596, 375];
+  for (const width of validationWidths) {
+    await page.setViewportSize({ width, height: 820 });
+    const quickActionLayout = await page.locator(".composer").evaluate((composer) => {
+      const toolbar = composer.querySelector<HTMLElement>(".composer-quick-actions")!;
+      const textarea = composer.querySelector<HTMLElement>("textarea")!;
+      const workflow = toolbar.querySelector<HTMLElement>(".workflow-toggle")!;
+      const rect = (element: HTMLElement) => {
+        const box = element.getBoundingClientRect();
+        return { top: box.top, right: box.right, bottom: box.bottom, left: box.left };
+      };
+      return {
+        composer: rect(composer as HTMLElement),
+        toolbar: rect(toolbar),
+        textarea: rect(textarea),
+        workflow: rect(workflow),
+        buttons: Array.from(toolbar.querySelectorAll<HTMLElement>("button")).map(rect),
+      };
+    });
+    const composerLayout = await page.locator(".composer-footer").evaluate((footer) => {
+      const controls = footer.querySelector<HTMLElement>(".composer-controls")!;
+      const options = footer.querySelector<HTMLElement>(".composer-options")!;
+      const actions = footer.querySelector<HTMLElement>(".composer-actions")!;
+      const project = footer.querySelector<HTMLElement>(".project-selector-trigger")!;
+      const mode = footer.querySelector<HTMLElement>(".mode-toggle")!;
+      const rect = (element: HTMLElement) => {
+        const box = element.getBoundingClientRect();
+        return { top: box.top, right: box.right, bottom: box.bottom, left: box.left };
+      };
+      const interactiveBounds = Array.from(footer.querySelectorAll<HTMLElement>("button")).map(rect);
+      return {
+        footer: rect(footer as HTMLElement),
+        controls: rect(controls),
+        options: rect(options),
+        actions: rect(actions),
+        project: rect(project),
+        mode: rect(mode),
+        interactiveBounds,
+        approvalInActions: Boolean(actions.querySelector(".approval-mode-selector")),
+      };
+    });
+    expect(quickActionLayout.toolbar.bottom).toBeLessThanOrEqual(quickActionLayout.textarea.top + 1);
+    expect(quickActionLayout.workflow.bottom).toBeLessThanOrEqual(quickActionLayout.textarea.top + 1);
+    expect(quickActionLayout.textarea.bottom).toBeLessThanOrEqual(composerLayout.footer.top + 1);
+    for (const bounds of quickActionLayout.buttons) {
+      expect(bounds.left).toBeGreaterThanOrEqual(quickActionLayout.composer.left - 1);
+      expect(bounds.right).toBeLessThanOrEqual(quickActionLayout.composer.right + 1);
+      expect(bounds.top).toBeGreaterThanOrEqual(quickActionLayout.toolbar.top - 1);
+      expect(bounds.bottom).toBeLessThanOrEqual(quickActionLayout.toolbar.bottom + 1);
+    }
+    expect(composerLayout.options.right).toBeLessThanOrEqual(composerLayout.actions.left + 1);
+    expect(composerLayout.actions.right).toBeLessThanOrEqual(composerLayout.footer.right + 1);
+    expect(composerLayout.project.right).toBeLessThanOrEqual(composerLayout.mode.left + 1);
+    expect(Math.abs(composerLayout.project.top - composerLayout.mode.top)).toBeLessThanOrEqual(1);
+    expect(composerLayout.approvalInActions).toBe(true);
+    for (const bounds of composerLayout.interactiveBounds) {
+      expect(bounds.left).toBeGreaterThanOrEqual(composerLayout.footer.left - 1);
+      expect(bounds.right).toBeLessThanOrEqual(composerLayout.footer.right + 1);
+    }
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+    await page.screenshot({ path: testInfo.outputPath(`composer-${width}.png`) });
+  }
+  await page.setViewportSize(initialViewport);
+
   await trigger.click();
 
   const popover = page.getByRole("dialog", { name: "上下文用量" });
@@ -3421,6 +3647,17 @@ test("switches the runtime approval mode from the composer", async ({ page }, te
   await expect.poll(() => page.evaluate(() =>
     (window as unknown as { __lastApprovalMode: string | null }).__lastApprovalMode,
   )).toBe("full_access");
+  await expect(trigger.locator("span")).toBeVisible();
+  if (testInfo.project.name === "narrow") {
+    await page.setViewportSize({ width: 596, height: 820 });
+    await expect(trigger.locator("span")).toBeVisible();
+    const groups = await Promise.all([
+      page.locator(".composer-options").boundingBox(),
+      page.locator(".composer-actions").boundingBox(),
+    ]);
+    expect(groups.every(Boolean)).toBe(true);
+    expect(groups[0]!.x + groups[0]!.width).toBeLessThanOrEqual(groups[1]!.x + 1);
+  }
   await page.evaluate(() => {
     (window as unknown as { __emitAgentEvent: (event: unknown) => void }).__emitAgentEvent({
       schemaVersion: 1,
@@ -3895,8 +4132,19 @@ test("clears the previous thread view while the selected thread is loading", asy
   await expect(page.getByText("正在读取会话", { exact: true })).toBeVisible();
 });
 
-test("starts a workspace terminal from the workbench tab and forwards keystrokes", async ({ page }) => {
+test("keeps workspace terminal input ordered and preserves the session across tabs", async ({ page }, testInfo) => {
   const startCount = () => page.evaluate(() => (window as unknown as { __ptyStartRequests: unknown[] }).__ptyStartRequests.length);
+  if (testInfo.project.name === "narrow") {
+    await page.setViewportSize({ width: 381, height: 420 });
+  }
+  await page.addInitScript(() => {
+    localStorage.setItem("kcoder_theme", "dark");
+    localStorage.setItem("kcoder_e2e_pty_write_delay_ms", "25");
+    localStorage.setItem(
+      "kcoder_e2e_pty_output",
+      "\u001b[34mPS D:\\code\\Nick\\k-coder>\u001b[0m pnpm tauri dev\r\nReady\r\nPS D:\\code\\Nick\\k-coder> ",
+    );
+  });
   await page.goto("/");
   await page.getByRole("button", { name: "工作台", exact: true }).click();
   await page.getByRole("tab", { name: "终端" }).click();
@@ -3912,7 +4160,18 @@ test("starts a workspace terminal from the workbench tab and forwards keystrokes
 
   await page.locator(".terminal-view .xterm-helper-textarea").focus();
   await page.keyboard.type("pnpm tauri build");
-  await expect.poll(() => page.evaluate(() => (window as unknown as { __ptyWrites: string[] }).__ptyWrites.join(""))).toContain("pnpm tauri build");
+  await page.keyboard.press("Enter");
+  await page.keyboard.type("pnpm tauri dev");
+  await page.keyboard.press("Enter");
+  await expect.poll(() => page.evaluate(() => (window as unknown as { __ptyWrites: string[] }).__ptyWrites.join(""))).toBe(
+    "pnpm tauri build\rpnpm tauri dev\r",
+  );
+  const writeMetrics = await page.evaluate(() => (window as unknown as {
+    __ptyWriteMetrics: { active: number; maxConcurrent: number };
+  }).__ptyWriteMetrics);
+  expect(writeMetrics.active).toBe(0);
+  expect(writeMetrics.maxConcurrent).toBe(1);
+  await page.locator(".terminal-view").screenshot({ path: testInfo.outputPath("terminal-input-stable.png") });
 
   const started = await startCount();
   await page.getByRole("tab", { name: "文件" }).click();

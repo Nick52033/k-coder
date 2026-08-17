@@ -112,6 +112,10 @@
   flex-direction: column;
 }
 
+.terminal-tab-host[hidden] {
+  display: none;
+}
+
 .git-actions {
   flex-wrap: wrap;
 }

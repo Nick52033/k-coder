@@ -4,12 +4,13 @@ import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
 import "./TerminalPanel.css";
-import { closePty, ptyStatus, readPtyOutput, resizePty, startPty, writePty } from "../api/runtime";
+import { closePty, readPtyOutput, resizePty, startPty, waitPty, writePty } from "../api/runtime";
 import type { CommandState } from "../types/runtime";
 
 type TerminalStatus = "starting" | "running" | "exited" | "error";
 
-const POLL_INTERVAL_MS = 90;
+const OUTPUT_POLL_INTERVAL_MS = 32;
+const INPUT_BATCH_INTERVAL_MS = 12;
 
 function readCssVariable(name: string, fallback: string) {
   const value = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
@@ -17,11 +18,30 @@ function readCssVariable(name: string, fallback: string) {
 }
 
 function terminalTheme() {
+  const dark = document.documentElement.dataset.theme === "dark";
   return {
     background: readCssVariable("--color-surface-panel", "#161A26"),
     foreground: readCssVariable("--color-ink", "#E3E8F0"),
-    cursor: readCssVariable("--color-ink", "#E3E8F0"),
+    cursor: readCssVariable("--color-brand-light", "#7FAEFF"),
+    cursorAccent: readCssVariable("--color-surface-panel", "#161A26"),
     selectionBackground: readCssVariable("--color-brand-ring", "rgba(79, 138, 255, 0.28)"),
+    selectionInactiveBackground: dark ? "rgba(127, 174, 255, 0.14)" : "rgba(47, 111, 228, 0.12)",
+    black: dark ? "#11151F" : "#172033",
+    red: dark ? "#F87171" : "#B4232C",
+    green: dark ? "#34D399" : "#13734F",
+    yellow: dark ? "#EAB54B" : "#8A5A00",
+    blue: dark ? "#7FAEFF" : "#2F6FE4",
+    magenta: dark ? "#C59AF4" : "#8151B4",
+    cyan: dark ? "#67D5E8" : "#167A8B",
+    white: dark ? "#D7DDEA" : "#D8DEE9",
+    brightBlack: dark ? "#707A8C" : "#68758A",
+    brightRed: dark ? "#FCA5A5" : "#C24145",
+    brightGreen: dark ? "#6EE7B7" : "#158A61",
+    brightYellow: dark ? "#F7CD75" : "#AD6800",
+    brightBlue: dark ? "#A9C6FF" : "#2459B8",
+    brightMagenta: dark ? "#D8B4FE" : "#6F3E9B",
+    brightCyan: dark ? "#A5E8F0" : "#0F6978",
+    brightWhite: dark ? "#F1F5FA" : "#FFFFFF",
   };
 }
 
@@ -55,34 +75,82 @@ const delay = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve,
 export function TerminalPanel({ visible }: { visible: boolean }) {
   const containerRef = useRef<HTMLDivElement>(null);
   const fitRef = useRef<FitAddon | null>(null);
+  const termRef = useRef<Terminal | null>(null);
+  const refreshSizeRef = useRef<(() => void) | null>(null);
   const [status, setStatus] = useState<TerminalStatus>("starting");
   const [detail, setDetail] = useState("");
   const [epoch, setEpoch] = useState(0);
 
   useEffect(() => {
     const container = containerRef.current;
-    if (!container || !visible) return undefined;
+    if (!container) return undefined;
+    const host = container;
 
     let disposed = false;
     let sessionId: string | null = null;
     let running = false;
+    let outputCursor = 0;
+    let inputBuffer = "";
+    let inputTimer: number | null = null;
+    let inputChain = Promise.resolve();
+    let resizeFrame: number | null = null;
+    let resizeInFlight = false;
+    let pendingSize: { rows: number; cols: number } | null = null;
+    let lastSentSize: { rows: number; cols: number } | null = null;
 
     const term = new Terminal({
       cursorBlink: true,
+      cursorStyle: "bar",
+      cursorWidth: 1,
       fontSize: 12,
       fontFamily: readCssVariable("--font-family-mono", "Consolas, monospace"),
+      fontWeight: "400",
+      fontWeightBold: "600",
+      letterSpacing: 0,
+      lineHeight: 1.25,
+      minimumContrastRatio: 4.5,
       scrollback: 5000,
+      smoothScrollDuration: 0,
       theme: terminalTheme(),
     });
     const fit = new FitAddon();
     fitRef.current = fit;
+    termRef.current = term;
     term.loadAddon(fit);
     term.open(container);
     fit.fit();
 
+    function showConnectionError(reason: unknown) {
+      if (disposed) return;
+      running = false;
+      setDetail(toReadableError(reason));
+      setStatus("error");
+    }
+
+    function flushInput() {
+      if (inputTimer !== null) {
+        window.clearTimeout(inputTimer);
+        inputTimer = null;
+      }
+      if (!sessionId || !running || !inputBuffer) return;
+      const targetSessionId = sessionId;
+      const input = inputBuffer;
+      inputBuffer = "";
+      inputChain = inputChain
+        .then(() => writePty(targetSessionId, input))
+        .catch((reason) => showConnectionError(reason));
+    }
+
     const inputSubscription = term.onData((data) => {
       if (!sessionId || !running) return;
-      void writePty(sessionId, data).catch(() => undefined);
+      inputBuffer += data;
+      if (/[\r\n\x03\x04\x1b]/.test(data)) {
+        flushInput();
+        return;
+      }
+      if (inputTimer === null) {
+        inputTimer = window.setTimeout(flushInput, INPUT_BATCH_INTERVAL_MS);
+      }
     });
 
     const themeObserver = new MutationObserver(() => {
@@ -90,41 +158,82 @@ export function TerminalPanel({ visible }: { visible: boolean }) {
     });
     themeObserver.observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme"] });
 
-    const resizeObserver = new ResizeObserver(() => {
-      if (container.offsetWidth === 0 || container.offsetHeight === 0) return;
+    async function flushResize() {
+      if (resizeInFlight) return;
+      resizeInFlight = true;
+      while (!disposed && running && sessionId && pendingSize) {
+        const size = pendingSize;
+        pendingSize = null;
+        if (lastSentSize?.rows === size.rows && lastSentSize.cols === size.cols) continue;
+        try {
+          await resizePty(sessionId, size.rows, size.cols);
+          lastSentSize = size;
+        } catch (reason) {
+          showConnectionError(reason);
+        }
+      }
+      resizeInFlight = false;
+    }
+
+    function refreshSize() {
+      if (host.offsetWidth === 0 || host.offsetHeight === 0) return;
       fit.fit();
       if (sessionId && running) {
-        void resizePty(sessionId, Math.max(term.rows, 2), Math.max(term.cols, 2)).catch(() => undefined);
+        pendingSize = { rows: Math.max(term.rows, 2), cols: Math.max(term.cols, 2) };
+        void flushResize();
       }
-    });
-    resizeObserver.observe(container);
+    }
 
-    async function poll() {
-      let cursor = 0;
-      while (!disposed && sessionId) {
+    function scheduleSizeRefresh() {
+      if (resizeFrame !== null) return;
+      resizeFrame = requestAnimationFrame(() => {
+        resizeFrame = null;
+        refreshSize();
+      });
+    }
+
+    refreshSizeRef.current = scheduleSizeRefresh;
+    const resizeObserver = new ResizeObserver(scheduleSizeRefresh);
+    resizeObserver.observe(host);
+
+    async function pollOutput(targetSessionId: string) {
+      while (!disposed && running) {
         try {
-          const page = await readPtyOutput(sessionId, cursor, 500);
+          const page = await readPtyOutput(targetSessionId, outputCursor, 500);
           if (disposed) return;
-          for (const chunk of page.chunks) term.write(chunk.text);
-          cursor = page.nextCursor;
-          const view = await ptyStatus(sessionId);
-          if (disposed) return;
-          if (view.state.state !== "running") {
-            running = false;
-            const tail = await readPtyOutput(sessionId, cursor, 1000).catch(() => null);
-            if (tail) for (const chunk of tail.chunks) term.write(chunk.text);
-            setDetail(describeState(view.state));
-            setStatus("exited");
-            return;
-          }
+          if (page.chunks.length > 0) term.write(page.chunks.map((chunk) => chunk.text).join(""));
+          outputCursor = page.nextCursor;
         } catch (reason) {
-          if (!disposed) {
-            setDetail(toReadableError(reason));
-            setStatus("error");
-          }
+          showConnectionError(reason);
           return;
         }
-        await delay(POLL_INTERVAL_MS);
+        await delay(OUTPUT_POLL_INTERVAL_MS);
+      }
+    }
+
+    async function drainOutput(targetSessionId: string) {
+      for (let attempt = 0; attempt < 2 && !disposed; attempt += 1) {
+        const page = await readPtyOutput(targetSessionId, outputCursor, 1000).catch(() => null);
+        if (!page) return;
+        if (page.chunks.length > 0) term.write(page.chunks.map((chunk) => chunk.text).join(""));
+        outputCursor = page.nextCursor;
+        if (page.chunks.length === 0) return;
+        await delay(16);
+      }
+    }
+
+    async function monitorSession(targetSessionId: string) {
+      const outputTask = pollOutput(targetSessionId);
+      try {
+        const view = await waitPty(targetSessionId);
+        running = false;
+        await outputTask;
+        await drainOutput(targetSessionId);
+        if (disposed) return;
+        setDetail(describeState(view.state));
+        setStatus("exited");
+      } catch (reason) {
+        showConnectionError(reason);
       }
     }
 
@@ -143,13 +252,11 @@ export function TerminalPanel({ visible }: { visible: boolean }) {
         }
         sessionId = session.id;
         running = true;
+        lastSentSize = { rows: session.rows, cols: session.cols };
         setStatus("running");
-        void poll();
+        void monitorSession(session.id);
       } catch (reason) {
-        if (!disposed) {
-          setDetail(toReadableError(reason));
-          setStatus("error");
-        }
+        showConnectionError(reason);
       }
     }
     void boot();
@@ -157,33 +264,47 @@ export function TerminalPanel({ visible }: { visible: boolean }) {
     return () => {
       disposed = true;
       running = false;
+      if (inputTimer !== null) window.clearTimeout(inputTimer);
+      if (resizeFrame !== null) cancelAnimationFrame(resizeFrame);
       themeObserver.disconnect();
       resizeObserver.disconnect();
       inputSubscription.dispose();
-      if (sessionId) void closePty(sessionId).catch(() => undefined);
+      const closingSessionId = sessionId;
+      if (closingSessionId) void closePty(closingSessionId).catch(() => undefined);
       fitRef.current = null;
+      termRef.current = null;
+      refreshSizeRef.current = null;
       term.dispose();
     };
-  }, [epoch, visible]);
+  }, [epoch]);
 
   useEffect(() => {
     if (!visible) return;
-    const frame = requestAnimationFrame(() => fitRef.current?.fit());
+    const frame = requestAnimationFrame(() => {
+      refreshSizeRef.current?.();
+      termRef.current?.focus();
+    });
     return () => cancelAnimationFrame(frame);
   }, [visible, epoch]);
 
+  const stateLabel = status === "starting"
+    ? "正在启动…"
+    : status === "running"
+      ? "运行中"
+      : status === "exited"
+        ? detail
+        : "连接已断开";
+
   return (
-    <div className="terminal-view">
+    <div className="terminal-view" data-status={status}>
       <div className="panel-toolbar terminal-toolbar">
         <span className="terminal-title">
           <SquareTerminal size={14} />
           <strong>终端</strong>
-          <small>
-            {status === "starting" && "正在启动…"}
-            {status === "running" && "运行中"}
-            {status === "exited" && detail}
-            {status === "error" && "连接已断开"}
-          </small>
+          <span className="terminal-state" aria-live="polite">
+            <span className="terminal-state-dot" aria-hidden="true" />
+            <small>{stateLabel}</small>
+          </span>
         </span>
         <button
           type="button"

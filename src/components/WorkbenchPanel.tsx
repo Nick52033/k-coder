@@ -97,10 +97,10 @@ export function WorkbenchPanel({ onAttach, open = false }: { onAttach: (attachme
       </div>
       {tab === "files" && <FilesView onAttach={onAttach} />}
       {tab === "git" && <GitView />}
-      {terminalMounted && tab === "terminal" && (
-        <div className="terminal-tab-host">
+      {terminalMounted && (
+        <div className="terminal-tab-host" hidden={tab !== "terminal"}>
           <Suspense fallback={<div className="panel-empty">正在载入终端...</div>}>
-            <TerminalPanel visible />
+            <TerminalPanel visible={open && tab === "terminal"} />
           </Suspense>
         </div>
       )}

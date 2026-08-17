@@ -2,6 +2,9 @@ import { Fragment, FormEvent, KeyboardEvent, useEffect, useMemo, useRef, useStat
 import {
   Activity,
   ArrowUp,
+  AtSign,
+  BookOpen,
+  ChevronDown,
   ChevronRight,
   Check,
   CircleAlert,
@@ -12,6 +15,7 @@ import {
   FolderPlus,
   Hammer,
   History,
+  ImagePlus,
   PanelRightOpen,
   PanelRightClose,
   Loader2,
@@ -32,6 +36,7 @@ import {
   Sun,
   Trash2,
   Undo2,
+  UsersRound,
   X,
   Target,
 } from "lucide-react";
@@ -1080,20 +1085,29 @@ function App() {
     });
   }
 
-  function openComposerSkillPicker() {
+  function openComposerSuggestionPicker(kind: ComposerTrigger["kind"]) {
     if (activeThreadIsStandalone) return;
+    const marker = kind === "file" ? "@" : "/";
     const separator = draft.length > 0 && !/\s$/.test(draft) ? " " : "";
     const triggerStart = draft.length + separator.length;
-    const nextDraft = `${draft}${separator}/`;
+    const nextDraft = `${draft}${separator}${marker}`;
     const nextCursor = nextDraft.length;
     setDraft(nextDraft);
-    setComposerTrigger({ kind: "skill", start: triggerStart, end: nextCursor, query: "" });
+    setComposerTrigger({ kind, start: triggerStart, end: nextCursor, query: "" });
     setComposerSuggestionIndex(0);
     requestAnimationFrame(() => {
       const textarea = composerRef.current;
       textarea?.focus();
       textarea?.setSelectionRange(nextCursor, nextCursor);
     });
+  }
+
+  function openComposerFilePicker() {
+    openComposerSuggestionPicker("file");
+  }
+
+  function openComposerSkillPicker() {
+    openComposerSuggestionPicker("skill");
   }
 
   async function submitMessage(event: FormEvent) {
@@ -1368,14 +1382,18 @@ function App() {
               {workbenchOpen ? <PanelRightOpen size={16} /> : <PanelRightClose size={16} />}
             </button>
             <button
-              className={cn("segmented-button", agentPanelOpen && "segmented-button--active")}
+              className={cn(
+                "segmented-button",
+                "segmented-button--subagent",
+                agentPanelOpen && "segmented-button--active",
+              )}
               type="button"
               aria-label="子智能体"
               title="子智能体"
               aria-pressed={agentPanelOpen}
               onClick={() => { setAgentPanelOpen((value) => !value); setWorkbenchOpen(false); }}
             >
-              <Bot size={16} />
+              <UsersRound size={16} aria-hidden="true" data-icon="subagent" />
             </button>
           </div>
           <button
@@ -2031,6 +2049,52 @@ function App() {
           onDragOver={handleDragOver}
           onDrop={handleDrop}
         >
+          <div className="composer-quick-actions" role="toolbar" aria-label="输入快捷操作">
+            <button
+              type="button"
+              className="composer-quick-action"
+              aria-label="引用工作区文件"
+              title={activeThreadIsStandalone ? "独立会话不能引用工作区文件" : "引用工作区文件"}
+              disabled={activeThreadIsStandalone}
+              onClick={openComposerFilePicker}
+            >
+              <AtSign size={17} aria-hidden="true" />
+            </button>
+            <button
+              type="button"
+              className="composer-quick-action"
+              aria-label="添加图片"
+              title="添加图片"
+              onClick={() => void handlePickImages()}
+            >
+              <ImagePlus size={17} aria-hidden="true" />
+            </button>
+            <button
+              type="button"
+              className="composer-quick-action"
+              aria-label="使用 Skill"
+              title={activeThreadIsStandalone ? "独立会话不能使用 Skill" : "使用 Skill"}
+              disabled={activeThreadIsStandalone}
+              onClick={openComposerSkillPicker}
+            >
+              <BookOpen size={17} aria-hidden="true" />
+            </button>
+            <ComposerAddMenu onOpenSettings={openSettingsSection} />
+            <span className="composer-quick-actions-divider" aria-hidden="true" />
+            <WorkflowSelector
+              definitions={workflows}
+              run={workflowRun}
+              selectedWorkflowId={selectedWorkflowId}
+              standalone={activeThreadIsStandalone}
+              disabled={currentThreadBusy || Boolean(queuedWorkflowId)}
+              compact
+              onSelect={(workflowId) => {
+                setSelectedWorkflowId(workflowId);
+                if (workflowId) setAgentMode("craft");
+                setModeMenuOpen(false);
+              }}
+            />
+          </div>
           {attachments.length > 0 && (
             <div className="attachment-strip">
               {attachments.map((attachment) => (
@@ -2069,157 +2133,146 @@ function App() {
             />
           )}
           <div className="composer-footer">
-            <ProjectSelector
-              projects={selectableProjects}
-              activeProject={activeProject}
-              standalone={activeThreadIsStandalone}
-              disabled={anyTurnBusy}
-              switching={workspaceSwitching}
-              onSelect={selectComposerProject}
-              onCreateProject={pickProjectForComposer}
-              onSelectStandalone={selectComposerStandalone}
-            />
-            <ComposerAddMenu
-              skillDisabled={activeThreadIsStandalone}
-              onAddAttachment={() => void handlePickImages()}
-              onAddSkill={openComposerSkillPicker}
-              onOpenSettings={openSettingsSection}
-            />
-            <WorkflowSelector
-              definitions={workflows}
-              run={workflowRun}
-              selectedWorkflowId={selectedWorkflowId}
-              standalone={activeThreadIsStandalone}
-              disabled={currentThreadBusy || Boolean(queuedWorkflowId)}
-              onSelect={(workflowId) => {
-                setSelectedWorkflowId(workflowId);
-                if (workflowId) setAgentMode("craft");
-                setModeMenuOpen(false);
-              }}
-            />
-            <div ref={modeMenuRef} className="composer-mode-selector">
-              <button
-                type="button"
-                className="mode-toggle"
-                onClick={() => setModeMenuOpen(!modeMenuOpen)}
-                aria-label="选择模式"
-                title={workflowModeLocked ? "机器人工作流固定使用 Craft 模式" : "选择交互模式"}
-                disabled={workflowModeLocked}
-              >
-                {agentMode === "craft" && (
-                  <>
-                    <span className="mode-glyph mode-glyph--craft" aria-hidden="true">
-                      <Hammer size={13} strokeWidth={2.2} />
-                    </span>
-                    <span>Craft</span>
-                  </>
-                )}
-                {agentMode === "ask" && (
-                  <>
-                    <MessageSquare size={16} />
-                    <span>Ask</span>
-                  </>
-                )}
-                {agentMode === "plan" && (
-                  <>
-                    <FileDiff size={16} />
-                    <span>Plan</span>
-                  </>
-                )}
-              </button>
-              {modeMenuOpen && !workflowModeLocked && (
-                <div className="mode-menu">
+            <div className="composer-controls">
+              <div className="composer-options">
+                <ProjectSelector
+                  projects={selectableProjects}
+                  activeProject={activeProject}
+                  standalone={activeThreadIsStandalone}
+                  disabled={anyTurnBusy}
+                  switching={workspaceSwitching}
+                  onSelect={selectComposerProject}
+                  onCreateProject={pickProjectForComposer}
+                  onSelectStandalone={selectComposerStandalone}
+                />
+                <div ref={modeMenuRef} className="composer-mode-selector">
                   <button
                     type="button"
-                    className={`mode-option ${agentMode === "craft" ? "mode-option--active" : ""}`}
-                    onClick={() => {
-                      setAgentMode("craft");
-                      setModeMenuOpen(false);
-                    }}
+                    className="mode-toggle"
+                    onClick={() => setModeMenuOpen(!modeMenuOpen)}
+                    aria-label="选择模式"
+                    aria-haspopup="menu"
+                    aria-expanded={modeMenuOpen}
+                    title={workflowModeLocked ? "机器人工作流固定使用 Craft 模式" : "选择交互模式"}
+                    disabled={workflowModeLocked}
                   >
-                    <span className="mode-glyph mode-glyph--craft" aria-hidden="true">
-                      <Hammer size={14} strokeWidth={2.2} />
-                    </span>
-                    <div>
-                      <strong>Craft</strong>
-                      <span>直接执行，修改代码</span>
-                    </div>
+                    {agentMode === "craft" && (
+                      <>
+                        <span className="mode-glyph mode-glyph--craft" aria-hidden="true">
+                          <Hammer size={13} strokeWidth={2.2} />
+                        </span>
+                        <span>Craft</span>
+                      </>
+                    )}
+                    {agentMode === "ask" && (
+                      <>
+                        <MessageSquare size={16} />
+                        <span>Ask</span>
+                      </>
+                    )}
+                    {agentMode === "plan" && (
+                      <>
+                        <FileDiff size={16} />
+                        <span>Plan</span>
+                      </>
+                    )}
+                    <ChevronDown className="mode-chevron" size={13} aria-hidden="true" />
                   </button>
-                  <button
-                    type="button"
-                    className={`mode-option ${agentMode === "ask" ? "mode-option--active" : ""}`}
-                    onClick={() => {
-                      setAgentMode("ask");
-                      setModeMenuOpen(false);
-                    }}
-                  >
-                    <MessageSquare size={16} />
-                    <div>
-                      <strong>Ask</strong>
-                      <span>只回答问题，不修改代码</span>
+                  {modeMenuOpen && !workflowModeLocked && (
+                    <div className="mode-menu" role="menu" aria-label="交互模式">
+                      <button
+                        type="button"
+                        className={`mode-option ${agentMode === "craft" ? "mode-option--active" : ""}`}
+                        onClick={() => {
+                          setAgentMode("craft");
+                          setModeMenuOpen(false);
+                        }}
+                      >
+                        <span className="mode-glyph mode-glyph--craft" aria-hidden="true">
+                          <Hammer size={14} strokeWidth={2.2} />
+                        </span>
+                        <div>
+                          <strong>Craft</strong>
+                          <span>直接执行，修改代码</span>
+                        </div>
+                      </button>
+                      <button
+                        type="button"
+                        className={`mode-option ${agentMode === "ask" ? "mode-option--active" : ""}`}
+                        onClick={() => {
+                          setAgentMode("ask");
+                          setModeMenuOpen(false);
+                        }}
+                      >
+                        <MessageSquare size={16} />
+                        <div>
+                          <strong>Ask</strong>
+                          <span>只回答问题，不修改代码</span>
+                        </div>
+                      </button>
+                      <button
+                        type="button"
+                        className={`mode-option ${agentMode === "plan" ? "mode-option--active" : ""}`}
+                        onClick={() => {
+                          setAgentMode("plan");
+                          setModeMenuOpen(false);
+                        }}
+                      >
+                        <FileDiff size={16} />
+                        <div>
+                          <strong>Plan</strong>
+                          <span>先制定计划，等待确认</span>
+                        </div>
+                      </button>
                     </div>
-                  </button>
-                  <button
-                    type="button"
-                    className={`mode-option ${agentMode === "plan" ? "mode-option--active" : ""}`}
-                    onClick={() => {
-                      setAgentMode("plan");
-                      setModeMenuOpen(false);
-                    }}
-                  >
-                    <FileDiff size={16} />
-                    <div>
-                      <strong>Plan</strong>
-                      <span>先制定计划，等待确认</span>
-                    </div>
-                  </button>
+                  )}
                 </div>
-              )}
-            </div>
-            <ApprovalModeSelector
-              mode={approvalMode}
-              disabled={anyTurnBusy}
-              onChange={setApprovalMode}
-            />
-            <ReasoningSelector
-              effort={reasoningEffort}
-              onChange={setReasoningEffort}
-            />
-            <ModelSelector
-              provider={providerConfig}
-              providers={providerConfigs}
-              activeProviderId={activeProviderId}
-              onSaveProvider={saveProvider}
-              onActivateProvider={activateProvider}
-            />
-            <div className="composer-actions">
-              <ContextProgress
-                usage={contextUsage}
-                contextWindow={activeModelContextWindow}
-              />
-              {currentThreadBusy && (
+                <ReasoningSelector
+                  effort={reasoningEffort}
+                  onChange={setReasoningEffort}
+                />
+                <ModelSelector
+                  provider={providerConfig}
+                  providers={providerConfigs}
+                  activeProviderId={activeProviderId}
+                  onSaveProvider={saveProvider}
+                  onActivateProvider={activateProvider}
+                />
+              </div>
+              <div className="composer-actions">
+                <ApprovalModeSelector
+                  mode={approvalMode}
+                  disabled={anyTurnBusy}
+                  onChange={setApprovalMode}
+                />
+                <ContextProgress
+                  usage={contextUsage}
+                  contextWindow={activeModelContextWindow}
+                />
+                {currentThreadBusy && (
+                  <button
+                    className="stop-button"
+                    type="button"
+                    aria-label={currentThreadCancelling ? "正在停止" : "停止生成"}
+                    title={currentThreadCancelling ? "正在停止" : "停止生成"}
+                    disabled={currentThreadCancelling}
+                    onClick={() => void stopTurn()}
+                  >
+                    {currentThreadCancelling
+                      ? <Loader2 className="spin" size={16} />
+                      : <Square size={15} fill="currentColor" />}
+                  </button>
+                )}
                 <button
-                  className="stop-button"
-                  type="button"
-                  aria-label={currentThreadCancelling ? "正在停止" : "停止生成"}
-                  title={currentThreadCancelling ? "正在停止" : "停止生成"}
-                  disabled={currentThreadCancelling}
-                  onClick={() => void stopTurn()}
+                  className="send-button"
+                  type="submit"
+                  aria-label="发送消息"
+                  title="发送消息"
+                  disabled={workspaceSwitching || (!draft.trim() && attachments.length === 0)}
                 >
-                  {currentThreadCancelling
-                    ? <Loader2 className="spin" size={16} />
-                    : <Square size={15} fill="currentColor" />}
+                  <ArrowUp size={18} strokeWidth={2.2} />
                 </button>
-              )}
-              <button
-                className="send-button"
-                type="submit"
-                aria-label="发送消息"
-                title="发送消息"
-                disabled={workspaceSwitching || (!draft.trim() && attachments.length === 0)}
-              >
-                <ArrowUp size={18} strokeWidth={2.2} />
-              </button>
+              </div>
             </div>
           </div>
         </form>

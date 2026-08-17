@@ -3470,11 +3470,77 @@ button {
   box-shadow: 0 0 0 2px var(--color-brand-ring);
 }
 
+.composer-quick-actions {
+  position: relative;
+  z-index: 3;
+  display: flex;
+  min-width: 0;
+  min-height: 38px;
+  padding: 3px 8px 2px;
+  align-items: center;
+  gap: 2px;
+  border-bottom: 1px solid var(--color-border);
+  background: color-mix(in srgb, var(--color-surface-panel) 42%, transparent);
+}
+
+.composer-quick-action {
+  display: inline-grid;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  flex: 0 0 32px;
+  place-items: center;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  color: var(--color-ink-muted);
+  background: transparent;
+  cursor: pointer;
+  transition: color var(--transition-fast), background-color var(--transition-fast), border-color var(--transition-fast);
+}
+
+.composer-quick-action:hover {
+  border-color: var(--color-border);
+  color: var(--color-brand);
+  background: var(--color-surface-hover);
+}
+
+.composer-quick-action:focus-visible {
+  outline: 2px solid var(--color-brand-ring);
+  outline-offset: 1px;
+}
+
+.composer-quick-action:disabled {
+  opacity: 0.42;
+  cursor: not-allowed;
+}
+
+.composer-quick-action:disabled:hover {
+  border-color: transparent;
+  color: var(--color-ink-muted);
+  background: transparent;
+}
+
+.composer-quick-actions-divider {
+  width: 1px;
+  height: 20px;
+  margin: 0 3px;
+  flex: 0 0 1px;
+  background: var(--color-border);
+}
+
+.composer-quick-actions .workflow-selector {
+  flex: 0 1 156px;
+}
+
+.composer-quick-actions .workflow-toggle {
+  max-width: 156px;
+}
+
 .composer textarea {
   display: block;
   width: 100%;
-  min-height: 76px;
-  padding: 13px 14px;
+  min-height: 68px;
+  padding: 12px 14px;
   font-size: var(--font-size-md);
   resize: none;
   border: 0;
@@ -3572,14 +3638,45 @@ button {
 .composer-footer {
   position: relative;
   z-index: 2;
+  display: grid;
   min-width: 0;
-  flex-wrap: wrap;
-  justify-content: flex-start;
-  gap: 10px;
-  padding: 7px 8px 8px 13px;
+  grid-template-columns: minmax(0, 1fr);
+  align-items: stretch;
+  gap: 0;
+  padding: 0;
 }
 
 .composer-footer > * {
+  max-width: 100%;
+}
+
+.composer-controls {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: minmax(0, 1fr) auto;
+  padding: 6px 8px 8px;
+  align-items: center;
+  gap: 8px;
+}
+
+.composer-options {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  flex-wrap: nowrap;
+  gap: 2px;
+}
+
+.composer-options > * {
+  max-width: 100%;
+}
+
+.composer-options .project-selector {
+  flex: 0 1 132px;
+}
+
+.composer-options .project-selector-trigger {
+  width: 100%;
   max-width: 100%;
 }
 
@@ -3844,6 +3941,23 @@ button {
   white-space: nowrap;
 }
 
+.workflow-selector--compact {
+  flex: 0 0 32px;
+}
+
+.workflow-selector--compact .workflow-toggle {
+  width: 32px;
+  max-width: 32px;
+  padding: 0;
+  justify-content: center;
+  gap: 0;
+}
+
+.workflow-selector--compact .workflow-toggle > span,
+.workflow-selector--compact .workflow-toggle > svg:last-child {
+  display: none;
+}
+
 .workflow-menu {
   position: absolute;
   z-index: 50;
@@ -3971,13 +4085,6 @@ button {
   text-align: left;
 }
 
-.composer-add-menu-item:first-child {
-  margin-bottom: 5px;
-  border-bottom: 1px solid var(--color-border);
-  border-bottom-right-radius: 0;
-  border-bottom-left-radius: 0;
-}
-
 .composer-add-menu-item:hover,
 .composer-add-menu-item:focus-visible {
   outline: 0;
@@ -4008,22 +4115,126 @@ button {
   white-space: nowrap;
 }
 
-.composer-footer .model-selector {
-  flex: 1 1 120px;
+.composer-options .model-selector {
+  flex: 1 1 148px;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
+.composer-options .model-selector-trigger {
+  width: 100%;
+  max-width: 100%;
+}
+
 .composer-actions {
   display: flex;
   flex: 0 0 auto;
   min-width: 0;
-  flex-shrink: 1;
   align-items: center;
-  gap: 8px;
+  gap: 4px;
   margin-left: auto;
+}
+
+.composer-actions::before {
+  width: 1px;
+  height: 20px;
+  margin-right: 2px;
+  flex: 0 0 1px;
+  background: var(--color-border);
+  content: "";
+}
+
+@media (max-width: 720px) {
+  .composer-quick-actions {
+    padding-right: 6px;
+    padding-left: 6px;
+  }
+
+  .composer-controls {
+    padding-right: 6px;
+    padding-left: 6px;
+    gap: 4px;
+  }
+
+  .composer-options {
+    gap: 2px;
+  }
+
+  .composer-options .project-selector {
+    flex-basis: 110px;
+  }
+
+  .composer-options .model-selector {
+    flex-basis: 112px;
+  }
+
+  .composer-actions {
+    gap: 2px;
+  }
+
+  .context-progress-trigger {
+    width: 50px;
+    padding-right: 4px;
+    padding-left: 4px;
+  }
+}
+
+@media (max-width: 520px) {
+  .composer-quick-actions .workflow-selector,
+  .composer-quick-actions .workflow-toggle {
+    max-width: 132px;
+  }
+
+  .composer .mode-toggle {
+    width: 32px;
+    min-width: 32px;
+    padding: 0;
+    justify-content: center;
+    gap: 0;
+  }
+
+  .composer .mode-toggle > span:not(.mode-glyph),
+  .composer .mode-chevron,
+  .composer-options .model-selector-current small,
+  .composer-options .model-selector-current > span,
+  .composer-options .model-selector-current em {
+    display: none;
+  }
+
+  .composer-options .model-selector {
+    flex-basis: 60px;
+  }
+
+  .composer-options .project-selector {
+    flex: 0 0 32px;
+  }
+
+  .composer-options .project-selector-trigger {
+    padding: 0;
+    justify-content: center;
+    gap: 0;
+  }
+
+  .composer-options .project-selector-trigger > span,
+  .composer-options .project-selector-chevron {
+    display: none;
+  }
+
+  .composer-options .model-selector-trigger {
+    padding-right: 5px;
+    padding-left: 6px;
+    gap: 4px;
+  }
+
+  .composer-actions {
+    padding-left: 2px;
+  }
+
+  .composer-actions::before {
+    margin-right: 0;
+  }
 }
 
 .context-progress {

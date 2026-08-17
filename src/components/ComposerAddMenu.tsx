@@ -2,27 +2,19 @@ import { useEffect, useId, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import {
   Boxes,
-  FilePlus2,
+  Menu,
   Network,
-  Plus,
   Puzzle,
-  Sparkles,
   Workflow,
 } from "lucide-react";
 
 type AddSettingsSection = "plugins" | "mcp" | "miniapps" | "workflows";
 
 interface ComposerAddMenuProps {
-  skillDisabled?: boolean;
-  onAddAttachment: () => void;
-  onAddSkill: () => void;
   onOpenSettings: (section: AddSettingsSection) => void;
 }
 
 export function ComposerAddMenu({
-  skillDisabled = false,
-  onAddAttachment,
-  onAddSkill,
   onOpenSettings,
 }: ComposerAddMenuProps) {
   const [isOpen, setIsOpen] = useState(false);
@@ -112,17 +104,17 @@ export function ComposerAddMenu({
         ref={triggerRef}
         className="composer-add-trigger"
         type="button"
-        aria-label="添加"
+        aria-label="更多操作"
         aria-expanded={isOpen}
         aria-haspopup="menu"
         aria-controls={isOpen ? menuId : undefined}
-        title="添加"
+        title="更多操作"
         onClick={() => {
           if (!isOpen) updateMenuPosition();
           setIsOpen((open) => !open);
         }}
       >
-        <Plus size={18} strokeWidth={2.2} aria-hidden="true" />
+        <Menu size={17} aria-hidden="true" />
       </button>
 
       {isOpen && createPortal(
@@ -135,14 +127,6 @@ export function ComposerAddMenu({
           style={menuPosition}
           onKeyDown={handleMenuKeyDown}
         >
-          <AddMenuItem icon={<FilePlus2 size={17} />} label="添加附件" onClick={() => runAction(onAddAttachment)} />
-          <AddMenuItem
-            icon={<Sparkles size={17} />}
-            label="添加 Skill"
-            disabled={skillDisabled}
-            title={skillDisabled ? "不在项目中的会话不能使用 Skill" : undefined}
-            onClick={() => runAction(onAddSkill)}
-          />
           <AddMenuItem icon={<Puzzle size={17} />} label="添加插件" onClick={() => runAction(() => onOpenSettings("plugins"))} />
           <AddMenuItem icon={<Network size={17} />} label="添加 MCP" onClick={() => runAction(() => onOpenSettings("mcp"))} />
           <AddMenuItem icon={<Boxes size={17} />} label="添加小程序" onClick={() => runAction(() => onOpenSettings("miniapps"))} />
@@ -157,14 +141,10 @@ export function ComposerAddMenu({
 function AddMenuItem({
   icon,
   label,
-  disabled = false,
-  title,
   onClick,
 }: {
   icon: React.ReactNode;
   label: string;
-  disabled?: boolean;
-  title?: string;
   onClick: () => void;
 }) {
   return (
@@ -172,8 +152,6 @@ function AddMenuItem({
       className="composer-add-menu-item"
       type="button"
       role="menuitem"
-      disabled={disabled}
-      title={title}
       onClick={onClick}
     >
       <span aria-hidden="true">{icon}</span>

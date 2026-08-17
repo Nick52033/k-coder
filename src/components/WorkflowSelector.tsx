@@ -8,6 +8,7 @@ interface WorkflowSelectorProps {
   selectedWorkflowId: string | null;
   standalone: boolean;
   disabled: boolean;
+  compact?: boolean;
   onSelect: (workflowId: string | null) => void;
 }
 
@@ -17,6 +18,7 @@ export function WorkflowSelector({
   selectedWorkflowId,
   standalone,
   disabled,
+  compact = false,
   onSelect,
 }: WorkflowSelectorProps) {
   const [open, setOpen] = useState(false);
@@ -35,7 +37,7 @@ export function WorkflowSelector({
   }, [open]);
 
   return (
-    <div className="workflow-selector" ref={rootRef}>
+    <div className={`workflow-selector${compact ? " workflow-selector--compact" : ""}`} ref={rootRef}>
       <button
         type="button"
         className="workflow-toggle"
@@ -45,7 +47,7 @@ export function WorkflowSelector({
         disabled={unavailable}
         onClick={() => setOpen((value) => !value)}
       >
-        <Bot size={15} />
+        <Bot size={15} aria-hidden="true" data-icon="robot" />
         <span>{activeDefinition?.name ?? "普通智能体"}</span>
         <ChevronDown size={13} />
       </button>
