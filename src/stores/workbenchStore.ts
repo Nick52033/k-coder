@@ -697,12 +697,25 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
   },
 
   sendMessage: async (input, attachments = [], agentMode, workflowId) => {
-    const { activeThreadId: threadId } = get();
+    const { activeThreadId: threadId, activeTurns } = get();
     const text = input.trim();
     if (!threadId || (!text && attachments.length === 0)) return;
-    set({ error: "" });
+    const interruptActiveTurnId = activeTurns[threadId];
+    set((state) => ({
+      cancellingTurns: interruptActiveTurnId
+        ? { ...state.cancellingTurns, [threadId]: interruptActiveTurnId }
+        : state.cancellingTurns,
+      error: "",
+    }));
     try {
-      const handle = await startTurn(threadId, text, attachments, agentMode, workflowId);
+      const handle = await startTurn(
+        threadId,
+        text,
+        attachments,
+        agentMode,
+        workflowId,
+        interruptActiveTurnId,
+      );
       if (handle.state === "queued") {
         await get().processQueue();
       } else if (!terminalTurnIds.has(handle.turnId)) {
@@ -712,7 +725,12 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
         }));
       }
     } catch (error) {
-      set({ error: errorMessage(error) });
+      set((state) => ({
+        cancellingTurns: state.cancellingTurns[threadId] === interruptActiveTurnId
+          ? withoutActiveTurn(state.cancellingTurns, threadId)
+          : state.cancellingTurns,
+        error: errorMessage(error),
+      }));
     }
   },
 
@@ -762,7 +780,7 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
     if (!queuedMessage || queuedMessage.kind !== "message") return;
 
     const activeTurnId = get().activeTurns[queuedMessage.threadId];
-    if (activeTurnId) {
+    if (activeTurnId && get().cancellingTurns[queuedMessage.threadId] !== activeTurnId) {
       try {
         await steerQueuedTurn(
           queuedMessage.threadId,
@@ -1034,13 +1052,10 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
         restoredActiveTurns: withoutActiveTurn(state.restoredActiveTurns, event.threadId),
       }));
     }
-    const lifecyclePatch = reduceTurnLifecycle(event, {
-      activeTurns: get().activeTurns,
-      cancellingTurns: get().cancellingTurns,
-    });
-    if (lifecyclePatch) {
-      set(lifecyclePatch);
-    }
+    set((state) => reduceTurnLifecycle(event, {
+      activeTurns: state.activeTurns,
+      cancellingTurns: state.cancellingTurns,
+    }) ?? state);
     const hydration = hydrationBuffers.get(event.threadId);
     if (hydration) {
       hydration.events.push(event);
@@ -1074,16 +1089,19 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
       appendToolOutput,
       resultDurationMs,
     };
-    const state = get();
-    const reduction = reduceAgentEvent(event, state, helpers);
-    if (!reduction) return;
-    if (Object.keys(reduction.state).length > 0) {
-      set(reduction.state);
-    }
-    if (reduction.sideEffects?.includes("processQueue")) {
+    // Tauri can deliver adjacent lifecycle events while React is rendering. Reduce
+    // inside Zustand's functional updater so each event sees the newest message
+    // list instead of overwriting a user message with an older snapshot.
+    let sideEffects: Array<"processQueue" | "refreshPlan"> | undefined;
+    set((state) => {
+      const reduction = reduceAgentEvent(event, state, helpers);
+      sideEffects = reduction?.sideEffects;
+      return reduction?.state ?? state;
+    });
+    if (sideEffects?.includes("processQueue")) {
       void get().processQueue();
     }
-    if (reduction.sideEffects?.includes("refreshPlan") && event.type === "tool_completed") {
+    if (sideEffects?.includes("refreshPlan") && event.type === "tool_completed") {
       void getPlan(event.threadId)
         .then((updatedPlan) => {
           if (get().activeThreadId === event.threadId) set({ plan: updatedPlan });

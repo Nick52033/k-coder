@@ -384,7 +384,7 @@ fn build_system_prompt(
         sections.push(format!(
             "<workspace>\n工作区路径（仅用于识别，不是工具参数）：{workspace_path}\n项目名称：{project_name}\n工具路径规则：所有工作区路径参数必须是相对工作区根目录的路径。工作区根目录使用 `.`；例如使用 `docs/开发路线图.md` 或 `src-tauri/src`。不得把上面的绝对路径传给工具，也不得使用 `..` 或其他父目录遍历。\n</workspace>"
         ));
-        sections.push("<workspace_tool_protocol>\n调用文件工具前必须先确认路径事实，不要凭记忆拼接文件名：未知位置先用 list_directory 从 `.` 开始逐级查看，或用 search_repository 搜索明确的代码标识或内容并采用结果返回的路径。list_directory 只接受已存在的目录；read_file 只接受一个已存在的普通文件；两者都不接受目录/文件混用、猜测路径或 `*`、`?`、`[...]` 通配符。工具报路径错误后不要重复同一参数，应读取父目录或重新搜索后再试。\nWindows PowerShell 下原生 `rg` 不会展开 `dist/assets/index-*.js` 这类路径通配符；请使用 `rg --glob 'index-*.js' -n 'CodeEditor' dist/assets`，或先用 `Get-ChildItem` 取出精确 `.FullName` 再传给 `rg`。若命令把一个原生程序的输出通过管道交给 `rg`，并在正则中使用 `$` 行尾锚点，Windows PowerShell 会把管道内容转换为 CRLF；接收端必须使用 `rg --crlf`（例如 `rg --files path | rg --crlf 'name\\.js$'`），或改用 `Select-String`。\n</workspace_tool_protocol>".to_string());
+        sections.push("<workspace_tool_protocol>\n调用文件工具前必须先确认路径事实，不要凭记忆拼接文件名：未知位置先用 list_directory 从 `.` 开始逐级查看，或用 search_repository 搜索明确的代码标识或内容并采用结果返回的路径。list_directory 只接受已存在的目录；read_file 只接受一个已存在的普通文件；两者都不接受目录/文件混用、猜测路径或 `*`、`?`、`[...]` 通配符。工具报路径错误后不要重复同一参数，应读取父目录或重新搜索后再试。路径和内容已经确认且文件版本未变化时，不得为了“再次确认真实状态”重复读取高度重叠的行；修改后最多做一次针对改动点的验证，任务已完成时直接给出最终答复。\nWindows PowerShell 下原生 `rg` 不会展开 `dist/assets/index-*.js` 这类路径通配符；请使用 `rg --glob 'index-*.js' -n 'CodeEditor' dist/assets`，或先用 `Get-ChildItem` 取出精确 `.FullName` 再传给 `rg`。若命令把一个原生程序的输出通过管道交给 `rg`，并在正则中使用 `$` 行尾锚点，Windows PowerShell 会把管道内容转换为 CRLF；接收端必须使用 `rg --crlf`（例如 `rg --files path | rg --crlf 'name\\.js$'`），或改用 `Select-String`。\n</workspace_tool_protocol>".to_string());
         sections.push("<workspace_tool_batch_protocol>\n如果路径没有在当前用户请求、工作区上下文或此前的 list_directory/search_repository/read_file 结果中被明确确认，不得调用 read_file 或 list_directory。先单独调用 list_directory 或 search_repository，等待返回结果，再使用返回的精确路径读取；不要在同一批中并行发起发现调用和猜测的读取调用，也不要根据常见命名自行拼接目录或文件名。\n</workspace_tool_batch_protocol>".to_string());
     } else {
         sections.push("<workspace>\n当前会话不在任何项目中。不得读取、修改、搜索或执行任何本地项目内容，也不得把宿主当前打开的工作区当作本会话项目。只有 <available_tools> 中明确列出的非项目工具可用。\n</workspace>".to_string());
@@ -1204,7 +1204,17 @@ pub async fn turn_start(
     request: RunTurnRequest,
     attachments: Vec<ImageAttachment>,
     workflow_id: Option<String>,
+    interrupt_active_turn_id: Option<String>,
 ) -> CommandResult<TurnHandle> {
+    if interrupt_active_turn_id
+        .as_deref()
+        .is_some_and(|turn_id| turn_id.trim().is_empty())
+    {
+        return Err(CommandError::new(
+            "invalid_request",
+            "interruptActiveTurnId must not be empty",
+        ));
+    }
     let turn_id = Uuid::new_v4().to_string();
     let thread_id = request.thread_id.clone();
     let (signal, started) = oneshot::channel();
@@ -1214,20 +1224,23 @@ pub async fn turn_start(
         turn_id: turn_id.clone(),
         state: TurnState::Queued,
     };
-    let should_start = state
-        .enqueue_thread_turn(MailboxTurn {
-            handle: handle.clone(),
-            kind: MailboxTurnKind::Message {
-                request,
-                attachments,
-                workflow_id,
+    let enqueue = state
+        .enqueue_thread_turn_interrupting(
+            MailboxTurn {
+                handle: handle.clone(),
+                kind: MailboxTurnKind::Message {
+                    request,
+                    attachments,
+                    workflow_id,
+                },
+                started: Some(signal),
             },
-            started: Some(signal),
-        })
+            interrupt_active_turn_id.as_deref(),
+        )
         .await;
     emit_mailbox_changed(&app, state.inner(), &thread_id).await;
 
-    if !should_start {
+    if !enqueue.should_start {
         return Ok(handle);
     }
 
@@ -2612,6 +2625,8 @@ mod tests {
         assert!(prompt.contains("list_directory 只接受已存在的目录"));
         assert!(prompt.contains("read_file 只接受一个已存在的普通文件"));
         assert!(prompt.contains("工具报路径错误后不要重复同一参数"));
+        assert!(prompt.contains("不得为了“再次确认真实状态”重复读取高度重叠的行"));
+        assert!(prompt.contains("修改后最多做一次针对改动点的验证"));
         assert!(prompt.contains("不要在同一批中并行发起发现调用和猜测的读取调用"));
         assert!(prompt.contains("不会展开 `dist/assets/index-*.js`"));
         assert!(prompt.contains("rg --glob 'index-*.js'"));

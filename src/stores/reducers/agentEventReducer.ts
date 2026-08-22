@@ -562,8 +562,10 @@ export function reduceAgentEvent(
           usage: event.usage,
           lastTurn: { turnId: event.turnId, state: "completed", error: null },
           turnTimeline,
-          messages: state.messages.some((message) => message.turnId === event.turnId)
-            ? state.messages.map((message) => message.turnId === event.turnId
+          messages: state.messages.some((message) =>
+            message.turnId === event.turnId && message.role === "assistant",
+          )
+            ? state.messages.map((message) => message.turnId === event.turnId && message.role === "assistant"
                 ? toConversationMessage(event.message, event.turnId)
                 : message)
             : [...state.messages, toConversationMessage(event.message, event.turnId)],

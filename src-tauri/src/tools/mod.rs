@@ -1,10 +1,12 @@
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::fmt::Write;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -936,17 +938,36 @@ impl ToolHandler for ListDirectoryTool {
         }
         entries.sort_by(|left, right| left["name"].as_str().cmp(&right["name"].as_str()));
         let entry_count = entries.len();
+        let normalized_path = directory
+            .strip_prefix(&workspace.root)
+            .map(|value| {
+                let value = value.to_string_lossy().replace('\\', "/");
+                if value.is_empty() {
+                    ".".to_string()
+                } else {
+                    value
+                }
+            })
+            .map_err(|_| {
+                ToolError::Denied("directory resolved outside the workspace".to_string())
+            })?;
         let output = serde_json::to_string_pretty(&json!({
-            "path": path,
+            "path": normalized_path,
             "entries": entries,
             "truncated": omitted > 0,
             "omitted": omitted
         }))
         .map_err(|error| ToolError::Execution(error.to_string()))?;
+        let directory_revision = sha256_hex(output.as_bytes());
         Ok(ToolResult {
             success: true,
             output,
-            metadata: json!({ "entryCount": entry_count, "truncated": omitted > 0 }),
+            metadata: json!({
+                "path": normalized_path,
+                "directoryRevision": directory_revision,
+                "entryCount": entry_count,
+                "truncated": omitted > 0
+            }),
         })
     }
 }
@@ -1003,6 +1024,11 @@ impl ToolHandler for ReadFileTool {
             bytes = tokio::fs::read(&file) => bytes,
         }
         .map_err(|error| ToolError::Execution(error.to_string()))?;
+        let file_revision = sha256_hex(&bytes);
+        let normalized_path = file
+            .strip_prefix(&workspace.root)
+            .map(|value| value.to_string_lossy().replace('\\', "/"))
+            .map_err(|_| ToolError::Denied("file resolved outside the workspace".to_string()))?;
         let text = decode_text(&bytes)?;
         let line_starts = line_start_offsets(&text);
         let total_lines = line_starts.len();
@@ -1060,7 +1086,8 @@ impl ToolHandler for ReadFileTool {
             success: true,
             output,
             metadata: json!({
-                "path": path,
+                "path": normalized_path,
+                "fileRevision": file_revision,
                 "offset": offset,
                 "bytesReturned": end - offset,
                 "totalBytes": text.len(),
@@ -1298,12 +1325,22 @@ impl ToolHandler for RunCommandTool {
             .iter()
             .map(|chunk| chunk.text.as_str())
             .collect::<String>();
+        let output_was_empty = text.trim().is_empty();
+        let exit_code = match &status.state {
+            CommandState::Exited { code } => Some(*code),
+            _ => None,
+        };
+        if output_was_empty
+            && let Some(message) = empty_command_failure_message(&arguments.command, exit_code)
+        {
+            text.push_str(&message);
+        }
         let recovery_hint = command_recovery_hint(
             shell,
             self.runtime.uses_windows_powershell_native_pipeline(),
             &arguments.command,
             &status.state,
-            text.trim().is_empty(),
+            output_was_empty,
         );
         if let Some(hint) = recovery_hint {
             if !text.ends_with('\n') && !text.is_empty() {
@@ -1312,6 +1349,7 @@ impl ToolHandler for RunCommandTool {
             text.push_str("[提示] ");
             text.push_str(hint);
         }
+        let observation_revision = sha256_hex(text.as_bytes());
         let output_chunks = bounded_command_output_chunks(&output.chunks);
         let duration_ms = status
             .finished_at_ms
@@ -1322,6 +1360,8 @@ impl ToolHandler for RunCommandTool {
             "startedAtMs": status.started_at_ms,
             "finishedAtMs": status.finished_at_ms,
             "durationMs": duration_ms,
+            "exitCode": exit_code,
+            "observationRevision": observation_revision,
             "shell": shell,
             "outputTruncated": status.output_truncated,
             "nextCursor": output.next_cursor,
@@ -1340,6 +1380,25 @@ impl ToolHandler for RunCommandTool {
             metadata,
         })
     }
+}
+
+fn empty_command_failure_message(command: &str, exit_code: Option<i32>) -> Option<String> {
+    let code = exit_code.filter(|code| *code != 0)?;
+    if code == 1 && contains_rg_command(command) {
+        return Some("rg: no matches (exit code 1).".to_string());
+    }
+    Some(format!(
+        "command produced no output and exited with code {code}."
+    ))
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .fold(String::with_capacity(64), |mut output, byte| {
+            let _ = write!(output, "{byte:02x}");
+            output
+        })
 }
 
 fn command_recovery_hint(
@@ -2413,6 +2472,11 @@ mod tests {
             .unwrap();
         assert!(listed.metadata["truncated"].as_bool().unwrap());
         assert!(!listed.output.contains("node_modules"));
+        assert_eq!(listed.metadata["path"], ".");
+        assert_eq!(
+            listed.metadata["directoryRevision"].as_str().unwrap().len(),
+            64
+        );
 
         let read = registry
             .dispatch(
@@ -2427,6 +2491,8 @@ mod tests {
         assert_eq!(read.metadata["truncated"], true);
         assert_eq!(read.metadata["startLine"], 1);
         assert_eq!(read.metadata["linesReturned"], 1);
+        assert_eq!(read.metadata["path"], "utf16.txt");
+        assert_eq!(read.metadata["fileRevision"].as_str().unwrap().len(), 64);
     }
 
     #[tokio::test]
@@ -2466,6 +2532,68 @@ mod tests {
         assert_eq!(bytes.output, "two");
         assert_eq!(bytes.metadata["offset"], 4);
         assert_eq!(bytes.metadata["startLine"], 2);
+        assert_eq!(
+            lines.metadata["fileRevision"],
+            bytes.metadata["fileRevision"]
+        );
+    }
+
+    #[tokio::test]
+    async fn read_file_revision_changes_only_when_the_full_file_changes() {
+        let workspace = tempfile::tempdir().unwrap();
+        let path = workspace.path().join("revision.txt");
+        std::fs::write(&path, "one\ntwo\nthree\n").unwrap();
+        let registry = ToolRegistry::read_only();
+        let first = registry
+            .dispatch(
+                &context(workspace.path()),
+                "read_file",
+                json!({ "path": "revision.txt", "startLine": 1, "lineCount": 1 }),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let second = registry
+            .dispatch(
+                &context(workspace.path()),
+                "read_file",
+                json!({ "path": "revision.txt", "startLine": 2, "lineCount": 1 }),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            first.metadata["fileRevision"],
+            second.metadata["fileRevision"]
+        );
+
+        std::fs::write(&path, "one\nchanged\nthree\n").unwrap();
+        let changed = registry
+            .dispatch(
+                &context(workspace.path()),
+                "read_file",
+                json!({ "path": "revision.txt", "startLine": 1, "lineCount": 1 }),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(
+            first.metadata["fileRevision"],
+            changed.metadata["fileRevision"]
+        );
+    }
+
+    #[test]
+    fn empty_command_failures_report_exit_codes_and_rg_no_matches() {
+        assert_eq!(
+            empty_command_failure_message("rg -n missing .", Some(1)).as_deref(),
+            Some("rg: no matches (exit code 1).")
+        );
+        assert_eq!(
+            empty_command_failure_message("cargo test", Some(101)).as_deref(),
+            Some("command produced no output and exited with code 101.")
+        );
+        assert_eq!(empty_command_failure_message("cargo test", Some(0)), None);
     }
 
     #[tokio::test]

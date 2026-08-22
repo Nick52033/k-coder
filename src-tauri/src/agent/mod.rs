@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -48,8 +48,12 @@ const MAX_REASONING_SUMMARY_BYTES: usize = 64 * 1024;
 const MAX_PROVIDER_CONTEXT_BYTES: usize = 512 * 1024;
 const MAX_TOOL_OUTPUT_BYTES: usize = 128 * 1024;
 const MAX_IDENTICAL_TOOL_CALLS: usize = 2;
+const SUBSTANTIAL_READ_OVERLAP_PERCENT: usize = 80;
+const MAX_RECOVERABLE_REDUNDANT_READ_OBSERVATIONS: usize = 2;
+const MAX_READ_RECOVERY_INSTRUCTIONS: usize = 4;
 const PROGRESS_CHECK_WINDOW: usize = 5;
 const MAX_NO_PROGRESS_WINDOWS: usize = 3;
+const MAX_PROTOCOL_RETRIES: usize = 5;
 pub const DEFAULT_SOFT_TURN_PROVIDER_CALLS: u32 = 100;
 pub const DEFAULT_SOFT_TURN_TOTAL_TOKENS: u64 = 1_000_000;
 pub const DEFAULT_SOFT_TURN_DURATION_MS: u64 = 10 * 60 * 1_000;
@@ -138,6 +142,278 @@ enum TurnContinuationDecision {
     Stop,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ReadRevisionKey {
+    path: String,
+    revision: String,
+}
+
+#[derive(Debug, Default)]
+struct ReadRevisionCoverage {
+    intervals: Vec<(usize, usize)>,
+    redundant_observations: usize,
+}
+
+#[derive(Debug, Default)]
+struct ReadObservationTracker {
+    coverage: HashMap<ReadRevisionKey, ReadRevisionCoverage>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ReadObservationDecision {
+    NewCoverage,
+    AlreadyCovered {
+        path: String,
+        revision: String,
+        start_line: usize,
+        end_line: usize,
+        overlap_percent: usize,
+    },
+    RecoveryRequired {
+        path: String,
+        revision: String,
+        start_line: usize,
+        end_line: usize,
+        overlap_percent: usize,
+    },
+    RepeatedLoop {
+        path: String,
+        revision: String,
+        start_line: usize,
+        end_line: usize,
+        overlap_percent: usize,
+    },
+}
+
+impl ReadObservationTracker {
+    fn observe(&mut self, result: &ToolResult) -> Option<ReadObservationDecision> {
+        if !result.success {
+            return None;
+        }
+        let path = result.metadata.get("path")?.as_str()?.to_string();
+        let revision = result.metadata.get("fileRevision")?.as_str()?.to_string();
+        let start_line = usize::try_from(result.metadata.get("startLine")?.as_u64()?).ok()?;
+        let end_line = usize::try_from(result.metadata.get("endLine")?.as_u64()?).ok()?;
+        if start_line == 0 || end_line < start_line {
+            return None;
+        }
+
+        let normalized_path = if cfg!(windows) {
+            path.to_lowercase()
+        } else {
+            path.clone()
+        };
+        self.coverage
+            .retain(|key, _| key.path != normalized_path || key.revision == revision);
+        let key = ReadRevisionKey {
+            path: normalized_path,
+            revision: revision.clone(),
+        };
+        let coverage = self.coverage.entry(key).or_default();
+        let requested_lines = end_line.saturating_sub(start_line).saturating_add(1);
+        let covered_lines = coverage
+            .intervals
+            .iter()
+            .map(|(covered_start, covered_end)| {
+                let overlap_start = start_line.max(*covered_start);
+                let overlap_end = end_line.min(*covered_end);
+                overlap_end
+                    .checked_sub(overlap_start)
+                    .map(|value| value.saturating_add(1))
+                    .unwrap_or(0)
+            })
+            .sum::<usize>();
+        let overlap_percent = covered_lines.saturating_mul(100) / requested_lines.max(1);
+
+        if overlap_percent >= SUBSTANTIAL_READ_OVERLAP_PERCENT {
+            coverage.redundant_observations = coverage.redundant_observations.saturating_add(1);
+            let observation = (path, revision, start_line, end_line, overlap_percent);
+            return Some(
+                if coverage.redundant_observations > MAX_RECOVERABLE_REDUNDANT_READ_OBSERVATIONS {
+                    ReadObservationDecision::RepeatedLoop {
+                        path: observation.0,
+                        revision: observation.1,
+                        start_line: observation.2,
+                        end_line: observation.3,
+                        overlap_percent: observation.4,
+                    }
+                } else if coverage.redundant_observations
+                    == MAX_RECOVERABLE_REDUNDANT_READ_OBSERVATIONS
+                {
+                    ReadObservationDecision::RecoveryRequired {
+                        path: observation.0,
+                        revision: observation.1,
+                        start_line: observation.2,
+                        end_line: observation.3,
+                        overlap_percent: observation.4,
+                    }
+                } else {
+                    ReadObservationDecision::AlreadyCovered {
+                        path: observation.0,
+                        revision: observation.1,
+                        start_line: observation.2,
+                        end_line: observation.3,
+                        overlap_percent: observation.4,
+                    }
+                },
+            );
+        }
+
+        coverage.redundant_observations = 0;
+        coverage.intervals.push((start_line, end_line));
+        coverage
+            .intervals
+            .sort_unstable_by_key(|interval| interval.0);
+        coverage.intervals = merge_line_intervals(&coverage.intervals);
+        Some(ReadObservationDecision::NewCoverage)
+    }
+}
+
+#[derive(Debug)]
+struct ReadObservationOutcome {
+    result: ToolResult,
+    recovery_instruction: Option<String>,
+    stop_reason: Option<String>,
+}
+
+fn merge_line_intervals(intervals: &[(usize, usize)]) -> Vec<(usize, usize)> {
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(intervals.len());
+    for &(start, end) in intervals {
+        if let Some((_, previous_end)) = merged.last_mut()
+            && start <= previous_end.saturating_add(1)
+        {
+            *previous_end = (*previous_end).max(end);
+        } else {
+            merged.push((start, end));
+        }
+    }
+    merged
+}
+
+fn read_observation_result(
+    original: ToolResult,
+    decision: ReadObservationDecision,
+) -> ReadObservationOutcome {
+    let (
+        kind,
+        path,
+        revision,
+        start_line,
+        end_line,
+        overlap_percent,
+        recovery_required,
+        should_stop,
+    ) = match decision {
+        ReadObservationDecision::NewCoverage => {
+            return ReadObservationOutcome {
+                result: original,
+                recovery_instruction: None,
+                stop_reason: None,
+            };
+        }
+        ReadObservationDecision::AlreadyCovered {
+            path,
+            revision,
+            start_line,
+            end_line,
+            overlap_percent,
+        } => (
+            "read_observation_already_covered",
+            path,
+            revision,
+            start_line,
+            end_line,
+            overlap_percent,
+            false,
+            false,
+        ),
+        ReadObservationDecision::RecoveryRequired {
+            path,
+            revision,
+            start_line,
+            end_line,
+            overlap_percent,
+        } => (
+            "read_observation_recovery_required",
+            path,
+            revision,
+            start_line,
+            end_line,
+            overlap_percent,
+            true,
+            false,
+        ),
+        ReadObservationDecision::RepeatedLoop {
+            path,
+            revision,
+            start_line,
+            end_line,
+            overlap_percent,
+        } => (
+            "repeated_observation_loop",
+            path,
+            revision,
+            start_line,
+            end_line,
+            overlap_percent,
+            false,
+            true,
+        ),
+    };
+    let message = if should_stop {
+        format!(
+            "repeated_observation_loop: 模型在文件未变化时仍反复读取 {path} 的第 {start_line}-{end_line} 行。k-Coder 已停止本轮以避免继续空转；请重试并要求直接使用已有观察。"
+        )
+    } else if recovery_required {
+        format!(
+            "Host recovery: file {path} is unchanged and {overlap_percent}% of lines {start_line}-{end_line} were already returned. No duplicate content was returned. The next provider request will receive a system correction; do not read this revision through read_file, shell commands, or repository search again. Reuse the existing observation, continue with a genuinely unresolved fact, perform the requested edit or validation, or finish the task."
+        )
+    } else {
+        format!(
+            "File {path} is unchanged and {overlap_percent}% of lines {start_line}-{end_line} were already returned. The duplicate content was suppressed; use the existing observation, read a non-overlapping range for a specific unresolved fact, or finish the task."
+        )
+    };
+    let mut metadata = original.metadata;
+    if !metadata.is_object() {
+        metadata = json!({});
+    }
+    metadata["observationStatus"] = Value::String(kind.to_string());
+    metadata["overlapPercent"] = Value::from(overlap_percent as u64);
+    metadata["contentSuppressed"] = Value::Bool(true);
+    metadata["recoveryRequired"] = Value::Bool(recovery_required);
+    metadata["turnContinues"] = Value::Bool(!should_stop);
+    let output = json!({
+        "type": kind,
+        "path": path,
+        "fileRevision": revision,
+        "startLine": start_line,
+        "endLine": end_line,
+        "overlapPercent": overlap_percent,
+        "recoveryRequired": recovery_required,
+        "turnContinues": !should_stop,
+        "message": message,
+    })
+    .to_string();
+    let recovery_path =
+        serde_json::to_string(&path).unwrap_or_else(|_| "\"<invalid path>\"".into());
+    let recovery_revision =
+        serde_json::to_string(&revision).unwrap_or_else(|_| "\"<invalid revision>\"".into());
+    let recovery_instruction = recovery_required.then(|| {
+        format!(
+            "[Host-enforced read recovery]\nThe unchanged workspace file whose JSON-encoded path is {recovery_path} at JSON-encoded revision {recovery_revision} has already been observed for lines {start_line}-{end_line} ({overlap_percent}% overlap). The duplicate read returned no new evidence. Do not request read_file for an overlapping range of this revision and do not bypass this boundary with shell commands or repository search. Reuse the existing observation already present in the conversation or compacted context. Continue with a genuinely unresolved non-overlapping fact, make the requested change, run focused validation, or give the final answer."
+        )
+    });
+    ReadObservationOutcome {
+        result: ToolResult {
+            success: !should_stop,
+            output,
+            metadata,
+        },
+        recovery_instruction,
+        stop_reason: should_stop.then_some(message),
+    }
+}
+
 /// 进展快照：用于检测任务是否有实质性进展
 #[derive(Clone, PartialEq, Eq)]
 struct ProgressSnapshot {
@@ -158,9 +434,37 @@ impl ProgressSnapshot {
                     progress_fingerprints.insert(hasher.finish());
                 }
                 StoredEventKind::ToolResult { name, result, .. } if result.success => {
+                    if result
+                        .metadata
+                        .get("contentSuppressed")
+                        .and_then(Value::as_bool)
+                        == Some(true)
+                    {
+                        continue;
+                    }
                     "tool".hash(&mut hasher);
                     name.hash(&mut hasher);
-                    result.output.hash(&mut hasher);
+                    match name.as_str() {
+                        "read_file" => {
+                            result.metadata.get("path").hash(&mut hasher);
+                            result.metadata.get("fileRevision").hash(&mut hasher);
+                            result.metadata.get("startLine").hash(&mut hasher);
+                            result.metadata.get("endLine").hash(&mut hasher);
+                        }
+                        "list_directory" => {
+                            result.metadata.get("path").hash(&mut hasher);
+                            result.metadata.get("directoryRevision").hash(&mut hasher);
+                        }
+                        "search_repository" => {
+                            result.metadata.get("query").hash(&mut hasher);
+                            result.metadata.get("resultRevision").hash(&mut hasher);
+                        }
+                        "run_command" => {
+                            result.metadata.get("exitCode").hash(&mut hasher);
+                            result.metadata.get("observationRevision").hash(&mut hasher);
+                        }
+                        _ => result.output.hash(&mut hasher),
+                    }
                     progress_fingerprints.insert(hasher.finish());
                 }
                 _ => {}
@@ -238,6 +542,7 @@ pub struct AgentRuntime {
     reasoning_effort: ReasoningEffort,
     supports_vision: bool,
     logger: Option<StructuredLogger>,
+    transient_retry_delays: Vec<Duration>,
 }
 
 impl AgentRuntime {
@@ -286,6 +591,11 @@ impl AgentRuntime {
             reasoning_effort: ReasoningEffort::default(),
             supports_vision: false,
             logger: None,
+            transient_retry_delays: vec![
+                Duration::from_secs(1),
+                Duration::from_secs(2),
+                Duration::from_secs(4),
+            ],
         }
     }
 
@@ -296,6 +606,12 @@ impl AgentRuntime {
 
     pub fn with_logger(mut self, logger: StructuredLogger) -> Self {
         self.logger = Some(logger);
+        self
+    }
+
+    #[cfg(test)]
+    fn with_transient_retry_delays(mut self, delays: Vec<Duration>) -> Self {
+        self.transient_retry_delays = delays;
         self
     }
 
@@ -685,6 +1001,8 @@ impl AgentRuntime {
         let mut provider_context_bytes = 0usize;
         let mut last_call_signature = None::<String>;
         let mut identical_call_streak = 0usize;
+        let mut read_observations = ReadObservationTracker::default();
+        let mut pending_read_recovery_instructions = Vec::<String>::new();
         let token_budget = self.max_total_tokens;
         let mut soft_turn_segment = self
             .soft_turn_limits
@@ -793,6 +1111,14 @@ impl AgentRuntime {
                 last_snapshot = Some(current_snapshot);
             }
 
+            let mut request_runtime_instructions = self.runtime_instructions.clone();
+            for instruction in pending_read_recovery_instructions.drain(..) {
+                if !request_runtime_instructions.trim().is_empty() {
+                    request_runtime_instructions.push_str("\n\n");
+                }
+                request_runtime_instructions.push_str(&instruction);
+            }
+
             let events = self.repository.load(&thread_id).await?;
             let last_context_usage = last_active_context_usage(&events);
             let provider_history = provider_history(events, self.supports_vision);
@@ -800,7 +1126,7 @@ impl AgentRuntime {
             if force_compaction
                 || context::needs_compaction_for_request(
                     &history,
-                    &self.runtime_instructions,
+                    &request_runtime_instructions,
                     &tool_definitions,
                     self.working_context_limit.min(self.context_limit),
                 )
@@ -869,12 +1195,12 @@ impl AgentRuntime {
                     history = compacted;
                 }
             }
-            if !self.runtime_instructions.trim().is_empty() {
+            if !request_runtime_instructions.trim().is_empty() {
                 history.insert(
                     0,
                     ProviderMessage::Text {
                         role: MessageRole::System,
-                        text: self.runtime_instructions.clone(),
+                        text: request_runtime_instructions,
                     },
                 );
             }
@@ -890,10 +1216,8 @@ impl AgentRuntime {
                 turn_id: turn_id.clone(),
                 status: AgentActivityStatus::Thinking,
             }));
-            // 重试逻辑：对于不完整的工具调用错误，最多重试5次
-            const MAX_RETRIES: u32 = 5;
-            let mut retry_count = 0;
-            let mut _last_error: Option<ProviderError> = None;
+            let mut transient_retry_count = 0usize;
+            let mut protocol_retry_count = 0usize;
 
             // 声明需要在重试循环外部的变量
             let response: String;
@@ -915,46 +1239,64 @@ impl AgentRuntime {
                 let call_index = provider_call_index;
                 provider_call_index = provider_call_index.saturating_add(1);
                 let provider_started = std::time::Instant::now();
-                let mut stream = loop {
-                    match provider.stream(request.clone(), cancellation.clone()).await {
-                        Ok(stream) => break stream,
-                        Err(ProviderError::Cancelled) => {
-                            self.record_provider_metric(provider_started, false, None);
-                            return self
-                                .finish_cancelled(&thread_id, &turn_id, &publisher)
-                                .await;
-                        }
-                        Err(error) => {
-                            // 检查是否是不完整工具调用错误且可以重试
-                            let is_incomplete_tool_call =
-                                error.to_string().contains("incomplete tool call");
+                let mut stream = match provider
+                    .stream(request.clone(), cancellation.clone())
+                    .await
+                {
+                    Ok(stream) => stream,
+                    Err(ProviderError::Cancelled) => {
+                        self.record_provider_metric(provider_started, false, None);
+                        return self
+                            .finish_cancelled(&thread_id, &turn_id, &publisher)
+                            .await;
+                    }
+                    Err(error) => {
+                        self.record_provider_metric(provider_started, false, None);
+                        let retry_delay = if error.is_transient() {
+                            self.transient_retry_delays
+                                .get(transient_retry_count)
+                                .copied()
+                                .map(|delay| (delay, true))
+                        } else if is_incomplete_tool_call_error(&error)
+                            && protocol_retry_count < MAX_PROTOCOL_RETRIES
+                        {
+                            Some((protocol_retry_delay(protocol_retry_count), false))
+                        } else {
+                            None
+                        };
 
-                            if is_incomplete_tool_call && retry_count < MAX_RETRIES {
-                                retry_count += 1;
-                                _last_error = Some(error);
-
-                                // 等待一小段时间后重试（指数退避）
-                                // 200ms, 500ms, 1000ms, 2000ms, 4000ms
-                                let wait_ms = 200 * (1 << (retry_count - 1));
-                                let wait_ms = wait_ms.min(4000); // 最多等待4秒
-                                tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
-
-                                continue;
+                        if let Some((delay, transient)) = retry_delay {
+                            if !wait_for_provider_retry(delay, &cancellation).await {
+                                return self
+                                    .finish_cancelled(&thread_id, &turn_id, &publisher)
+                                    .await;
                             }
-
-                            self.record_provider_metric(provider_started, false, None);
-
-                            // 如果已经重试过，在错误信息中包含重试次数
-                            let error_msg = if retry_count > 0 {
-                                format!("{} (已重试 {} 次)", error, retry_count)
+                            if transient {
+                                transient_retry_count += 1;
                             } else {
-                                error.to_string()
-                            };
-
-                            return self
-                                .finish_failed(&thread_id, &turn_id, error_msg, &publisher)
-                                .await;
+                                protocol_retry_count += 1;
+                            }
+                            self.record_provider_retry();
+                            continue 'retry_loop;
                         }
+
+                        let message = if error.is_transient()
+                            && transient_retry_count > 0
+                        {
+                            format!(
+                                "{} (已自动重试 {} 次)",
+                                error, transient_retry_count
+                            )
+                        } else if is_incomplete_tool_call_error(&error)
+                            && protocol_retry_count > 0
+                        {
+                            format!("{} (已重试 {} 次)", error, protocol_retry_count)
+                        } else {
+                            error.to_string()
+                        };
+                        return self
+                            .finish_failed(&thread_id, &turn_id, message, &publisher)
+                            .await;
                     }
                 };
 
@@ -1249,12 +1591,6 @@ impl AgentRuntime {
                                 iteration_usage_inner,
                             );
 
-                            // 检查是否是可重试的错误（不完整工具调用或 JSON 解析失败）
-                            let error_str = error.to_string();
-                            let is_retriable = error_str.contains("incomplete tool call")
-                                || error_str.contains("invalid JSON arguments")
-                                || error_str.contains("returned invalid JSON");
-
                             if let Some(usage) = iteration_usage_inner {
                                 self.persist_provider_usage(
                                     &thread_id,
@@ -1268,21 +1604,52 @@ impl AgentRuntime {
                                 .await?;
                             }
 
-                            if is_retriable && !attempt_had_output && retry_count < MAX_RETRIES {
-                                retry_count += 1;
-
-                                // 等待一小段时间后重试（指数退避）
-                                // 200ms, 500ms, 1000ms, 2000ms, 4000ms
-                                let wait_ms = 200 * (1 << (retry_count - 1));
-                                let wait_ms = wait_ms.min(4000); // 最多等待4秒
-                                tokio::time::sleep(std::time::Duration::from_millis(wait_ms)).await;
-
-                                // 跳出内层循环，重新开始整个请求
+                            let transient_stream_error =
+                                error.is_transient() && !attempt_had_output;
+                            let retry_delay = if transient_stream_error {
+                                self.transient_retry_delays
+                                    .get(transient_retry_count)
+                                    .copied()
+                                    .map(|delay| (delay, true))
+                            } else if is_retryable_protocol_stream_error(&error)
+                                && !attempt_had_output
+                                && protocol_retry_count < MAX_PROTOCOL_RETRIES
+                            {
+                                Some((protocol_retry_delay(protocol_retry_count), false))
+                            } else {
+                                None
+                            };
+                            if let Some((delay, transient)) = retry_delay {
+                                if !wait_for_provider_retry(delay, &cancellation).await {
+                                    return self
+                                        .finish_cancelled(&thread_id, &turn_id, &publisher)
+                                        .await;
+                                }
+                                if transient {
+                                    transient_retry_count += 1;
+                                } else {
+                                    protocol_retry_count += 1;
+                                }
+                                self.record_provider_retry();
                                 continue 'retry_loop;
                             }
 
+                            let message = if error.is_transient()
+                                && transient_retry_count > 0
+                            {
+                                format!(
+                                    "{} (已自动重试 {} 次)",
+                                    error, transient_retry_count
+                                )
+                            } else if is_retryable_protocol_stream_error(&error)
+                                && protocol_retry_count > 0
+                            {
+                                format!("{} (已重试 {} 次)", error, protocol_retry_count)
+                            } else {
+                                error.to_string()
+                            };
                             return self
-                                .finish_failed(&thread_id, &turn_id, error.to_string(), &publisher)
+                                .finish_failed(&thread_id, &turn_id, message, &publisher)
                                 .await;
                         }
                         None => {
@@ -1450,8 +1817,9 @@ impl AgentRuntime {
                     last_call_signature = Some(signature);
                     identical_call_streak = 1;
                 }
+                let repeated_identical_call = identical_call_streak > MAX_IDENTICAL_TOOL_CALLS;
 
-                if identical_call_streak > MAX_IDENTICAL_TOOL_CALLS {
+                if call.name != "read_file" && repeated_identical_call {
                     let reason = format!(
                         "repeated_tool_call: {} was requested with identical arguments more than {MAX_IDENTICAL_TOOL_CALLS} consecutive times",
                         call.name
@@ -1505,7 +1873,7 @@ impl AgentRuntime {
                     progress: None,
                 };
 
-                let (result, item_status) = match self
+                let (mut result, mut item_status) = match self
                     .execute_tool_with_progress(context, &call, cancellation.clone(), &publisher)
                     .await
                 {
@@ -1536,6 +1904,32 @@ impl AgentRuntime {
                         (failure_result(message), AgentItemStatus::Failed)
                     }
                 };
+
+                if call.name == "read_file"
+                    && let Some(decision) = read_observations.observe(&result)
+                {
+                    let outcome = read_observation_result(result, decision);
+                    result = outcome.result;
+                    if let Some(instruction) = outcome.recovery_instruction
+                        && pending_read_recovery_instructions.len()
+                            < MAX_READ_RECOVERY_INSTRUCTIONS
+                        && !pending_read_recovery_instructions.contains(&instruction)
+                    {
+                        pending_read_recovery_instructions.push(instruction);
+                    }
+                    if let Some(reason) = outcome.stop_reason {
+                        item_status = AgentItemStatus::Failed;
+                        stop_reason = Some(reason);
+                    }
+                } else if call.name == "read_file" && repeated_identical_call {
+                    let reason = format!(
+                        "repeated_tool_call: {} was requested with identical arguments more than {MAX_IDENTICAL_TOOL_CALLS} consecutive times without producing a versioned observation",
+                        call.name
+                    );
+                    result = failure_result(reason.clone());
+                    item_status = AgentItemStatus::Failed;
+                    stop_reason = Some(reason);
+                }
 
                 if let Some(metrics) = &self.metrics {
                     metrics.tool(result.success);
@@ -2709,6 +3103,41 @@ impl AgentRuntime {
             );
         }
     }
+
+    fn record_provider_retry(&self) {
+        if let Some(metrics) = &self.metrics {
+            metrics.retry();
+        }
+    }
+}
+
+fn is_incomplete_tool_call_error(error: &ProviderError) -> bool {
+    matches!(error, ProviderError::InvalidResponse(message) if message.to_ascii_lowercase().contains("incomplete tool call"))
+}
+
+fn is_retryable_protocol_stream_error(error: &ProviderError) -> bool {
+    let ProviderError::InvalidResponse(message) = error else {
+        return false;
+    };
+    let message = message.to_ascii_lowercase();
+    message.contains("incomplete tool call")
+        || message.contains("invalid json arguments")
+        || message.contains("returned invalid json")
+}
+
+fn protocol_retry_delay(retry_count: usize) -> Duration {
+    let multiplier = 1u64 << retry_count.min(4);
+    Duration::from_millis((200 * multiplier).min(4_000))
+}
+
+async fn wait_for_provider_retry(delay: Duration, cancellation: &CancellationToken) -> bool {
+    if cancellation.is_cancelled() {
+        return false;
+    }
+    tokio::select! {
+        _ = cancellation.cancelled() => false,
+        _ = tokio::time::sleep(delay) => true,
+    }
 }
 
 fn preview_hashes(preview: &PatchPreview) -> Vec<ExpectedFileHash> {
@@ -2940,6 +3369,7 @@ fn outcome(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
     use std::path::Path;
     use std::sync::Mutex;
     use std::time::Duration;
@@ -3048,6 +3478,47 @@ mod tests {
     impl EventPublisher for RecordingPublisher {
         fn publish(&self, event: AgentEventEnvelope) {
             self.events.lock().unwrap().push(event);
+        }
+    }
+
+    struct PreStreamProvider {
+        outcomes: Mutex<VecDeque<Result<Vec<Result<ProviderEvent, ProviderError>>, ProviderError>>>,
+        requests: Mutex<Vec<ProviderRequest>>,
+    }
+
+    impl PreStreamProvider {
+        fn new(
+            outcomes: Vec<Result<Vec<Result<ProviderEvent, ProviderError>>, ProviderError>>,
+        ) -> Self {
+            Self {
+                outcomes: Mutex::new(outcomes.into()),
+                requests: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn requests(&self) -> Vec<ProviderRequest> {
+            self.requests.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl Provider for PreStreamProvider {
+        async fn stream(
+            &self,
+            request: ProviderRequest,
+            cancellation: CancellationToken,
+        ) -> Result<crate::providers::ProviderStream, ProviderError> {
+            if cancellation.is_cancelled() {
+                return Err(ProviderError::Cancelled);
+            }
+            self.requests.lock().unwrap().push(request);
+            match self.outcomes.lock().unwrap().pop_front() {
+                Some(Ok(events)) => Ok(Box::pin(futures_util::stream::iter(events))),
+                Some(Err(error)) => Err(error),
+                None => Err(ProviderError::InvalidResponse(
+                    "pre-stream test provider ran out of outcomes".into(),
+                )),
+            }
         }
     }
 
@@ -3376,6 +3847,358 @@ mod tests {
         assert!(result.output.ends_with("TAIL"));
         assert_eq!(result.metadata["outputTruncated"], Value::Bool(true));
         assert!(result.metadata["omittedOutputBytes"].as_u64().unwrap() > 0);
+    }
+
+    fn versioned_read_result(
+        path: &str,
+        revision: &str,
+        start_line: usize,
+        end_line: usize,
+    ) -> ToolResult {
+        ToolResult {
+            success: true,
+            output: "file contents".to_string(),
+            metadata: json!({
+                "path": path,
+                "fileRevision": revision,
+                "startLine": start_line,
+                "endLine": end_line
+            }),
+        }
+    }
+
+    #[test]
+    fn semantic_read_tracker_recovers_once_before_stopping_overlap_loops() {
+        let mut tracker = ReadObservationTracker::default();
+        assert_eq!(
+            tracker.observe(&versioned_read_result("src/file.rs", "revision-a", 1, 400)),
+            Some(ReadObservationDecision::NewCoverage)
+        );
+        assert_eq!(
+            tracker.observe(&versioned_read_result(
+                "src/file.rs",
+                "revision-a",
+                401,
+                800
+            )),
+            Some(ReadObservationDecision::NewCoverage)
+        );
+        assert!(matches!(
+            tracker.observe(&versioned_read_result("src/file.rs", "revision-a", 2, 399)),
+            Some(ReadObservationDecision::AlreadyCovered {
+                overlap_percent: 100,
+                ..
+            })
+        ));
+        assert!(matches!(
+            tracker.observe(&versioned_read_result("src/file.rs", "revision-a", 3, 398)),
+            Some(ReadObservationDecision::RecoveryRequired {
+                overlap_percent: 100,
+                ..
+            })
+        ));
+        assert!(matches!(
+            tracker.observe(&versioned_read_result("src/file.rs", "revision-a", 4, 397)),
+            Some(ReadObservationDecision::RepeatedLoop {
+                overlap_percent: 100,
+                ..
+            })
+        ));
+        assert_eq!(
+            tracker.observe(&versioned_read_result("src/file.rs", "revision-b", 1, 400)),
+            Some(ReadObservationDecision::NewCoverage)
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_repeated_read_recovers_and_the_turn_can_complete() {
+        let (directory, repository, runtime, thread_id) = runtime_fixture().await;
+        std::fs::write(directory.path().join("loop.txt"), "line 1\nline 2\nline 3").unwrap();
+        let read_call = |id: &str| ProviderEvent::ToolCall {
+            call: ToolCall {
+                id: id.into(),
+                name: "read_file".into(),
+                arguments: json!({
+                    "path": "loop.txt",
+                    "startLine": 1,
+                    "lineCount": 3
+                }),
+                metadata: json!({}),
+            },
+        };
+        let provider = Arc::new(FakeProvider::script(vec![
+            vec![Ok(read_call("read-1")), Ok(ProviderEvent::Completed)],
+            vec![Ok(read_call("read-2")), Ok(ProviderEvent::Completed)],
+            vec![Ok(read_call("read-3")), Ok(ProviderEvent::Completed)],
+            vec![
+                Ok(ProviderEvent::TextDelta {
+                    delta: "已使用已有观察完成分析".into(),
+                }),
+                Ok(ProviderEvent::Completed),
+            ],
+        ]));
+
+        let outcome = runtime
+            .run_turn(
+                provider.clone(),
+                "fake".to_string(),
+                RunTurnRequest {
+                    thread_id: thread_id.clone(),
+                    input: "inspect the file once".to_string(),
+                    agent_mode: None,
+                },
+                CancellationToken::new(),
+                Arc::new(RecordingPublisher::default()),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.state, TurnState::Completed);
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 4);
+        assert!(requests[3].messages.iter().any(|message| matches!(
+            message,
+            ProviderMessage::Text {
+                role: MessageRole::System,
+                text,
+            } if text.contains("[Host-enforced read recovery]")
+                && text.contains("loop.txt")
+                && text.contains("Do not request read_file")
+        )));
+
+        let events = repository.load(&thread_id).await.unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event.kind, StoredEventKind::UserMessage { .. }))
+                .count(),
+            1,
+            "runtime recovery must not be persisted as a fake user message"
+        );
+        let results = events
+            .into_iter()
+            .filter_map(|event| match event.kind {
+                StoredEventKind::ToolResult {
+                    call_id, result, ..
+                } => Some((call_id, result)),
+                _ => None,
+            })
+            .collect::<HashMap<_, _>>();
+        assert_eq!(
+            results["read-2"].metadata["observationStatus"],
+            "read_observation_already_covered"
+        );
+        assert_eq!(
+            results["read-3"].metadata["observationStatus"],
+            "read_observation_recovery_required"
+        );
+        assert!(results["read-3"].success);
+        assert_eq!(results["read-3"].metadata["contentSuppressed"], true);
+        assert_eq!(results["read-3"].metadata["recoveryRequired"], true);
+        assert_eq!(results["read-3"].metadata["turnContinues"], true);
+    }
+
+    #[tokio::test]
+    async fn repeated_failed_read_still_uses_the_generic_hard_stop() {
+        let (_directory, repository, runtime, thread_id) = runtime_fixture().await;
+        let read_call = |id: &str| ProviderEvent::ToolCall {
+            call: ToolCall {
+                id: id.into(),
+                name: "read_file".into(),
+                arguments: json!({"path": "missing.txt"}),
+                metadata: json!({}),
+            },
+        };
+        let provider = Arc::new(FakeProvider::script(vec![
+            vec![Ok(read_call("read-1")), Ok(ProviderEvent::Completed)],
+            vec![Ok(read_call("read-2")), Ok(ProviderEvent::Completed)],
+            vec![Ok(read_call("read-3")), Ok(ProviderEvent::Completed)],
+        ]));
+
+        let outcome = runtime
+            .run_turn(
+                provider,
+                "fake".into(),
+                RunTurnRequest {
+                    thread_id: thread_id.clone(),
+                    input: "read the missing file".into(),
+                    agent_mode: None,
+                },
+                CancellationToken::new(),
+                Arc::new(RecordingPublisher::default()),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.state, TurnState::Failed);
+        assert!(
+            outcome
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("repeated_tool_call")
+                    && error.contains("without producing a versioned observation"))
+        );
+        let results = repository
+            .load(&thread_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter_map(|event| match event.kind {
+                StoredEventKind::ToolResult {
+                    call_id, result, ..
+                } => Some((call_id, result)),
+                _ => None,
+            })
+            .collect::<HashMap<_, _>>();
+        assert!(!results["read-1"].success);
+        assert!(!results["read-2"].success);
+        assert!(!results["read-3"].success);
+        assert!(results["read-3"].output.contains("repeated_tool_call"));
+    }
+
+    #[tokio::test]
+    async fn recovery_still_stops_varied_overlapping_reads_after_one_correction() {
+        let (directory, repository, runtime, thread_id) = runtime_fixture().await;
+        let contents = (1..=500)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(directory.path().join("loop.txt"), contents).unwrap();
+        let provider = Arc::new(FakeProvider::script(vec![
+            vec![
+                Ok(ProviderEvent::ToolCall {
+                    call: ToolCall {
+                        id: "read-1".into(),
+                        name: "read_file".into(),
+                        arguments: json!({
+                            "path": "loop.txt",
+                            "startLine": 1,
+                            "lineCount": 400
+                        }),
+                        metadata: json!({}),
+                    },
+                }),
+                Ok(ProviderEvent::Completed),
+            ],
+            vec![
+                Ok(ProviderEvent::ToolCall {
+                    call: ToolCall {
+                        id: "read-2".into(),
+                        name: "read_file".into(),
+                        arguments: json!({
+                            "path": "loop.txt",
+                            "startLine": 2,
+                            "lineCount": 399
+                        }),
+                        metadata: json!({}),
+                    },
+                }),
+                Ok(ProviderEvent::Completed),
+            ],
+            vec![
+                Ok(ProviderEvent::ToolCall {
+                    call: ToolCall {
+                        id: "list-between".into(),
+                        name: "list_directory".into(),
+                        arguments: json!({ "path": "." }),
+                        metadata: json!({}),
+                    },
+                }),
+                Ok(ProviderEvent::Completed),
+            ],
+            vec![
+                Ok(ProviderEvent::ToolCall {
+                    call: ToolCall {
+                        id: "read-3".into(),
+                        name: "read_file".into(),
+                        arguments: json!({
+                            "path": "loop.txt",
+                            "startLine": 3,
+                            "lineCount": 398
+                        }),
+                        metadata: json!({}),
+                    },
+                }),
+                Ok(ProviderEvent::Completed),
+            ],
+            vec![
+                Ok(ProviderEvent::ToolCall {
+                    call: ToolCall {
+                        id: "read-4".into(),
+                        name: "read_file".into(),
+                        arguments: json!({
+                            "path": "loop.txt",
+                            "startLine": 4,
+                            "lineCount": 397
+                        }),
+                        metadata: json!({}),
+                    },
+                }),
+                Ok(ProviderEvent::Completed),
+            ],
+        ]));
+
+        let outcome = runtime
+            .run_turn(
+                provider.clone(),
+                "fake".to_string(),
+                RunTurnRequest {
+                    thread_id: thread_id.clone(),
+                    input: "keep confirming the same file".to_string(),
+                    agent_mode: None,
+                },
+                CancellationToken::new(),
+                Arc::new(RecordingPublisher::default()),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.state, TurnState::Failed);
+        assert!(
+            outcome
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("repeated_observation_loop")
+                    && error.contains("模型在文件未变化时仍反复读取"))
+        );
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 5);
+        assert!(requests[4].messages.iter().any(|message| matches!(
+            message,
+            ProviderMessage::Text {
+                role: MessageRole::System,
+                text,
+            } if text.contains("[Host-enforced read recovery]")
+        )));
+        let results = repository
+            .load(&thread_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter_map(|event| match event.kind {
+                StoredEventKind::ToolResult {
+                    call_id, result, ..
+                } => Some((call_id, result)),
+                _ => None,
+            })
+            .collect::<HashMap<_, _>>();
+        assert_eq!(results["read-2"].success, true);
+        assert_eq!(results["read-2"].metadata["contentSuppressed"], true);
+        assert_eq!(
+            results["read-2"].metadata["observationStatus"],
+            "read_observation_already_covered"
+        );
+        assert_eq!(results["read-3"].success, true);
+        assert_eq!(
+            results["read-3"].metadata["observationStatus"],
+            "read_observation_recovery_required"
+        );
+        assert_eq!(results["read-3"].metadata["recoveryRequired"], true);
+        assert_eq!(results["read-4"].success, false);
+        assert_eq!(
+            results["read-4"].metadata["observationStatus"],
+            "repeated_observation_loop"
+        );
     }
 
     #[tokio::test]
@@ -3972,9 +4795,22 @@ mod tests {
         ));
         assert!(matches!(
             requests[1].messages.last(),
-            Some(ProviderMessage::ToolResult { output, .. }) if output == "workspace docs"
+            Some(ProviderMessage::ToolResult { output, .. })
+                if output.starts_with("[read_file observation] ")
+                    && output.contains(r#""path":"README.md""#)
+                    && output.contains(r#""startLine":1"#)
+                    && output.contains(r#""endLine":1"#)
+                    && output.ends_with("workspace docs")
         ));
         let events = repository.load(&thread_id).await.unwrap();
+        let stored_result = events.iter().find_map(|event| match &event.kind {
+            StoredEventKind::ToolResult { result, .. } => Some(result),
+            _ => None,
+        });
+        assert_eq!(
+            stored_result.map(|result| result.output.as_str()),
+            Some("workspace docs")
+        );
         assert_eq!(
             events
                 .iter()
@@ -4843,6 +5679,304 @@ mod tests {
                     )
                 })
         );
+    }
+
+    #[tokio::test]
+    async fn transient_pre_stream_failures_retry_the_same_request_then_succeed() {
+        let (directory, _repository, runtime, thread_id) = runtime_fixture().await;
+        let metrics = RuntimeMetrics::new(directory.path()).unwrap();
+        let provider = Arc::new(PreStreamProvider::new(vec![
+            Err(ProviderError::Http {
+                status: 503,
+                message: "busy once".into(),
+            }),
+            Err(ProviderError::Http {
+                status: 503,
+                message: "busy twice".into(),
+            }),
+            Ok(vec![
+                Ok(ProviderEvent::TextDelta {
+                    delta: "recovered".into(),
+                }),
+                Ok(ProviderEvent::Completed),
+            ]),
+        ]));
+
+        let outcome = runtime
+            .with_metrics(metrics.clone())
+            .with_transient_retry_delays(vec![Duration::from_millis(1); 3])
+            .run_turn(
+                provider.clone(),
+                "deepseek-v4-flash-0731".into(),
+                RunTurnRequest {
+                    thread_id,
+                    input: "inspect the repository".into(),
+                    agent_mode: None,
+                },
+                CancellationToken::new(),
+                Arc::new(RecordingPublisher::default()),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.state, TurnState::Completed);
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 3);
+        assert!(requests.windows(2).all(|pair| pair[0] == pair[1]));
+        let snapshot = metrics.snapshot().unwrap();
+        assert_eq!(snapshot.provider_calls, 3);
+        assert_eq!(snapshot.provider_failures, 2);
+        assert_eq!(snapshot.retry_count, 2);
+    }
+
+    #[tokio::test]
+    async fn transient_pre_stream_retry_exhaustion_preserves_the_http_failure() {
+        let (directory, _repository, runtime, thread_id) = runtime_fixture().await;
+        let metrics = RuntimeMetrics::new(directory.path()).unwrap();
+        let provider = Arc::new(PreStreamProvider::new(
+            (0..4)
+                .map(|_| {
+                    Err(ProviderError::Http {
+                        status: 503,
+                        message: "服务繁忙，请稍后重试".into(),
+                    })
+                })
+                .collect(),
+        ));
+
+        let outcome = runtime
+            .with_metrics(metrics.clone())
+            .with_transient_retry_delays(vec![Duration::from_millis(1); 3])
+            .run_turn(
+                provider.clone(),
+                "deepseek-v4-flash-0731".into(),
+                RunTurnRequest {
+                    thread_id,
+                    input: "inspect the repository".into(),
+                    agent_mode: None,
+                },
+                CancellationToken::new(),
+                Arc::new(RecordingPublisher::default()),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.state, TurnState::Failed);
+        let error = outcome.error.unwrap();
+        assert!(error.contains("provider returned HTTP 503"));
+        assert!(error.contains("已自动重试 3 次"));
+        assert_eq!(provider.requests().len(), 4);
+        let snapshot = metrics.snapshot().unwrap();
+        assert_eq!(snapshot.provider_calls, 4);
+        assert_eq!(snapshot.provider_failures, 4);
+        assert_eq!(snapshot.retry_count, 3);
+    }
+
+    #[tokio::test]
+    async fn authentication_and_request_validation_failures_are_not_retried() {
+        for status in [400, 401] {
+            let (_directory, _repository, runtime, thread_id) = runtime_fixture().await;
+            let provider = Arc::new(PreStreamProvider::new(vec![
+                Err(ProviderError::Http {
+                    status,
+                    message: "do not replay".into(),
+                }),
+                Ok(vec![
+                    Ok(ProviderEvent::TextDelta {
+                        delta: "must not run".into(),
+                    }),
+                    Ok(ProviderEvent::Completed),
+                ]),
+            ]));
+
+            let outcome = runtime
+                .with_transient_retry_delays(vec![Duration::from_millis(1); 3])
+                .run_turn(
+                    provider.clone(),
+                    "deepseek-v4-flash-0731".into(),
+                    RunTurnRequest {
+                        thread_id,
+                        input: "do not retry an invalid request".into(),
+                        agent_mode: None,
+                    },
+                    CancellationToken::new(),
+                    Arc::new(RecordingPublisher::default()),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(outcome.state, TurnState::Failed);
+            assert_eq!(provider.requests().len(), 1, "HTTP {status} was replayed");
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_interrupts_transient_retry_backoff_without_another_request() {
+        let (_directory, _repository, runtime, thread_id) = runtime_fixture().await;
+        let provider = Arc::new(PreStreamProvider::new(vec![
+            Err(ProviderError::Http {
+                status: 503,
+                message: "busy".into(),
+            }),
+            Ok(vec![
+                Ok(ProviderEvent::TextDelta {
+                    delta: "must not run".into(),
+                }),
+                Ok(ProviderEvent::Completed),
+            ]),
+        ]));
+        let cancellation = CancellationToken::new();
+        let task_provider = provider.clone();
+        let task_cancellation = cancellation.clone();
+        let task = tokio::spawn(async move {
+            runtime
+                .with_transient_retry_delays(vec![Duration::from_secs(30)])
+                .run_turn(
+                    task_provider,
+                    "deepseek-v4-flash-0731".into(),
+                    RunTurnRequest {
+                        thread_id,
+                        input: "cancel while waiting".into(),
+                        agent_mode: None,
+                    },
+                    task_cancellation,
+                    Arc::new(RecordingPublisher::default()),
+                )
+                .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while provider.requests().is_empty() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+        cancellation.cancel();
+        let outcome = tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("cancellation should interrupt backoff")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(outcome.state, TurnState::Cancelled);
+        assert_eq!(provider.requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn transient_stream_error_before_output_retries_then_succeeds() {
+        let (_directory, _repository, runtime, thread_id) = runtime_fixture().await;
+        let provider = Arc::new(FakeProvider::script(vec![
+            vec![Err(ProviderError::Unavailable("servers overloaded".into()))],
+            vec![
+                Ok(ProviderEvent::TextDelta {
+                    delta: "recovered".into(),
+                }),
+                Ok(ProviderEvent::Completed),
+            ],
+        ]));
+
+        let outcome = runtime
+            .with_transient_retry_delays(vec![Duration::from_millis(1); 3])
+            .run_turn(
+                provider.clone(),
+                "deepseek-v4-flash-0731".into(),
+                RunTurnRequest {
+                    thread_id,
+                    input: "retry an overloaded empty stream".into(),
+                    agent_mode: None,
+                },
+                CancellationToken::new(),
+                Arc::new(RecordingPublisher::default()),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.state, TurnState::Completed);
+        assert_eq!(provider.requests().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn transient_stream_error_after_output_is_not_retried() {
+        let (_directory, _repository, runtime, thread_id) = runtime_fixture().await;
+        let provider = Arc::new(FakeProvider::script(vec![
+            vec![
+                Ok(ProviderEvent::TextDelta {
+                    delta: "partial".into(),
+                }),
+                Err(ProviderError::Unavailable("servers overloaded".into())),
+            ],
+            vec![
+                Ok(ProviderEvent::TextDelta {
+                    delta: "must not run".into(),
+                }),
+                Ok(ProviderEvent::Completed),
+            ],
+        ]));
+
+        let outcome = runtime
+            .with_transient_retry_delays(vec![Duration::from_millis(1); 3])
+            .run_turn(
+                provider.clone(),
+                "gpt-5".into(),
+                RunTurnRequest {
+                    thread_id,
+                    input: "do not replay emitted output".into(),
+                    agent_mode: None,
+                },
+                CancellationToken::new(),
+                Arc::new(RecordingPublisher::default()),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.state, TurnState::Failed);
+        assert_eq!(provider.requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn transient_stream_retry_exhaustion_preserves_last_error_and_retry_count() {
+        let (directory, _repository, runtime, thread_id) = runtime_fixture().await;
+        let metrics = RuntimeMetrics::new(directory.path()).unwrap();
+        let provider = Arc::new(FakeProvider::script(
+            (0..4)
+                .map(|attempt| {
+                    vec![Err(ProviderError::Unavailable(format!(
+                        "servers overloaded on attempt {}",
+                        attempt + 1
+                    )))]
+                })
+                .collect(),
+        ));
+
+        let outcome = runtime
+            .with_metrics(metrics.clone())
+            .with_transient_retry_delays(vec![Duration::from_millis(1); 3])
+            .run_turn(
+                provider.clone(),
+                "gpt-5".into(),
+                RunTurnRequest {
+                    thread_id,
+                    input: "retry temporary server overloads".into(),
+                    agent_mode: None,
+                },
+                CancellationToken::new(),
+                Arc::new(RecordingPublisher::default()),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.state, TurnState::Failed);
+        let error = outcome
+            .error
+            .expect("the failed turn should retain an error");
+        assert!(error.contains("servers overloaded on attempt 4"));
+        assert!(error.contains("已自动重试 3 次"));
+        assert_eq!(provider.requests().len(), 4);
+        let snapshot = metrics.snapshot().unwrap();
+        assert_eq!(snapshot.provider_calls, 4);
+        assert_eq!(snapshot.provider_failures, 4);
+        assert_eq!(snapshot.retry_count, 3);
     }
 
     #[tokio::test]

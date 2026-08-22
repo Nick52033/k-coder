@@ -1340,7 +1340,7 @@ mod tests {
                 }),
                 Ok(ProviderEvent::Completed),
             ],
-            vec![Err(crate::providers::ProviderError::Request(
+            vec![Err(crate::providers::ProviderError::InvalidResponse(
                 "follow-up failed".into(),
             ))],
         ]));

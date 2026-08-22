@@ -1,4 +1,5 @@
-import { Fragment, FormEvent, KeyboardEvent, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, FormEvent, KeyboardEvent, useEffect, useId, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import {
   Activity,
   ArrowUp,
@@ -132,6 +133,7 @@ type ThemeMode = "light" | "dark";
 const STORAGE_THEME = "kcoder_theme";
 const THREAD_PROJECT_KEY = "kcoder_thread_project_map";
 const KNOWN_PROJECTS_KEY = "kcoder_known_projects";
+const HIDDEN_PROJECT_GROUPS_KEY = "kcoder_hidden_project_groups";
 const appWindow = getCurrentWindow();
 
 function readThreadProjectMap(): Record<string, string> {
@@ -164,6 +166,15 @@ function workspaceProjects(state: WorkspaceState): ProjectRecord[] {
 function readKnownProjectPaths(): string[] {
   try {
     const raw = localStorage.getItem(KNOWN_PROJECTS_KEY);
+    return raw ? (JSON.parse(raw) as string[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+function readHiddenProjectPaths(): string[] {
+  try {
+    const raw = localStorage.getItem(HIDDEN_PROJECT_GROUPS_KEY);
     return raw ? (JSON.parse(raw) as string[]) : [];
   } catch {
     return [];
@@ -225,6 +236,7 @@ function App() {
   const [workspaceError, setWorkspaceError] = useState("");
   const [threadProjectMap, setThreadProjectMap] = useState<Record<string, string>>(() => readThreadProjectMap());
   const [knownProjectPaths, setKnownProjectPaths] = useState<string[]>(() => readKnownProjectPaths());
+  const [hiddenProjectPaths, setHiddenProjectPaths] = useState<string[]>(() => readHiddenProjectPaths());
   const [expandedProjects, setExpandedProjects] = useState<Set<string>>(new Set());
   const [projectMenuOpen, setProjectMenuOpen] = useState<string | null>(null);
   const [pinnedProjects, setPinnedProjects] = useState<Set<string>>(() => {
@@ -235,11 +247,15 @@ function App() {
   const [agentMode, setAgentMode] = useState<"craft" | "ask" | "plan">("craft");
   const [selectedWorkflowId, setSelectedWorkflowId] = useState<string | null>(null);
   const [modeMenuOpen, setModeMenuOpen] = useState(false);
+  const [modeMenuPosition, setModeMenuPosition] = useState({ left: 12, bottom: 48, width: 260, maxHeight: 320 });
   const [expandedChangeSets, setExpandedChangeSets] = useState<Set<string>>(new Set());
   const [queueExpanded, setQueueExpanded] = useState(false);
   const messageAreaRef = useRef<HTMLDivElement>(null);
   const composerRef = useRef<HTMLTextAreaElement>(null);
   const modeMenuRef = useRef<HTMLDivElement>(null);
+  const modeMenuPopoverRef = useRef<HTMLDivElement>(null);
+  const modeMenuTriggerRef = useRef<HTMLButtonElement>(null);
+  const modeMenuId = useId();
   const composerSearchRequestRef = useRef(0);
   const followLatestRef = useRef(true);
   const scrollFrameRef = useRef<number | null>(null);
@@ -311,8 +327,15 @@ function App() {
   );
   const currentThreadQueue = messageQueue.filter((message) => message.threadId === activeThreadId);
   const pendingQueueCount = currentThreadQueue.filter((message) => message.status === "pending").length;
-  // 普通会话列表只展示未绑定到项目的会话；持久化绑定优先于旧的本地展示映射。
-  const standaloneThreads = threads.filter((thread) => !threadProjectPath(thread, threadProjectMap));
+  const hiddenProjectKeys = useMemo(
+    () => new Set(hiddenProjectPaths.map(workspacePathKey)),
+    [hiddenProjectPaths],
+  );
+  // 删除项目分组只改变展示归类；会话的项目事实和不可变工作区绑定继续保留。
+  const conversationListThreads = threads.filter((thread) => {
+    const projectPath = threadProjectPath(thread, threadProjectMap);
+    return !projectPath || hiddenProjectKeys.has(workspacePathKey(projectPath));
+  });
   const activeThread = threads.find((thread) => thread.id === activeThreadId) ?? null;
   const activeThreadWorkspacePath = activeThread
     ? threadProjectPath(activeThread, threadProjectMap) ?? null
@@ -469,6 +492,21 @@ function App() {
     try { localStorage.setItem(KNOWN_PROJECTS_KEY, JSON.stringify(knownProjectPaths)); } catch { /* noop */ }
   }, [knownProjectPaths]);
 
+  useEffect(() => {
+    try { localStorage.setItem(HIDDEN_PROJECT_GROUPS_KEY, JSON.stringify(hiddenProjectPaths)); } catch { /* noop */ }
+  }, [hiddenProjectPaths]);
+
+  const restoreProjectGroups = (paths: string[]) => {
+    setHiddenProjectPaths((current) => current.filter(
+      (hiddenPath) => !paths.some((path) => workspacePathsEqual(hiddenPath, path)),
+    ));
+  };
+
+  const registerProjectPaths = (paths: string[]) => {
+    setKnownProjectPaths((current) => mergeWorkspacePaths(current, paths));
+    restoreProjectGroups(paths);
+  };
+
   const ensureProjectWorkspace = async (projectPath: string) => {
     workspaceOperationCountRef.current += 1;
     setWorkspaceSwitching(true);
@@ -548,7 +586,7 @@ function App() {
         project,
         ...projects.filter((item) => !workspacePathsEqual(item.path, project.path)),
       ]);
-      setKnownProjectPaths((current) => mergeWorkspacePaths(current, paths));
+      registerProjectPaths(paths);
       setThreadProjectMap(readThreadProjectMap());
       setWorkspaceRevision((value) => value + 1);
       void initialize();
@@ -566,7 +604,7 @@ function App() {
         `信任并在此项目中新建会话？\n\n${projectPath}\n\n信任后，智能体可以读取文件并在审批后修改内容。`,
       );
       if (!trusted) return;
-      setKnownProjectPaths((current) => mergeWorkspacePaths(current, [projectPath]));
+      registerProjectPaths([projectPath]);
       await createSessionUnderProject(projectPath);
     } catch (reason) {
       setWorkspaceError(`无法打开项目：${toReadableError(reason)}`);
@@ -687,14 +725,52 @@ function App() {
     return () => document.removeEventListener("mousedown", handler);
   }, [projectMenuOpen]);
 
+  const updateModeMenuPosition = () => {
+    const trigger = modeMenuTriggerRef.current;
+    if (!trigger) return;
+    const triggerRect = trigger.getBoundingClientRect();
+    const composerRect = trigger.closest(".composer")?.getBoundingClientRect();
+    const viewportPadding = 12;
+    const menuGap = 8;
+    const anchorTop = composerRect?.top ?? triggerRect.top;
+    const boundsLeft = Math.max(viewportPadding, (composerRect?.left ?? 0) + viewportPadding);
+    const boundsRight = Math.min(
+      window.innerWidth - viewportPadding,
+      (composerRect?.right ?? window.innerWidth) - viewportPadding,
+    );
+    const width = Math.min(260, Math.max(0, boundsRight - boundsLeft));
+    setModeMenuPosition({
+      left: Math.max(boundsLeft, Math.min(triggerRect.left, boundsRight - width)),
+      bottom: Math.max(viewportPadding, window.innerHeight - anchorTop + menuGap),
+      width,
+      maxHeight: Math.max(0, Math.min(320, anchorTop - viewportPadding - menuGap)),
+    });
+  };
+
   useEffect(() => {
-    if (!modeMenuOpen) return;
+    if (!modeMenuOpen) return undefined;
     const handler = (event: MouseEvent) => {
       if (!(event.target instanceof Node)) return;
-      if (!modeMenuRef.current?.contains(event.target)) setModeMenuOpen(false);
+      if (!modeMenuRef.current?.contains(event.target) && !modeMenuPopoverRef.current?.contains(event.target)) {
+        setModeMenuOpen(false);
+      }
     };
+    const keyboardHandler = (event: globalThis.KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      setModeMenuOpen(false);
+      modeMenuTriggerRef.current?.focus();
+    };
+    updateModeMenuPosition();
     document.addEventListener("mousedown", handler);
-    return () => document.removeEventListener("mousedown", handler);
+    document.addEventListener("keydown", keyboardHandler);
+    window.addEventListener("resize", updateModeMenuPosition);
+    window.addEventListener("scroll", updateModeMenuPosition, true);
+    return () => {
+      document.removeEventListener("mousedown", handler);
+      document.removeEventListener("keydown", keyboardHandler);
+      window.removeEventListener("resize", updateModeMenuPosition);
+      window.removeEventListener("scroll", updateModeMenuPosition, true);
+    };
   }, [modeMenuOpen]);
 
   const togglePinProject = (projectPath: string) => {
@@ -705,6 +781,32 @@ function App() {
       localStorage.setItem("kcoder_pinned_projects", JSON.stringify([...next]));
       return next;
     });
+  };
+
+  const removeProjectGroup = (projectPath: string, projectName: string, threadCount: number) => {
+    const threadNotice = threadCount > 0
+      ? `其中 ${threadCount} 个会话不会被删除，会继续显示在“会话”列表中。`
+      : "该项目当前没有会话。";
+    const confirmed = window.confirm(
+      `确定从项目列表中删除“${projectName}”分组？\n\n${threadNotice}\n项目文件不会被删除，重新添加项目后可恢复分组。`,
+    );
+    if (confirmed) {
+      setKnownProjectPaths((current) => current.filter(
+        (path) => !workspacePathsEqual(path, projectPath),
+      ));
+      setHiddenProjectPaths((current) => mergeWorkspacePaths(current, [projectPath]));
+      setExpandedProjects((current) => new Set(
+        [...current].filter((path) => !workspacePathsEqual(path, projectPath)),
+      ));
+      setPinnedProjects((current) => {
+        const next = new Set(
+          [...current].filter((path) => !workspacePathsEqual(path, projectPath)),
+        );
+        try { localStorage.setItem("kcoder_pinned_projects", JSON.stringify([...next])); } catch { /* noop */ }
+        return next;
+      });
+    }
+    setProjectMenuOpen(null);
   };
 
   const toggleTheme = () => {
@@ -780,6 +882,10 @@ function App() {
     () => projectsWithThreads.map((project) => project.record),
     [projectsWithThreads],
   );
+  const visibleProjectGroups = useMemo(
+    () => projectsWithThreads.filter((project) => !hiddenProjectKeys.has(project.key)),
+    [hiddenProjectKeys, projectsWithThreads],
+  );
   const activeProject = useMemo<ProjectRecord | null>(() => {
     if (!effectiveWorkspacePath) return null;
     const registered = selectableProjects.find((project) => workspacePathsEqual(project.path, effectiveWorkspacePath));
@@ -795,6 +901,7 @@ function App() {
   }, [effectiveWorkspacePath, selectableProjects]);
 
   const selectComposerProject = async (project: ProjectRecord) => {
+    restoreProjectGroups([project.path]);
     if (activeProject && workspacePathsEqual(project.path, activeProject.path)) return;
     await createSessionUnderProject(project.path);
   };
@@ -1508,7 +1615,7 @@ function App() {
           </label>
           {sideView === "conversations" ? (
             <nav className="thread-list" aria-label="会话列表">
-              {standaloneThreads.map((thread) => {
+              {conversationListThreads.map((thread) => {
                 const isSubagentThread = subagentThreadIds.has(thread.id);
                 return (
                   <div className={cn("thread-item", thread.id === activeThreadId && "thread-item--active")} key={thread.id}>
@@ -1528,7 +1635,7 @@ function App() {
                   </div>
                 );
               })}
-              {!standaloneThreads.length && (
+              {!conversationListThreads.length && (
                 <div className="thread-empty">
                   <MessageSquare size={16} />
                   <span>{threadQuery ? "没有匹配的会话" : "还没有会话"}</span>
@@ -1538,7 +1645,7 @@ function App() {
           ) : (
             <nav className="thread-list" aria-label="项目列表">
               {(() => {
-                if (!projectsWithThreads.length) {
+                if (!visibleProjectGroups.length) {
                   return (
                     <div className="thread-empty">
                       <Folder size={16} />
@@ -1546,7 +1653,7 @@ function App() {
                     </div>
                   );
                 }
-                return projectsWithThreads.map((project) => {
+                return visibleProjectGroups.map((project) => {
                   const projectPath = project.record.path;
                   const isExpanded = expandedProjects.has(projectPath);
                   const isActiveProject = activeProject
@@ -1622,33 +1729,14 @@ function App() {
                                 </button>
                                 <button
                                   type="button"
-                                  disabled={project.threads.length > 0}
-                                  title={project.threads.length > 0 ? "项目包含会话，无法移除" : "从项目列表移除"}
-                                  onClick={() => {
-                                    if (window.confirm(`确定从项目列表中删除"${project.record.name}"？\n\n该操作不会删除项目内的会话。`)) {
-                                      const map = readThreadProjectMap();
-                                      let changed = false;
-                                      for (const id of Object.keys(map)) {
-                                        if (workspacePathsEqual(map[id], projectPath)) { delete map[id]; changed = true; }
-                                      }
-                                      if (changed) {
-                                        setThreadProjectMap(map);
-                                        saveThreadProjectMap(map);
-                                      }
-                                      // 同时从 known 列表移除空项目
-                                      setKnownProjectPaths((current) => current.filter(
-                                        (path) => !workspacePathsEqual(path, projectPath),
-                                      ));
-                                      setExpandedProjects((prev) => {
-                                        const next = new Set(prev);
-                                        next.delete(projectPath);
-                                        return next;
-                                      });
-                                    }
-                                    setProjectMenuOpen(null);
-                                  }}
+                                  title="删除项目分组"
+                                  onClick={() => removeProjectGroup(
+                                    projectPath,
+                                    project.record.name,
+                                    project.threads.length,
+                                  )}
                                 >
-                                  <Trash2 size={13} /><span>删除</span>
+                                  <Trash2 size={13} /><span>删除分组</span>
                                 </button>
                               </div>
                             )}
@@ -2003,8 +2091,12 @@ function App() {
                           <button
                             type="button"
                             aria-label={`加入当前对话 ${queueItem.input || "图片消息"}`}
-                            title={queueItem.workflowId ? "机器人工作流必须作为独立 Turn 启动" : "加入当前对话"}
-                            disabled={Boolean(queueItem.workflowId)}
+                            title={queueItem.workflowId
+                              ? "机器人工作流必须作为独立 Turn 启动"
+                              : currentThreadCancelling
+                                ? "当前对话正在停止"
+                                : "加入当前对话"}
+                            disabled={Boolean(queueItem.workflowId) || currentThreadCancelling}
                             onClick={() => void sendQueuedMessageNow(queueItem.id)}
                           >
                             <ArrowUp size={16} strokeWidth={2.2} />
@@ -2147,12 +2239,17 @@ function App() {
                 />
                 <div ref={modeMenuRef} className="composer-mode-selector">
                   <button
+                    ref={modeMenuTriggerRef}
                     type="button"
                     className="mode-toggle"
-                    onClick={() => setModeMenuOpen(!modeMenuOpen)}
+                    onClick={() => {
+                      if (!modeMenuOpen) updateModeMenuPosition();
+                      setModeMenuOpen(!modeMenuOpen);
+                    }}
                     aria-label="选择模式"
                     aria-haspopup="menu"
                     aria-expanded={modeMenuOpen}
+                    aria-controls={modeMenuOpen ? modeMenuId : undefined}
                     title={workflowModeLocked ? "机器人工作流固定使用 Craft 模式" : "选择交互模式"}
                     disabled={workflowModeLocked}
                   >
@@ -2178,8 +2275,15 @@ function App() {
                     )}
                     <ChevronDown className="mode-chevron" size={13} aria-hidden="true" />
                   </button>
-                  {modeMenuOpen && !workflowModeLocked && (
-                    <div className="mode-menu" role="menu" aria-label="交互模式">
+                  {modeMenuOpen && !workflowModeLocked ? createPortal(
+                    <div
+                      ref={modeMenuPopoverRef}
+                      id={modeMenuId}
+                      className="mode-menu composer-popover-surface"
+                      role="menu"
+                      aria-label="交互模式"
+                      style={modeMenuPosition}
+                    >
                       <button
                         type="button"
                         className={`mode-option ${agentMode === "craft" ? "mode-option--active" : ""}`}
@@ -2224,8 +2328,9 @@ function App() {
                           <span>先制定计划，等待确认</span>
                         </div>
                       </button>
-                    </div>
-                  )}
+                    </div>,
+                    document.body,
+                  ) : null}
                 </div>
                 <ReasoningSelector
                   effort={reasoningEffort}
@@ -2267,7 +2372,7 @@ function App() {
                   className="send-button"
                   type="submit"
                   aria-label="发送消息"
-                  title="发送消息"
+                  title={currentThreadBusy ? "发送并停止当前生成" : "发送消息"}
                   disabled={workspaceSwitching || (!draft.trim() && attachments.length === 0)}
                 >
                   <ArrowUp size={18} strokeWidth={2.2} />

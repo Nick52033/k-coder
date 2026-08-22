@@ -469,6 +469,7 @@ export type TurnTimelineItem =
 export type ProviderKind = "open_ai_compatible";
 export type ProviderTransport =
   | "open_ai_chat_completions"
+  | "deep_seek_chat_completions"
   | "open_ai_responses"
   | "anthropic_messages"
   | "google_gemini";
@@ -578,7 +579,7 @@ export interface BrowserSettings { enabled: boolean; allowLocalhost: boolean; }
 export interface BrowserAuditEvent { timestampMs: number; action: string; target: string; success: boolean; detail: string; }
 export interface BrowserArtifact { id: string; name: string; mediaType: string; sizeBytes: number; createdAtMs: number; }
 export interface DocumentContent { path: string; name: string; mediaType: string; content: string; sourceBytes: number; extractedBytes: number; truncated: boolean; }
-export interface MetricsSnapshot { providerCalls: number; providerFailures: number; averageProviderLatencyMs: number; inputTokens: number; outputTokens: number; compactionCount: number; compactedMessages: number; estimatedContextTokensSaved: number; toolCalls: number; toolSuccessRate: number; fallbackCount: number; completedTasks: number; failedTasks: number; estimatedCostUsd: number | null; }
+export interface MetricsSnapshot { providerCalls: number; providerFailures: number; averageProviderLatencyMs: number; inputTokens: number; outputTokens: number; compactionCount: number; compactedMessages: number; estimatedContextTokensSaved: number; toolCalls: number; toolSuccessRate: number; fallbackCount: number; retryCount: number; completedTasks: number; failedTasks: number; estimatedCostUsd: number | null; }
 export interface EvaluationReport { total: number; passed: number; passRate: number; failures: string[]; }
 
 export interface TurnOutcome {

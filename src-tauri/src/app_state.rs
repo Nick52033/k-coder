@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -25,10 +25,11 @@ use crate::protocol::{
     ThreadTurnsPage, TurnItemsView, TurnState, UserInputAction, UserInputResolution,
 };
 use crate::providers::{
-    AnthropicMessagesProvider, CredentialError, CredentialStore, FallbackProvider, FallbackTarget,
-    GoogleGeminiProvider, OpenAiChatCompletionsProvider, OpenAiResponsesProvider,
-    OsCredentialStore, Provider, ProviderCatalogView, ProviderConfig, ProviderConfigError,
-    ProviderConfigStore, ProviderConfigView, ProviderTransport, SaveProviderConfigRequest,
+    AnthropicMessagesProvider, CredentialError, CredentialStore, DeepSeekChatCompletionsProvider,
+    FallbackProvider, FallbackTarget, GoogleGeminiProvider, OpenAiChatCompletionsProvider,
+    OpenAiResponsesProvider, OsCredentialStore, Provider, ProviderCatalogView, ProviderConfig,
+    ProviderConfigError, ProviderConfigStore, ProviderConfigView, ProviderTransport,
+    SaveProviderConfigRequest,
 };
 use crate::storage::{
     JsonlThreadRepository, StorageError, StoredEvent, StoredEventKind, ThreadRepository,
@@ -53,6 +54,7 @@ pub struct AppState {
     bundled_tools: Option<BundledTools>,
     logger: StructuredLogger,
     active_turns: Mutex<HashMap<String, ActiveTurn>>,
+    turn_state_changed: Notify,
     thread_mailbox: ThreadMailbox,
     thread_operations: ThreadOperationGate,
     recovery_lock: Mutex<()>,
@@ -67,6 +69,12 @@ struct ActiveTurn {
     turn_id: String,
     cancellation: CancellationToken,
     control: Arc<TurnControl>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct EnqueueThreadTurnOutcome {
+    pub(crate) should_start: bool,
+    pub(crate) interrupted_turn_id: Option<String>,
 }
 
 impl AppState {
@@ -221,6 +229,7 @@ impl AppState {
             bundled_tools,
             logger,
             active_turns: Mutex::new(HashMap::new()),
+            turn_state_changed: Notify::new(),
             thread_mailbox: ThreadMailbox::default(),
             thread_operations: ThreadOperationGate::default(),
             recovery_lock: Mutex::new(()),
@@ -253,15 +262,59 @@ impl AppState {
         self.thread_mailbox.enqueue(item).await
     }
 
+    pub(crate) async fn enqueue_thread_turn_interrupting(
+        &self,
+        item: MailboxTurn,
+        expected_active_turn_id: Option<&str>,
+    ) -> EnqueueThreadTurnOutcome {
+        let thread_id = item.handle.thread_id.clone();
+        let _operation_guard = self.thread_operations.lock(&thread_id).await;
+        let active_turns = self.active_turns.lock().await;
+        let active_turn_id = active_turns
+            .get(&thread_id)
+            .map(|active| active.turn_id.clone());
+        let interrupted_turn_id = expected_active_turn_id
+            .filter(|expected| active_turn_id.as_deref() == Some(*expected))
+            .map(str::to_string);
+
+        // The replacement must be owned by the mailbox before cancellation can
+        // make the current worker advance to its next item.
+        let should_start = self.thread_mailbox.enqueue(item).await;
+        if interrupted_turn_id.is_some() {
+            let active = active_turns
+                .get(&thread_id)
+                .expect("the matching active turn remains locked");
+            active.control.close();
+            active.cancellation.cancel();
+            self.subagents.cancel_for_parent(&thread_id);
+        }
+
+        EnqueueThreadTurnOutcome {
+            should_start,
+            interrupted_turn_id,
+        }
+    }
+
     pub async fn next_thread_turn(
         &self,
         thread_id: &str,
     ) -> Option<(MailboxTurn, ThreadOperationGuard)> {
-        let operation_guard = self.thread_operations.lock(thread_id).await;
-        self.thread_mailbox
-            .next(thread_id)
-            .await
-            .map(|item| (item, operation_guard))
+        loop {
+            let turn_state_changed = self.turn_state_changed.notified();
+            tokio::pin!(turn_state_changed);
+            turn_state_changed.as_mut().enable();
+            let operation_guard = self.thread_operations.lock(thread_id).await;
+            if self.active_turns.lock().await.contains_key(thread_id) {
+                drop(operation_guard);
+                turn_state_changed.await;
+                continue;
+            }
+            return self
+                .thread_mailbox
+                .next(thread_id)
+                .await
+                .map(|item| (item, operation_guard));
+        }
     }
 
     pub async fn remove_queued_turn(&self, thread_id: &str, turn_id: &str) -> bool {
@@ -791,7 +844,7 @@ impl AppState {
         Ok(self
             .provider_config
             .load()?
-            .map(|config| config.active_model().supports_vision)
+            .map(|config| model_supports_vision(&config, config.active_model()))
             .unwrap_or(false))
     }
 
@@ -852,8 +905,14 @@ impl AppState {
         api_key: String,
     ) -> Result<Arc<dyn Provider>, AppStateError> {
         let provider: Arc<dyn Provider> = match config.transport {
+            ProviderTransport::OpenAiChatCompletions if is_deepseek_model(&config.model) => {
+                Arc::new(DeepSeekChatCompletionsProvider::new(config, api_key)?)
+            }
             ProviderTransport::OpenAiChatCompletions => {
                 Arc::new(OpenAiChatCompletionsProvider::new(config, api_key)?)
+            }
+            ProviderTransport::DeepSeekChatCompletions => {
+                Arc::new(DeepSeekChatCompletionsProvider::new(config, api_key)?)
             }
             ProviderTransport::OpenAiResponses => {
                 Arc::new(OpenAiResponsesProvider::new(config, api_key)?)
@@ -1027,8 +1086,10 @@ impl AppState {
     }
 
     pub async fn finish_turn(&self, thread_id: &str) {
-        if let Some(active) = self.active_turns.lock().await.remove(thread_id) {
+        let active = self.active_turns.lock().await.remove(thread_id);
+        if let Some(active) = active {
             active.control.close();
+            self.turn_state_changed.notify_waiters();
         }
     }
 
@@ -1340,6 +1401,33 @@ fn active_turn_items(events: &[StoredEvent], turn_id: &str) -> Vec<(String, Agen
     active
 }
 
+/// Recognize a DeepSeek model when an older configuration still selects the
+/// generic OpenAI-compatible transport.  The provider segment must start with
+/// `deepseek` and use a separator, so unrelated names such as
+/// `my-deepseek-proxy` remain on the ordinary OpenAI path.  This covers the
+/// official chat/reasoner, V3/V4/R1 and gateway-prefixed model IDs without
+/// hard-coding a finite catalog.
+fn is_deepseek_model(model: &str) -> bool {
+    model
+        .to_ascii_lowercase()
+        .split(|character| matches!(character, '/' | ':'))
+        .any(|segment| {
+            segment.strip_prefix("deepseek").is_some_and(|suffix| {
+                suffix.is_empty() || matches!(suffix.chars().next(), Some('-' | '_' | '.'))
+            })
+        })
+}
+
+fn model_supports_vision(
+    config: &ProviderConfig,
+    model: &crate::providers::ProviderModelConfig,
+) -> bool {
+    model.supports_vision
+        && config.transport != ProviderTransport::DeepSeekChatCompletions
+        && !(config.transport == ProviderTransport::OpenAiChatCompletions
+            && is_deepseek_model(&model.id))
+}
+
 fn provider_target_specs(
     config: &ProviderConfig,
     requires_vision: bool,
@@ -1349,14 +1437,14 @@ fn provider_target_specs(
         config.base_url.clone(),
         active_model.id.clone(),
         config.name.clone(),
-        active_model.supports_vision,
+        model_supports_vision(config, active_model),
     )];
     for fallback in config.fallback_models() {
         candidates.push((
             config.base_url.clone(),
             fallback.id.clone(),
             format!("{} / {}", config.name, fallback.display_name),
-            fallback.supports_vision,
+            model_supports_vision(config, fallback),
         ));
     }
     for endpoint in config.enabled_endpoints() {
@@ -1364,14 +1452,14 @@ fn provider_target_specs(
             endpoint.base_url.clone(),
             active_model.id.clone(),
             endpoint.name.clone(),
-            active_model.supports_vision,
+            model_supports_vision(config, active_model),
         ));
         for fallback in config.fallback_models() {
             candidates.push((
                 endpoint.base_url.clone(),
                 fallback.id.clone(),
                 format!("{} / {}", endpoint.name, fallback.display_name),
-                fallback.supports_vision,
+                model_supports_vision(config, fallback),
             ));
         }
     }
@@ -1472,6 +1560,62 @@ mod tests {
     #[derive(Default)]
     struct FakeCredentials {
         api_keys: StdMutex<HashMap<String, String>>,
+    }
+
+    #[test]
+    fn recognizes_deepseek_model_families_for_automatic_dialect_selection() {
+        for model in [
+            "deepseek-chat",
+            "deepseek-reasoner",
+            "deepseek-v3.2",
+            "deepseek-v4-pro-0813",
+            "deepseek-ai/deepseek-r1",
+            "gateway:deepseek-v4_flash",
+        ] {
+            assert!(is_deepseek_model(model), "expected DeepSeek model: {model}");
+        }
+        for model in ["deepseekish", "my-deepseek-v4-proxy", "openai/deepseekish"] {
+            assert!(
+                !is_deepseek_model(model),
+                "unexpected DeepSeek match: {model}"
+            );
+        }
+    }
+
+    #[test]
+    fn deepseek_chat_completions_is_text_only_even_if_catalog_flags_vision() {
+        for (transport, model) in [
+            (ProviderTransport::DeepSeekChatCompletions, "private-model"),
+            (
+                ProviderTransport::OpenAiChatCompletions,
+                "deepseek-reasoner",
+            ),
+        ] {
+            let config = SaveProviderConfigRequest {
+                id: "deepseek".to_string(),
+                kind: ProviderKind::OpenAiCompatible,
+                transport,
+                name: "DeepSeek".to_string(),
+                base_url: "https://api.deepseek.com".to_string(),
+                model: model.to_string(),
+                models: vec![crate::providers::ProviderModelConfig {
+                    id: model.to_string(),
+                    display_name: model.to_string(),
+                    context_window: 1_000_000,
+                    max_output_tokens: Some(256_000),
+                    supports_vision: true,
+                    fallback: false,
+                }],
+                endpoints: Vec::new(),
+                api_key: None,
+                activate: true,
+            }
+            .public_config()
+            .expect("DeepSeek configuration should validate");
+
+            assert!(!model_supports_vision(&config, config.active_model()));
+            assert!(provider_target_specs(&config, true).is_empty());
+        }
     }
 
     impl CredentialStore for FakeCredentials {
@@ -1794,6 +1938,203 @@ mod tests {
                 .await,
             Err(AppStateError::ThreadMailboxNotEmpty(thread_id)) if thread_id == thread.id
         ));
+    }
+
+    #[tokio::test]
+    async fn replacement_enqueue_cancels_only_the_matching_mailbox_turn() {
+        let directory = tempfile::tempdir().unwrap();
+        let state =
+            AppState::with_credentials(directory.path(), Arc::new(FakeCredentials::default()))
+                .unwrap();
+        let active_item = MailboxTurn {
+            handle: crate::protocol::TurnHandle {
+                schema_version: crate::protocol::PROTOCOL_VERSION,
+                thread_id: "thread".into(),
+                turn_id: "turn-current".into(),
+                state: TurnState::Queued,
+            },
+            kind: MailboxTurnKind::Retry,
+            started: None,
+        };
+        assert!(state.enqueue_thread_turn(active_item).await);
+        let (_, operation_guard) = state
+            .next_thread_turn("thread")
+            .await
+            .expect("the mailbox worker should own the active item");
+        let workspace = state.workspace_root();
+        let (cancellation, control) = state
+            .begin_turn_with_id_in_workspace_locked(
+                "thread",
+                "turn-current",
+                &workspace,
+                &operation_guard,
+            )
+            .await
+            .unwrap();
+        drop(operation_guard);
+
+        let replacement = MailboxTurn {
+            handle: crate::protocol::TurnHandle {
+                schema_version: crate::protocol::PROTOCOL_VERSION,
+                thread_id: "thread".into(),
+                turn_id: "turn-replacement".into(),
+                state: TurnState::Queued,
+            },
+            kind: MailboxTurnKind::Message {
+                request: crate::agent::RunTurnRequest {
+                    thread_id: "thread".into(),
+                    input: "use this direction instead".into(),
+                    agent_mode: None,
+                },
+                attachments: Vec::new(),
+                workflow_id: None,
+            },
+            started: None,
+        };
+        let enqueue = state
+            .enqueue_thread_turn_interrupting(replacement, Some("turn-current"))
+            .await;
+
+        assert!(!enqueue.should_start);
+        assert_eq!(enqueue.interrupted_turn_id.as_deref(), Some("turn-current"));
+        assert!(cancellation.is_cancelled());
+        assert!(
+            control
+                .steer(crate::protocol::ChatMessage {
+                    schema_version: crate::protocol::PROTOCOL_VERSION,
+                    id: "late-steer".into(),
+                    role: crate::protocol::MessageRole::User,
+                    content: Vec::new(),
+                    created_at_ms: 1,
+                })
+                .is_err()
+        );
+        let snapshot = state.thread_mailbox().snapshot("thread", None).await;
+        assert_eq!(snapshot.pending.len(), 1);
+        assert_eq!(snapshot.pending[0].turn_id, "turn-replacement");
+        state.finish_turn("thread").await;
+    }
+
+    #[tokio::test]
+    async fn replacement_enqueue_retains_input_without_interrupting_a_successor() {
+        let directory = tempfile::tempdir().unwrap();
+        let state =
+            AppState::with_credentials(directory.path(), Arc::new(FakeCredentials::default()))
+                .unwrap();
+        assert!(
+            state
+                .enqueue_thread_turn(MailboxTurn {
+                    handle: crate::protocol::TurnHandle {
+                        schema_version: crate::protocol::PROTOCOL_VERSION,
+                        thread_id: "thread".into(),
+                        turn_id: "turn-current".into(),
+                        state: TurnState::Queued,
+                    },
+                    kind: MailboxTurnKind::Retry,
+                    started: None,
+                })
+                .await
+        );
+        let (_, operation_guard) = state.next_thread_turn("thread").await.unwrap();
+        let workspace = state.workspace_root();
+        let (cancellation, control) = state
+            .begin_turn_with_id_in_workspace_locked(
+                "thread",
+                "turn-current",
+                &workspace,
+                &operation_guard,
+            )
+            .await
+            .unwrap();
+        drop(operation_guard);
+
+        let enqueue = state
+            .enqueue_thread_turn_interrupting(
+                MailboxTurn {
+                    handle: crate::protocol::TurnHandle {
+                        schema_version: crate::protocol::PROTOCOL_VERSION,
+                        thread_id: "thread".into(),
+                        turn_id: "turn-replacement".into(),
+                        state: TurnState::Queued,
+                    },
+                    kind: MailboxTurnKind::Message {
+                        request: crate::agent::RunTurnRequest {
+                            thread_id: "thread".into(),
+                            input: "keep this queued".into(),
+                            agent_mode: None,
+                        },
+                        attachments: Vec::new(),
+                        workflow_id: None,
+                    },
+                    started: None,
+                },
+                Some("turn-stale"),
+            )
+            .await;
+
+        assert!(!enqueue.should_start);
+        assert_eq!(enqueue.interrupted_turn_id, None);
+        assert!(!cancellation.is_cancelled());
+        let still_open = crate::protocol::ChatMessage {
+            schema_version: crate::protocol::PROTOCOL_VERSION,
+            id: "accepted-steer".into(),
+            role: crate::protocol::MessageRole::User,
+            content: Vec::new(),
+            created_at_ms: 1,
+        };
+        control.steer(still_open.clone()).unwrap();
+        assert_eq!(control.take_pending(), vec![still_open]);
+        let snapshot = state.thread_mailbox().snapshot("thread", None).await;
+        assert_eq!(snapshot.pending.len(), 1);
+        assert_eq!(snapshot.pending[0].turn_id, "turn-replacement");
+        state.finish_turn("thread").await;
+    }
+
+    #[tokio::test]
+    async fn replacement_worker_waits_for_a_blocking_compatibility_turn() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = Arc::new(
+            AppState::with_credentials(directory.path(), Arc::new(FakeCredentials::default()))
+                .unwrap(),
+        );
+        let workspace = state.workspace_root();
+        let (cancellation, _) = state
+            .begin_turn_with_id_in_workspace("thread", "turn-blocking", &workspace)
+            .await
+            .unwrap();
+        let enqueue = state
+            .enqueue_thread_turn_interrupting(
+                MailboxTurn {
+                    handle: crate::protocol::TurnHandle {
+                        schema_version: crate::protocol::PROTOCOL_VERSION,
+                        thread_id: "thread".into(),
+                        turn_id: "turn-replacement".into(),
+                        state: TurnState::Queued,
+                    },
+                    kind: MailboxTurnKind::Retry,
+                    started: None,
+                },
+                Some("turn-blocking"),
+            )
+            .await;
+        assert!(enqueue.should_start);
+        assert_eq!(
+            enqueue.interrupted_turn_id.as_deref(),
+            Some("turn-blocking")
+        );
+        assert!(cancellation.is_cancelled());
+
+        let waiting_state = state.clone();
+        let waiting = tokio::spawn(async move { waiting_state.next_thread_turn("thread").await });
+        tokio::task::yield_now().await;
+        assert!(!waiting.is_finished());
+        state.finish_turn("thread").await;
+        let (replacement, operation_guard) = waiting
+            .await
+            .unwrap()
+            .expect("the replacement remains queued until the active turn is released");
+        assert_eq!(replacement.handle.turn_id, "turn-replacement");
+        drop(operation_guard);
     }
 
     #[tokio::test]

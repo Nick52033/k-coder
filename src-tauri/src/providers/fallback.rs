@@ -71,7 +71,7 @@ impl Provider for FallbackProvider {
 
 fn retryable(error: &ProviderError) -> bool {
     match error {
-        ProviderError::Request(_) => true,
+        ProviderError::Request(_) | ProviderError::Unavailable(_) => true,
         ProviderError::Http { status, .. } => {
             matches!(*status, 408 | 429) || (500..=599).contains(status)
         }
@@ -120,6 +120,7 @@ mod tests {
             status: 503,
             message: "down".into()
         }));
+        assert!(retryable(&ProviderError::Unavailable("overloaded".into())));
         assert!(!retryable(&ProviderError::Http {
             status: 401,
             message: "auth".into()

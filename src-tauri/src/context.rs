@@ -185,13 +185,23 @@ pub fn compact(
         .cloned()
         .map(|summary| normalize_compaction_summary(summary, user_context));
     let previous_summary = previous_summary.as_ref();
-    let recent_tool_results = previous_summary
-        .into_iter()
-        .flat_map(|summary| summary.recent_tool_results.iter())
-        .chain(messages.iter())
-        .filter(|message| matches!(message, ProviderMessage::ToolResult { .. }))
-        .map(summarize_large_tool_result)
-        .collect::<Vec<_>>();
+    let latest_mutation = latest_successful_workspace_mutation(messages);
+    let workspace_fact_start = latest_mutation.unwrap_or(0);
+    let mut recent_tool_results = Vec::new();
+    if latest_mutation.is_none() {
+        recent_tool_results.extend(
+            previous_summary
+                .into_iter()
+                .flat_map(|summary| summary.recent_tool_results.iter())
+                .cloned(),
+        );
+    }
+    recent_tool_results.extend(
+        messages[workspace_fact_start..]
+            .iter()
+            .filter(|message| matches!(message, ProviderMessage::ToolResult { .. }))
+            .map(summarize_large_tool_result),
+    );
     let recent_tool_results = recent_tool_results[recent_tool_results
         .len()
         .saturating_sub(RECENT_TOOL_RESULT_LIMIT)..]
@@ -216,7 +226,7 @@ pub fn compact(
     let keep_tokens = budget.history / 4;
     let mut kept = Vec::new();
     let mut used = 0;
-    for message in messages.iter().rev() {
+    for message in messages[workspace_fact_start..].iter().rev() {
         let tokens = message_chars(message).div_ceil(CHARS_PER_TOKEN);
         if used + tokens > keep_tokens && !kept.is_empty() {
             break;
@@ -233,14 +243,22 @@ pub fn compact(
     } else {
         user_context.current_user_request.clone()
     };
+    let mut inherited_tool_observations = Vec::new();
+    if latest_mutation.is_none() {
+        inherited_tool_observations.extend(
+            previous_summary
+                .into_iter()
+                .flat_map(|summary| summary.important_tool_observations.iter().cloned()),
+        );
+    }
+    inherited_tool_observations.extend(important_tool_observations(
+        &messages[workspace_fact_start.min(compacted_count)..compacted_count],
+    ));
     let important_tool_observations = merge_string_history(
-        previous_summary
-            .into_iter()
-            .flat_map(|summary| summary.important_tool_observations.iter().cloned())
-            .chain(important_tool_observations(&messages[..compacted_count])),
+        inherited_tool_observations,
         IMPORTANT_TOOL_OBSERVATION_LIMIT,
     );
-    let new_summary_text = messages[..compacted_count]
+    let new_summary_text = messages[workspace_fact_start.min(compacted_count)..compacted_count]
         .iter()
         .filter_map(|message| match message {
             ProviderMessage::Text { role, text } => {
@@ -262,13 +280,14 @@ pub fn compact(
         .collect::<Vec<_>>()
         .join("\n");
     let summary_text = previous_summary
+        .filter(|_| latest_mutation.is_none())
         .and_then(stable_previous_summary_text)
         .into_iter()
         .chain((!new_summary_text.is_empty()).then_some(new_summary_text.as_str()))
         .collect::<Vec<_>>()
         .join("\n");
     let mut summary = CompactionSummary {
-        contract_version: 4,
+        contract_version: 5,
         summary: bound(&summary_text, budget.history * CHARS_PER_TOKEN / 4),
         user_constraints,
         recent_user_messages,
@@ -285,6 +304,25 @@ pub fn compact(
     let result = render_provider_history(Some(&summary), &kept);
     summary.estimated_after_tokens = estimate_tokens(&result);
     (summary, result)
+}
+
+fn latest_successful_workspace_mutation(messages: &[ProviderMessage]) -> Option<usize> {
+    messages
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(index, message)| match message {
+            ProviderMessage::ToolResult {
+                name,
+                success: true,
+                ..
+            } if is_workspace_mutation_tool(name) => Some(index),
+            _ => None,
+        })
+}
+
+fn is_workspace_mutation_tool(name: &str) -> bool {
+    matches!(name, "apply_patch" | "write_file")
 }
 
 pub(crate) fn render_provider_history(
@@ -366,7 +404,13 @@ fn important_tool_observations(messages: &[ProviderMessage]) -> Vec<String> {
     messages
         .iter()
         .filter_map(|message| {
-            let ProviderMessage::ToolResult { name, output, .. } = message else {
+            let ProviderMessage::ToolResult {
+                name,
+                success,
+                output,
+                ..
+            } = message
+            else {
                 return None;
             };
             let mut high_signal = output
@@ -377,12 +421,14 @@ fn important_tool_observations(messages: &[ProviderMessage]) -> Vec<String> {
                 .filter(|line| !line.is_empty())
                 .collect::<Vec<_>>();
             if high_signal.is_empty() {
-                high_signal = output
-                    .lines()
-                    .map(str::trim)
-                    .filter(|line| !line.is_empty())
-                    .take(1)
-                    .collect();
+                if !success || is_workspace_mutation_tool(name) {
+                    high_signal = output
+                        .lines()
+                        .map(str::trim)
+                        .filter(|line| !line.is_empty())
+                        .take(1)
+                        .collect();
+                }
             }
             if high_signal.is_empty() {
                 return None;
@@ -621,6 +667,65 @@ mod tests {
     }
 
     #[test]
+    fn successful_mutation_invalidates_stale_workspace_facts_but_keeps_request_and_outcome() {
+        let previous_summary = CompactionSummary {
+            contract_version: 4,
+            summary: "The method still uses JObject.Parse and manual mapping.".into(),
+            user_constraints: vec!["Do not change the public contract".into()],
+            recent_user_messages: vec!["Simplify GetCompanyConfig".into()],
+            current_user_request: "Simplify GetCompanyConfig".into(),
+            important_tool_observations: vec!["tool read_file: JObject.Parse(configJson)".into()],
+            recent_tool_results: vec![ProviderMessage::ToolResult {
+                call_id: "old-read".into(),
+                name: "read_file".into(),
+                success: true,
+                output: "JObject.Parse(configJson)".into(),
+            }],
+            compacted_message_count: 10,
+            estimated_before_tokens: 1_000,
+            estimated_after_tokens: 500,
+        };
+        let messages = vec![
+            ProviderMessage::AssistantToolCalls {
+                text: "I will patch the manual JObject mapping.".into(),
+                calls: vec![],
+            },
+            ProviderMessage::ToolResult {
+                call_id: "pre-patch-read".into(),
+                name: "read_file".into(),
+                success: true,
+                output: "var value = JObject.Parse(configJson);".into(),
+            },
+            ProviderMessage::ToolResult {
+                call_id: "patch".into(),
+                name: "apply_patch".into(),
+                success: true,
+                output: "Patch applied successfully to GetCompanyConfig.".into(),
+            },
+            ProviderMessage::Text {
+                role: MessageRole::Assistant,
+                text: "The method now directly deserializes the company config.".into(),
+            },
+        ];
+        let mut user_context = CompactionUserContext::default();
+        user_context.observe("Simplify GetCompanyConfig and keep its public contract".into());
+
+        let (summary, compacted) =
+            compact(&messages, 2_000, Some(&previous_summary), &user_context);
+        let rendered = serde_json::to_string(&(summary.clone(), compacted)).unwrap();
+
+        assert!(!rendered.contains("JObject"));
+        assert!(rendered.contains("Simplify GetCompanyConfig"));
+        assert!(rendered.contains("Patch applied successfully"));
+        assert!(
+            summary
+                .user_constraints
+                .iter()
+                .any(|constraint| constraint.contains("public contract"))
+        );
+    }
+
+    #[test]
     fn compaction_preserves_recent_user_requests() {
         let mut messages = vec![ProviderMessage::Text {
             role: MessageRole::User,
@@ -745,7 +850,7 @@ mod tests {
             text: format!("历史 {index} {}", "x".repeat(500)),
         }));
         let (summary, compacted) = compact_once(&messages, 1_024);
-        assert_eq!(summary.contract_version, 4);
+        assert_eq!(summary.contract_version, 5);
         assert_eq!(summary.current_user_request, "请修复并运行测试");
         assert!(
             summary
@@ -852,7 +957,7 @@ mod tests {
                 Some(ProviderMessage::Text { text, .. }) => text,
                 other => panic!("expected rendered compaction summary, got {other:?}"),
             };
-            assert_eq!(rendered.matches("[Compacted context v4]").count(), 1);
+            assert_eq!(rendered.matches("[Compacted context v5]").count(), 1);
 
             previous_summary = Some(summary);
             messages.clear();

@@ -1,4 +1,5 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { Check, ChevronDown, Hand, ShieldCheck } from "lucide-react";
 import type { ApprovalMode } from "../types/runtime";
 
@@ -10,21 +11,55 @@ interface ApprovalModeSelectorProps {
 
 export function ApprovalModeSelector({ mode, disabled, onChange }: ApprovalModeSelectorProps) {
   const [open, setOpen] = useState(false);
+  const [menuPosition, setMenuPosition] = useState({ left: 12, bottom: 48, width: 430, maxHeight: 320 });
   const rootRef = useRef<HTMLDivElement>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
+  const menuId = useId();
+
+  const updateMenuPosition = () => {
+    const trigger = rootRef.current;
+    if (!trigger) return;
+    const triggerRect = trigger.getBoundingClientRect();
+    const composerRect = trigger.closest(".composer")?.getBoundingClientRect();
+    const viewportPadding = 12;
+    const menuGap = 8;
+    const anchorTop = composerRect?.top ?? triggerRect.top;
+    const boundsLeft = Math.max(viewportPadding, (composerRect?.left ?? 0) + viewportPadding);
+    const boundsRight = Math.min(
+      window.innerWidth - viewportPadding,
+      (composerRect?.right ?? window.innerWidth) - viewportPadding,
+    );
+    const width = Math.min(430, Math.max(0, boundsRight - boundsLeft));
+    setMenuPosition({
+      left: Math.max(boundsLeft, boundsRight - width),
+      bottom: Math.max(viewportPadding, window.innerHeight - anchorTop + menuGap),
+      width,
+      maxHeight: Math.max(0, Math.min(320, anchorTop - viewportPadding - menuGap)),
+    });
+  };
 
   useEffect(() => {
-    if (!open) return;
+    if (!open) return undefined;
     const closeFromPointer = (event: PointerEvent) => {
-      if (!rootRef.current?.contains(event.target as Node)) setOpen(false);
+      const target = event.target as Node;
+      if (!rootRef.current?.contains(target) && !menuRef.current?.contains(target)) setOpen(false);
     };
     const closeFromKeyboard = (event: KeyboardEvent) => {
-      if (event.key === "Escape") setOpen(false);
+      if (event.key === "Escape") {
+        setOpen(false);
+        rootRef.current?.querySelector("button")?.focus();
+      }
     };
+    updateMenuPosition();
     document.addEventListener("pointerdown", closeFromPointer);
     document.addEventListener("keydown", closeFromKeyboard);
+    window.addEventListener("resize", updateMenuPosition);
+    window.addEventListener("scroll", updateMenuPosition, true);
     return () => {
       document.removeEventListener("pointerdown", closeFromPointer);
       document.removeEventListener("keydown", closeFromKeyboard);
+      window.removeEventListener("resize", updateMenuPosition);
+      window.removeEventListener("scroll", updateMenuPosition, true);
     };
   }, [open]);
 
@@ -46,16 +81,27 @@ export function ApprovalModeSelector({ mode, disabled, onChange }: ApprovalModeS
         aria-label={`操作批准方式：${fullAccess ? "完整访问" : "请求批准"}`}
         aria-haspopup="menu"
         aria-expanded={open}
+        aria-controls={open ? menuId : undefined}
         title={fullAccess ? "完整访问：自动批准工具操作" : "请求批准：敏感操作前先询问"}
         disabled={disabled}
-        onClick={() => setOpen((value) => !value)}
+        onClick={() => {
+          if (!open) updateMenuPosition();
+          setOpen((value) => !value);
+        }}
       >
         {fullAccess ? <ShieldCheck size={16} /> : <Hand size={16} />}
         {fullAccess ? <span>完整访问</span> : null}
         <ChevronDown size={14} className="approval-mode-chevron" />
       </button>
-      {open && (
-        <div className="approval-mode-menu" role="menu" aria-label="操作批准方式">
+      {open ? createPortal(
+        <div
+          ref={menuRef}
+          id={menuId}
+          className="approval-mode-menu composer-popover-surface"
+          role="menu"
+          aria-label="操作批准方式"
+          style={menuPosition}
+        >
           <div className="approval-mode-menu-title">如何批准智能体操作？</div>
           <button
             type="button"
@@ -85,8 +131,9 @@ export function ApprovalModeSelector({ mode, disabled, onChange }: ApprovalModeS
             </span>
             {mode === "full_access" && <Check size={17} />}
           </button>
-        </div>
-      )}
+        </div>,
+        document.body,
+      ) : null}
     </div>
   );
 }

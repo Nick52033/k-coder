@@ -109,6 +109,7 @@ pub enum ProviderKind {
 pub enum ProviderTransport {
     #[default]
     OpenAiChatCompletions,
+    DeepSeekChatCompletions,
     OpenAiResponses,
     AnthropicMessages,
     GoogleGemini,
@@ -669,6 +670,18 @@ mod tests {
                 .expect("endpoint should build")
                 .as_str(),
             "https://example.com/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn deserializes_the_deepseek_chat_completions_transport() {
+        let transport: ProviderTransport = serde_json::from_str(r#""deep_seek_chat_completions""#)
+            .expect("DeepSeek transport should deserialize");
+
+        assert_eq!(transport, ProviderTransport::DeepSeekChatCompletions);
+        assert_eq!(
+            serde_json::to_string(&transport).expect("transport should serialize"),
+            r#""deep_seek_chat_completions""#
         );
     }
 

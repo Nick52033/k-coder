@@ -3743,10 +3743,8 @@ button {
 }
 
 .project-selector-menu {
-  position: absolute;
-  z-index: 50;
-  bottom: calc(100% + 7px);
-  left: 0;
+  position: fixed;
+  z-index: 1250;
   display: grid;
   width: min(380px, calc(100vw - 40px));
   max-height: min(420px, calc(100dvh - 180px));
@@ -3761,29 +3759,44 @@ button {
 
 .project-selector-search {
   display: flex;
-  min-height: 40px;
-  padding: 0 11px;
+  height: 40px;
+  padding: 0 12px;
   align-items: center;
   gap: 8px;
   border-bottom: 1px solid var(--color-border);
   color: var(--color-ink-subtle);
+  transition: border-color var(--transition-fast), color var(--transition-fast), background-color var(--transition-fast);
+}
+
+.project-selector-search:focus-within {
+  border-bottom-color: var(--color-brand-light);
+  color: var(--color-brand);
+  background: color-mix(in srgb, var(--color-brand) 5%, transparent);
 }
 
 .project-selector-search input {
   width: 100%;
   min-width: 0;
-  height: 38px;
+  height: 32px;
   padding: 0;
   border: 0;
+  border-radius: 0;
   outline: 0;
   color: var(--color-ink);
   background: transparent;
+  box-shadow: none;
   font-size: var(--font-size-sm);
+}
+
+[data-theme] .project-selector-search input:focus:not([type="checkbox"]):not([type="radio"]) {
+  border-color: transparent;
+  box-shadow: none;
+  transform: none;
 }
 
 .project-selector-options {
   min-height: 0;
-  padding: 5px;
+  padding: 4px;
   overflow-y: auto;
 }
 
@@ -3852,7 +3865,7 @@ button {
 
 .project-selector-footer {
   display: grid;
-  padding: 5px;
+  padding: 4px;
   border-top: 1px solid var(--color-border);
 }
 
@@ -4277,14 +4290,7 @@ button {
 }
 
 .context-progress-popover {
-  position: fixed;
-  z-index: 1200;
   padding: 14px;
-  border: 1px solid var(--color-border-strong);
-  border-radius: var(--radius-md);
-  color: var(--color-ink);
-  background: var(--color-surface-raised);
-  box-shadow: 0 16px 40px rgba(20, 28, 24, 0.18);
 }
 
 .context-progress-heading {

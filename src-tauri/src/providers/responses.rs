@@ -8,7 +8,8 @@ use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 use super::common::{
-    build_client, read_error_message, redact_error, redact_event, require_api_key,
+    build_client, classify_event_error, read_error_message, redact_error, redact_event,
+    require_api_key,
 };
 use super::sse::SseDecoder;
 use super::{
@@ -48,6 +49,7 @@ struct ResponsesStreamEvent {
     item: Option<Value>,
     error: Option<ResponsesError>,
     message: Option<String>,
+    code: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -72,6 +74,9 @@ struct ResponsesUsage {
 #[derive(Deserialize)]
 struct ResponsesError {
     message: String,
+    code: Option<String>,
+    #[serde(rename = "type")]
+    error_type: Option<String>,
 }
 
 struct ParsedResponsesEvent {
@@ -255,13 +260,23 @@ fn parse_sse_data(data: &str) -> Result<ParsedResponsesEvent, ProviderError> {
         ProviderError::InvalidResponse(format!("malformed Responses API event: {error}"))
     })?;
     if event.event_type == "error" || event.event_type == "response.failed" {
+        let response_error = event.error.as_ref().or_else(|| {
+            event
+                .response
+                .as_ref()
+                .and_then(|response| response.error.as_ref())
+        });
         let message = event
-            .error
-            .or_else(|| event.response.and_then(|response| response.error))
-            .map(|error| error.message)
-            .or(event.message)
+            .message
+            .clone()
+            .or_else(|| response_error.map(|error| error.message.clone()))
             .unwrap_or_else(|| "Responses API reported an error".to_string());
-        return Err(ProviderError::InvalidResponse(message));
+        let code = event
+            .code
+            .as_deref()
+            .or_else(|| response_error.and_then(|error| error.code.as_deref()));
+        let error_type = response_error.and_then(|error| error.error_type.as_deref());
+        return Err(classify_event_error(message, code, error_type));
     }
 
     let mut events = Vec::new();
@@ -396,6 +411,30 @@ mod tests {
             ProviderEvent::ProviderContext { provider, .. } if provider == "openai_responses"
         ));
         assert!(parse_sse_data(r#"{"type":"response.completed","response":{"usage":{"input_tokens":3,"output_tokens":2}}}"#).unwrap().completed);
+    }
+
+    #[test]
+    fn classifies_streamed_response_failures_by_error_code() {
+        let top_level = parse_sse_data(
+            r#"{"type":"error","code":"server_error","message":"The server had an error while processing your request."}"#,
+        )
+        .err()
+        .expect("the error event should fail the stream");
+        assert!(matches!(top_level, ProviderError::Unavailable(_)));
+
+        let nested = parse_sse_data(
+            r#"{"type":"response.failed","response":{"error":{"code":"server_error","message":"Our servers are currently overloaded."}}}"#,
+        )
+        .err()
+        .expect("the failed response should fail the stream");
+        assert!(matches!(nested, ProviderError::Unavailable(_)));
+
+        let invalid = parse_sse_data(
+            r#"{"type":"error","code":"invalid_request_error","message":"Invalid request"}"#,
+        )
+        .err()
+        .expect("the error event should fail the stream");
+        assert!(matches!(invalid, ProviderError::InvalidResponse(_)));
     }
 
     #[test]

@@ -1,8 +1,10 @@
+use std::fmt::Write;
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
 use crate::protocol::{ToolDefinition, ToolResult};
@@ -38,6 +40,7 @@ impl RepositorySearchIndex {
         if query.is_empty() || query.len() > 256 {
             return Err("search query must contain 1 to 256 characters".into());
         }
+        let query_lower = query.to_lowercase();
         // 在 Windows / 跨盘符 / 工作区为符号连接时，canonicalize 经常直接失败并吞掉全部结果；
         // 这里退化到绝对路径，保证索引至少能在工作区内扫描到文件。
         let root = match self.root.canonicalize() {
@@ -77,8 +80,13 @@ impl RepositorySearchIndex {
                             !token.is_empty() && terms.iter().any(|term| *token == term.as_str())
                         })
                         .count() as u32;
-                    // 同时命中的 term 越多分数越高；同一行重复出现同一 term 也加权。
-                    let score = matched * 10 + total;
+                    // Exact symbol hits should outrank generated/minified files even when
+                    // those files repeat the same token hundreds of times on one line.
+                    let phrase_matches = lower.matches(&query_lower).count().min(3) as u32;
+                    let mut score = matched * 100 + total.min(3) * 25 + phrase_matches * 20;
+                    if is_low_signal_vendor_path(&relative) {
+                        score = score.div_ceil(10);
+                    }
                     let column = terms
                         .iter()
                         .filter_map(|term| lower.find(term.as_str()))
@@ -105,6 +113,18 @@ impl RepositorySearchIndex {
         results.truncate(limit.clamp(1, MAX_RESULTS));
         Ok(results)
     }
+}
+
+fn is_low_signal_vendor_path(path: &str) -> bool {
+    let normalized = format!("/{}", path.replace('\\', "/").to_ascii_lowercase());
+    normalized.contains("/vendor/")
+        || normalized.contains("/vendors/")
+        || normalized.contains("/wwwroot/lib/")
+        || normalized.contains("/public/lib/")
+        || normalized.contains("/third_party/")
+        || normalized.contains("/third-party/")
+        || normalized.ends_with(".min.js")
+        || normalized.ends_with(".min.css")
 }
 
 fn absolutize(path: &Path) -> PathBuf {
@@ -245,6 +265,7 @@ impl ToolHandler for SearchTool {
             .map_err(|error| ToolError::InvalidArguments(error.to_string()))?;
         let index = self.index.clone();
         let query = args.query;
+        let observation_query = query.trim().to_string();
         let limit = args.limit.unwrap_or(50);
         let results = tokio::task::spawn_blocking(move || index.search(&query, limit))
             .await
@@ -253,13 +274,28 @@ impl ToolHandler for SearchTool {
         if cancellation.is_cancelled() {
             return Err(ToolError::Cancelled);
         }
+        let output = serde_json::to_string(&results)
+            .map_err(|error| ToolError::Execution(error.to_string()))?;
+        let result_revision = sha256_hex(output.as_bytes());
         Ok(ToolResult {
             success: true,
-            output: serde_json::to_string(&results)
-                .map_err(|error| ToolError::Execution(error.to_string()))?,
-            metadata: json!({"resultCount": results.len()}),
+            output,
+            metadata: json!({
+                "query": observation_query,
+                "resultRevision": result_revision,
+                "resultCount": results.len()
+            }),
         })
     }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .fold(String::with_capacity(64), |mut output, byte| {
+            let _ = write!(output, "{byte:02x}");
+            output
+        })
 }
 
 #[cfg(test)]
@@ -278,5 +314,31 @@ mod tests {
         assert_eq!(results[0].line, 2);
         assert_eq!(results[1].path, "a.rs");
         assert_eq!(results[1].line, 1);
+    }
+
+    #[test]
+    fn exact_source_symbol_outranks_repeated_minified_vendor_hits() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("Permission.Business");
+        let vendor = dir.path().join("wwwroot/lib");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&vendor).unwrap();
+        std::fs::write(
+            source.join("SsrRecordBll.cs"),
+            "public CompanyConfig GetCompanyConfig() => config;\n",
+        )
+        .unwrap();
+        std::fs::write(
+            vendor.join("bundle.min.js"),
+            "GetCompanyConfig ".repeat(100),
+        )
+        .unwrap();
+
+        let results = RepositorySearchIndex::new(dir.path().to_path_buf())
+            .search("GetCompanyConfig", 10)
+            .unwrap();
+
+        assert_eq!(results[0].path, "Permission.Business/SsrRecordBll.cs");
+        assert!(results[0].score > results[1].score);
     }
 }

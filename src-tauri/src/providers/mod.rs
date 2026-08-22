@@ -29,7 +29,7 @@ pub use config::{
 pub use credentials::{CredentialError, CredentialStore, OsCredentialStore};
 pub use fallback::{FallbackProvider, FallbackTarget};
 pub use gemini::GoogleGeminiProvider;
-pub use openai::OpenAiChatCompletionsProvider;
+pub use openai::{DeepSeekChatCompletionsProvider, OpenAiChatCompletionsProvider};
 pub use responses::OpenAiResponsesProvider;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -126,10 +126,23 @@ pub enum ProviderError {
     Request(String),
     #[error("provider returned HTTP {status}: {message}")]
     Http { status: u16, message: String },
+    #[error("provider is temporarily unavailable: {0}")]
+    Unavailable(String),
     #[error("provider response was invalid: {0}")]
     InvalidResponse(String),
     #[error("provider stream ended before completion")]
     Interrupted,
+}
+
+impl ProviderError {
+    pub(crate) fn is_transient(&self) -> bool {
+        match self {
+            Self::Request(_) => true,
+            Self::Http { status, .. } => matches!(*status, 408 | 429 | 502 | 503 | 504),
+            Self::Unavailable(_) => true,
+            Self::Cancelled | Self::InvalidResponse(_) | Self::Interrupted => false,
+        }
+    }
 }
 
 pub type ProviderStream =
@@ -142,4 +155,38 @@ pub trait Provider: Send + Sync {
         request: ProviderRequest,
         cancellation: CancellationToken,
     ) -> Result<ProviderStream, ProviderError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ProviderError;
+
+    #[test]
+    fn classifies_only_supported_pre_stream_failures_as_transient() {
+        assert!(ProviderError::Request("network".into()).is_transient());
+        for status in [408, 429, 502, 503, 504] {
+            assert!(
+                ProviderError::Http {
+                    status,
+                    message: "transient".into(),
+                }
+                .is_transient(),
+                "HTTP {status} should be transient"
+            );
+        }
+        for status in [400, 401, 403, 409, 500, 501, 505] {
+            assert!(
+                !ProviderError::Http {
+                    status,
+                    message: "do not replay".into(),
+                }
+                .is_transient(),
+                "HTTP {status} should not be replayed"
+            );
+        }
+        assert!(!ProviderError::Cancelled.is_transient());
+        assert!(!ProviderError::Interrupted.is_transient());
+        assert!(ProviderError::Unavailable("servers are overloaded".into()).is_transient());
+        assert!(!ProviderError::InvalidResponse("bad".into()).is_transient());
+    }
 }

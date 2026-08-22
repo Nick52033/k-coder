@@ -120,7 +120,84 @@ pub(super) fn redact_error(error: ProviderError, secret: &str) -> ProviderError 
         ProviderError::InvalidResponse(message) => {
             ProviderError::InvalidResponse(redact(&message, secret))
         }
+        ProviderError::Unavailable(message) => ProviderError::Unavailable(redact(&message, secret)),
         other => other,
+    }
+}
+
+pub(super) fn classify_event_error(
+    message: String,
+    code: Option<&str>,
+    error_type: Option<&str>,
+) -> ProviderError {
+    let transient_code = code
+        .into_iter()
+        .chain(error_type)
+        .map(str::trim)
+        .map(str::to_ascii_lowercase)
+        .any(|value| {
+            matches!(
+                value.as_str(),
+                "server_error"
+                    | "internal_error"
+                    | "internal_server_error"
+                    | "overloaded_error"
+                    | "server_overloaded"
+                    | "service_unavailable"
+                    | "temporarily_unavailable"
+            )
+        });
+    let normalized_message = message.to_ascii_lowercase();
+    let transient_message = normalized_message.contains("overloaded")
+        || normalized_message.contains("temporarily unavailable")
+        || normalized_message.contains("server is busy")
+        || normalized_message.contains("servers are busy");
+    if transient_code || transient_message {
+        ProviderError::Unavailable(message)
+    } else {
+        ProviderError::InvalidResponse(message)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{classify_event_error, redact_error};
+    use crate::providers::ProviderError;
+
+    #[test]
+    fn classifies_structured_and_legacy_overload_events_as_unavailable() {
+        assert!(matches!(
+            classify_event_error(
+                "Our servers are currently overloaded. Please try again later.".into(),
+                Some("server_error"),
+                None,
+            ),
+            ProviderError::Unavailable(message) if message.contains("overloaded")
+        ));
+        assert!(matches!(
+            classify_event_error("Service temporarily unavailable".into(), None, None),
+            ProviderError::Unavailable(_)
+        ));
+        assert!(matches!(
+            classify_event_error(
+                "invalid tool schema".into(),
+                Some("invalid_request_error"),
+                None
+            ),
+            ProviderError::InvalidResponse(_)
+        ));
+    }
+
+    #[test]
+    fn redacts_secrets_from_temporary_unavailability_errors() {
+        let error = redact_error(
+            ProviderError::Unavailable("server rejected secret-key while overloaded".into()),
+            "secret-key",
+        );
+        assert_eq!(
+            error,
+            ProviderError::Unavailable("server rejected [REDACTED] while overloaded".into())
+        );
     }
 }
 

@@ -30,6 +30,9 @@ enum MetricEvent {
     Fallback {
         timestamp_ms: u64,
     },
+    Retry {
+        timestamp_ms: u64,
+    },
     Task {
         timestamp_ms: u64,
         completed: bool,
@@ -50,6 +53,7 @@ pub struct MetricsSnapshot {
     pub tool_calls: u64,
     pub tool_success_rate: f64,
     pub fallback_count: u64,
+    pub retry_count: u64,
     pub completed_tasks: u64,
     pub failed_tasks: u64,
     pub estimated_cost_usd: Option<f64>,
@@ -108,6 +112,11 @@ impl RuntimeMetrics {
             timestamp_ms: now_ms(),
         });
     }
+    pub fn retry(&self) {
+        self.record(MetricEvent::Retry {
+            timestamp_ms: now_ms(),
+        });
+    }
     pub fn task(&self, completed: bool) {
         self.record(MetricEvent::Task {
             timestamp_ms: now_ms(),
@@ -155,6 +164,7 @@ impl RuntimeMetrics {
                     }
                 }
                 MetricEvent::Fallback { .. } => result.fallback_count += 1,
+                MetricEvent::Retry { .. } => result.retry_count += 1,
                 MetricEvent::Task { completed, .. } => {
                     if completed {
                         result.completed_tasks += 1
@@ -187,12 +197,14 @@ mod tests {
         metrics.tool(true);
         metrics.tool(false);
         metrics.fallback();
+        metrics.retry();
         metrics.task(true);
         let snapshot = metrics.snapshot().unwrap();
         assert_eq!(snapshot.average_provider_latency_ms, 200);
         assert_eq!(snapshot.provider_failures, 1);
         assert_eq!(snapshot.tool_success_rate, 0.5);
         assert_eq!(snapshot.fallback_count, 1);
+        assert_eq!(snapshot.retry_count, 1);
         assert_eq!(snapshot.compaction_count, 1);
         assert_eq!(snapshot.compacted_messages, 12);
         assert_eq!(snapshot.estimated_context_tokens_saved, 7_500);

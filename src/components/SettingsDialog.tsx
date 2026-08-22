@@ -124,6 +124,7 @@ function editableModel(model?: Partial<ProviderModelConfig>): EditableProviderMo
 
 const transportOptions: Array<{ value: ProviderTransport; label: string }> = [
   { value: "open_ai_chat_completions", label: "OpenAI Chat Completions" },
+  { value: "deep_seek_chat_completions", label: "DeepSeek Chat Completions" },
   { value: "open_ai_responses", label: "OpenAI Responses API" },
   { value: "anthropic_messages", label: "Anthropic Messages API" },
   { value: "google_gemini", label: "Google Gemini API" },
@@ -817,13 +818,14 @@ function ProviderEditor({ providerItem, error, onSave }: ProviderEditorProps) {
   const [saved, setSaved] = useState(false);
   const [testing, setTesting] = useState(false);
   const [testResult, setTestResult] = useState("");
+  const deepSeekTextOnly = transport === "deep_seek_chat_completions";
 
   const normalizedModels = models.map(({ id, displayName, contextWindow, maxOutputTokens, supportsVision, fallback }) => ({
     id: id.trim(),
     displayName: displayName.trim(),
     contextWindow,
     maxOutputTokens,
-    supportsVision,
+    supportsVision: deepSeekTextOnly ? false : supportsVision,
     fallback,
   }));
   const modelIds = normalizedModels.map((model) => model.id).filter(Boolean);
@@ -969,7 +971,8 @@ function ProviderEditor({ providerItem, error, onSave }: ProviderEditorProps) {
                     <label className="provider-model-option">
                       <input
                         type="checkbox"
-                        checked={configuredModel.supportsVision || false}
+                        checked={!deepSeekTextOnly && (configuredModel.supportsVision || false)}
+                        disabled={deepSeekTextOnly}
                         onChange={(event) => updateModel(configuredModel.key, { supportsVision: event.target.checked })}
                       />
                       <span>支持图片</span>
@@ -1141,6 +1144,7 @@ function UsagePage() {
       <div><span>总 Token</span><strong>{usage?.totalTokens ?? 0}</strong></div>
       <div><span>平均延迟</span><strong>{metrics?.averageProviderLatencyMs ?? 0} ms</strong></div>
       <div><span>Provider 失败</span><strong>{metrics?.providerFailures ?? 0}</strong></div>
+      <div><span>自动重试</span><strong>{metrics?.retryCount ?? 0}</strong></div>
       <div><span>工具成功率</span><strong>{Math.round((metrics?.toolSuccessRate ?? 0) * 100)}%</strong></div>
       <div><span>故障切换</span><strong>{metrics?.fallbackCount ?? 0}</strong></div>
     </div>

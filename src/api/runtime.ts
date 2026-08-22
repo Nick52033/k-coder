@@ -173,8 +173,20 @@ export function runTurn(threadId: string, input: string, attachments: ImageAttac
   return invoke<TurnOutcome>("run_turn", { request: { threadId, input, agentMode }, attachments, workflowId });
 }
 
-export function startTurn(threadId: string, input: string, attachments: ImageAttachment[] = [], agentMode?: string, workflowId?: string) {
-  return invoke<TurnHandle>("turn_start", { request: { threadId, input, agentMode }, attachments, workflowId });
+export function startTurn(
+  threadId: string,
+  input: string,
+  attachments: ImageAttachment[] = [],
+  agentMode?: string,
+  workflowId?: string,
+  interruptActiveTurnId?: string,
+) {
+  return invoke<TurnHandle>("turn_start", {
+    request: { threadId, input, agentMode },
+    attachments,
+    workflowId,
+    interruptActiveTurnId,
+  });
 }
 
 export function listBuiltinWorkflows() {

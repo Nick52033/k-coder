@@ -6,6 +6,7 @@ test.beforeEach(async ({ page }) => {
     const callbacks = new Map<number, (...args: unknown[]) => void>();
     let callbackId = 1;
     let agentEventCallbackId: number | null = null;
+    let mailboxEventCallbackId: number | null = null;
     const threadFixture = { schemaVersion: 1, id: "thread-1", title: "Phase 6 workbench", createdAtMs: 1, updatedAtMs: 2, archived: false, inProject: true, workspacePath: "D:\\code\\k-coder" };
     const threadOverride = localStorage.getItem("kcoder_e2e_thread_override");
     const thread = threadOverride ? { ...threadFixture, ...JSON.parse(threadOverride) } : threadFixture;
@@ -91,6 +92,20 @@ test.beforeEach(async ({ page }) => {
       attachments: unknown[];
       workflowId?: string | null;
     }>>();
+    const mailboxRevisionByThread = new Map<string, number>();
+    function bumpMailboxRevision(threadId: string) {
+      const revision = (mailboxRevisionByThread.get(threadId) ?? 0) + 1;
+      mailboxRevisionByThread.set(threadId, revision);
+      return revision;
+    }
+    function emitMailboxChanged(threadId: string, revision: number) {
+      if (mailboxEventCallbackId === null) return;
+      callbacks.get(mailboxEventCallbackId)?.({
+        event: "thread-mailbox-changed",
+        id: 1,
+        payload: { schemaVersion: 1, threadId, revision },
+      });
+    }
     function restoreMailboxFixture() {
       const restoredMailbox = JSON.parse(localStorage.getItem("kcoder_e2e_mailbox") ?? "null") as null | {
         threadId: string;
@@ -107,6 +122,7 @@ test.beforeEach(async ({ page }) => {
       };
       if (!restoredMailbox) return;
       mailboxByThread.set(restoredMailbox.threadId, restoredMailbox.pending);
+      mailboxRevisionByThread.set(restoredMailbox.threadId, 1);
       if (restoredMailbox.activeTurnId) {
         activeTurnIds.set(restoredMailbox.threadId, restoredMailbox.activeTurnId);
       }
@@ -253,7 +269,7 @@ test.beforeEach(async ({ page }) => {
       save_browser_settings: { enabled: true, allowLocalhost: false },
       list_browser_audit: [{ timestampMs: 3, action: "navigate", target: "https://example.com", success: true, detail: "ok" }],
       list_browser_artifacts: [{ id: "shot-1", name: "shot-1.png", mediaType: "image/png", sizeBytes: 2048, createdAtMs: 3 }],
-      advanced_metrics: { providerCalls: 2, providerFailures: 0, averageProviderLatencyMs: 120, inputTokens: 100, outputTokens: 20, toolCalls: 2, toolSuccessRate: 1, fallbackCount: 0, completedTasks: 1, failedTasks: 0, estimatedCostUsd: null },
+      advanced_metrics: { providerCalls: 2, providerFailures: 0, averageProviderLatencyMs: 120, inputTokens: 100, outputTokens: 20, toolCalls: 2, toolSuccessRate: 1, fallbackCount: 0, retryCount: 2, completedTasks: 1, failedTasks: 0, estimatedCostUsd: null },
       run_regression_evaluation: { total: 3, passed: 3, passRate: 1, failures: [] },
       cancel_turn: true,
       create_thread: secondThread,
@@ -333,6 +349,8 @@ test.beforeEach(async ({ page }) => {
           if (command === "plugin:event|listen") {
             if (args?.event === "agent-event" && typeof args.handler === "number") {
               agentEventCallbackId = args.handler;
+            } else if (args?.event === "thread-mailbox-changed" && typeof args.handler === "number") {
+              mailboxEventCallbackId = args.handler;
             }
             return 1;
           }
@@ -425,6 +443,7 @@ test.beforeEach(async ({ page }) => {
                   attachments,
                 },
               ]);
+              bumpMailboxRevision(threadId);
             } else {
               if (workflowId && workflowRun?.state !== "active") {
                 const definition = workflowDefinitions.find((item) => item.id === workflowId);
@@ -524,6 +543,7 @@ test.beforeEach(async ({ page }) => {
             return {
               schemaVersion: 1,
               threadId,
+              revision: mailboxRevisionByThread.get(threadId) ?? 0,
               activeTurnId: activeTurnIds.get(threadId) ?? null,
               pending: mailboxByThread.get(threadId) ?? [],
             };
@@ -534,12 +554,14 @@ test.beforeEach(async ({ page }) => {
             const pending = mailboxByThread.get(threadId) ?? [];
             const next = pending.filter((item) => item.turnId !== turnId);
             mailboxByThread.set(threadId, next);
+            if (next.length !== pending.length) bumpMailboxRevision(threadId);
             return next.length !== pending.length;
           }
           if (command === "clear_thread_mailbox") {
             const threadId = String(args?.threadId ?? "");
             const removed = mailboxByThread.get(threadId)?.length ?? 0;
             mailboxByThread.set(threadId, []);
+            if (removed > 0) bumpMailboxRevision(threadId);
             return removed;
           }
           if (command === "turn_steer") {
@@ -564,6 +586,7 @@ test.beforeEach(async ({ page }) => {
               request.threadId,
               pending.filter((item) => item.turnId !== request.queuedTurnId),
             );
+            bumpMailboxRevision(request.threadId);
             return {
               schemaVersion: 1,
               threadId: request.threadId,
@@ -619,6 +642,14 @@ test.beforeEach(async ({ page }) => {
               return {
                 ...detail,
                 summary: { ...detail.summary, workspacePath: forcedThreadWorkspacePath },
+              };
+            }
+            const threadId = String(args?.threadId ?? "");
+            const activeTurnId = activeTurnIds.get(threadId);
+            if (activeTurnId) {
+              return {
+                ...(responses.read_thread as Record<string, unknown>),
+                lastTurn: { turnId: activeTurnId, state: "streaming", error: null },
               };
             }
           }
@@ -812,8 +843,16 @@ test.beforeEach(async ({ page }) => {
         const agentEvent = event as { type?: string; threadId?: string; turnId?: string };
         if (agentEvent.threadId && agentEvent.turnId && agentEvent.type === "turn_started") {
           activeTurnIds.set(agentEvent.threadId, agentEvent.turnId);
+          const pending = mailboxByThread.get(agentEvent.threadId) ?? [];
+          const next = pending.filter((item) => item.turnId !== agentEvent.turnId);
+          if (next.length !== pending.length) {
+            mailboxByThread.set(agentEvent.threadId, next);
+            const revision = bumpMailboxRevision(agentEvent.threadId);
+            emitMailboxChanged(agentEvent.threadId, revision);
+          }
         } else if (
           agentEvent.threadId
+          && activeTurnIds.get(agentEvent.threadId) === agentEvent.turnId
           && ["turn_completed", "turn_failed", "turn_cancelled"].includes(agentEvent.type ?? "")
         ) {
           activeTurnIds.delete(agentEvent.threadId);
@@ -825,13 +864,66 @@ test.beforeEach(async ({ page }) => {
   });
 });
 
-test("closes the composer mode menu when clicking outside", async ({ page }) => {
+test("keeps composer popover surfaces consistent and closes the mode menu outside", async ({ page }, testInfo) => {
   await page.goto("/");
-  await page.getByRole("button", { name: "选择模式" }).click();
-  await expect(page.locator(".mode-menu")).toBeVisible();
+  if (testInfo.project.name === "narrow") await page.setViewportSize({ width: 420, height: 820 });
+  const composer = page.locator(".composer");
+  const modeTrigger = page.getByRole("button", { name: "选择模式" });
+  const modeMenu = page.locator(".mode-menu");
+  const surfaceStyle = (selector: string) => page.locator(selector).evaluate((element) => {
+    const style = getComputedStyle(element);
+    return {
+      border: style.border,
+      borderRadius: style.borderRadius,
+      backgroundColor: style.backgroundColor,
+      boxShadow: style.boxShadow,
+    };
+  });
+  const expectMenuWithinComposer = async (selector: string) => {
+    const [menuBox, composerBox] = await Promise.all([
+      page.locator(selector).boundingBox(),
+      composer.boundingBox(),
+    ]);
+    expect(menuBox).not.toBeNull();
+    expect(composerBox).not.toBeNull();
+    expect(menuBox!.x).toBeGreaterThanOrEqual(composerBox!.x + 11);
+    expect(menuBox!.x + menuBox!.width).toBeLessThanOrEqual(composerBox!.x + composerBox!.width - 11);
+    expect(menuBox!.y + menuBox!.height).toBeLessThanOrEqual(composerBox!.y - 7);
+  };
+
+  await modeTrigger.click();
+  await expect(modeMenu).toBeVisible();
+  await expect(modeMenu).toHaveClass(/composer-popover-surface/);
+  await expectMenuWithinComposer(".mode-menu");
+  const expectedSurface = await surfaceStyle(".mode-menu");
 
   await page.getByRole("heading", { name: "Phase 6 workbench" }).click();
-  await expect(page.locator(".mode-menu")).toBeHidden();
+  await expect(modeMenu).toBeHidden();
+
+  await page.locator(".context-progress-trigger").click();
+  const contextPopover = page.locator(".context-progress-popover");
+  await expect(contextPopover).toBeVisible();
+  await expect(contextPopover).toHaveClass(/composer-popover-surface/);
+  expect(await surfaceStyle(".context-progress-popover")).toEqual(expectedSurface);
+  await page.keyboard.press("Escape");
+
+  await page.getByRole("button", { name: /操作批准方式/ }).click();
+  const approvalMenu = page.locator(".approval-mode-menu");
+  await expect(approvalMenu).toBeVisible();
+  await expect(approvalMenu).toHaveClass(/composer-popover-surface/);
+  expect(await surfaceStyle(".approval-mode-menu")).toEqual(expectedSurface);
+  await expectMenuWithinComposer(".approval-mode-menu");
+  await page.keyboard.press("Escape");
+
+  await modeTrigger.click();
+  await page.keyboard.press("Escape");
+  await expect(modeMenu).toBeHidden();
+  await expect(modeTrigger).toBeFocused();
+
+  await modeTrigger.click();
+  await page.waitForTimeout(250);
+  await page.screenshot({ path: testInfo.outputPath(`composer-mode-menu-${testInfo.project.name}.png`), fullPage: true });
+  await page.keyboard.press("Escape");
 });
 
 test("starts a built-in robot workflow from the composer and cancels it after the turn", async ({ page }, testInfo) => {
@@ -1799,14 +1891,29 @@ test("selects the active workspace project from the composer", async ({ page }, 
   await expect(dialog.getByText("D:\\code\\k-coder", { exact: true })).toBeVisible();
   await expect(dialog.getByText("\\\\server\\share\\repo", { exact: true })).toBeVisible();
   expect(await dialog.textContent()).not.toContain("\\\\?\\");
-  const dialogBox = await dialog.boundingBox();
+  const search = dialog.getByRole("textbox", { name: "搜索项目" });
+  await expect(search).toBeFocused();
+  const [dialogBox, composerBox, searchBox] = await Promise.all([
+    dialog.boundingBox(),
+    composer.boundingBox(),
+    search.boundingBox(),
+  ]);
   const viewport = page.viewportSize();
   expect(dialogBox).not.toBeNull();
+  expect(composerBox).not.toBeNull();
+  expect(searchBox).not.toBeNull();
   expect(dialogBox?.x ?? 0).toBeGreaterThanOrEqual(0);
   expect((dialogBox?.x ?? 0) + (dialogBox?.width ?? 0)).toBeLessThanOrEqual(viewport?.width ?? 0);
   expect(dialogBox?.y ?? 0).toBeGreaterThanOrEqual(0);
+  expect((dialogBox?.y ?? 0) + (dialogBox?.height ?? 0)).toBeLessThanOrEqual((composerBox?.y ?? 0) - 7);
+  expect(searchBox?.y ?? 0).toBeGreaterThanOrEqual(dialogBox?.y ?? 0);
+  expect((searchBox?.y ?? 0) + (searchBox?.height ?? 0)).toBeLessThanOrEqual(
+    (dialogBox?.y ?? 0) + (dialogBox?.height ?? 0),
+  );
+  expect(searchBox?.height ?? 0).toBeLessThanOrEqual(32);
+  await expect(search).toHaveCSS("box-shadow", "none");
+  await expect(page.locator(".composer:focus-within")).toHaveCount(0);
   await page.screenshot({ path: testInfo.outputPath("composer-project-menu.png"), fullPage: true });
-  const search = dialog.getByRole("textbox", { name: "搜索项目" });
   await search.fill("\\\\server\\share");
   await expect(dialog.getByRole("option", { name: /shared-repo/ })).toBeVisible();
   await search.fill("paypro");
@@ -1915,7 +2022,7 @@ test("keeps a migrated unbound project thread in the current project", async ({ 
   })).toBe("D:\\code\\k-coder");
 });
 
-test("keeps the sidebar and composer project selection in sync", async ({ page }, testInfo) => {
+test("keeps project selection in sync and removes groups without deleting conversations", async ({ page }, testInfo) => {
   await page.addInitScript(() => {
     const currentPath = "D:\\code\\k-coder";
     const codexPath = "D:\\code\\codex";
@@ -1951,9 +2058,9 @@ test("keeps the sidebar and composer project selection in sync", async ({ page }
     const kCoderGroup = projectList.locator(".project-group").filter({ hasText: "k-coder" });
     await expect(kCoderGroup.locator(".project-group-toggle")).toHaveAttribute("aria-current", "page");
     await kCoderGroup.getByRole("button", { name: "更多操作" }).click();
-    const removeBoundProject = kCoderGroup.getByRole("button", { name: "删除" });
-    await expect(removeBoundProject).toBeDisabled();
-    await expect(removeBoundProject).toHaveAttribute("title", "项目包含会话，无法移除");
+    const removeBoundProject = kCoderGroup.getByRole("button", { name: "删除分组", exact: true });
+    await expect(removeBoundProject).toBeEnabled();
+    await expect(removeBoundProject).toHaveAttribute("title", "删除项目分组");
     await kCoderGroup.getByRole("button", { name: "更多操作" }).click();
     await projectTrigger.click();
   }
@@ -1970,6 +2077,54 @@ test("keeps the sidebar and composer project selection in sync", async ({ page }
     await kCoderGroup.getByText("Phase 6 workbench", { exact: true }).click();
     await expect(composer.getByRole("button", { name: "当前项目 k-coder" })).toBeVisible();
     await expect(kCoderGroup.locator(".project-group-toggle")).toHaveAttribute("aria-current", "page");
+
+    let deletePrompt = "";
+    page.once("dialog", async (dialog) => {
+      deletePrompt = dialog.message();
+      expect(dialog.type()).toBe("confirm");
+      await dialog.accept();
+    });
+    await kCoderGroup.getByRole("button", { name: "更多操作" }).click();
+    await kCoderGroup.getByRole("button", { name: "删除分组", exact: true }).click();
+
+    expect(deletePrompt).toContain("1 个会话不会被删除");
+    expect(deletePrompt).toContain("项目文件不会被删除");
+    await expect(kCoderGroup).toHaveCount(0);
+    await expect(projectList.locator(".project-group")).toHaveCount(1);
+    await page.getByRole("tab", { name: "会话" }).click();
+    await expect(page.getByRole("navigation", { name: "会话列表" }).getByText("Phase 6 workbench", { exact: true })).toBeVisible();
+    await expect(composer.getByRole("button", { name: "当前项目 k-coder" })).toBeVisible();
+    await expect.poll(() => page.evaluate(() => JSON.parse(
+      localStorage.getItem("kcoder_hidden_project_groups") ?? "[]",
+    ))).toEqual(["D:\\code\\k-coder"]);
+    await expect.poll(() => page.evaluate(() => JSON.parse(
+      localStorage.getItem("kcoder_known_projects") ?? "[]",
+    ))).toEqual(["D:\\code\\codex"]);
+    await expect.poll(() => page.evaluate(() => JSON.parse(
+      localStorage.getItem("kcoder_thread_project_map") ?? "{}",
+    )["thread-1"])).toBe("D:\\code\\k-coder");
+    expect(await page.evaluate(() => (
+      window as unknown as { __invoked: string[] }
+    ).__invoked.filter((command) => command === "delete_thread").length)).toBe(0);
+
+    await page.reload();
+    await expect(page.getByRole("navigation", { name: "会话列表" }).getByText("Phase 6 workbench", { exact: true })).toBeVisible();
+    await page.getByRole("tab", { name: "项目" }).click();
+    const restoredProjectList = page.getByRole("navigation", { name: "项目列表" });
+    await expect(restoredProjectList.locator(".project-group")).toHaveCount(1);
+    await expect(restoredProjectList.getByText("k-coder", { exact: true })).toHaveCount(0);
+    await page.screenshot({ path: testInfo.outputPath("project-group-deleted.png"), fullPage: true });
+
+    await composer.getByRole("button", { name: "当前项目 k-coder" }).click();
+    const activeProjectOption = page.getByRole("dialog", { name: "选择项目" })
+      .getByRole("option", { name: /k-coder/ });
+    await expect(activeProjectOption).toHaveAttribute("aria-selected", "true");
+    await activeProjectOption.click();
+    await expect(restoredProjectList.locator(".project-group")).toHaveCount(2);
+    await expect(restoredProjectList.getByText("k-coder", { exact: true })).toBeVisible();
+    await expect.poll(() => page.evaluate(() => JSON.parse(
+      localStorage.getItem("kcoder_hidden_project_groups") ?? "[]",
+    ))).toEqual([]);
   }
 
   await page.screenshot({ path: testInfo.outputPath("linked-project-selection.png"), fullPage: true });
@@ -2409,14 +2564,13 @@ test("follows streamed growth only while the conversation remains near the lates
   )).toBeLessThanOrEqual(2);
 });
 
-test("atomically steers and removes a queued message from the backend mailbox", async ({ page }, testInfo) => {
+test("primary send stops the observed turn and starts the new direction in the same conversation", async ({ page }, testInfo) => {
   await page.goto("/");
-  await expect(page.locator(".message-queue")).toHaveCount(0);
   await page.evaluate(() => {
     (window as unknown as { __emitAgentEvent: (event: unknown) => void }).__emitAgentEvent({
       schemaVersion: 1,
       threadId: "thread-1",
-      turnId: "turn-live-queue",
+      turnId: "turn-primary-active",
       type: "turn_started",
       phase: "exploring",
     });
@@ -2424,21 +2578,116 @@ test("atomically steers and removes a queued message from the backend mailbox", 
 
   const composer = page.getByRole("textbox", { name: "消息" });
   await expect(composer).toBeEnabled();
-  await composer.fill("queued first");
+  await composer.fill("改为先修复发送逻辑，再继续验证");
   await page.getByRole("button", { name: "发送消息", exact: true }).click();
-  await expect(page.locator(".message-queue")).toContainText("队列 (1)");
-  await expect(page.locator(".message--user").getByText("queued first", { exact: true })).toHaveCount(0);
-  await expect(page.locator(".queue-list")).toContainText("queued first");
-  await expect.poll(() => page.evaluate(() => (window as unknown as { __invoked: string[] }).__invoked.filter((command) => command === "turn_interrupt").length)).toBe(0);
 
-  await composer.fill("queued second");
-  await page.getByRole("button", { name: "发送消息", exact: true }).click();
+  await expect(page.getByRole("button", { name: "正在停止" })).toBeDisabled();
+  await expect(page.locator(".mode-label")).toHaveText("正在停止");
+  await expect(page.locator(".message-queue")).toContainText("队列 (1)");
+  await expect(page.locator(".queue-list")).toContainText("改为先修复发送逻辑，再继续验证");
+  await expect(page.getByRole("button", { name: "加入当前对话 改为先修复发送逻辑，再继续验证" })).toBeDisabled();
+  await expect.poll(() => page.evaluate(() => (
+    window as unknown as { __runTurnCalls: Array<Record<string, unknown>> }
+  ).__runTurnCalls[0])).toMatchObject({
+    request: {
+      threadId: "thread-1",
+      input: "改为先修复发送逻辑，再继续验证",
+    },
+    interruptActiveTurnId: "turn-primary-active",
+  });
+  await expect.poll(() => page.evaluate(() => {
+    const invoked = (window as unknown as { __invoked: string[] }).__invoked;
+    return {
+      interrupt: invoked.filter((command) => command === "turn_interrupt").length,
+      steer: invoked.filter((command) => command === "turn_steer").length,
+      steerQueued: invoked.filter((command) => command === "turn_steer_queued").length,
+    };
+  })).toEqual({ interrupt: 0, steer: 0, steerQueued: 0 });
+  await page.screenshot({ path: testInfo.outputPath("primary-send-stopping-current-turn.png"), fullPage: true });
+
+  await page.evaluate(() => {
+    const emit = (window as unknown as { __emitAgentEvent: (event: unknown) => void }).__emitAgentEvent;
+    emit({
+      schemaVersion: 1,
+      threadId: "thread-1",
+      turnId: "turn-primary-active",
+      type: "turn_cancelled",
+      phase: "cancelled",
+      durationMs: 120,
+    });
+    emit({
+      schemaVersion: 4,
+      threadId: "thread-1",
+      turnId: "turn-start-1",
+      type: "turn_started",
+      phase: "exploring",
+      userMessage: {
+        schemaVersion: 1,
+        id: "user-turn-start-1",
+        role: "user",
+        content: [{ type: "text", text: "改为先修复发送逻辑，再继续验证" }],
+        createdAtMs: Date.now(),
+      },
+    });
+    emit({
+      schemaVersion: 5,
+      threadId: "thread-1",
+      turnId: "turn-start-1",
+      type: "turn_completed",
+      phase: "complete",
+      message: {
+        schemaVersion: 1,
+        id: "assistant-turn-start-1",
+        role: "assistant",
+        content: [{ type: "text", text: "已按新的方向接续完成。" }],
+        createdAtMs: Date.now(),
+      },
+      usage: null,
+      durationMs: 80,
+    });
+  });
+  await expect(page.locator(".message--user").getByText("改为先修复发送逻辑，再继续验证", { exact: true })).toBeVisible();
+  await expect(page.getByText("已按新的方向接续完成。", { exact: true })).toBeVisible();
+  await expect(page.locator(".message--assistant").filter({ hasText: "已按新的方向接续完成。" })).toHaveCount(1);
+  await expect(page.locator(".message-queue")).toHaveCount(0);
+});
+
+test("atomically steers and removes a queued message from the backend mailbox", async ({ page }, testInfo) => {
+  await page.addInitScript(() => {
+    localStorage.setItem("kcoder_e2e_mailbox", JSON.stringify({
+      threadId: "thread-1",
+      activeTurnId: "turn-live-queue",
+      pending: [
+        {
+          schemaVersion: 1,
+          turnId: "queued-first",
+          threadId: "thread-1",
+          kind: "message",
+          input: "queued first",
+          agentMode: "craft",
+          workflowId: null,
+          attachments: [],
+        },
+        {
+          schemaVersion: 1,
+          turnId: "queued-second",
+          threadId: "thread-1",
+          kind: "message",
+          input: "queued second",
+          agentMode: "craft",
+          workflowId: null,
+          attachments: [],
+        },
+      ],
+    }));
+  });
+  await page.goto("/");
 
   await expect(page.locator(".message-queue")).toContainText("队列 (2)");
+  await page.locator(".queue-toggle").click();
   await expect(page.locator(".queue-list")).toContainText("queued first");
   await expect(page.locator(".queue-list")).toContainText("queued second");
-  await expect(page.locator(".message--user").getByText("queued second", { exact: true })).toHaveCount(0);
-  await expect.poll(() => page.evaluate(() => (window as unknown as { __runTurnCalls: unknown[] }).__runTurnCalls.length)).toBe(2);
+  await expect(page.locator(".message--user").getByText("queued first", { exact: true })).toHaveCount(0);
   await page.screenshot({ path: testInfo.outputPath("queued-message-actions.png"), fullPage: true });
 
   await page.getByRole("button", { name: "加入当前对话 queued first", exact: true }).click();
@@ -2446,6 +2695,7 @@ test("atomically steers and removes a queued message from the backend mailbox", 
   await expect.poll(() => page.evaluate(() => (window as unknown as { __invoked: string[] }).__invoked.filter((command) => command === "turn_steer").length)).toBe(0);
   await expect.poll(() => page.evaluate(() => (window as unknown as { __invoked: string[] }).__invoked.filter((command) => command === "remove_queued_turn").length)).toBe(0);
   await expect.poll(() => page.evaluate(() => (window as unknown as { __invoked: string[] }).__invoked.filter((command) => command === "turn_interrupt").length)).toBe(0);
+  await expect.poll(() => page.evaluate(() => (window as unknown as { __runTurnCalls: unknown[] }).__runTurnCalls.length)).toBe(0);
   await expect(page.locator(".message-queue")).toContainText("队列 (1)");
   await page.evaluate(() => {
     (window as unknown as { __emitAgentEvent: (event: unknown) => void }).__emitAgentEvent({
@@ -3664,12 +3914,43 @@ test("switches providers and models from the composer footer", async ({ page }, 
 test("switches the runtime approval mode from the composer", async ({ page }, testInfo) => {
   await page.goto("/");
   const trigger = page.getByRole("button", { name: /操作批准方式/ });
+  const menu = page.getByRole("menu", { name: "操作批准方式" });
+  const expectMenuWithinComposer = async () => {
+    const geometry = await page.evaluate(() => {
+      const composer = document.querySelector<HTMLElement>(".composer")!;
+      const approvalMenu = document.querySelector<HTMLElement>(".approval-mode-menu")!;
+      const menuRect = approvalMenu.getBoundingClientRect();
+      const composerRect = composer.getBoundingClientRect();
+      const descriptions = [...approvalMenu.querySelectorAll<HTMLElement>("small")].map((element) => {
+        const rect = element.getBoundingClientRect();
+        return { left: rect.left, right: rect.right, top: rect.top, bottom: rect.bottom };
+      });
+      return {
+        menu: { left: menuRect.left, right: menuRect.right, top: menuRect.top, bottom: menuRect.bottom },
+        composer: { left: composerRect.left, right: composerRect.right, top: composerRect.top },
+        descriptions,
+        clientWidth: approvalMenu.clientWidth,
+        scrollWidth: approvalMenu.scrollWidth,
+      };
+    });
+    expect(geometry.menu.left).toBeGreaterThanOrEqual(geometry.composer.left + 11);
+    expect(geometry.menu.right).toBeLessThanOrEqual(geometry.composer.right - 11);
+    expect(geometry.menu.top).toBeGreaterThanOrEqual(11);
+    expect(geometry.menu.bottom).toBeLessThanOrEqual(geometry.composer.top - 7);
+    expect(geometry.scrollWidth).toBeLessThanOrEqual(geometry.clientWidth);
+    for (const description of geometry.descriptions) {
+      expect(description.left).toBeGreaterThanOrEqual(geometry.menu.left);
+      expect(description.right).toBeLessThanOrEqual(geometry.menu.right);
+      expect(description.top).toBeGreaterThanOrEqual(geometry.menu.top);
+      expect(description.bottom).toBeLessThanOrEqual(geometry.menu.bottom);
+    }
+  };
 
   await expect(trigger).toHaveAttribute("aria-label", "操作批准方式：请求批准");
   await expect(trigger).not.toContainText("请求批准");
   await trigger.click();
-  const menu = page.getByRole("menu", { name: "操作批准方式" });
   await expect(menu).toBeVisible();
+  await expectMenuWithinComposer();
   await expect(menu.getByRole("menuitemradio", { name: /请求批准/ })).toHaveAttribute("aria-checked", "true");
   await menu.getByRole("menuitemradio", { name: /完整访问/ }).click();
 
@@ -3687,6 +3968,8 @@ test("switches the runtime approval mode from the composer", async ({ page }, te
     ]);
     expect(groups.every(Boolean)).toBe(true);
     expect(groups[0]!.x + groups[0]!.width).toBeLessThanOrEqual(groups[1]!.x + 1);
+    await page.setViewportSize({ width: 420, height: 820 });
+    await expect(trigger.locator("span")).toBeHidden();
   }
   await page.evaluate(() => {
     (window as unknown as { __emitAgentEvent: (event: unknown) => void }).__emitAgentEvent({
@@ -3717,8 +4000,12 @@ test("switches the runtime approval mode from the composer", async ({ page }, te
   await expect(page.locator(".message-role").getByText("k-Coder", { exact: true })).toHaveCount(1);
   await trigger.click();
   await expect(menu.getByRole("menuitemradio", { name: /完整访问/ })).toHaveAttribute("aria-checked", "true");
+  await expectMenuWithinComposer();
   await page.waitForTimeout(250);
   await page.screenshot({ path: testInfo.outputPath(`approval-mode-${testInfo.project.name}.png`), fullPage: true });
+  await page.keyboard.press("Escape");
+  await expect(menu).toBeHidden();
+  await expect(trigger).toBeFocused();
 });
 
 test("adds, edits, deletes, and saves structured provider models", async ({ page }) => {
@@ -3759,6 +4046,7 @@ test("exposes opt-in memory, browser audit, and advanced metrics", async ({ page
 
   await page.getByRole("button", { name: /用量追踪/ }).click();
   await expect(page.getByText("120 ms", { exact: true })).toBeVisible();
+  await expect(page.locator(".usage-summary-grid > div").filter({ hasText: "自动重试" }).getByText("2", { exact: true })).toBeVisible();
   await page.getByRole("button", { name: "运行回归评估" }).click();
   await expect(page.getByText(/回归评估 3\/3/)).toBeVisible();
   await page.screenshot({ path: testInfo.outputPath(`phase9-${testInfo.project.name}.png`), fullPage: true });

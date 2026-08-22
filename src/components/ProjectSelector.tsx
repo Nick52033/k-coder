@@ -1,4 +1,5 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { Check, ChevronDown, Folder, FolderPlus, FolderX, Loader2, Search } from "lucide-react";
 import type { ProjectRecord } from "../types/runtime";
 import { cn } from "../lib/cn";
@@ -28,8 +29,11 @@ export function ProjectSelector({
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
   const [selecting, setSelecting] = useState(false);
+  const [menuPosition, setMenuPosition] = useState({ left: 12, bottom: 48, width: 380, maxHeight: 420 });
   const rootRef = useRef<HTMLDivElement>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
   const searchRef = useRef<HTMLInputElement>(null);
+  const menuId = useId();
   const unavailable = disabled || switching || selecting;
   const filteredProjects = useMemo(() => {
     const normalizedQuery = query.trim().toLocaleLowerCase();
@@ -39,20 +43,50 @@ export function ProjectSelector({
     );
   }, [projects, query]);
 
+  const updateMenuPosition = () => {
+    const trigger = rootRef.current;
+    if (!trigger) return;
+    const triggerRect = trigger.getBoundingClientRect();
+    const composerRect = trigger.closest(".composer")?.getBoundingClientRect();
+    const anchorTop = composerRect?.top ?? triggerRect.top;
+    const viewportPadding = 12;
+    const menuGap = 8;
+    const width = Math.min(380, Math.max(0, window.innerWidth - viewportPadding * 2));
+    setMenuPosition({
+      left: Math.max(
+        viewportPadding,
+        Math.min(triggerRect.left, window.innerWidth - width - viewportPadding),
+      ),
+      bottom: Math.max(viewportPadding, window.innerHeight - anchorTop + menuGap),
+      width,
+      maxHeight: Math.max(0, Math.min(420, anchorTop - viewportPadding - menuGap)),
+    });
+  };
+
   useEffect(() => {
     if (!open) return undefined;
     const handlePointerDown = (event: MouseEvent) => {
-      if (!rootRef.current?.contains(event.target as Node)) setOpen(false);
+      const target = event.target as Node;
+      if (!rootRef.current?.contains(target) && !menuRef.current?.contains(target)) setOpen(false);
     };
     const handleKeyDown = (event: globalThis.KeyboardEvent) => {
-      if (event.key === "Escape") setOpen(false);
+      if (event.key === "Escape") {
+        setOpen(false);
+        setQuery("");
+        rootRef.current?.querySelector("button")?.focus();
+      }
     };
+    updateMenuPosition();
     document.addEventListener("mousedown", handlePointerDown);
     window.addEventListener("keydown", handleKeyDown);
+    window.addEventListener("resize", updateMenuPosition);
+    window.addEventListener("scroll", updateMenuPosition, true);
     requestAnimationFrame(() => searchRef.current?.focus());
     return () => {
       document.removeEventListener("mousedown", handlePointerDown);
       window.removeEventListener("keydown", handleKeyDown);
+      window.removeEventListener("resize", updateMenuPosition);
+      window.removeEventListener("scroll", updateMenuPosition, true);
     };
   }, [open]);
 
@@ -69,9 +103,13 @@ export function ProjectSelector({
         aria-label={standalone ? "当前不在项目中" : activeProject ? `当前项目 ${activeProject.name}` : "选择项目"}
         aria-expanded={open}
         aria-haspopup="dialog"
+        aria-controls={open ? menuId : undefined}
         title={standalone ? "当前会话不使用项目工作区" : activeProject ? toUserFacingPath(activeProject.path) : "选择当前对话的项目"}
         disabled={unavailable}
-        onClick={() => setOpen((value) => !value)}
+        onClick={() => {
+          if (!open) updateMenuPosition();
+          setOpen((value) => !value);
+        }}
       >
         {switching || selecting ? (
           <Loader2 className="spin" size={15} />
@@ -84,8 +122,15 @@ export function ProjectSelector({
         <ChevronDown className="project-selector-chevron" size={13} />
       </button>
 
-      {open ? (
-        <div className="project-selector-menu" role="dialog" aria-label="选择项目">
+      {open ? createPortal(
+        <div
+          ref={menuRef}
+          id={menuId}
+          className="project-selector-menu"
+          role="dialog"
+          aria-label="选择项目"
+          style={menuPosition}
+        >
           <label className="project-selector-search">
             <Search size={14} aria-hidden="true" />
             <input
@@ -110,10 +155,6 @@ export function ProjectSelector({
                   title={displayPath}
                   disabled={unavailable}
                   onClick={async () => {
-                    if (active) {
-                      close();
-                      return;
-                    }
                     setSelecting(true);
                     try {
                       await onSelect(project);
@@ -177,7 +218,8 @@ export function ProjectSelector({
               {standalone ? <Check className="project-selector-footer-check" size={15} aria-hidden="true" /> : null}
             </button>
           </div>
-        </div>
+        </div>,
+        document.body,
       ) : null}
     </div>
   );

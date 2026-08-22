@@ -601,7 +601,9 @@ impl TurnError {
 
     pub fn classify(message: String) -> Self {
         let normalized = message.to_ascii_lowercase();
-        let (code, retryable, category) = if normalized.contains("token_budget_exceeded")
+        let (code, retryable, category) = if normalized.contains("repeated_observation_loop") {
+            ("repeated_observation_loop", true, TurnErrorCategory::Tool)
+        } else if normalized.contains("token_budget_exceeded")
             || normalized.contains("response_limit")
         {
             ("limit_exceeded", false, TurnErrorCategory::Runtime)
@@ -1061,6 +1063,18 @@ pub struct UserInputResolution {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repeated_observation_loop_is_a_retryable_tool_error() {
+        let error = TurnError::classify(
+            "repeated_observation_loop: 模型在文件未变化时仍反复读取 src/lib.rs".into(),
+        );
+
+        assert_eq!(error.code, "repeated_observation_loop");
+        assert_eq!(error.category, TurnErrorCategory::Tool);
+        assert!(error.retryable);
+        assert!(error.message.contains("模型在文件未变化时仍反复读取"));
+    }
 
     #[test]
     fn image_content_blocks_use_camel_case_and_read_legacy_jsonl() {

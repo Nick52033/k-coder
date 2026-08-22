@@ -110,7 +110,7 @@ export function ContextProgress({ usage, contextWindow }: ContextProgressProps) 
         <div
           ref={popoverRef}
           id={popoverId}
-          className="context-progress-popover"
+          className="context-progress-popover composer-popover-surface"
           data-level={level}
           role="dialog"
           aria-label="上下文用量"
