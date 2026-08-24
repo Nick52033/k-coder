@@ -2564,7 +2564,7 @@ test("follows streamed growth only while the conversation remains near the lates
   )).toBeLessThanOrEqual(2);
 });
 
-test("primary send stops the observed turn and starts the new direction in the same conversation", async ({ page }, testInfo) => {
+test("primary send queues behind the active turn and the queued send steers it", async ({ page }, testInfo) => {
   await page.goto("/");
   await page.evaluate(() => {
     (window as unknown as { __emitAgentEvent: (event: unknown) => void }).__emitAgentEvent({
@@ -2581,11 +2581,13 @@ test("primary send stops the observed turn and starts the new direction in the s
   await composer.fill("改为先修复发送逻辑，再继续验证");
   await page.getByRole("button", { name: "发送消息", exact: true }).click();
 
-  await expect(page.getByRole("button", { name: "正在停止" })).toBeDisabled();
-  await expect(page.locator(".mode-label")).toHaveText("正在停止");
+  await expect(page.getByRole("button", { name: "停止生成" })).toBeEnabled();
+  await expect(page.locator(".mode-label")).toHaveText("正在生成");
+  await expect(page.getByRole("button", { name: "发送消息", exact: true })).toHaveAttribute("title", "加入消息队列");
   await expect(page.locator(".message-queue")).toContainText("队列 (1)");
   await expect(page.locator(".queue-list")).toContainText("改为先修复发送逻辑，再继续验证");
-  await expect(page.getByRole("button", { name: "加入当前对话 改为先修复发送逻辑，再继续验证" })).toBeDisabled();
+  const steerQueuedButton = page.getByRole("button", { name: "发送到当前对话 改为先修复发送逻辑，再继续验证" });
+  await expect(steerQueuedButton).toBeEnabled();
   await expect.poll(() => page.evaluate(() => (
     window as unknown as { __runTurnCalls: Array<Record<string, unknown>> }
   ).__runTurnCalls[0])).toMatchObject({
@@ -2593,8 +2595,11 @@ test("primary send stops the observed turn and starts the new direction in the s
       threadId: "thread-1",
       input: "改为先修复发送逻辑，再继续验证",
     },
-    interruptActiveTurnId: "turn-primary-active",
   });
+  await expect.poll(() => page.evaluate(() => Object.prototype.hasOwnProperty.call(
+    (window as unknown as { __runTurnCalls: Array<Record<string, unknown>> }).__runTurnCalls[0] ?? {},
+    "interruptActiveTurnId",
+  ))).toBe(false);
   await expect.poll(() => page.evaluate(() => {
     const invoked = (window as unknown as { __invoked: string[] }).__invoked;
     return {
@@ -2603,53 +2608,46 @@ test("primary send stops the observed turn and starts the new direction in the s
       steerQueued: invoked.filter((command) => command === "turn_steer_queued").length,
     };
   })).toEqual({ interrupt: 0, steer: 0, steerQueued: 0 });
-  await page.screenshot({ path: testInfo.outputPath("primary-send-stopping-current-turn.png"), fullPage: true });
+  await page.screenshot({ path: testInfo.outputPath("primary-send-queued-current-turn.png"), fullPage: true });
+
+  await steerQueuedButton.click();
+  await expect.poll(() => page.evaluate(() => {
+    const invoked = (window as unknown as { __invoked: string[] }).__invoked;
+    return {
+      interrupt: invoked.filter((command) => command === "turn_interrupt").length,
+      steer: invoked.filter((command) => command === "turn_steer").length,
+      steerQueued: invoked.filter((command) => command === "turn_steer_queued").length,
+    };
+  })).toEqual({ interrupt: 0, steer: 0, steerQueued: 1 });
+  await expect.poll(() => page.evaluate(() => (
+    window as unknown as { __invocationArgs: Record<string, unknown> }
+  ).__invocationArgs.turn_steer_queued)).toEqual({
+    request: {
+      threadId: "thread-1",
+      expectedTurnId: "turn-primary-active",
+      queuedTurnId: "turn-start-1",
+    },
+  });
+  await expect(page.locator(".message-queue")).toHaveCount(0);
 
   await page.evaluate(() => {
-    const emit = (window as unknown as { __emitAgentEvent: (event: unknown) => void }).__emitAgentEvent;
-    emit({
-      schemaVersion: 1,
-      threadId: "thread-1",
-      turnId: "turn-primary-active",
-      type: "turn_cancelled",
-      phase: "cancelled",
-      durationMs: 120,
-    });
-    emit({
+    (window as unknown as { __emitAgentEvent: (event: unknown) => void }).__emitAgentEvent({
       schemaVersion: 4,
       threadId: "thread-1",
-      turnId: "turn-start-1",
-      type: "turn_started",
+      turnId: "turn-primary-active",
+      type: "turn_steered",
       phase: "exploring",
-      userMessage: {
+      message: {
         schemaVersion: 1,
-        id: "user-turn-start-1",
+        id: "steer-turn-primary-active",
         role: "user",
         content: [{ type: "text", text: "改为先修复发送逻辑，再继续验证" }],
         createdAtMs: Date.now(),
       },
     });
-    emit({
-      schemaVersion: 5,
-      threadId: "thread-1",
-      turnId: "turn-start-1",
-      type: "turn_completed",
-      phase: "complete",
-      message: {
-        schemaVersion: 1,
-        id: "assistant-turn-start-1",
-        role: "assistant",
-        content: [{ type: "text", text: "已按新的方向接续完成。" }],
-        createdAtMs: Date.now(),
-      },
-      usage: null,
-      durationMs: 80,
-    });
   });
   await expect(page.locator(".message--user").getByText("改为先修复发送逻辑，再继续验证", { exact: true })).toBeVisible();
-  await expect(page.getByText("已按新的方向接续完成。", { exact: true })).toBeVisible();
-  await expect(page.locator(".message--assistant").filter({ hasText: "已按新的方向接续完成。" })).toHaveCount(1);
-  await expect(page.locator(".message-queue")).toHaveCount(0);
+  await expect(page.locator(".mode-label")).toHaveText("正在生成");
 });
 
 test("atomically steers and removes a queued message from the backend mailbox", async ({ page }, testInfo) => {
@@ -2690,7 +2688,7 @@ test("atomically steers and removes a queued message from the backend mailbox", 
   await expect(page.locator(".message--user").getByText("queued first", { exact: true })).toHaveCount(0);
   await page.screenshot({ path: testInfo.outputPath("queued-message-actions.png"), fullPage: true });
 
-  await page.getByRole("button", { name: "加入当前对话 queued first", exact: true }).click();
+  await page.getByRole("button", { name: "发送到当前对话 queued first", exact: true }).click();
   await expect.poll(() => page.evaluate(() => (window as unknown as { __invoked: string[] }).__invoked.filter((command) => command === "turn_steer_queued").length)).toBe(1);
   await expect.poll(() => page.evaluate(() => (window as unknown as { __invoked: string[] }).__invoked.filter((command) => command === "turn_steer").length)).toBe(0);
   await expect.poll(() => page.evaluate(() => (window as unknown as { __invoked: string[] }).__invoked.filter((command) => command === "remove_queued_turn").length)).toBe(0);

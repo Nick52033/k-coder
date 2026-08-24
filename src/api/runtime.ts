@@ -179,13 +179,11 @@ export function startTurn(
   attachments: ImageAttachment[] = [],
   agentMode?: string,
   workflowId?: string,
-  interruptActiveTurnId?: string,
 ) {
   return invoke<TurnHandle>("turn_start", {
     request: { threadId, input, agentMode },
     attachments,
     workflowId,
-    interruptActiveTurnId,
   });
 }
 

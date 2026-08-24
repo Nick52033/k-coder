@@ -1204,17 +1204,7 @@ pub async fn turn_start(
     request: RunTurnRequest,
     attachments: Vec<ImageAttachment>,
     workflow_id: Option<String>,
-    interrupt_active_turn_id: Option<String>,
 ) -> CommandResult<TurnHandle> {
-    if interrupt_active_turn_id
-        .as_deref()
-        .is_some_and(|turn_id| turn_id.trim().is_empty())
-    {
-        return Err(CommandError::new(
-            "invalid_request",
-            "interruptActiveTurnId must not be empty",
-        ));
-    }
     let turn_id = Uuid::new_v4().to_string();
     let thread_id = request.thread_id.clone();
     let (signal, started) = oneshot::channel();
@@ -1224,23 +1214,20 @@ pub async fn turn_start(
         turn_id: turn_id.clone(),
         state: TurnState::Queued,
     };
-    let enqueue = state
-        .enqueue_thread_turn_interrupting(
-            MailboxTurn {
-                handle: handle.clone(),
-                kind: MailboxTurnKind::Message {
-                    request,
-                    attachments,
-                    workflow_id,
-                },
-                started: Some(signal),
+    let should_start = state
+        .enqueue_thread_turn(MailboxTurn {
+            handle: handle.clone(),
+            kind: MailboxTurnKind::Message {
+                request,
+                attachments,
+                workflow_id,
             },
-            interrupt_active_turn_id.as_deref(),
-        )
+            started: Some(signal),
+        })
         .await;
     emit_mailbox_changed(&app, state.inner(), &thread_id).await;
 
-    if !enqueue.should_start {
+    if !should_start {
         return Ok(handle);
     }
 

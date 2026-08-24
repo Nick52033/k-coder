@@ -697,16 +697,10 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
   },
 
   sendMessage: async (input, attachments = [], agentMode, workflowId) => {
-    const { activeThreadId: threadId, activeTurns } = get();
+    const { activeThreadId: threadId } = get();
     const text = input.trim();
     if (!threadId || (!text && attachments.length === 0)) return;
-    const interruptActiveTurnId = activeTurns[threadId];
-    set((state) => ({
-      cancellingTurns: interruptActiveTurnId
-        ? { ...state.cancellingTurns, [threadId]: interruptActiveTurnId }
-        : state.cancellingTurns,
-      error: "",
-    }));
+    set({ error: "" });
     try {
       const handle = await startTurn(
         threadId,
@@ -714,7 +708,6 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
         attachments,
         agentMode,
         workflowId,
-        interruptActiveTurnId,
       );
       if (handle.state === "queued") {
         await get().processQueue();
@@ -725,12 +718,7 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
         }));
       }
     } catch (error) {
-      set((state) => ({
-        cancellingTurns: state.cancellingTurns[threadId] === interruptActiveTurnId
-          ? withoutActiveTurn(state.cancellingTurns, threadId)
-          : state.cancellingTurns,
-        error: errorMessage(error),
-      }));
+      set({ error: errorMessage(error) });
     }
   },
 

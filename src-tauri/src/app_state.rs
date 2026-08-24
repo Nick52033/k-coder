@@ -71,12 +71,6 @@ struct ActiveTurn {
     control: Arc<TurnControl>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct EnqueueThreadTurnOutcome {
-    pub(crate) should_start: bool,
-    pub(crate) interrupted_turn_id: Option<String>,
-}
-
 impl AppState {
     pub fn new(data_root: impl AsRef<Path>) -> Result<Self, AppStateError> {
         Self::with_credentials(data_root, Arc::new(OsCredentialStore::new()))
@@ -260,39 +254,6 @@ impl AppState {
         let thread_id = item.handle.thread_id.clone();
         let _operation_guard = self.thread_operations.lock(&thread_id).await;
         self.thread_mailbox.enqueue(item).await
-    }
-
-    pub(crate) async fn enqueue_thread_turn_interrupting(
-        &self,
-        item: MailboxTurn,
-        expected_active_turn_id: Option<&str>,
-    ) -> EnqueueThreadTurnOutcome {
-        let thread_id = item.handle.thread_id.clone();
-        let _operation_guard = self.thread_operations.lock(&thread_id).await;
-        let active_turns = self.active_turns.lock().await;
-        let active_turn_id = active_turns
-            .get(&thread_id)
-            .map(|active| active.turn_id.clone());
-        let interrupted_turn_id = expected_active_turn_id
-            .filter(|expected| active_turn_id.as_deref() == Some(*expected))
-            .map(str::to_string);
-
-        // The replacement must be owned by the mailbox before cancellation can
-        // make the current worker advance to its next item.
-        let should_start = self.thread_mailbox.enqueue(item).await;
-        if interrupted_turn_id.is_some() {
-            let active = active_turns
-                .get(&thread_id)
-                .expect("the matching active turn remains locked");
-            active.control.close();
-            active.cancellation.cancel();
-            self.subagents.cancel_for_parent(&thread_id);
-        }
-
-        EnqueueThreadTurnOutcome {
-            should_start,
-            interrupted_turn_id,
-        }
     }
 
     pub async fn next_thread_turn(
@@ -1941,7 +1902,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replacement_enqueue_cancels_only_the_matching_mailbox_turn() {
+    async fn ordinary_enqueue_keeps_the_active_mailbox_turn_running() {
         let directory = tempfile::tempdir().unwrap();
         let state =
             AppState::with_credentials(directory.path(), Arc::new(FakeCredentials::default()))
@@ -1973,17 +1934,17 @@ mod tests {
             .unwrap();
         drop(operation_guard);
 
-        let replacement = MailboxTurn {
+        let queued_message = MailboxTurn {
             handle: crate::protocol::TurnHandle {
                 schema_version: crate::protocol::PROTOCOL_VERSION,
                 thread_id: "thread".into(),
-                turn_id: "turn-replacement".into(),
+                turn_id: "turn-queued".into(),
                 state: TurnState::Queued,
             },
             kind: MailboxTurnKind::Message {
                 request: crate::agent::RunTurnRequest {
                     thread_id: "thread".into(),
-                    input: "use this direction instead".into(),
+                    input: "keep this queued".into(),
                     agent_mode: None,
                 },
                 attachments: Vec::new(),
@@ -1991,89 +1952,7 @@ mod tests {
             },
             started: None,
         };
-        let enqueue = state
-            .enqueue_thread_turn_interrupting(replacement, Some("turn-current"))
-            .await;
-
-        assert!(!enqueue.should_start);
-        assert_eq!(enqueue.interrupted_turn_id.as_deref(), Some("turn-current"));
-        assert!(cancellation.is_cancelled());
-        assert!(
-            control
-                .steer(crate::protocol::ChatMessage {
-                    schema_version: crate::protocol::PROTOCOL_VERSION,
-                    id: "late-steer".into(),
-                    role: crate::protocol::MessageRole::User,
-                    content: Vec::new(),
-                    created_at_ms: 1,
-                })
-                .is_err()
-        );
-        let snapshot = state.thread_mailbox().snapshot("thread", None).await;
-        assert_eq!(snapshot.pending.len(), 1);
-        assert_eq!(snapshot.pending[0].turn_id, "turn-replacement");
-        state.finish_turn("thread").await;
-    }
-
-    #[tokio::test]
-    async fn replacement_enqueue_retains_input_without_interrupting_a_successor() {
-        let directory = tempfile::tempdir().unwrap();
-        let state =
-            AppState::with_credentials(directory.path(), Arc::new(FakeCredentials::default()))
-                .unwrap();
-        assert!(
-            state
-                .enqueue_thread_turn(MailboxTurn {
-                    handle: crate::protocol::TurnHandle {
-                        schema_version: crate::protocol::PROTOCOL_VERSION,
-                        thread_id: "thread".into(),
-                        turn_id: "turn-current".into(),
-                        state: TurnState::Queued,
-                    },
-                    kind: MailboxTurnKind::Retry,
-                    started: None,
-                })
-                .await
-        );
-        let (_, operation_guard) = state.next_thread_turn("thread").await.unwrap();
-        let workspace = state.workspace_root();
-        let (cancellation, control) = state
-            .begin_turn_with_id_in_workspace_locked(
-                "thread",
-                "turn-current",
-                &workspace,
-                &operation_guard,
-            )
-            .await
-            .unwrap();
-        drop(operation_guard);
-
-        let enqueue = state
-            .enqueue_thread_turn_interrupting(
-                MailboxTurn {
-                    handle: crate::protocol::TurnHandle {
-                        schema_version: crate::protocol::PROTOCOL_VERSION,
-                        thread_id: "thread".into(),
-                        turn_id: "turn-replacement".into(),
-                        state: TurnState::Queued,
-                    },
-                    kind: MailboxTurnKind::Message {
-                        request: crate::agent::RunTurnRequest {
-                            thread_id: "thread".into(),
-                            input: "keep this queued".into(),
-                            agent_mode: None,
-                        },
-                        attachments: Vec::new(),
-                        workflow_id: None,
-                    },
-                    started: None,
-                },
-                Some("turn-stale"),
-            )
-            .await;
-
-        assert!(!enqueue.should_start);
-        assert_eq!(enqueue.interrupted_turn_id, None);
+        assert!(!state.enqueue_thread_turn(queued_message).await);
         assert!(!cancellation.is_cancelled());
         let still_open = crate::protocol::ChatMessage {
             schema_version: crate::protocol::PROTOCOL_VERSION,
@@ -2086,12 +1965,12 @@ mod tests {
         assert_eq!(control.take_pending(), vec![still_open]);
         let snapshot = state.thread_mailbox().snapshot("thread", None).await;
         assert_eq!(snapshot.pending.len(), 1);
-        assert_eq!(snapshot.pending[0].turn_id, "turn-replacement");
+        assert_eq!(snapshot.pending[0].turn_id, "turn-queued");
         state.finish_turn("thread").await;
     }
 
     #[tokio::test]
-    async fn replacement_worker_waits_for_a_blocking_compatibility_turn() {
+    async fn queued_worker_waits_for_a_blocking_compatibility_turn() {
         let directory = tempfile::tempdir().unwrap();
         let state = Arc::new(
             AppState::with_credentials(directory.path(), Arc::new(FakeCredentials::default()))
@@ -2102,38 +1981,31 @@ mod tests {
             .begin_turn_with_id_in_workspace("thread", "turn-blocking", &workspace)
             .await
             .unwrap();
-        let enqueue = state
-            .enqueue_thread_turn_interrupting(
-                MailboxTurn {
-                    handle: crate::protocol::TurnHandle {
-                        schema_version: crate::protocol::PROTOCOL_VERSION,
-                        thread_id: "thread".into(),
-                        turn_id: "turn-replacement".into(),
-                        state: TurnState::Queued,
-                    },
-                    kind: MailboxTurnKind::Retry,
-                    started: None,
+        let should_start = state
+            .enqueue_thread_turn(MailboxTurn {
+                handle: crate::protocol::TurnHandle {
+                    schema_version: crate::protocol::PROTOCOL_VERSION,
+                    thread_id: "thread".into(),
+                    turn_id: "turn-queued".into(),
+                    state: TurnState::Queued,
                 },
-                Some("turn-blocking"),
-            )
+                kind: MailboxTurnKind::Retry,
+                started: None,
+            })
             .await;
-        assert!(enqueue.should_start);
-        assert_eq!(
-            enqueue.interrupted_turn_id.as_deref(),
-            Some("turn-blocking")
-        );
-        assert!(cancellation.is_cancelled());
+        assert!(should_start);
+        assert!(!cancellation.is_cancelled());
 
         let waiting_state = state.clone();
         let waiting = tokio::spawn(async move { waiting_state.next_thread_turn("thread").await });
         tokio::task::yield_now().await;
         assert!(!waiting.is_finished());
         state.finish_turn("thread").await;
-        let (replacement, operation_guard) = waiting
+        let (queued_turn, operation_guard) = waiting
             .await
             .unwrap()
-            .expect("the replacement remains queued until the active turn is released");
-        assert_eq!(replacement.handle.turn_id, "turn-replacement");
+            .expect("the message remains queued until the active turn is released");
+        assert_eq!(queued_turn.handle.turn_id, "turn-queued");
         drop(operation_guard);
     }
 

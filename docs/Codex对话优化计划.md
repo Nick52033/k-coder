@@ -185,7 +185,7 @@
 ### 验收结果
 
 - Rust 回归覆盖消息接纳、关闭后保留、过期活动 Turn、重复请求和 retry 项拒绝。
-- 双视口 E2E 确认“加入当前对话”只调用一次 `turn_steer_queued`，不调用旧 steer、独立删除或 interrupt。
+- 双视口 E2E 确认队列项“发送到当前对话”只调用一次 `turn_steer_queued`，不调用旧 steer、独立删除或 interrupt。
 - `pnpm build`、Rust 格式/检查、全量 Rust 240 项测试和完整 E2E（70 通过、2 条窄屏条件跳过）通过。
 - 现有 `pnpm tauri dev` watcher 已加载最新调试二进制，开发服务返回 HTTP 200，`k-Coder` 主窗口响应正常；未触发真实模型请求。
 

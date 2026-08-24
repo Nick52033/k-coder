@@ -2090,12 +2090,12 @@ function App() {
                         {queueItem.kind === "message" && (
                           <button
                             type="button"
-                            aria-label={`加入当前对话 ${queueItem.input || "图片消息"}`}
+                            aria-label={`发送到当前对话 ${queueItem.input || "图片消息"}`}
                             title={queueItem.workflowId
                               ? "机器人工作流必须作为独立 Turn 启动"
                               : currentThreadCancelling
                                 ? "当前对话正在停止"
-                                : "加入当前对话"}
+                                : "发送到当前对话"}
                             disabled={Boolean(queueItem.workflowId) || currentThreadCancelling}
                             onClick={() => void sendQueuedMessageNow(queueItem.id)}
                           >
@@ -2372,7 +2372,7 @@ function App() {
                   className="send-button"
                   type="submit"
                   aria-label="发送消息"
-                  title={currentThreadBusy ? "发送并停止当前生成" : "发送消息"}
+                  title={currentThreadBusy ? "加入消息队列" : "发送消息"}
                   disabled={workspaceSwitching || (!draft.trim() && attachments.length === 0)}
                 >
                   <ArrowUp size={18} strokeWidth={2.2} />
