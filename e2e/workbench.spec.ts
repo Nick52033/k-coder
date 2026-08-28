@@ -4,6 +4,7 @@ import { readFileSync } from "node:fs";
 test.beforeEach(async ({ page }) => {
   await page.addInitScript(() => {
     const callbacks = new Map<number, (...args: unknown[]) => void>();
+    const tauriEventCallbackIds = new Map<string, number>();
     let callbackId = 1;
     let agentEventCallbackId: number | null = null;
     let mailboxEventCallbackId: number | null = null;
@@ -346,7 +347,32 @@ test.beforeEach(async ({ page }) => {
         invoke: async (command: string, args?: Record<string, unknown>) => {
           (window as unknown as { __invoked: string[] }).__invoked.push(command);
           invocationArgs[command] = args ?? {};
+          if (command === "plugin:dialog|open") {
+            const selected = localStorage.getItem("kcoder_e2e_attachment_dialog_paths");
+            return selected ? JSON.parse(selected) : null;
+          }
+          if (command === "plugin:fs|stat") {
+            const raw = localStorage.getItem("kcoder_e2e_attachment_file_bytes");
+            const size = raw ? (JSON.parse(raw) as number[]).length : 0;
+            return {
+              isFile: true,
+              isDirectory: false,
+              isSymlink: false,
+              size,
+              mtime: null,
+              atime: null,
+              birthtime: null,
+              readonly: true,
+            };
+          }
+          if (command === "plugin:fs|read_file") {
+            const bytes = localStorage.getItem("kcoder_e2e_attachment_file_bytes");
+            return bytes ? JSON.parse(bytes) : [];
+          }
           if (command === "plugin:event|listen") {
+            if (typeof args?.event === "string" && typeof args.handler === "number") {
+              tauriEventCallbackIds.set(args.event, args.handler);
+            }
             if (args?.event === "agent-event" && typeof args.handler === "number") {
               agentEventCallbackId = args.handler;
             } else if (args?.event === "thread-mailbox-changed" && typeof args.handler === "number") {
@@ -826,6 +852,25 @@ test.beforeEach(async ({ page }) => {
           ) {
             throw new Error(localStorage.getItem("kcoder_e2e_external_open_error") ?? "external open failed");
           }
+          if (command === "extract_local_document") {
+            const delayMs = Number(localStorage.getItem("kcoder_e2e_attachment_extract_delay_ms") ?? 0);
+            if (delayMs > 0) await new Promise((resolve) => setTimeout(resolve, delayMs));
+            const name = String(args?.name ?? "attachment.txt");
+            const dataUrl = String(args?.dataUrl ?? "");
+            const encoded = dataUrl.split(",", 2)[1] ?? "";
+            const bytes = Uint8Array.from(atob(encoded), (value) => value.charCodeAt(0));
+            const spreadsheetContent = /\.(xlsx|xls|xlsm|xlsb)$/i.test(name)
+              ? "[工作表: 预算]\n项目\t金额\n住宿\t128.5\n"
+              : null;
+            return {
+              path: `attachment://fixture/${name}`,
+              name,
+              kind: "document",
+              content: spreadsheetContent ?? new TextDecoder().decode(bytes),
+              size: bytes.byteLength,
+              truncated: false,
+            };
+          }
           return responses[command] ?? null;
         },
       },
@@ -839,6 +884,12 @@ test.beforeEach(async ({ page }) => {
       __lastProviderRequest: null,
       __lastActivatedProvider: null,
       __lastApprovalMode: null,
+      __registeredTauriEvents: tauriEventCallbackIds,
+      __emitTauriEvent: (event: string, payload: unknown) => {
+        const handlerId = tauriEventCallbackIds.get(event);
+        if (handlerId === undefined) throw new Error(`${event} listener is not ready`);
+        callbacks.get(handlerId)?.({ event, id: 1, payload });
+      },
       __emitAgentEvent: (event: unknown) => {
         const agentEvent = event as { type?: string; threadId?: string; turnId?: string };
         if (agentEvent.threadId && agentEvent.turnId && agentEvent.type === "turn_started") {
@@ -1045,11 +1096,11 @@ test("restores a queued robot identity from the mailbox snapshot", async ({ page
   await expect(page.getByText("执行回归测试")).toBeVisible();
 });
 
-test("uses composer quick actions for files, images, Skills, and extension entry points", async ({ page }, testInfo) => {
+test("uses composer quick actions for files, attachments, Skills, and extension entry points", async ({ page }, testInfo) => {
   await page.goto("/");
   const toolbar = page.getByRole("toolbar", { name: "输入快捷操作" });
   const fileAction = toolbar.getByRole("button", { name: "引用工作区文件" });
-  const imageAction = toolbar.getByRole("button", { name: "添加图片" });
+  const attachmentAction = toolbar.getByRole("button", { name: "添加附件" });
   const skillAction = toolbar.getByRole("button", { name: "使用 Skill" });
   const moreAction = toolbar.getByRole("button", { name: "更多操作" });
   const agentSelector = toolbar.getByRole("button", { name: "选择机器人" });
@@ -1062,6 +1113,7 @@ test("uses composer quick actions for files, images, Skills, and extension entry
   await expect(agentSelector).toHaveAttribute("aria-label", "选择机器人");
   await expect(agentSelector.locator('[data-icon="robot"]')).toHaveCount(1);
   await expect(toolbar.locator(".workflow-selector--compact")).toHaveCount(1);
+  await expect(attachmentAction).toHaveAttribute("title", "添加附件");
   await expect(page.locator(".composer .project-selector")).toHaveCount(1);
   await fileAction.click();
   const fileSuggestions = page.getByRole("listbox", { name: "文件引用" });
@@ -1078,10 +1130,13 @@ test("uses composer quick actions for files, images, Skills, and extension entry
   await skillSuggestions.getByRole("option", { name: /\/workspace-review/ }).click();
   await expect(composer).toHaveValue("/workspace-review ");
 
-  await imageAction.click();
+  await attachmentAction.click();
   await expect.poll(() => page.evaluate(() => (
     window as unknown as { __invoked: string[] }
   ).__invoked.includes("plugin:dialog|open"))).toBe(true);
+  expect(await page.evaluate(() => (
+    window as unknown as { __invocationArgs: Record<string, unknown> }
+  ).__invocationArgs["plugin:dialog|open"])).toEqual({ options: { multiple: true } });
 
   await moreAction.click();
   const menu = page.getByRole("menu", { name: "添加内容" });
@@ -2918,6 +2973,280 @@ test("restores an active conversation without replaying existing text or restart
   expect(await page.evaluate(() => (
     window as unknown as { __invoked: string[] }
   ).__invoked.filter((command) => command === "turn_start" || command === "turn_retry"))).toHaveLength(0);
+});
+
+test("pastes local documents into the composer without intercepting plain text", async ({ page }, testInfo) => {
+  await page.goto("/");
+  const composer = page.getByRole("textbox", { name: "消息" });
+
+  const plainTextPrevented = await composer.evaluate((element) => {
+    const transfer = new DataTransfer();
+    transfer.setData("text/plain", "保留普通文本粘贴");
+    const event = new ClipboardEvent("paste", { bubbles: true, cancelable: true, clipboardData: transfer });
+    element.dispatchEvent(event);
+    return event.defaultPrevented;
+  });
+  expect(plainTextPrevented).toBe(false);
+
+  await composer.fill("请总结附件");
+  await page.evaluate(() => localStorage.setItem("kcoder_e2e_attachment_extract_delay_ms", "150"));
+  await composer.evaluate((element) => {
+    const transfer = new DataTransfer();
+    transfer.items.add(new File(
+      ["# Release notes\n\n- Paste files directly"],
+      "release-notes.md",
+      { type: "text/markdown", lastModified: 42 },
+    ));
+    element.dispatchEvent(new ClipboardEvent("paste", {
+      bubbles: true,
+      cancelable: true,
+      clipboardData: transfer,
+    }));
+  });
+
+  await expect(page.getByRole("button", { name: "发送消息", exact: true })).toBeDisabled();
+  const pendingAttachment = page.getByLabel("待发送附件");
+  await expect(pendingAttachment.getByText("release-notes.md", { exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "发送消息", exact: true })).toBeEnabled();
+  await expect(composer).toHaveAttribute("placeholder", "输入消息，可直接粘贴或拖入文件");
+  const extractionArgs = await page.evaluate(() => (
+    window as unknown as { __invocationArgs: Record<string, Record<string, unknown>> }
+  ).__invocationArgs.extract_local_document);
+  expect(extractionArgs).toMatchObject({ name: "release-notes.md" });
+  expect(extractionArgs).not.toHaveProperty("path");
+  expect(extractionArgs.dataUrl).toMatch(/^data:text\/markdown;base64,/);
+  await page.screenshot({ path: testInfo.outputPath("pasted-document-in-composer.png"), fullPage: true });
+
+  await page.getByRole("button", { name: "发送消息", exact: true }).click();
+  await expect.poll(() => page.evaluate(() => (
+    window as unknown as { __runTurnCalls: Array<{ request?: { input?: string } }> }
+  ).__runTurnCalls[0]?.request?.input)).toContain("[附件: release-notes.md]");
+  await expect.poll(() => page.evaluate(() => (
+    window as unknown as { __runTurnCalls: Array<{ request?: { input?: string } }> }
+  ).__runTurnCalls[0]?.request?.input)).toContain("Paste files directly");
+  expect(await page.evaluate(() => (
+    window as unknown as { __runTurnCalls: Array<{ attachments?: unknown[] }> }
+  ).__runTurnCalls[0]?.attachments)).toEqual([]);
+});
+
+test("rejects unsupported pasted files with visible feedback", async ({ page }) => {
+  await page.goto("/");
+  const composer = page.getByRole("textbox", { name: "消息" });
+  await composer.evaluate((element) => {
+    const transfer = new DataTransfer();
+    transfer.items.add(new File([new Uint8Array([0, 1, 2])], "archive.zip", { type: "application/zip" }));
+    element.dispatchEvent(new ClipboardEvent("paste", {
+      bubbles: true,
+      cancelable: true,
+      clipboardData: transfer,
+    }));
+  });
+
+  await expect(page.getByRole("status").filter({ hasText: "archive.zip：已选择，但暂不支持解析此文件类型" })).toBeVisible();
+  await expect(page.getByLabel("待发送附件")).toHaveCount(0);
+  expect(await page.evaluate(() => (
+    window as unknown as { __invoked: string[] }
+  ).__invoked.filter((command) => command === "extract_local_document"))).toHaveLength(0);
+});
+
+test("allows selecting any file before reporting unsupported formats", async ({ page }) => {
+  await page.goto("/");
+  await page.evaluate(() => {
+    localStorage.setItem(
+      "kcoder_e2e_attachment_dialog_paths",
+      JSON.stringify(["C:\\fixtures\\archive.zip"]),
+    );
+  });
+
+  await page.getByRole("toolbar", { name: "输入快捷操作" })
+    .getByRole("button", { name: "添加附件" })
+    .click();
+
+  await expect(page.getByRole("status").filter({
+    hasText: "archive.zip：已选择，但暂不支持解析此文件类型",
+  })).toBeVisible();
+  expect(await page.evaluate(() => (
+    window as unknown as { __invocationArgs: Record<string, unknown> }
+  ).__invocationArgs["plugin:dialog|open"])).toEqual({ options: { multiple: true } });
+  expect(await page.evaluate(() => (
+    window as unknown as { __invoked: string[] }
+  ).__invoked.filter((command) => command === "plugin:fs|read_file"))).toHaveLength(0);
+  expect(await page.evaluate(() => (
+    window as unknown as { __invoked: string[] }
+  ).__invoked.filter((command) => command === "plugin:fs|stat"))).toHaveLength(0);
+  await expect(page.getByLabel("待发送附件")).toHaveCount(0);
+  expect(await page.evaluate(() => (
+    window as unknown as { __invoked: string[] }
+  ).__invoked.filter((command) => command === "extract_local_document"))).toHaveLength(0);
+});
+
+test("keeps local attachment reads limited to dynamically scoped fs commands", async () => {
+  const capability = JSON.parse(readFileSync(
+    new URL("../src-tauri/capabilities/default.json", import.meta.url),
+    "utf8",
+  )) as { permissions: unknown[] };
+
+  expect(capability.permissions).toEqual(expect.arrayContaining([
+    "fs:allow-stat",
+    "fs:allow-read-file",
+  ]));
+  expect(capability.permissions).not.toContain("fs:default");
+  expect(capability.permissions.filter((permission) => {
+    if (!permission || typeof permission !== "object") return false;
+    const identifier = (permission as { identifier?: unknown }).identifier;
+    return typeof identifier === "string" && identifier.startsWith("fs:");
+  })).toEqual([]);
+});
+
+test("imports Excel through Tauri native file drop without duplicate DOM handling", async ({ page }) => {
+  await page.goto("/");
+  await page.evaluate(() => {
+    localStorage.setItem(
+      "kcoder_e2e_attachment_file_bytes",
+      JSON.stringify([0x50, 0x4b, 0x03, 0x04]),
+    );
+  });
+  await expect.poll(() => page.evaluate(() => (
+    window as unknown as { __registeredTauriEvents: Map<string, number> }
+  ).__registeredTauriEvents.has("tauri://drag-drop"))).toBe(true);
+
+  const composer = page.locator(".composer");
+  await composer.evaluate((element) => {
+    const bounds = element.getBoundingClientRect();
+    const scaleFactor = window.devicePixelRatio || 1;
+    const emit = (
+      window as unknown as { __emitTauriEvent: (event: string, payload: unknown) => void }
+    ).__emitTauriEvent;
+    emit("tauri://drag-enter", {
+      paths: ["C:\\fixtures\\native-budget.xlsx"],
+      position: {
+        x: (bounds.left + bounds.width / 2) * scaleFactor,
+        y: (bounds.top + bounds.height / 2) * scaleFactor,
+      },
+    });
+  });
+  await expect(composer).toHaveClass(/composer--drag-active/);
+
+  await page.evaluate(() => {
+    (
+      window as unknown as { __emitTauriEvent: (event: string, payload: unknown) => void }
+    ).__emitTauriEvent("tauri://drag-over", { position: { x: 1, y: 1 } });
+  });
+  await expect(composer).not.toHaveClass(/composer--drag-active/);
+
+  await composer.evaluate((element) => {
+    const bounds = element.getBoundingClientRect();
+    const scaleFactor = window.devicePixelRatio || 1;
+    const emit = (
+      window as unknown as { __emitTauriEvent: (event: string, payload: unknown) => void }
+    ).__emitTauriEvent;
+    const position = {
+      x: (bounds.left + bounds.width / 2) * scaleFactor,
+      y: (bounds.top + bounds.height / 2) * scaleFactor,
+    };
+    emit("tauri://drag-over", { position });
+    emit("tauri://drag-drop", {
+      paths: ["C:\\fixtures\\native-budget.xlsx"],
+      position,
+    });
+  });
+
+  await expect(page.getByLabel("待发送附件")
+    .getByText("native-budget.xlsx", { exact: true })).toBeVisible();
+  await expect(composer).not.toHaveClass(/composer--drag-active/);
+
+  await page.getByRole("textbox", { name: "消息" }).evaluate((element) => {
+    const transfer = new DataTransfer();
+    transfer.items.add(new File(
+      [new Uint8Array([0x50, 0x4b, 0x03, 0x04])],
+      "native-budget.xlsx",
+      { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" },
+    ));
+    element.dispatchEvent(new DragEvent("drop", {
+      bubbles: true,
+      cancelable: true,
+      dataTransfer: transfer,
+    }));
+  });
+  expect(await page.evaluate(() => (
+    window as unknown as { __invoked: string[] }
+  ).__invoked.filter((command) => command === "extract_local_document"))).toHaveLength(1);
+});
+
+test("selects supported Excel files after a metadata size preflight", async ({ page }) => {
+  await page.goto("/");
+  await page.evaluate(() => {
+    localStorage.setItem(
+      "kcoder_e2e_attachment_dialog_paths",
+      JSON.stringify(["C:\\fixtures\\budget.xlsx"]),
+    );
+    localStorage.setItem(
+      "kcoder_e2e_attachment_file_bytes",
+      JSON.stringify([0x50, 0x4b, 0x03, 0x04]),
+    );
+  });
+
+  await page.getByRole("toolbar", { name: "输入快捷操作" })
+    .getByRole("button", { name: "添加附件" })
+    .click();
+
+  await expect(page.getByLabel("待发送附件").getByText("budget.xlsx", { exact: true })).toBeVisible();
+  expect(await page.evaluate(() => (
+    window as unknown as { __invocationArgs: Record<string, Record<string, unknown>> }
+  ).__invocationArgs["plugin:fs|stat"])).toMatchObject({
+    path: "C:\\fixtures\\budget.xlsx",
+  });
+  expect(await page.evaluate(() => (
+    window as unknown as { __invocationArgs: Record<string, Record<string, unknown>> }
+  ).__invocationArgs["plugin:fs|read_file"])).toMatchObject({
+    path: "C:\\fixtures\\budget.xlsx",
+  });
+  const extractionArgs = await page.evaluate(() => (
+    window as unknown as { __invocationArgs: Record<string, Record<string, unknown>> }
+  ).__invocationArgs.extract_local_document);
+  expect(extractionArgs).toMatchObject({ name: "budget.xlsx" });
+  expect(extractionArgs.dataUrl).toMatch(
+    /^data:application\/vnd\.openxmlformats-officedocument\.spreadsheetml\.sheet;base64,/,
+  );
+});
+
+test("pastes common Excel workbooks and sends extracted sheet content", async ({ page }) => {
+  await page.goto("/");
+  const composer = page.getByRole("textbox", { name: "消息" });
+  await composer.fill("请汇总预算");
+  await composer.evaluate((element) => {
+    const transfer = new DataTransfer();
+    transfer.items.add(new File(
+      [new Uint8Array([0x50, 0x4b, 0x03, 0x04])],
+      "budget.xlsx",
+      {
+        type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        lastModified: 43,
+      },
+    ));
+    element.dispatchEvent(new ClipboardEvent("paste", {
+      bubbles: true,
+      cancelable: true,
+      clipboardData: transfer,
+    }));
+  });
+
+  await expect(page.getByLabel("待发送附件").getByText("budget.xlsx", { exact: true })).toBeVisible();
+  const extractionArgs = await page.evaluate(() => (
+    window as unknown as { __invocationArgs: Record<string, Record<string, unknown>> }
+  ).__invocationArgs.extract_local_document);
+  expect(extractionArgs).toMatchObject({ name: "budget.xlsx" });
+  expect(extractionArgs.dataUrl).toMatch(
+    /^data:application\/vnd\.openxmlformats-officedocument\.spreadsheetml\.sheet;base64,/,
+  );
+
+  await page.getByRole("button", { name: "发送消息", exact: true }).click();
+  await expect.poll(() => page.evaluate(() => (
+    window as unknown as { __runTurnCalls: Array<{ request?: { input?: string } }> }
+  ).__runTurnCalls[0]?.request?.input)).toContain("[附件: budget.xlsx]");
+  await expect.poll(() => page.evaluate(() => (
+    window as unknown as { __runTurnCalls: Array<{ request?: { input?: string } }> }
+  ).__runTurnCalls[0]?.request?.input)).toContain("[工作表: 预算]\n项目\t金额\n住宿\t128.5");
 });
 
 test("sends images without frontend OCR and opens the conversation preview", async ({ page }, testInfo) => {

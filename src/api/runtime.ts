@@ -337,6 +337,7 @@ export function searchWorkspaceFiles(query: string, limit = 50) { return invoke<
 export function previewWorkspaceFile(path: string) { return invoke<FilePreview>("preview_workspace_file", { path }); }
 export function saveWorkspaceFile(request: SaveWorkspaceFileRequest) { return invoke<FilePreview>("save_workspace_file", { request }); }
 export function extractAttachment(path: string) { return invoke<AttachmentContent>("extract_attachment", { path }); }
+export function extractLocalDocument(name: string, dataUrl: string) { return invoke<AttachmentContent>("extract_local_document", { name, dataUrl }); }
 export function openWorkspaceFile(path: string) { return invoke<void>("open_workspace_file", { path }); }
 export function revealWorkspaceFile(path: string) { return invoke<void>("reveal_workspace_file", { path }); }
 export function getGitStatus() { return invoke<GitStatusView>("git_status"); }

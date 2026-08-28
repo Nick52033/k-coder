@@ -12,6 +12,8 @@
     "core:window:allow-show",
     "core:window:allow-hide",
     "dialog:allow-open",
+    "fs:allow-stat",
+    "fs:allow-read-file",
     "opener:default",
     "global-shortcut:default",
     "notification:default"

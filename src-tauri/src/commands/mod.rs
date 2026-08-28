@@ -12,7 +12,7 @@ use crate::advanced::{
     CreateGoalRequest, DocumentContent, EvaluationReport, GoalTransitionRequest, GoalView,
     MemorySettings, MemoryUpsertRequest, MemoryView, MetricsSnapshot, PlanUpdateRequest, PlanView,
     RepositorySearchIndex, SearchResult, WorkflowDefinitionView, WorkflowRunState, WorkflowRunView,
-    extract_document, run_recorded_evaluation,
+    extract_document, extract_document_data_url, run_recorded_evaluation,
 };
 use crate::agent::mailbox::{MailboxTurn, MailboxTurnKind, QueuedTurnSteerError};
 use crate::agent::thread_operation::ThreadOperationGuard;
@@ -1111,6 +1111,26 @@ pub fn extract_attachment(
     }
     workbench::extract_attachment(&state.workspace_root(), &path)
         .map_err(|error| CommandError::new("attachment", error))
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn extract_local_document(
+    name: String,
+    data_url: String,
+) -> CommandResult<AttachmentContent> {
+    let document =
+        tauri::async_runtime::spawn_blocking(move || extract_document_data_url(&name, &data_url))
+            .await
+            .map_err(|error| CommandError::new("attachment", error))?
+            .map_err(|error| CommandError::new("attachment", error))?;
+    Ok(AttachmentContent {
+        path: document.path,
+        name: document.name,
+        kind: "document".into(),
+        content: document.content,
+        size: document.source_bytes,
+        truncated: document.truncated,
+    })
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -2493,11 +2513,14 @@ mod tests {
     use std::path::Path;
     use std::sync::{Arc, Mutex};
 
+    use base64::Engine;
+
     use super::{
         CRAFT_MODE_INSTRUCTIONS, CommandError, TurnStartPublisher, build_system_prompt,
-        ordinary_turn_soft_limits, plugin_command_error, require_project_thread_for_subagent,
-        require_project_thread_for_workflow, require_queued_workflow_steerable, retry_mode,
-        tools_for_mode, tools_without_project, validate_workflow_turn_context,
+        extract_local_document, ordinary_turn_soft_limits, plugin_command_error,
+        require_project_thread_for_subagent, require_project_thread_for_workflow,
+        require_queued_workflow_steerable, retry_mode, tools_for_mode, tools_without_project,
+        validate_workflow_turn_context,
     };
     use crate::agent::EventPublisher;
     use crate::protocol::{AgentEvent, AgentEventEnvelope, AgentMode, PROTOCOL_VERSION};
@@ -2527,6 +2550,29 @@ mod tests {
     fn soft_turn_limits_apply_only_without_an_active_goal() {
         assert!(ordinary_turn_soft_limits(false).is_some());
         assert!(ordinary_turn_soft_limits(true).is_none());
+    }
+
+    #[tokio::test]
+    async fn local_document_command_accepts_only_user_supplied_memory_content() {
+        let encoded = base64::engine::general_purpose::STANDARD.encode("release notes");
+        let attachment = extract_local_document(
+            "notes.md".into(),
+            format!("data:text/markdown;base64,{encoded}"),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(attachment.kind, "document");
+        assert_eq!(attachment.name, "notes.md");
+        assert_eq!(attachment.content, "release notes");
+        assert_eq!(attachment.size, 13);
+        assert!(attachment.path.starts_with("attachment://"));
+
+        let error =
+            extract_local_document("../notes.md".into(), "data:text/plain;base64,QQ==".into())
+                .await
+                .unwrap_err();
+        assert_eq!(error.code, "attachment");
     }
 
     #[tokio::test]

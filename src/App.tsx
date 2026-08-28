@@ -16,7 +16,6 @@ import {
   FolderPlus,
   Hammer,
   History,
-  ImagePlus,
   PanelRightOpen,
   PanelRightClose,
   Loader2,
@@ -42,7 +41,7 @@ import {
   Target,
 } from "lucide-react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { getRuntimeStatus, getWorkspaceState, switchWorkspace, subscribeToAgentEvents, subscribeToMailboxEvents, listSubagents, getExtensionOverview, searchWorkspaceFiles } from "./api/runtime";
+import { extractLocalDocument, getRuntimeStatus, getWorkspaceState, switchWorkspace, subscribeToAgentEvents, subscribeToMailboxEvents, listSubagents, getExtensionOverview, searchWorkspaceFiles } from "./api/runtime";
 import { useWorkbenchStore } from "./stores/workbenchStore";
 import { reconcileConversationMessages } from "./stores/reducers/historyProjection";
 import { PatchReviewDialog } from "./components/PatchReviewDialog";
@@ -60,10 +59,11 @@ import { MarkdownContent } from "./components/MarkdownContent";
 import { ImagePreviewDialog } from "./components/ImagePreviewDialog";
 import { cn } from "./lib/cn";
 import { open } from "@tauri-apps/plugin-dialog";
-import { readFile } from "@tauri-apps/plugin-fs";
+import { readFile, stat } from "@tauri-apps/plugin-fs";
 import type { AttachmentContent, FileEntry, GoalView, ImageAttachment, ProjectRecord, RuntimeStatus, ThreadSummary, WorkspaceState } from "./types/runtime";
 import { ComposerSuggestionMenu, type ComposerSuggestion } from "./components/ComposerSuggestionMenu";
 import { ComposerAddMenu } from "./components/ComposerAddMenu";
+import { useToast } from "./components/Toast";
 import { ProjectSelector } from "./components/ProjectSelector";
 import { WorkflowControl } from "./components/WorkflowControl";
 import { WorkflowSelector } from "./components/WorkflowSelector";
@@ -136,6 +136,123 @@ const KNOWN_PROJECTS_KEY = "kcoder_known_projects";
 const HIDDEN_PROJECT_GROUPS_KEY = "kcoder_hidden_project_groups";
 const appWindow = getCurrentWindow();
 
+const MAX_COMPOSER_ATTACHMENTS = 8;
+const MAX_IMAGE_ATTACHMENTS = 4;
+const MAX_IMAGE_ATTACHMENT_BYTES = 4 * 1024 * 1024;
+const MAX_TOTAL_IMAGE_ATTACHMENT_BYTES = 8 * 1024 * 1024;
+const MAX_LOCAL_DOCUMENT_BYTES = 8 * 1024 * 1024;
+const MAX_DOCUMENT_CONTEXT_BYTES = 64 * 1024;
+const MAX_MESSAGE_INPUT_BYTES = 100_000;
+
+const IMAGE_MIME_BY_EXTENSION: Record<string, string> = {
+  png: "image/png",
+  jpg: "image/jpeg",
+  jpeg: "image/jpeg",
+  gif: "image/gif",
+  webp: "image/webp",
+};
+
+const DOCUMENT_EXTENSIONS = new Set([
+  "txt", "md", "markdown", "json", "csv", "tsv", "toml", "yaml", "yml", "xml", "html", "log",
+  "rs", "ts", "tsx", "js", "jsx", "py", "go", "java", "cs", "sql", "c", "h", "cc", "cpp", "cxx", "hpp",
+  "swift", "kt", "kts", "rb", "php", "scala", "sh", "bash", "zsh", "fish", "ps1", "psm1", "bat", "cmd",
+  "css", "scss", "sass", "less", "vue", "svelte", "astro", "ini", "cfg", "conf", "properties", "gradle", "pdf", "docx",
+  "xlsx", "xls", "xlsm", "xlsb",
+]);
+
+const DOCUMENT_MIME_BY_EXTENSION: Record<string, string> = {
+  pdf: "application/pdf",
+  docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  xlsx: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  xls: "application/vnd.ms-excel",
+  xlsm: "application/vnd.ms-excel.sheet.macroEnabled.12",
+  xlsb: "application/vnd.ms-excel.sheet.binary.macroEnabled.12",
+};
+
+type AttachmentImportSource = "clipboard" | "drop" | "picker";
+
+interface LocalAttachmentCandidate {
+  blob: Blob;
+  name: string;
+  size: number;
+  type: string;
+  lastModified: number;
+  identity?: string;
+}
+
+function fileExtension(name: string): string {
+  const index = name.lastIndexOf(".");
+  return index >= 0 ? name.slice(index + 1).toLowerCase() : "";
+}
+
+function imageMime(candidate: LocalAttachmentCandidate): string | null {
+  const declared = candidate.type.toLowerCase();
+  if (Object.values(IMAGE_MIME_BY_EXTENSION).includes(declared)) return declared;
+  return IMAGE_MIME_BY_EXTENSION[fileExtension(candidate.name)] ?? null;
+}
+
+function candidateFromFile(file: File): LocalAttachmentCandidate {
+  const fallbackExtension = Object.entries(IMAGE_MIME_BY_EXTENSION)
+    .find(([, mime]) => mime === file.type.toLowerCase())?.[0] ?? "bin";
+  return {
+    blob: file,
+    name: file.name || `clipboard-${Date.now()}.${fallbackExtension}`,
+    size: file.size,
+    type: file.type,
+    lastModified: file.lastModified,
+  };
+}
+
+function readBlobAsDataUrl(blob: Blob, mediaType: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(reader.error ?? new Error("读取文件失败"));
+    reader.onload = () => {
+      if (typeof reader.result !== "string") {
+        reject(new Error("读取文件失败"));
+        return;
+      }
+      resolve(reader.result);
+    };
+    reader.readAsDataURL(blob.type === mediaType ? blob : blob.slice(0, blob.size, mediaType));
+  });
+}
+
+function utf8Bytes(value: string): number {
+  return new TextEncoder().encode(value).length;
+}
+
+function boundUtf8(value: string, maxBytes: number): { value: string; bytes: number; truncated: boolean } {
+  const encoded = new TextEncoder().encode(value);
+  if (encoded.length <= maxBytes) return { value, bytes: encoded.length, truncated: false };
+  let end = maxBytes;
+  const decoder = new TextDecoder("utf-8", { fatal: true });
+  while (end > 0) {
+    try {
+      return { value: decoder.decode(encoded.slice(0, end)), bytes: end, truncated: true };
+    } catch {
+      end -= 1;
+    }
+  }
+  return { value: "", bytes: 0, truncated: true };
+}
+
+function clipboardFiles(data: DataTransfer): File[] {
+  const files = [...Array.from(data.files)];
+  for (const item of Array.from(data.items)) {
+    if (item.kind !== "file") continue;
+    const file = item.getAsFile();
+    if (file) files.push(file);
+  }
+  const seen = new Set<string>();
+  return files.filter((file) => {
+    const key = `${file.name}\u0000${file.size}\u0000${file.lastModified}\u0000${file.type}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
 function readThreadProjectMap(): Record<string, string> {
   try {
     const raw = localStorage.getItem(THREAD_PROJECT_KEY);
@@ -207,6 +324,7 @@ function toReadableError(reason: unknown): string {
 }
 
 function App() {
+  const toast = useToast();
   const [runtime, setRuntime] = useState<RuntimeStatus | null>(null);
   const [runtimeError, setRuntimeError] = useState("");
   const [draft, setDraft] = useState("");
@@ -220,6 +338,8 @@ function App() {
   const [settingsSection, setSettingsSection] = useState<SettingsSection>("providers");
   const [selectedChangeId, setSelectedChangeId] = useState<string | null>(null);
   const [attachments, setAttachments] = useState<AttachmentContent[]>([]);
+  const [attachmentImporting, setAttachmentImporting] = useState(false);
+  const [composerDragActive, setComposerDragActive] = useState(false);
   const [previewImage, setPreviewImage] = useState<ImageAttachment | null>(null);
   const [threadQuery, setThreadQuery] = useState("");
   const [workbenchOpen, setWorkbenchOpen] = useState(false);
@@ -251,12 +371,18 @@ function App() {
   const [expandedChangeSets, setExpandedChangeSets] = useState<Set<string>>(new Set());
   const [queueExpanded, setQueueExpanded] = useState(false);
   const messageAreaRef = useRef<HTMLDivElement>(null);
+  const composerContainerRef = useRef<HTMLFormElement>(null);
   const composerRef = useRef<HTMLTextAreaElement>(null);
   const modeMenuRef = useRef<HTMLDivElement>(null);
   const modeMenuPopoverRef = useRef<HTMLDivElement>(null);
   const modeMenuTriggerRef = useRef<HTMLButtonElement>(null);
   const modeMenuId = useId();
   const composerSearchRequestRef = useRef(0);
+  const attachmentImportingRef = useRef(false);
+  const nativeDragDropReadyRef = useRef(false);
+  const importAttachmentPathsRef = useRef<(paths: string[], source: AttachmentImportSource) => Promise<void>>(
+    async () => undefined,
+  );
   const followLatestRef = useRef(true);
   const scrollFrameRef = useRef<number | null>(null);
   const workspaceOperationCountRef = useRef(0);
@@ -1159,10 +1285,16 @@ function App() {
     );
   }
 
-  function addImageAttachment(attachment: AttachmentContent) {
+  function appendAttachments(incoming: AttachmentContent[]) {
     setAttachments((items) => {
-      if (items.some((item) => item.path === attachment.path)) return items;
-      return [...items, attachment];
+      const paths = new Set(items.map((item) => item.path));
+      const next = [...items];
+      for (const attachment of incoming) {
+        if (paths.has(attachment.path) || next.length >= MAX_COMPOSER_ATTACHMENTS) continue;
+        paths.add(attachment.path);
+        next.push(attachment);
+      }
+      return next;
     });
   }
 
@@ -1219,6 +1351,10 @@ function App() {
 
   async function submitMessage(event: FormEvent) {
     event.preventDefault();
+    if (attachmentImportingRef.current) {
+      toast.info("请等待附件处理完成");
+      return;
+    }
     const message = draft.trim();
     if (!message && attachments.length === 0) return;
     if (activeThreadWorkspacePath) {
@@ -1231,6 +1367,11 @@ function App() {
     const attachmentContext = attachments.filter((attachment) => attachment.kind === "document").map((attachment) =>
       `\n\n[附件: ${attachment.name}]\n${attachment.content}`,
     ).join("");
+    const composedInput = message + attachmentContext;
+    if (utf8Bytes(composedInput) > MAX_MESSAGE_INPUT_BYTES) {
+      toast.error("消息与文档内容合计不能超过 100 KB，请移除部分附件或缩短消息");
+      return;
+    }
     const imageAttachments = attachments
       .filter((attachment) => attachment.kind === "image")
       .map((attachment) => ({
@@ -1242,7 +1383,7 @@ function App() {
     setAttachments([]);
     if (currentThreadBusy) setQueueExpanded(true);
     void sendMessage(
-      message + attachmentContext,
+      composedInput,
       imageAttachments,
       agentMode,
       selectedWorkflowId ?? undefined,
@@ -1325,127 +1466,280 @@ function App() {
     }
   }
 
+  async function importAttachmentCandidates(
+    candidates: LocalAttachmentCandidate[],
+    source: AttachmentImportSource,
+  ) {
+    if (candidates.length === 0) return;
+    if (attachmentImportingRef.current) {
+      toast.info("正在处理上一批附件");
+      return;
+    }
+
+    attachmentImportingRef.current = true;
+    setAttachmentImporting(true);
+    const imported: AttachmentContent[] = [];
+    const failures: string[] = [];
+    let duplicateCount = 0;
+    let truncatedCount = 0;
+    let imageCount = attachments.filter((attachment) => attachment.kind === "image").length;
+    let imageBytes = attachments
+      .filter((attachment) => attachment.kind === "image")
+      .reduce((total, attachment) => total + attachment.size, 0);
+    let documentContextBytes = attachments
+      .filter((attachment) => attachment.kind === "document")
+      .reduce((total, attachment) => total + utf8Bytes(attachment.content), 0);
+    const knownPaths = new Set(attachments.map((attachment) => attachment.path));
+
+    try {
+      for (const candidate of candidates) {
+        if (attachments.length + imported.length >= MAX_COMPOSER_ATTACHMENTS) {
+          failures.push(`${candidate.name}：最多添加 ${MAX_COMPOSER_ATTACHMENTS} 个附件`);
+          continue;
+        }
+
+        const mime = imageMime(candidate);
+        if (mime) {
+          if (candidate.size > MAX_IMAGE_ATTACHMENT_BYTES) {
+            failures.push(`${candidate.name}：图片不能超过 4 MiB`);
+            continue;
+          }
+          if (imageCount >= MAX_IMAGE_ATTACHMENTS) {
+            failures.push(`${candidate.name}：最多添加 ${MAX_IMAGE_ATTACHMENTS} 张图片`);
+            continue;
+          }
+          if (imageBytes + candidate.size > MAX_TOTAL_IMAGE_ATTACHMENT_BYTES) {
+            failures.push(`${candidate.name}：图片总大小不能超过 8 MiB`);
+            continue;
+          }
+          try {
+            const path = candidate.identity
+              ? `file://${candidate.identity}`
+              : `${source}://${encodeURIComponent(candidate.name)}?size=${candidate.size}&modified=${candidate.lastModified}`;
+            if (knownPaths.has(path)) {
+              duplicateCount += 1;
+              continue;
+            }
+            const content = await readBlobAsDataUrl(candidate.blob, mime);
+            imported.push({
+              path,
+              name: candidate.name,
+              kind: "image",
+              content,
+              size: candidate.size,
+              truncated: false,
+            });
+            knownPaths.add(path);
+            imageCount += 1;
+            imageBytes += candidate.size;
+          } catch (reason) {
+            failures.push(`${candidate.name}：${toReadableError(reason)}`);
+          }
+          continue;
+        }
+
+        const extension = fileExtension(candidate.name);
+        if (!DOCUMENT_EXTENSIONS.has(extension)) {
+          failures.push(`${candidate.name}：已选择，但暂不支持解析此文件类型`);
+          continue;
+        }
+        if (candidate.size > MAX_LOCAL_DOCUMENT_BYTES) {
+          failures.push(`${candidate.name}：文档不能超过 8 MiB`);
+          continue;
+        }
+        try {
+          const dataUrl = await readBlobAsDataUrl(
+            candidate.blob,
+            candidate.type || "application/octet-stream",
+          );
+          const extracted = await extractLocalDocument(candidate.name, dataUrl);
+          if (!extracted.content.trim()) {
+            failures.push(`${candidate.name}：未提取到可发送的文本`);
+            continue;
+          }
+          if (knownPaths.has(extracted.path)) {
+            duplicateCount += 1;
+            continue;
+          }
+          const remaining = Math.max(0, MAX_DOCUMENT_CONTEXT_BYTES - documentContextBytes);
+          if (remaining === 0) {
+            failures.push(`${candidate.name}：文档内容总量不能超过 64 KiB`);
+            continue;
+          }
+          const bounded = boundUtf8(extracted.content, remaining);
+          imported.push({
+            ...extracted,
+            content: bounded.value,
+            truncated: extracted.truncated || bounded.truncated,
+          });
+          knownPaths.add(extracted.path);
+          documentContextBytes += bounded.bytes;
+          if (extracted.truncated || bounded.truncated) truncatedCount += 1;
+        } catch (reason) {
+          failures.push(`${candidate.name}：${toReadableError(reason)}`);
+        }
+      }
+
+      if (imported.length > 0) appendAttachments(imported);
+      if (truncatedCount > 0) toast.info(`${truncatedCount} 个文档已按上下文上限截断`);
+      if (failures.length > 0) {
+        const suffix = failures.length > 1 ? `（另有 ${failures.length - 1} 个）` : "";
+        toast.error(`${failures[0]}${suffix}`);
+      } else if (duplicateCount > 0 && imported.length === 0) {
+        toast.info("附件已在输入区中");
+      }
+    } finally {
+      attachmentImportingRef.current = false;
+      setAttachmentImporting(false);
+    }
+  }
+
   function handlePaste(event: React.ClipboardEvent<HTMLTextAreaElement>) {
-    const items = event.clipboardData.items;
-    const imageFiles: File[] = [];
-    for (let i = 0; i < items.length; i++) {
-      const item = items[i];
-      if (item.type.startsWith("image/")) {
-        const file = item.getAsFile();
-        if (file) imageFiles.push(file);
-      }
-    }
-    if (imageFiles.length === 0) return; // 没有图片，使用默认粘贴行为（粘贴文本）
-
-    event.preventDefault();
-    for (const file of imageFiles) {
-      const reader = new FileReader();
-      reader.onload = () => {
-        const dataUrl = reader.result as string;
-        const name = file.name || `paste-${Date.now()}.png`;
-        addImageAttachment({
-          path: `clipboard://${name}`,
-          name,
-          kind: "image",
-          content: dataUrl,
-          size: file.size,
-          truncated: false,
-        });
-      };
-      reader.readAsDataURL(file);
-    }
-  }
-
-  // Handle local file drag over the composer area
-  function handleDragOver(event: React.DragEvent) {
-    const items = event.dataTransfer.items;
-    if (items.length > 0) {
-      const hasImage = Array.from(items).some(
-        (item) => item.kind === "file" && item.type.startsWith("image/"),
-      );
-      if (hasImage) {
-        event.preventDefault();
-        event.dataTransfer.dropEffect = "copy";
-      }
-    }
-  }
-
-  function handleDrop(event: React.DragEvent) {
-    const files = Array.from(event.dataTransfer.files).filter((file) =>
-      file.type.startsWith("image/"),
-    );
+    const files = clipboardFiles(event.clipboardData);
     if (files.length === 0) return;
     event.preventDefault();
-    for (const file of files) {
-      const reader = new FileReader();
-      reader.onload = () => {
-        const dataUrl = reader.result as string;
-        addImageAttachment({
-          path: `drop://${file.name}`,
-          name: file.name,
-          kind: "image",
-          content: dataUrl,
-          size: file.size,
-          truncated: false,
-        });
-      };
-      reader.readAsDataURL(file);
+    void importAttachmentCandidates(files.map(candidateFromFile), "clipboard");
+  }
+
+  function handleDragOver(event: React.DragEvent<HTMLFormElement>) {
+    if (!Array.from(event.dataTransfer.items).some((item) => item.kind === "file")) return;
+    event.preventDefault();
+    if (nativeDragDropReadyRef.current) return;
+    event.dataTransfer.dropEffect = "copy";
+    setComposerDragActive(true);
+  }
+
+  function handleDragLeave(event: React.DragEvent<HTMLFormElement>) {
+    const nextTarget = event.relatedTarget;
+    if (!(nextTarget instanceof Node) || !event.currentTarget.contains(nextTarget)) {
+      setComposerDragActive(false);
     }
   }
 
-  // Pick local images via Tauri file dialog
-  async function handlePickImages() {
+  function handleDrop(event: React.DragEvent<HTMLFormElement>) {
+    const files = Array.from(event.dataTransfer.files);
+    if (files.length === 0) return;
+    event.preventDefault();
+    setComposerDragActive(false);
+    if (nativeDragDropReadyRef.current) return;
+    void importAttachmentCandidates(files.map(candidateFromFile), "drop");
+  }
+
+  async function importAttachmentPaths(paths: string[], source: AttachmentImportSource) {
+    const candidates: LocalAttachmentCandidate[] = [];
+    const readFailures: string[] = [];
+    for (const filePath of paths) {
+      const name = filePath.split(/[/\\]/).pop() ?? "attachment";
+      const extension = fileExtension(name);
+      const imageMediaType = IMAGE_MIME_BY_EXTENSION[extension];
+      if (!imageMediaType && !DOCUMENT_EXTENSIONS.has(extension)) {
+        readFailures.push(`${name}：已选择，但暂不支持解析此文件类型`);
+        continue;
+      }
+      try {
+        const metadata = await stat(filePath);
+        if (!metadata.isFile) {
+          readFailures.push(`${name}：只能添加普通文件`);
+          continue;
+        }
+        const maxBytes = imageMediaType
+          ? MAX_IMAGE_ATTACHMENT_BYTES
+          : MAX_LOCAL_DOCUMENT_BYTES;
+        if (metadata.size > maxBytes) {
+          readFailures.push(`${name}：${imageMediaType ? "图片不能超过 4 MiB" : "文档不能超过 8 MiB"}`);
+          continue;
+        }
+        const bytes = await readFile(filePath);
+        const copy = new Uint8Array(bytes.byteLength);
+        copy.set(bytes);
+        const mediaType = imageMediaType
+          ?? DOCUMENT_MIME_BY_EXTENSION[extension]
+          ?? "application/octet-stream";
+        candidates.push({
+          blob: new Blob([copy.buffer], { type: mediaType }),
+          name,
+          size: copy.byteLength,
+          type: mediaType,
+          lastModified: metadata.mtime?.getTime() ?? 0,
+          identity: filePath,
+        });
+      } catch (reason) {
+        readFailures.push(`${name}：${toReadableError(reason)}`);
+      }
+    }
+    await importAttachmentCandidates(candidates, source);
+    if (readFailures.length > 0) {
+      const suffix = readFailures.length > 1 ? `（另有 ${readFailures.length - 1} 个）` : "";
+      toast.error(`${readFailures[0]}${suffix}`);
+    }
+  }
+
+  async function handlePickAttachments() {
     try {
       const selected = await open({
         multiple: true,
-        filters: [
-          {
-            name: "Images",
-            extensions: ["png", "jpg", "jpeg", "gif", "webp", "bmp", "ico", "svg"],
-          },
-        ],
       });
       if (!selected) return;
       const paths = Array.isArray(selected) ? selected : [selected];
-      for (const filePath of paths) {
-        try {
-          const bytes = await readFile(filePath);
-          const ext = filePath.split(".").pop()?.toLowerCase() ?? "png";
-          const mimeMap: Record<string, string> = {
-            png: "image/png",
-            jpg: "image/jpeg",
-            jpeg: "image/jpeg",
-            gif: "image/gif",
-            webp: "image/webp",
-            bmp: "image/bmp",
-            ico: "image/x-icon",
-            svg: "image/svg+xml",
-          };
-          const mime = mimeMap[ext] ?? "image/png";
-          const base64 = btoa(
-            Array.from(new Uint8Array(bytes))
-              .map((b) => String.fromCharCode(b))
-              .join(""),
-          );
-          const dataUrl = `data:${mime};base64,${base64}`;
-          const name = filePath.split(/[/\\]/).pop() ?? `image.${ext}`;
-          const pathKey = `file://${filePath}`;
-          addImageAttachment({
-            path: pathKey,
-            name,
-            kind: "image",
-            content: dataUrl,
-            size: bytes.length,
-            truncated: false,
-          });
-        } catch {
-          // silently skip unreadable files
-        }
-      }
-    } catch {
-      // user cancelled
+      await importAttachmentPaths(paths, "picker");
+    } catch (reason) {
+      toast.error(`无法打开附件：${toReadableError(reason)}`);
     }
   }
+
+  importAttachmentPathsRef.current = importAttachmentPaths;
+
+  useEffect(() => {
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+
+    void appWindow.onDragDropEvent((event) => {
+      const payload = event.payload;
+      if (payload.type === "leave") {
+        setComposerDragActive(false);
+        return;
+      }
+
+      const composer = composerContainerRef.current;
+      const scaleFactor = window.devicePixelRatio > 0 ? window.devicePixelRatio : 1;
+      const point = {
+        x: payload.position.x / scaleFactor,
+        y: payload.position.y / scaleFactor,
+      };
+      const bounds = composer?.getBoundingClientRect();
+      const insideComposer = Boolean(
+        bounds
+        && point.x >= bounds.left
+        && point.x <= bounds.right
+        && point.y >= bounds.top
+        && point.y <= bounds.bottom,
+      );
+
+      if (payload.type === "drop") {
+        setComposerDragActive(false);
+        if (insideComposer && payload.paths.length > 0) {
+          void importAttachmentPathsRef.current(payload.paths, "drop");
+        }
+      } else {
+        setComposerDragActive(insideComposer);
+      }
+    }).then((stopListening) => {
+      if (disposed) {
+        stopListening();
+      } else {
+        nativeDragDropReadyRef.current = true;
+        unlisten = stopListening;
+      }
+    }).catch((reason: unknown) => {
+      if (!disposed) console.error("无法监听原生附件拖放事件:", reason);
+    });
+
+    return () => {
+      disposed = true;
+      nativeDragDropReadyRef.current = false;
+      unlisten?.();
+    };
+  }, []);
 
   function openSettingsSection(section: SettingsSection) {
     clearError();
@@ -2136,10 +2430,13 @@ function App() {
           onCancel={cancelActiveWorkflow}
         />
         <form
-          className="composer"
+          ref={composerContainerRef}
+          className={cn("composer", composerDragActive && "composer--drag-active")}
           onSubmit={submitMessage}
           onDragOver={handleDragOver}
+          onDragLeave={handleDragLeave}
           onDrop={handleDrop}
+          aria-busy={attachmentImporting}
         >
           <div className="composer-quick-actions" role="toolbar" aria-label="输入快捷操作">
             <button
@@ -2155,11 +2452,14 @@ function App() {
             <button
               type="button"
               className="composer-quick-action"
-              aria-label="添加图片"
-              title="添加图片"
-              onClick={() => void handlePickImages()}
+              aria-label="添加附件"
+              title="添加附件"
+              disabled={attachmentImporting}
+              onClick={() => void handlePickAttachments()}
             >
-              <ImagePlus size={17} aria-hidden="true" />
+              {attachmentImporting
+                ? <Loader2 className="spin" size={17} aria-hidden="true" />
+                : <Paperclip size={17} aria-hidden="true" />}
             </button>
             <button
               type="button"
@@ -2188,7 +2488,7 @@ function App() {
             />
           </div>
           {attachments.length > 0 && (
-            <div className="attachment-strip">
+            <div className="attachment-strip" aria-label="待发送附件">
               {attachments.map((attachment) => (
                 <span
                   key={attachment.path}
@@ -2199,6 +2499,13 @@ function App() {
                     ? <img src={attachment.content} alt={attachment.name} className="attachment-thumb" />
                     : <Paperclip size={12} />}
                   <span className="attachment-name">{attachment.name}</span>
+                  {attachment.kind === "document" && attachment.truncated
+                    ? (
+                      <span className="attachment-truncated" aria-label={`${attachment.name} 内容已截断`} title="内容已按上限截断">
+                        <CircleAlert size={12} aria-hidden="true" />
+                      </span>
+                    )
+                    : null}
                   <button type="button" aria-label={`移除 ${attachment.name}`} onClick={() => setAttachments((items) => items.filter((item) => item.path !== attachment.path))}><X size={12} /></button>
                 </span>
               ))}
@@ -2211,7 +2518,7 @@ function App() {
             onChange={handleComposerChange}
             onKeyDown={handleComposerKeyDown}
             onPaste={handlePaste}
-            placeholder="输入消息，可直接粘贴或拖拽图片"
+            placeholder="输入消息，可直接粘贴或拖入文件"
             rows={3}
           />
           {composerTrigger && (
@@ -2373,7 +2680,7 @@ function App() {
                   type="submit"
                   aria-label="发送消息"
                   title={currentThreadBusy ? "加入消息队列" : "发送消息"}
-                  disabled={workspaceSwitching || (!draft.trim() && attachments.length === 0)}
+                  disabled={attachmentImporting || workspaceSwitching || (!draft.trim() && attachments.length === 0)}
                 >
                   <ArrowUp size={18} strokeWidth={2.2} />
                 </button>
@@ -2383,7 +2690,7 @@ function App() {
         </form>
       </section>
 
-      <WorkbenchPanel key={workspaceRevision} open={workbenchOpen} onAttach={(attachment) => setAttachments((items) => items.some((item) => item.path === attachment.path) ? items : [...items, attachment])} />
+      <WorkbenchPanel key={workspaceRevision} open={workbenchOpen} onAttach={(attachment) => appendAttachments([attachment])} />
       <AgentActivityPanel open={agentPanelOpen} parentThreadId={activeThreadId} onClose={() => setAgentPanelOpen(false)} />
       <ImagePreviewDialog image={previewImage} onClose={() => setPreviewImage(null)} />
       <aside className="activity-panel activity-panel--overlay" aria-hidden="true">

@@ -18,7 +18,7 @@ use crate::protocol::ToolRisk;
 use crate::tools::ToolHandler;
 
 pub use browser::{BrowserArtifact, BrowserAuditEvent, BrowserService, BrowserSettings};
-pub use document::{DocumentContent, extract_document};
+pub use document::{DocumentContent, extract_document, extract_document_data_url};
 pub use evaluation::{EvaluationReport, run_recorded_evaluation};
 pub use goal::{CreateGoalRequest, GoalState, GoalStore, GoalTransitionRequest, GoalView};
 pub use memory::{MemorySettings, MemoryStore, MemoryUpsertRequest, MemoryView};

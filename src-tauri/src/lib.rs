@@ -205,6 +205,7 @@ pub fn run() {
             commands::preview_workspace_file,
             commands::save_workspace_file,
             commands::extract_attachment,
+            commands::extract_local_document,
             commands::open_workspace_file,
             commands::reveal_workspace_file,
             commands::git_status,
