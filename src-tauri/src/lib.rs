@@ -5,6 +5,7 @@ pub mod commands;
 pub mod context;
 pub mod execution;
 pub mod extensions;
+pub mod knowledge;
 pub mod logging;
 pub mod multi_agent;
 pub mod ocr;
@@ -172,6 +173,24 @@ pub fn run() {
             commands::get_workflow_run,
             commands::cancel_workflow_run,
             commands::search_repository,
+            commands::get_knowledge_settings,
+            commands::set_knowledge_enabled,
+            commands::list_knowledge_collections,
+            commands::upsert_knowledge_collection,
+            commands::delete_knowledge_collection,
+            commands::add_knowledge_source,
+            commands::list_knowledge_sources,
+            commands::delete_knowledge_source,
+            commands::refresh_knowledge_source,
+            commands::get_knowledge_index_job,
+            commands::cancel_knowledge_index_job,
+            commands::get_embedding_settings,
+            commands::set_embedding_settings,
+            commands::set_embedding_api_key,
+            commands::delete_embedding_api_key,
+            commands::test_embedding_connection,
+            commands::search_knowledge,
+            commands::read_knowledge_citation,
             commands::get_memory_settings,
             commands::set_memory_enabled,
             commands::list_memories,
@@ -214,6 +233,9 @@ pub fn run() {
             commands::git_switch_branch,
             commands::git_action,
             commands::extension_overview,
+            commands::user_rules,
+            commands::save_user_rule,
+            commands::delete_user_rule,
             commands::plugin_overview,
             commands::set_plugin_enabled,
             commands::delete_plugin,

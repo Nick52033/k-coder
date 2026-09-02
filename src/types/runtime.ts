@@ -8,6 +8,17 @@ export interface RuntimeStatus {
 
 export interface ProjectRecord { id: string; name: string; path: string; trusted: boolean; lastOpenedAtMs: number; }
 export interface WorkspaceState { current: ProjectRecord; recent: ProjectRecord[]; }
+export interface KnowledgeSettings { enabled: boolean; autoSearch: boolean; maxResults: number; maxChunkTokens: number; knowledgeBudgetPercent: number; semanticEnabled: boolean; embeddingProvider: string; embeddingModel: string; embeddingDimension: number; embeddingConfigured: boolean; embeddingStatus: string; }
+export interface EmbeddingSettings { provider: string; endpoint: string; model: string; semanticEnabled: boolean; encodingFormat: string; batchSize: number; timeoutMs: number; maxVectorScanChunks: number; modelMaxInputTokens: number; vectorDimension: number; embeddingConfigured: boolean; embeddingStatus: string; }
+export interface KnowledgeCollection { id: string; name: string; scope: string; scopeKey: string; enabled: boolean; sourceCount: number; indexedChunkCount: number; updatedAtMs: number; }
+export interface UpsertKnowledgeCollectionRequest { id?: string | null; name: string; scope?: string; enabled: boolean; }
+export interface AddKnowledgeSourceRequest { collectionId: string; workspaceRelativePath: string; }
+export interface KnowledgeSource { sourceId: string; relativePath: string; sizeBytes: number; contentHashPrefix: string | null; activeRevisionId: string | null; activeEmbeddingModel: string | null; activeEmbeddingDimension: number; activeEmbeddingEncodingFormat: string; embeddingStatus: string; state: string; chunkCount: number; lastIndexedAtMs: number | null; lastErrorCode: string | null; initialJobId: string | null; }
+export interface KnowledgeIndexJob { jobId: string; sourceId: string; state: string; stage: string; embeddingMode: string; processedBytes: number; totalBytes: number; processedChunks: number; totalChunks: number; embeddingRequests: number; retryCount: number; lastHttpStatus: number | null; chunkCount: number; vectorCount: number; errorCode: string | null; createdAtMs: number; completedAtMs: number | null; }
+export interface KnowledgeSearchResult { citationId: string; title: string; path: string; locator: string; preview: string; revision: string; score: number; lexicalRank: number; semanticRank: number | null; }
+export interface KnowledgeSearchResponse { success: boolean; results: KnowledgeSearchResult[]; metadata: Record<string, unknown>; }
+export interface KnowledgeCitation { citationId: string; path: string; locator: string; text: string; revision: string; isCurrentRevision: boolean; }
+export interface SetEmbeddingSettingsRequest { semanticEnabled: boolean; batchSize: number; timeoutMs: number; maxVectorScanChunks: number; }
 export interface FileEntry { name: string; path: string; isDirectory: boolean; size: number | null; modifiedAtMs: number | null; }
 export interface FilePreview { path: string; name: string; language: string; content: string | null; dataUrl: string | null; size: number; truncated: boolean; editable: boolean; contentHash: string | null; }
 export interface SaveWorkspaceFileRequest { path: string; content: string; expectedHash: string; }
@@ -38,6 +49,9 @@ export interface McpDiagnostic { id: string; transport: string; enabled: boolean
 export interface HookDiagnostic { id: string; phase: string; tool: string; enabled: boolean; }
 export interface ExtensionAudit { timestampMs: number; event: string; kind: string; id: string; success: boolean; detail: string; }
 export interface ExtensionOverview { schemaVersion: number; configPaths: string[]; instructions: InstructionSource[]; skills: SkillDiagnostic[]; mcpServers: McpDiagnostic[]; hooks: HookDiagnostic[]; audit: ExtensionAudit[]; error: string | null; }
+export interface UserRule { id: string; title: string; content: string; createdAtMs: number; updatedAtMs: number; }
+export interface SaveUserRuleRequest { id: string | null; title: string; content: string; }
+export interface UserRulesView { schemaVersion: number; path: string; rules: UserRule[]; error: string | null; }
 export interface McpConfigDocumentView { scope: "global" | "project"; path: string; exists: boolean; content: string; error: string | null; }
 export interface McpConfigView { schemaVersion: number; global: McpConfigDocumentView; project: McpConfigDocumentView; overview: ExtensionOverview; }
 export type PluginState = "disabled" | "loaded" | "degraded" | "blocked" | "invalid";

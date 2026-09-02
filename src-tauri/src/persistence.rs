@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use rusqlite::{Connection, OptionalExtension, params};
@@ -6,7 +6,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use crate::protocol::{HistorySortDirection, ThreadItem, ThreadTurn, TodoItem, TokenUsage};
 use crate::storage::{StoredEvent, StoredEventKind, ThreadSummary, TurnSnapshot};
 
-pub const DATABASE_SCHEMA_VERSION: u32 = 5;
+pub const DATABASE_SCHEMA_VERSION: u32 = 8;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -70,6 +70,7 @@ pub enum ProjectionError {
 #[derive(Debug, Clone)]
 pub struct ProjectionDb {
     connection: Arc<Mutex<Connection>>,
+    data_root: Option<PathBuf>,
 }
 
 impl ProjectionDb {
@@ -81,7 +82,19 @@ impl ProjectionDb {
         migrate(&connection)?;
         Ok(Self {
             connection: Arc::new(Mutex::new(connection)),
+            data_root: Some(data_root.to_path_buf()),
         })
+    }
+
+    pub(crate) fn with_connection<T>(
+        &self,
+        operation: impl FnOnce(&mut Connection) -> Result<T, rusqlite::Error>,
+    ) -> Result<T, ProjectionError> {
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| ProjectionError::Poisoned)?;
+        operation(&mut connection).map_err(ProjectionError::Database)
     }
 
     #[cfg(test)]
@@ -90,7 +103,12 @@ impl ProjectionDb {
         migrate(&connection)?;
         Ok(Self {
             connection: Arc::new(Mutex::new(connection)),
+            data_root: None,
         })
+    }
+
+    pub(crate) fn data_root(&self) -> Option<PathBuf> {
+        self.data_root.clone()
     }
 
     pub fn replace_thread(
@@ -786,6 +804,119 @@ fn migrate(connection: &Connection) -> Result<(), rusqlite::Error> {
              COMMIT;",
         )?;
     }
+    if version < 6 {
+        connection.execute_batch(
+            "BEGIN;
+             CREATE TABLE IF NOT EXISTS knowledge_collections(
+               id TEXT PRIMARY KEY,
+               name TEXT NOT NULL,
+               scope TEXT NOT NULL,
+               scope_key TEXT NOT NULL,
+               enabled INTEGER NOT NULL DEFAULT 0,
+               deleted INTEGER NOT NULL DEFAULT 0,
+               created_at_ms INTEGER NOT NULL,
+               updated_at_ms INTEGER NOT NULL,
+               UNIQUE(scope_key,name));
+             CREATE INDEX IF NOT EXISTS knowledge_collections_enabled ON knowledge_collections(enabled,deleted);
+             CREATE TABLE IF NOT EXISTS knowledge_sources(
+               id TEXT PRIMARY KEY,
+               collection_id TEXT NOT NULL,
+               workspace_id TEXT NOT NULL,
+               relative_path TEXT NOT NULL,
+               size_bytes INTEGER NOT NULL,
+               modified_at_ms INTEGER NOT NULL,
+               content_hash TEXT,
+               active_revision_id TEXT,
+               active_embedding_model TEXT,
+               active_embedding_dimension INTEGER NOT NULL DEFAULT 0,
+               active_embedding_encoding_format TEXT NOT NULL DEFAULT 'float',
+               embedding_status TEXT NOT NULL DEFAULT 'lexical_only',
+               state TEXT NOT NULL,
+               last_error_code TEXT,
+               created_at_ms INTEGER NOT NULL,
+               updated_at_ms INTEGER NOT NULL,
+               UNIQUE(collection_id,workspace_id,relative_path));
+             CREATE INDEX IF NOT EXISTS knowledge_sources_collection ON knowledge_sources(collection_id);
+             CREATE TABLE IF NOT EXISTS knowledge_revisions(
+               id TEXT PRIMARY KEY,
+               source_id TEXT NOT NULL,
+               revision_hash TEXT NOT NULL,
+               parser_version TEXT NOT NULL,
+               chunker_version TEXT NOT NULL,
+               embedding_provider TEXT NOT NULL DEFAULT 'none',
+               embedding_model TEXT,
+               embedding_dimension INTEGER NOT NULL DEFAULT 0,
+               embedding_encoding_format TEXT NOT NULL DEFAULT 'float',
+               embedding_status TEXT NOT NULL DEFAULT 'lexical_only',
+               active INTEGER NOT NULL DEFAULT 0,
+               created_at_ms INTEGER NOT NULL,
+               UNIQUE(source_id,revision_hash));
+             CREATE INDEX IF NOT EXISTS knowledge_revisions_active ON knowledge_revisions(source_id,active);
+             CREATE TABLE IF NOT EXISTS knowledge_chunks(
+               id TEXT PRIMARY KEY,
+               revision_id TEXT NOT NULL,
+               ordinal INTEGER NOT NULL,
+               title TEXT NOT NULL,
+               text TEXT NOT NULL,
+               terms TEXT NOT NULL,
+               token_estimate INTEGER NOT NULL,
+               start_line INTEGER NOT NULL,
+               end_line INTEGER NOT NULL,
+               UNIQUE(revision_id,ordinal));
+             CREATE VIRTUAL TABLE IF NOT EXISTS knowledge_chunks_fts USING fts5(
+               chunk_id UNINDEXED, revision_id UNINDEXED, title, text, terms,
+               tokenize='unicode61 remove_diacritics 0');
+             CREATE TABLE IF NOT EXISTS knowledge_chunk_embeddings(
+               chunk_id TEXT NOT NULL,
+               revision_id TEXT NOT NULL,
+               provider TEXT NOT NULL,
+               model TEXT NOT NULL,
+               dimension INTEGER NOT NULL,
+               encoding_format TEXT NOT NULL DEFAULT 'float',
+               vector BLOB NOT NULL,
+               vector_hash TEXT NOT NULL,
+               created_at_ms INTEGER NOT NULL,
+               PRIMARY KEY(chunk_id,provider,model,dimension,encoding_format));
+             CREATE TABLE IF NOT EXISTS knowledge_index_jobs(
+               id TEXT PRIMARY KEY,
+               source_id TEXT NOT NULL,
+               requested_revision_hash TEXT,
+               stage TEXT NOT NULL DEFAULT 'parse',
+               embedding_mode TEXT NOT NULL DEFAULT 'lexical_only',
+               processed_chunks INTEGER NOT NULL DEFAULT 0,
+               total_chunks INTEGER NOT NULL DEFAULT 0,
+               embedding_requests INTEGER NOT NULL DEFAULT 0,
+               retry_count INTEGER NOT NULL DEFAULT 0,
+               last_http_status INTEGER,
+               state TEXT NOT NULL,
+               processed_bytes INTEGER NOT NULL DEFAULT 0,
+               total_bytes INTEGER NOT NULL DEFAULT 0,
+               error_code TEXT,
+               error_message TEXT,
+               created_at_ms INTEGER NOT NULL,
+               started_at_ms INTEGER,
+               completed_at_ms INTEGER);
+             CREATE INDEX IF NOT EXISTS knowledge_index_jobs_source ON knowledge_index_jobs(source_id,state,created_at_ms);
+             INSERT INTO schema_migrations(version,applied_at) VALUES(6,datetime('now'));
+             COMMIT;",
+        )?;
+    }
+    if version < 7 {
+        connection.execute_batch(
+            "BEGIN;
+             ALTER TABLE knowledge_index_jobs ADD COLUMN chunk_count INTEGER NOT NULL DEFAULT 0;
+             INSERT INTO schema_migrations(version,applied_at) VALUES(7,datetime('now'));
+             COMMIT;",
+        )?;
+    }
+    if version < 8 {
+        connection.execute_batch(
+            "BEGIN;
+             ALTER TABLE knowledge_index_jobs ADD COLUMN vector_count INTEGER NOT NULL DEFAULT 0;
+             INSERT INTO schema_migrations(version,applied_at) VALUES(8,datetime('now'));
+             COMMIT;",
+        )?;
+    }
     Ok(())
 }
 
@@ -870,5 +1001,33 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
         assert_eq!(tables.len(), 4);
+        let knowledge_job_columns = db
+            .connection
+            .lock()
+            .unwrap()
+            .prepare("PRAGMA table_info(knowledge_index_jobs)")
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(1)?, row.get::<_, Option<String>>(4)?))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(
+            knowledge_job_columns.iter().any(|(name, default)| {
+                name == "vector_count" && default.as_deref() == Some("0")
+            })
+        );
+        let embedding_table_exists: bool = db
+            .connection
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='knowledge_chunk_embeddings')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(embedding_table_exists);
     }
 }

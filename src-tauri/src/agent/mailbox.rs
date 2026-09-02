@@ -2,6 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex as StdMutex};
 
 use tokio::sync::{Mutex, oneshot};
+use tokio_util::sync::CancellationToken;
 
 use super::RunTurnRequest;
 use crate::protocol::{
@@ -256,6 +257,7 @@ fn bump_revision(state: &mut ThreadMailboxState, thread_id: &str) -> u64 {
 struct TurnControlState {
     accepting: bool,
     messages: VecDeque<ChatMessage>,
+    provider_cancellation: Option<CancellationToken>,
 }
 
 #[derive(Debug, Default)]
@@ -269,6 +271,7 @@ impl TurnControl {
             state: StdMutex::new(TurnControlState {
                 accepting: true,
                 messages: VecDeque::new(),
+                provider_cancellation: None,
             }),
         })
     }
@@ -279,7 +282,27 @@ impl TurnControl {
             return Err(());
         }
         state.messages.push_back(message);
+        if let Some(cancellation) = &state.provider_cancellation {
+            cancellation.cancel();
+        }
         Ok(())
+    }
+
+    pub fn begin_provider_request(
+        &self,
+        turn_cancellation: &CancellationToken,
+    ) -> CancellationToken {
+        let cancellation = turn_cancellation.child_token();
+        let mut state = self.state.lock().unwrap();
+        if !state.messages.is_empty() {
+            cancellation.cancel();
+        }
+        state.provider_cancellation = Some(cancellation.clone());
+        cancellation
+    }
+
+    pub fn end_provider_request(&self) {
+        self.state.lock().unwrap().provider_cancellation = None;
     }
 
     pub fn take_pending(&self) -> Vec<ChatMessage> {
@@ -526,5 +549,25 @@ mod tests {
                 })
                 .is_err()
         );
+    }
+
+    #[test]
+    fn steering_cancels_only_the_current_provider_request() {
+        let control = TurnControl::new();
+        let turn_cancellation = CancellationToken::new();
+        let provider_cancellation = control.begin_provider_request(&turn_cancellation);
+        let message = ChatMessage {
+            schema_version: PROTOCOL_VERSION,
+            id: "steer-provider".into(),
+            role: MessageRole::User,
+            content: Vec::new(),
+            created_at_ms: 1,
+        };
+
+        control.steer(message.clone()).unwrap();
+
+        assert!(provider_cancellation.is_cancelled());
+        assert!(!turn_cancellation.is_cancelled());
+        assert_eq!(control.take_pending(), vec![message]);
     }
 }

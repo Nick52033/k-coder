@@ -13,7 +13,11 @@ use crate::agent::mailbox::{MailboxTurn, QueuedTurnSteerError, ThreadMailbox, Tu
 use crate::agent::thread_operation::{ThreadOperationGate, ThreadOperationGuard};
 use crate::execution::{BundledTools, CommandRuntime, ExecutionError, NativePtyRuntime};
 use crate::extensions::mcp::OsMcpSecretStore;
-use crate::extensions::{ExtensionError, ExtensionOverview, ExtensionService, McpConfigView};
+use crate::extensions::{
+    ExtensionError, ExtensionOverview, ExtensionService, McpConfigView, SaveUserRuleRequest,
+    UserRulesView,
+};
+use crate::knowledge::KnowledgeService;
 use crate::logging::StructuredLogger;
 use crate::multi_agent::MultiAgentCoordinator;
 use crate::patch::{PatchError, PatchService};
@@ -62,6 +66,7 @@ pub struct AppState {
     extension_workspace: Mutex<Option<(PathBuf, u64)>>,
     subagents: MultiAgentCoordinator,
     advanced: AdvancedServices,
+    knowledge: KnowledgeService,
 }
 
 #[derive(Debug)]
@@ -175,6 +180,7 @@ impl AppState {
         let pty_runtime =
             NativePtyRuntime::new_with_bundled_tools(&workspace_root, bundled_tools.clone())?;
         let repository = Arc::new(JsonlThreadRepository::new(&data_root)?);
+        let knowledge = KnowledgeService::new(repository.projection(), credentials.clone());
         let approval_mode = repository
             .projection()
             .setting("approval_mode")
@@ -204,6 +210,17 @@ impl AppState {
             patch_service.clone(),
             command_runtime.clone(),
         )
+        .with_additional_handlers(
+            vec![
+                Arc::new(crate::knowledge::KnowledgeSearchTool::new(
+                    knowledge.clone(),
+                )),
+                Arc::new(crate::knowledge::KnowledgeCitationTool::new(
+                    knowledge.clone(),
+                )),
+            ],
+            crate::knowledge::knowledge_tool_risks(),
+        )?
         .with_additional_handlers(advanced_handlers, advanced_risks)?;
         Ok(Self {
             started_at: Instant::now(),
@@ -231,6 +248,7 @@ impl AppState {
             extension_workspace: Mutex::new(None),
             subagents,
             advanced,
+            knowledge,
         })
     }
 
@@ -332,6 +350,10 @@ impl AppState {
 
     pub fn advanced(&self) -> AdvancedServices {
         self.advanced.clone()
+    }
+
+    pub fn knowledge(&self) -> KnowledgeService {
+        self.knowledge.clone()
     }
 
     pub fn patch_service(&self) -> PatchService {
@@ -443,6 +465,15 @@ impl AppState {
             self.patch_service.clone(),
             command.clone(),
         )
+        .with_additional_handlers(
+            vec![
+                Arc::new(crate::knowledge::KnowledgeSearchTool::new(self.knowledge())),
+                Arc::new(crate::knowledge::KnowledgeCitationTool::new(
+                    self.knowledge(),
+                )),
+            ],
+            crate::knowledge::knowledge_tool_risks(),
+        )?
         .with_additional_handlers(advanced_handlers, advanced_risks)?;
         self.repository
             .projection()
@@ -517,6 +548,15 @@ impl AppState {
             self.patch_service.clone(),
             self.command_runtime(),
         )
+        .with_additional_handlers(
+            vec![
+                Arc::new(crate::knowledge::KnowledgeSearchTool::new(self.knowledge())),
+                Arc::new(crate::knowledge::KnowledgeCitationTool::new(
+                    self.knowledge(),
+                )),
+            ],
+            crate::knowledge::knowledge_tool_risks(),
+        )?
         .with_additional_handlers(advanced_handlers, advanced_risks)?)
     }
 
@@ -626,6 +666,33 @@ impl AppState {
         Ok(self
             .extensions
             .save_mcp_config(&self.workspace_root(), scope, content)?)
+    }
+
+    pub fn user_rules_view(&self) -> Result<UserRulesView, AppStateError> {
+        Ok(self.extensions.user_rules_view()?)
+    }
+
+    pub async fn save_user_rule(
+        &self,
+        request: SaveUserRuleRequest,
+    ) -> Result<UserRulesView, AppStateError> {
+        self.extensions.save_user_rule(request)?;
+        let prepared = self.prepare_extensions(true).await;
+        let mut view = self.extensions.user_rules_view()?;
+        if let Err(error) = prepared {
+            view.error = Some(error.to_string());
+        }
+        Ok(view)
+    }
+
+    pub async fn delete_user_rule(&self, id: &str) -> Result<UserRulesView, AppStateError> {
+        self.extensions.delete_user_rule(id)?;
+        let prepared = self.prepare_extensions(true).await;
+        let mut view = self.extensions.user_rules_view()?;
+        if let Err(error) = prepared {
+            view.error = Some(error.to_string());
+        }
+        Ok(view)
     }
 
     pub async fn set_extension_enabled(

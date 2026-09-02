@@ -24,7 +24,12 @@ use crate::execution::{
     CommandSessionView, OutputPage, PtyOutputPage, PtySessionView, StartCommandRequest,
     StartPtyRequest,
 };
-use crate::extensions::{ExtensionOverview, McpConfigView};
+use crate::extensions::{ExtensionOverview, McpConfigView, SaveUserRuleRequest, UserRulesView};
+use crate::knowledge::{
+    AddSourceRequest, EmbeddingConnectionTest, EmbeddingSettings, KnowledgeCollection,
+    KnowledgeError, KnowledgeIndexJob, KnowledgeSearchResponse, KnowledgeSettings, KnowledgeSource,
+    SetEmbeddingSettingsRequest, UpsertCollectionRequest,
+};
 use crate::logging::{LogQuery, LogQueryResult};
 use crate::multi_agent::{
     CreateSubagentRequest, MultiAgentError, SubagentEventPublisher, SubagentExecutionContext,
@@ -497,6 +502,9 @@ pub fn runtime_status(state: State<'_, AppState>) -> RuntimeStatus {
             "opt-in-memory".to_string(),
             "bounded-document-extraction".to_string(),
             "runtime-metrics".to_string(),
+            "knowledge-fts".to_string(),
+            "knowledge-citations".to_string(),
+            "embedding-configuration".to_string(),
         ],
     }
 }
@@ -660,6 +668,224 @@ pub fn search_repository(
     RepositorySearchIndex::new(state.workspace_root())
         .search(&query, limit.unwrap_or(50))
         .map_err(|error| CommandError::new("repository_search", error))
+}
+
+fn knowledge_command_error(error: KnowledgeError) -> CommandError {
+    CommandError::new(error.code(), error)
+}
+
+#[tauri::command]
+pub fn get_knowledge_settings(state: State<'_, AppState>) -> CommandResult<KnowledgeSettings> {
+    state
+        .knowledge()
+        .settings()
+        .map_err(knowledge_command_error)
+}
+
+#[tauri::command]
+pub fn set_knowledge_enabled(
+    state: State<'_, AppState>,
+    enabled: bool,
+) -> CommandResult<KnowledgeSettings> {
+    state
+        .knowledge()
+        .set_enabled(enabled)
+        .map_err(knowledge_command_error)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub fn list_knowledge_collections(
+    state: State<'_, AppState>,
+) -> CommandResult<Vec<KnowledgeCollection>> {
+    state
+        .knowledge()
+        .list_collections(&state.workspace_root())
+        .map_err(knowledge_command_error)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub fn upsert_knowledge_collection(
+    state: State<'_, AppState>,
+    request: UpsertCollectionRequest,
+) -> CommandResult<KnowledgeCollection> {
+    state
+        .knowledge()
+        .upsert_collection(&state.workspace_root(), request)
+        .map_err(knowledge_command_error)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn delete_knowledge_collection(
+    state: State<'_, AppState>,
+    collection_id: String,
+    confirmation_token: String,
+) -> CommandResult<serde_json::Value> {
+    state
+        .knowledge()
+        .delete_collection(&state.workspace_root(), &collection_id, &confirmation_token)
+        .await
+        .map_err(knowledge_command_error)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn add_knowledge_source(
+    state: State<'_, AppState>,
+    request: AddSourceRequest,
+) -> CommandResult<KnowledgeSource> {
+    state
+        .knowledge()
+        .add_source(&state.workspace_root(), request)
+        .await
+        .map_err(knowledge_command_error)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub fn list_knowledge_sources(
+    state: State<'_, AppState>,
+    collection_id: String,
+) -> CommandResult<Vec<KnowledgeSource>> {
+    state
+        .knowledge()
+        .list_sources(&state.workspace_root(), &collection_id)
+        .map_err(knowledge_command_error)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn delete_knowledge_source(
+    state: State<'_, AppState>,
+    source_id: String,
+    confirmation_token: String,
+) -> CommandResult<serde_json::Value> {
+    state
+        .knowledge()
+        .delete_source(&state.workspace_root(), &source_id, &confirmation_token)
+        .await
+        .map_err(knowledge_command_error)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn refresh_knowledge_source(
+    state: State<'_, AppState>,
+    source_id: String,
+) -> CommandResult<KnowledgeIndexJob> {
+    state
+        .knowledge()
+        .refresh_source(&state.workspace_root(), &source_id)
+        .await
+        .map_err(knowledge_command_error)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub fn get_knowledge_index_job(
+    state: State<'_, AppState>,
+    job_id: String,
+) -> CommandResult<KnowledgeIndexJob> {
+    state
+        .knowledge()
+        .get_job(&job_id)
+        .map_err(knowledge_command_error)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub fn cancel_knowledge_index_job(
+    state: State<'_, AppState>,
+    job_id: String,
+) -> CommandResult<KnowledgeIndexJob> {
+    state
+        .knowledge()
+        .cancel_job(&job_id)
+        .map_err(knowledge_command_error)
+}
+
+#[tauri::command]
+pub fn get_embedding_settings(state: State<'_, AppState>) -> CommandResult<EmbeddingSettings> {
+    state
+        .knowledge()
+        .embedding_settings()
+        .map_err(knowledge_command_error)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub fn set_embedding_settings(
+    state: State<'_, AppState>,
+    request: SetEmbeddingSettingsRequest,
+) -> CommandResult<EmbeddingSettings> {
+    state
+        .knowledge()
+        .set_embedding_settings(request)
+        .map_err(knowledge_command_error)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub fn set_embedding_api_key(
+    state: State<'_, AppState>,
+    api_key: String,
+) -> CommandResult<serde_json::Value> {
+    state
+        .knowledge()
+        .set_embedding_key(&api_key)
+        .map_err(knowledge_command_error)
+}
+
+#[tauri::command]
+pub fn delete_embedding_api_key(state: State<'_, AppState>) -> CommandResult<serde_json::Value> {
+    state
+        .knowledge()
+        .delete_embedding_key()
+        .map_err(knowledge_command_error)
+}
+
+#[tauri::command]
+pub async fn test_embedding_connection(
+    state: State<'_, AppState>,
+) -> CommandResult<EmbeddingConnectionTest> {
+    state
+        .knowledge()
+        .test_embedding_connection()
+        .await
+        .map_err(knowledge_command_error)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn search_knowledge(
+    state: State<'_, AppState>,
+    query: String,
+    limit: Option<usize>,
+    thread_id: Option<String>,
+    turn_id: Option<String>,
+) -> CommandResult<KnowledgeSearchResponse> {
+    state
+        .knowledge()
+        .search(
+            &state.workspace_root(),
+            thread_id.as_deref().unwrap_or("settings"),
+            turn_id.as_deref().unwrap_or("settings"),
+            &query,
+            limit.unwrap_or(6),
+        )
+        .await
+        .map_err(knowledge_command_error)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub fn read_knowledge_citation(
+    state: State<'_, AppState>,
+    citation_id: String,
+    before: Option<usize>,
+    after: Option<usize>,
+    thread_id: String,
+    turn_id: String,
+) -> CommandResult<crate::knowledge::KnowledgeCitation> {
+    state
+        .knowledge()
+        .read_citation(
+            &thread_id,
+            &turn_id,
+            &citation_id,
+            before.unwrap_or(0),
+            after.unwrap_or(0),
+        )
+        .map_err(knowledge_command_error)
 }
 
 #[tauri::command]
@@ -903,6 +1129,40 @@ pub async fn extension_overview(
         overview.error = Some(error.to_string());
     }
     Ok(overview)
+}
+
+#[tauri::command]
+pub async fn user_rules(state: State<'_, AppState>, refresh: bool) -> CommandResult<UserRulesView> {
+    let prepared = state.prepare_extensions(refresh).await;
+    let mut view = state
+        .user_rules_view()
+        .map_err(|error| CommandError::new("extensions", error))?;
+    if let Err(error) = prepared {
+        view.error = Some(error.to_string());
+    }
+    Ok(view)
+}
+
+#[tauri::command]
+pub async fn save_user_rule(
+    state: State<'_, AppState>,
+    request: SaveUserRuleRequest,
+) -> CommandResult<UserRulesView> {
+    state
+        .save_user_rule(request)
+        .await
+        .map_err(|error| CommandError::new("extensions", error))
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn delete_user_rule(
+    state: State<'_, AppState>,
+    id: String,
+) -> CommandResult<UserRulesView> {
+    state
+        .delete_user_rule(&id)
+        .await
+        .map_err(|error| CommandError::new("extensions", error))
 }
 
 #[tauri::command]

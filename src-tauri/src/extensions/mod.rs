@@ -9,6 +9,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 
+use serde::de::Error as _;
+use serde::ser::{SerializeMap, SerializeStruct};
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
@@ -29,6 +31,12 @@ const MAX_SELECTED_SKILLS: usize = 4;
 const MAX_AUDIT_RECORDS: usize = 200;
 const MAX_AUDIT_BYTES: u64 = 2 * 1024 * 1024;
 const MCP_CONFIG_FILE_NAME: &str = "mcp.json";
+const USER_RULES_CONFIG_FILE_NAME: &str = "user-rules.json";
+const USER_RULES_SCHEMA_VERSION: u32 = 1;
+const MAX_USER_RULES: usize = 64;
+const MAX_USER_RULE_TITLE_CHARS: usize = 80;
+const MAX_USER_RULE_BYTES: usize = 16 * 1024;
+const MAX_USER_RULES_CONFIG_BYTES: usize = 256 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ExtensionError {
@@ -70,11 +78,310 @@ impl Default for ExtensionConfig {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[derive(Debug, Clone, Default)]
 pub struct McpConfigFile {
-    #[serde(default)]
     pub mcp_servers: Vec<McpServerConfig>,
+}
+
+const DEFAULT_MCP_TIMEOUT_MS: u64 = 30_000;
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct McpConfigFileWire {
+    #[serde(default)]
+    mcp_servers: McpServersWire,
+}
+
+#[derive(Debug, Default)]
+struct McpServersWire(Vec<McpServerConfig>);
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct NamedMcpServerWire {
+    #[serde(default, rename = "type", alias = "transport")]
+    kind: Option<String>,
+    #[serde(default)]
+    enabled: Option<bool>,
+    #[serde(default, alias = "timeout_ms")]
+    timeout_ms: Option<u64>,
+    #[serde(default)]
+    command: Option<NamedMcpCommandWire>,
+    #[serde(default)]
+    args: Vec<String>,
+    #[serde(default)]
+    url: Option<String>,
+    #[serde(default, deserialize_with = "mcp::deserialize_header_map")]
+    headers: HashMap<String, String>,
+    #[serde(default, rename = "secret_env", alias = "secretEnv")]
+    secret_env: HashMap<String, String>,
+    #[serde(
+        default,
+        rename = "secret_headers",
+        alias = "secretHeaders",
+        deserialize_with = "mcp::deserialize_header_map"
+    )]
+    secret_headers: HashMap<String, String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum NamedMcpCommandWire {
+    Program(String),
+    Structured(Vec<String>),
+}
+
+impl<'de> Deserialize<'de> for McpServersWire {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct Visitor;
+
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = McpServersWire;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("an MCP server object or a legacy MCP server array")
+            }
+
+            fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                let mut servers = Vec::new();
+                while let Some(server) = sequence.next_element::<McpServerConfig>()? {
+                    servers.push(server);
+                }
+                Ok(McpServersWire(servers))
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::MapAccess<'de>,
+            {
+                let mut ids = HashSet::new();
+                let mut servers = Vec::new();
+                while let Some((id, server)) = map.next_entry::<String, NamedMcpServerWire>()? {
+                    if !ids.insert(id.clone()) {
+                        return Err(A::Error::custom(format!("duplicate MCP server {id}")));
+                    }
+                    servers.push(server.into_config(id).map_err(A::Error::custom)?);
+                }
+                Ok(McpServersWire(servers))
+            }
+        }
+
+        deserializer.deserialize_any(Visitor)
+    }
+}
+
+impl NamedMcpServerWire {
+    fn into_config(self, id: String) -> Result<McpServerConfig, String> {
+        let Self {
+            kind,
+            enabled,
+            timeout_ms,
+            command,
+            args,
+            url,
+            headers,
+            secret_env,
+            secret_headers,
+        } = self;
+        let is_http = match kind.as_deref() {
+            Some("stdio") => false,
+            Some("http" | "streamable-http" | "streamable_http") => true,
+            Some(other) => {
+                return Err(format!(
+                    "MCP server {id} type must be stdio or streamable-http, got {other}"
+                ));
+            }
+            None if command.is_some() && url.is_none() => false,
+            None if url.is_some() && command.is_none() => true,
+            None => {
+                return Err(format!(
+                    "MCP server {id} must set type or provide exactly one of command and url"
+                ));
+            }
+        };
+        let enabled = enabled.unwrap_or(true);
+        let timeout_ms = timeout_ms.unwrap_or(DEFAULT_MCP_TIMEOUT_MS);
+
+        let transport = if is_http {
+            if command.is_some() || !args.is_empty() || !secret_env.is_empty() {
+                return Err(format!(
+                    "MCP server {id} streamable-http configuration cannot contain stdio fields"
+                ));
+            }
+            let url = url
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| format!("MCP server {id} requires url"))?;
+            mcp::McpTransportConfig::StreamableHttp {
+                url,
+                headers,
+                secret_headers,
+            }
+        } else {
+            if url.is_some() || !headers.is_empty() || !secret_headers.is_empty() {
+                return Err(format!(
+                    "MCP server {id} stdio configuration cannot contain HTTP fields"
+                ));
+            }
+            let command = command.ok_or_else(|| format!("MCP server {id} requires command"))?;
+            let command = match command {
+                NamedMcpCommandWire::Program(program) => {
+                    if program.trim().is_empty() {
+                        return Err(format!("MCP server {id} requires command"));
+                    }
+                    let mut structured = Vec::with_capacity(args.len() + 1);
+                    structured.push(program);
+                    structured.extend(args);
+                    structured
+                }
+                NamedMcpCommandWire::Structured(structured) => {
+                    if !args.is_empty() {
+                        return Err(format!(
+                            "MCP server {id} cannot combine an array command with args"
+                        ));
+                    }
+                    structured
+                }
+            };
+            mcp::McpTransportConfig::Stdio {
+                command,
+                secret_env,
+            }
+        };
+
+        Ok(McpServerConfig {
+            id,
+            enabled,
+            timeout_ms,
+            transport,
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for McpConfigFile {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = McpConfigFileWire::deserialize(deserializer)?;
+        Ok(Self {
+            mcp_servers: wire.mcp_servers.0,
+        })
+    }
+}
+
+struct NamedMcpServers<'a>(&'a [McpServerConfig]);
+struct NamedMcpServer<'a>(&'a McpServerConfig);
+struct SortedStringMap<'a>(&'a HashMap<String, String>);
+
+impl Serialize for McpConfigFile {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut document = serializer.serialize_struct("McpConfigFile", 1)?;
+        document.serialize_field("mcpServers", &NamedMcpServers(&self.mcp_servers))?;
+        document.end()
+    }
+}
+
+impl Serialize for NamedMcpServers<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut servers = serializer.serialize_map(Some(self.0.len()))?;
+        for server in self.0 {
+            servers.serialize_entry(&server.id, &NamedMcpServer(server))?;
+        }
+        servers.end()
+    }
+}
+
+impl Serialize for NamedMcpServer<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let server = self.0;
+        match &server.transport {
+            mcp::McpTransportConfig::Stdio {
+                command,
+                secret_env,
+            } => {
+                let mut fields = 2;
+                fields += usize::from(!server.enabled);
+                fields += usize::from(server.timeout_ms != DEFAULT_MCP_TIMEOUT_MS);
+                fields += usize::from(command.len() > 1);
+                fields += usize::from(!secret_env.is_empty());
+                let mut value = serializer.serialize_struct("NamedMcpServer", fields)?;
+                value.serialize_field("type", "stdio")?;
+                if !server.enabled {
+                    value.serialize_field("enabled", &false)?;
+                }
+                if server.timeout_ms != DEFAULT_MCP_TIMEOUT_MS {
+                    value.serialize_field("timeoutMs", &server.timeout_ms)?;
+                }
+                value.serialize_field(
+                    "command",
+                    command.first().map(String::as_str).unwrap_or_default(),
+                )?;
+                if command.len() > 1 {
+                    value.serialize_field("args", &command[1..])?;
+                }
+                if !secret_env.is_empty() {
+                    value.serialize_field("secret_env", &SortedStringMap(secret_env))?;
+                }
+                value.end()
+            }
+            mcp::McpTransportConfig::StreamableHttp {
+                url,
+                headers,
+                secret_headers,
+            } => {
+                let mut fields = 2;
+                fields += usize::from(!server.enabled);
+                fields += usize::from(server.timeout_ms != DEFAULT_MCP_TIMEOUT_MS);
+                fields += usize::from(!headers.is_empty());
+                fields += usize::from(!secret_headers.is_empty());
+                let mut value = serializer.serialize_struct("NamedMcpServer", fields)?;
+                value.serialize_field("type", "streamable-http")?;
+                if !server.enabled {
+                    value.serialize_field("enabled", &false)?;
+                }
+                if server.timeout_ms != DEFAULT_MCP_TIMEOUT_MS {
+                    value.serialize_field("timeoutMs", &server.timeout_ms)?;
+                }
+                value.serialize_field("url", url)?;
+                if !headers.is_empty() {
+                    value.serialize_field("headers", &SortedStringMap(headers))?;
+                }
+                if !secret_headers.is_empty() {
+                    value.serialize_field("secret_headers", &SortedStringMap(secret_headers))?;
+                }
+                value.end()
+            }
+        }
+    }
+}
+
+impl Serialize for SortedStringMap<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut entries = self.0.iter().collect::<Vec<_>>();
+        entries.sort_by(|left, right| left.0.cmp(right.0));
+        let mut map = serializer.serialize_map(Some(entries.len()))?;
+        for (key, value) in entries {
+            map.serialize_entry(key, value)?;
+        }
+        map.end()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -103,6 +410,50 @@ pub struct InstructionSource {
     pub scope: String,
     pub priority: u32,
     pub bytes: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct UserRule {
+    pub id: String,
+    pub title: String,
+    pub content: String,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SaveUserRuleRequest {
+    pub id: Option<String>,
+    pub title: String,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UserRulesView {
+    pub schema_version: u32,
+    pub path: String,
+    pub rules: Vec<UserRule>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct UserRulesFile {
+    schema_version: u32,
+    #[serde(default)]
+    rules: Vec<UserRule>,
+}
+
+impl Default for UserRulesFile {
+    fn default() -> Self {
+        Self {
+            schema_version: USER_RULES_SCHEMA_VERSION,
+            rules: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -217,6 +568,7 @@ pub struct ExtensionService {
     skills: Arc<RwLock<Vec<LoadedSkill>>>,
     audit: Arc<Mutex<Vec<ExtensionAudit>>>,
     audit_path: PathBuf,
+    user_rules_lock: Arc<Mutex<()>>,
     plugins: PluginHost,
 }
 
@@ -266,6 +618,7 @@ impl ExtensionService {
             skills: Arc::new(RwLock::new(Vec::new())),
             audit: Arc::new(Mutex::new(audit)),
             audit_path,
+            user_rules_lock: Arc::new(Mutex::new(())),
             plugins,
         }
     }
@@ -475,8 +828,14 @@ impl ExtensionService {
 
     pub fn revision(&self, workspace: &Path) -> Result<u64, ExtensionError> {
         let (_, _, mut paths) = self.config_paths(workspace)?;
+        let user_rules_path = resolve_scoped_config_path(
+            &self.data_root,
+            Path::new(USER_RULES_CONFIG_FILE_NAME),
+            false,
+        )?;
         paths.extend([
             self.data_root.join("AGENTS.md"),
+            user_rules_path,
             workspace.join("AGENTS.md"),
         ]);
         if let Some(root) = &self.builtin_skills_root {
@@ -630,7 +989,7 @@ impl ExtensionService {
         let global = read_mcp_config_document("global", &mcp_paths[0])?;
         let project = read_mcp_config_document("project", &mcp_paths[1])?;
         Ok(McpConfigView {
-            schema_version: 1,
+            schema_version: 2,
             global,
             project,
             overview: self.overview(),
@@ -673,6 +1032,103 @@ impl ExtensionService {
             true,
             &format!("{} servers", config.mcp_servers.len()),
         );
+        Ok(())
+    }
+
+    pub fn user_rules_view(&self) -> Result<UserRulesView, ExtensionError> {
+        let _guard = self
+            .user_rules_lock
+            .lock()
+            .map_err(|_| ExtensionError::Io("user rule lock poisoned".into()))?;
+        let path = resolve_scoped_config_path(
+            &self.data_root,
+            Path::new(USER_RULES_CONFIG_FILE_NAME),
+            false,
+        )?;
+        let file = read_user_rules_file(&path)?;
+        Ok(UserRulesView {
+            schema_version: USER_RULES_SCHEMA_VERSION,
+            path: user_facing_path(&path),
+            rules: file.rules,
+            error: None,
+        })
+    }
+
+    pub fn save_user_rule(&self, request: SaveUserRuleRequest) -> Result<(), ExtensionError> {
+        let _guard = self
+            .user_rules_lock
+            .lock()
+            .map_err(|_| ExtensionError::Io("user rule lock poisoned".into()))?;
+        let display_path = resolve_scoped_config_path(
+            &self.data_root,
+            Path::new(USER_RULES_CONFIG_FILE_NAME),
+            false,
+        )?;
+        let mut file = read_user_rules_file(&display_path)?;
+        let (title, content) = validate_user_rule_input(&request.title, &request.content)?;
+        let now = crate::storage::now_ms();
+        let (id, detail) = if let Some(id) = request.id {
+            validate_user_rule_id(&id)?;
+            let rule = file
+                .rules
+                .iter_mut()
+                .find(|rule| rule.id == id)
+                .ok_or_else(|| ExtensionError::Config("user rule no longer exists".into()))?;
+            rule.title = title;
+            rule.content = content;
+            rule.updated_at_ms = now.max(rule.created_at_ms);
+            (id, "updated")
+        } else {
+            if file.rules.len() >= MAX_USER_RULES {
+                return Err(ExtensionError::Config(format!(
+                    "no more than {MAX_USER_RULES} user rules are allowed"
+                )));
+            }
+            let id = uuid::Uuid::new_v4().to_string();
+            file.rules.push(UserRule {
+                id: id.clone(),
+                title,
+                content,
+                created_at_ms: now,
+                updated_at_ms: now,
+            });
+            (id, "created")
+        };
+        validate_user_rules_file(&file, &display_path)?;
+        let path = resolve_scoped_config_path(
+            &self.data_root,
+            Path::new(USER_RULES_CONFIG_FILE_NAME),
+            true,
+        )?;
+        write_user_rules_file(&path, &file)?;
+        self.record("user_rule_saved", "user_rule", &id, true, detail);
+        Ok(())
+    }
+
+    pub fn delete_user_rule(&self, id: &str) -> Result<(), ExtensionError> {
+        validate_user_rule_id(id)?;
+        let _guard = self
+            .user_rules_lock
+            .lock()
+            .map_err(|_| ExtensionError::Io("user rule lock poisoned".into()))?;
+        let display_path = resolve_scoped_config_path(
+            &self.data_root,
+            Path::new(USER_RULES_CONFIG_FILE_NAME),
+            false,
+        )?;
+        let mut file = read_user_rules_file(&display_path)?;
+        let previous_len = file.rules.len();
+        file.rules.retain(|rule| rule.id != id);
+        if file.rules.len() == previous_len {
+            return Err(ExtensionError::Config("user rule no longer exists".into()));
+        }
+        let path = resolve_scoped_config_path(
+            &self.data_root,
+            Path::new(USER_RULES_CONFIG_FILE_NAME),
+            true,
+        )?;
+        write_user_rules_file(&path, &file)?;
+        self.record("user_rule_deleted", "user_rule", id, true, "deleted");
         Ok(())
     }
 
@@ -956,7 +1412,7 @@ fn read_mcp_config_document(
 }
 
 fn default_mcp_config_content() -> String {
-    "{\n  \"mcpServers\": []\n}\n".into()
+    "{\n  \"mcpServers\": {}\n}\n".into()
 }
 
 fn resolve_scoped_config_path(
@@ -1049,6 +1505,152 @@ fn write_mcp_config(path: &Path, config: &McpConfigFile) -> Result<(), Extension
     })
 }
 
+fn validate_user_rule_id(id: &str) -> Result<(), ExtensionError> {
+    uuid::Uuid::parse_str(id)
+        .map(|_| ())
+        .map_err(|_| ExtensionError::Config("user rule id is invalid".into()))
+}
+
+fn validate_user_rule_input(
+    title: &str,
+    content: &str,
+) -> Result<(String, String), ExtensionError> {
+    let title = title.trim();
+    if title.is_empty()
+        || title.chars().count() > MAX_USER_RULE_TITLE_CHARS
+        || title.chars().any(char::is_control)
+    {
+        return Err(ExtensionError::Config(format!(
+            "user rule title must contain 1-{MAX_USER_RULE_TITLE_CHARS} visible characters"
+        )));
+    }
+    if content.trim().is_empty() || content.len() > MAX_USER_RULE_BYTES {
+        return Err(ExtensionError::Config(format!(
+            "user rule content must contain 1-{MAX_USER_RULE_BYTES} UTF-8 bytes"
+        )));
+    }
+    Ok((title.to_string(), content.to_string()))
+}
+
+fn validate_user_rules_file(file: &UserRulesFile, path: &Path) -> Result<(), ExtensionError> {
+    if file.schema_version != USER_RULES_SCHEMA_VERSION {
+        return Err(ExtensionError::Config(format!(
+            "{} uses unsupported user rule schema version {}",
+            user_facing_path(path),
+            file.schema_version
+        )));
+    }
+    if file.rules.len() > MAX_USER_RULES {
+        return Err(ExtensionError::Config(format!(
+            "{} contains more than {MAX_USER_RULES} user rules",
+            user_facing_path(path)
+        )));
+    }
+    let mut ids = HashSet::new();
+    for rule in &file.rules {
+        validate_user_rule_id(&rule.id)?;
+        if !ids.insert(rule.id.as_str()) {
+            return Err(ExtensionError::Config(format!(
+                "{} contains duplicate user rule {}",
+                user_facing_path(path),
+                rule.id
+            )));
+        }
+        let (title, _) = validate_user_rule_input(&rule.title, &rule.content)?;
+        if title != rule.title {
+            return Err(ExtensionError::Config(format!(
+                "user rule {} title contains surrounding whitespace",
+                rule.id
+            )));
+        }
+        if rule.created_at_ms == 0
+            || rule.updated_at_ms == 0
+            || rule.updated_at_ms < rule.created_at_ms
+        {
+            return Err(ExtensionError::Config(format!(
+                "user rule {} has invalid timestamps",
+                rule.id
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn read_user_rules_file(path: &Path) -> Result<UserRulesFile, ExtensionError> {
+    let Some(bytes) = read_config_bytes(path)? else {
+        return Ok(UserRulesFile::default());
+    };
+    if bytes.len() > MAX_USER_RULES_CONFIG_BYTES {
+        return Err(ExtensionError::Config(format!(
+            "{} must be no larger than {MAX_USER_RULES_CONFIG_BYTES} bytes",
+            user_facing_path(path)
+        )));
+    }
+    let file = serde_json::from_slice::<UserRulesFile>(&bytes)
+        .map_err(|error| ExtensionError::Config(format!("{}: {error}", user_facing_path(path))))?;
+    validate_user_rules_file(&file, path)?;
+    Ok(file)
+}
+
+fn write_user_rules_file(path: &Path, file: &UserRulesFile) -> Result<(), ExtensionError> {
+    validate_user_rules_file(file, path)?;
+    let mut serialized = serde_json::to_vec_pretty(file)
+        .map_err(|error| ExtensionError::Config(error.to_string()))?;
+    serialized.push(b'\n');
+    if serialized.len() > MAX_USER_RULES_CONFIG_BYTES {
+        return Err(ExtensionError::Config(format!(
+            "{} must be no larger than {MAX_USER_RULES_CONFIG_BYTES} bytes",
+            user_facing_path(path)
+        )));
+    }
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| ExtensionError::Config("user rule path has no file name".into()))?;
+    let temporary = path.with_file_name(format!(".{file_name}.{}.tmp", uuid::Uuid::new_v4()));
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .map_err(|error| ExtensionError::Io(error.to_string()))?;
+    if let Err(error) = output
+        .write_all(&serialized)
+        .and_then(|_| output.sync_all())
+    {
+        let _ = fs::remove_file(&temporary);
+        return Err(ExtensionError::Io(error.to_string()));
+    }
+    drop(output);
+
+    #[cfg(target_os = "windows")]
+    {
+        let backup = path.with_file_name(format!(".{file_name}.{}.backup", uuid::Uuid::new_v4()));
+        let had_existing = path.exists();
+        if had_existing {
+            fs::rename(path, &backup).map_err(|error| {
+                let _ = fs::remove_file(&temporary);
+                ExtensionError::Io(error.to_string())
+            })?;
+        }
+        if let Err(error) = fs::rename(&temporary, path) {
+            if had_existing {
+                let _ = fs::rename(&backup, path);
+            }
+            let _ = fs::remove_file(&temporary);
+            return Err(ExtensionError::Io(error.to_string()));
+        }
+        if had_existing {
+            let _ = fs::remove_file(backup);
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    fs::rename(&temporary, path).map_err(|error| {
+        let _ = fs::remove_file(&temporary);
+        ExtensionError::Io(error.to_string())
+    })?;
+    Ok(())
+}
+
 fn discover_instructions(
     data_root: &Path,
     workspace: &Path,
@@ -1056,10 +1658,24 @@ fn discover_instructions(
     let workspace = workspace
         .canonicalize()
         .map_err(|error| ExtensionError::Io(error.to_string()))?;
-    let mut paths = vec![
-        (data_root.join("AGENTS.md"), "global".to_string(), 100),
-        (workspace.join("AGENTS.md"), "project".to_string(), 200),
-    ];
+    let mut paths = vec![(data_root.join("AGENTS.md"), "global".to_string(), 100)];
+    let user_rules_path =
+        resolve_scoped_config_path(data_root, Path::new(USER_RULES_CONFIG_FILE_NAME), false)?;
+    let user_rules = read_user_rules_file(&user_rules_path)?;
+    let mut user_rule_instructions = Vec::with_capacity(user_rules.rules.len());
+    for (index, rule) in user_rules.rules.into_iter().enumerate() {
+        let content = format!("# {}\n\n{}", rule.title, rule.content);
+        user_rule_instructions.push(LoadedInstruction {
+            source: InstructionSource {
+                path: format!("{}#{}", user_facing_path(&user_rules_path), rule.id),
+                scope: "user_rule".into(),
+                priority: 110 + index as u32,
+                bytes: content.len(),
+            },
+            content,
+        });
+    }
+    paths.push((workspace.join("AGENTS.md"), "project".to_string(), 200));
     let rules = workspace.join(".k-coder").join("rules");
     if rules.exists() {
         let canonical_rules = rules
@@ -1104,6 +1720,8 @@ fn discover_instructions(
             content,
         });
     }
+    result.extend(user_rule_instructions);
+    result.sort_by_key(|instruction| instruction.source.priority);
     Ok(result)
 }
 
@@ -1404,6 +2022,147 @@ mod tests {
     }
 
     #[test]
+    fn user_rules_are_ordered_between_global_and_project_instructions() {
+        let data = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let logger = StructuredLogger::new(data.path()).unwrap();
+        let service = ExtensionService::new(
+            data.path().into(),
+            ProjectionDb::memory().unwrap(),
+            Arc::new(mcp::OsMcpSecretStore::new()),
+            logger,
+        );
+        service
+            .save_user_rule(SaveUserRuleRequest {
+                id: None,
+                title: "注释规则".into(),
+                content: "公共方法需要注释".into(),
+            })
+            .unwrap();
+        service
+            .save_user_rule(SaveUserRuleRequest {
+                id: None,
+                title: "审批规则".into(),
+                content: "审批通过后结束流程".into(),
+            })
+            .unwrap();
+        fs::write(data.path().join("AGENTS.md"), "global").unwrap();
+        fs::write(workspace.path().join("AGENTS.md"), "project").unwrap();
+        fs::create_dir_all(workspace.path().join(".k-coder/rules")).unwrap();
+        fs::write(
+            workspace.path().join(".k-coder/rules/10-final.md"),
+            "project rule",
+        )
+        .unwrap();
+
+        let values = discover_instructions(data.path(), workspace.path()).unwrap();
+
+        assert_eq!(
+            values
+                .iter()
+                .map(|value| value.source.priority)
+                .collect::<Vec<_>>(),
+            vec![100, 110, 111, 200, 300]
+        );
+        assert_eq!(values[1].source.scope, "user_rule");
+        assert_eq!(values[1].content, "# 注释规则\n\n公共方法需要注释");
+        assert_eq!(values[2].content, "# 审批规则\n\n审批通过后结束流程");
+    }
+
+    #[test]
+    fn user_rules_can_be_created_edited_deleted_and_are_strictly_bounded() {
+        let data = tempfile::tempdir().unwrap();
+        let logger = StructuredLogger::new(data.path()).unwrap();
+        let service = ExtensionService::new(
+            data.path().into(),
+            ProjectionDb::memory().unwrap(),
+            Arc::new(mcp::OsMcpSecretStore::new()),
+            logger,
+        );
+        service
+            .save_user_rule(SaveUserRuleRequest {
+                id: None,
+                title: "方法注释".into(),
+                content: "公共方法必须包含注释。".into(),
+            })
+            .unwrap();
+        let created = service.user_rules_view().unwrap();
+        assert_eq!(created.schema_version, USER_RULES_SCHEMA_VERSION);
+        assert_eq!(created.rules.len(), 1);
+        let id = created.rules[0].id.clone();
+        assert!(uuid::Uuid::parse_str(&id).is_ok());
+
+        service
+            .save_user_rule(SaveUserRuleRequest {
+                id: Some(id.clone()),
+                title: "实体注释".into(),
+                content: "实体缺少注释时需要提醒。".into(),
+            })
+            .unwrap();
+        let updated = service.user_rules_view().unwrap();
+        assert_eq!(updated.rules[0].title, "实体注释");
+        assert_eq!(updated.rules[0].content, "实体缺少注释时需要提醒。");
+        assert_eq!(
+            updated.rules[0].created_at_ms,
+            created.rules[0].created_at_ms
+        );
+        assert!(updated.rules[0].updated_at_ms >= updated.rules[0].created_at_ms);
+
+        let oversized = service
+            .save_user_rule(SaveUserRuleRequest {
+                id: Some(id.clone()),
+                title: "超限".into(),
+                content: "x".repeat(MAX_USER_RULE_BYTES + 1),
+            })
+            .unwrap_err();
+        assert!(oversized.to_string().contains("UTF-8 bytes"));
+        assert_eq!(
+            service.user_rules_view().unwrap().rules[0].title,
+            "实体注释"
+        );
+
+        service.delete_user_rule(&id).unwrap();
+        assert!(service.user_rules_view().unwrap().rules.is_empty());
+        let missing = service.delete_user_rule(&id).unwrap_err();
+        assert!(missing.to_string().contains("no longer exists"));
+    }
+
+    #[test]
+    fn user_rule_configuration_rejects_link_escape() {
+        let data = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let outside_file = outside.path().join(USER_RULES_CONFIG_FILE_NAME);
+        fs::write(&outside_file, r#"{"schemaVersion":1,"rules":[]}"#).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside_file, data.path().join(USER_RULES_CONFIG_FILE_NAME))
+            .unwrap();
+        #[cfg(windows)]
+        if std::os::windows::fs::symlink_file(
+            &outside_file,
+            data.path().join(USER_RULES_CONFIG_FILE_NAME),
+        )
+        .is_err()
+        {
+            return;
+        }
+        let logger = StructuredLogger::new(data.path()).unwrap();
+        let service = ExtensionService::new(
+            data.path().into(),
+            ProjectionDb::memory().unwrap(),
+            Arc::new(mcp::OsMcpSecretStore::new()),
+            logger,
+        );
+
+        let error = service.user_rules_view().unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("escapes its configuration scope")
+        );
+    }
+
+    #[test]
     fn builtin_global_and_project_skills_have_deterministic_precedence() {
         let builtin = tempfile::tempdir().unwrap();
         let data = tempfile::tempdir().unwrap();
@@ -1641,7 +2400,7 @@ mod tests {
         .unwrap();
         fs::write(
             &project_mcp,
-            r#"{"mcpServers":[{"id":"shared","transport":"stdio","command":["project-mcp"]}]}"#,
+            r#"{"mcpServers":{"shared":{"type":"stdio","command":"project-mcp"}}}"#,
         )
         .unwrap();
 
@@ -1660,6 +2419,33 @@ mod tests {
     }
 
     #[test]
+    fn named_mcp_configuration_accepts_streamable_http_and_fixed_headers() {
+        let config = parse_mcp_config(
+            br#"{"mcpServers":{"dingtalk-docs":{"type":"streamable-http","url":"https://mcp.example.com/server/fixture","headers":{"Accept":"application/json, text/event-stream"}}}}"#,
+            Path::new("mcp.json"),
+        )
+        .unwrap();
+
+        assert_eq!(config.mcp_servers.len(), 1);
+        assert_eq!(config.mcp_servers[0].id, "dingtalk-docs");
+        match &config.mcp_servers[0].transport {
+            mcp::McpTransportConfig::StreamableHttp {
+                url,
+                headers,
+                secret_headers,
+            } => {
+                assert_eq!(url, "https://mcp.example.com/server/fixture");
+                assert_eq!(
+                    headers.get("Accept").map(String::as_str),
+                    Some("application/json, text/event-stream")
+                );
+                assert!(secret_headers.is_empty());
+            }
+            _ => panic!("expected streamable HTTP MCP configuration"),
+        }
+    }
+
+    #[test]
     fn dedicated_mcp_configuration_rejects_duplicates_before_writing() {
         let data = tempfile::tempdir().unwrap();
         let workspace = tempfile::tempdir().unwrap();
@@ -1671,7 +2457,7 @@ mod tests {
             Arc::new(mcp::OsMcpSecretStore::new()),
             logger,
         );
-        let content = r#"{"mcpServers":[{"id":"local","transport":"stdio","command":["node"]},{"id":"local","transport":"stdio","command":["node"]}]}"#;
+        let content = r#"{"mcpServers":{"local":{"type":"stdio","command":"node"},"local":{"type":"stdio","command":"node"}}}"#;
 
         let error = service
             .save_mcp_config(workspace.path(), "project", content)
@@ -1679,6 +2465,28 @@ mod tests {
 
         assert!(error.to_string().contains("duplicate MCP server local"));
         assert!(!workspace.path().join(".k-coder/mcp.json").exists());
+    }
+
+    #[test]
+    fn named_mcp_configuration_rejects_credentials_in_fixed_headers() {
+        let error = parse_mcp_config(
+            br#"{"mcpServers":{"remote":{"type":"streamable-http","url":"https://example.com/mcp","headers":{"Authorization":"Bearer plaintext"}}}}"#,
+            Path::new("mcp.json"),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("use secret_headers"));
+    }
+
+    #[test]
+    fn named_mcp_configuration_rejects_duplicate_headers_before_map_coercion() {
+        for content in [
+            br#"{"mcpServers":{"remote":{"type":"streamable-http","url":"https://example.com/mcp","headers":{"Accept":"application/json","Accept":"text/event-stream"}}}}"#.as_slice(),
+            br#"{"mcpServers":{"remote":{"type":"streamable-http","url":"https://example.com/mcp","headers":{"Accept":"application/json","accept":"text/event-stream"}}}}"#.as_slice(),
+        ] {
+            let error = parse_mcp_config(content, Path::new("mcp.json")).unwrap_err();
+            assert!(error.to_string().contains("duplicate HTTP header"));
+        }
     }
 
     #[test]
@@ -1697,6 +2505,7 @@ mod tests {
 
         let view = service.mcp_config_view(workspace.path()).unwrap();
 
+        assert_eq!(view.schema_version, 2);
         assert!(view.global.exists);
         assert_eq!(view.global.content, "{broken");
         assert!(view.global.error.is_some());
@@ -1758,7 +2567,13 @@ mod tests {
         assert!(view.project.exists);
         assert!(view.project.error.is_none());
         assert!(view.project.content.ends_with('\n'));
-        assert!(view.project.content.contains("\"local\""));
+        let saved = serde_json::from_str::<serde_json::Value>(&view.project.content).unwrap();
+        let local = &saved["mcpServers"]["local"];
+        assert!(saved["mcpServers"].is_object());
+        assert_eq!(local["type"], "stdio");
+        assert_eq!(local["command"], "node");
+        assert_eq!(local["args"], serde_json::json!(["server.mjs"]));
+        assert!(local.get("id").is_none());
         assert!(workspace.path().join(".k-coder/mcp.json").is_file());
         assert_eq!(
             projection

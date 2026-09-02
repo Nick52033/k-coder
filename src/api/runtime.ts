@@ -11,6 +11,8 @@ import type {
   GitStatusView,
   GitBranchView,
   ExtensionOverview,
+  SaveUserRuleRequest,
+  UserRulesView,
   PluginOverview,
   McpConfigView,
   ImageAttachment,
@@ -67,6 +69,16 @@ import type {
   WorkflowRunView,
   LogQuery,
   LogQueryResult,
+  KnowledgeSettings,
+  EmbeddingSettings,
+  KnowledgeCollection,
+  UpsertKnowledgeCollectionRequest,
+  AddKnowledgeSourceRequest,
+  KnowledgeSource,
+  KnowledgeIndexJob,
+  SetEmbeddingSettingsRequest,
+  KnowledgeSearchResponse,
+  KnowledgeCitation,
 } from "../types/runtime";
 
 export function getRuntimeStatus() {
@@ -262,6 +274,24 @@ export function getGoal(threadId: string) { return invoke<GoalView | null>("get_
 export function createGoal(request: CreateGoalRequest) { return invoke<GoalView>("create_goal", { request }); }
 export function transitionGoal(goalId: string, state: GoalState, reason?: string) { return invoke<GoalView>("transition_goal", { request: { goalId, state, reason } }); }
 export function searchRepository(query: string, limit = 50) { return invoke<SearchResult[]>("search_repository", { query, limit }); }
+export function getKnowledgeSettings() { return invoke<KnowledgeSettings>("get_knowledge_settings"); }
+export function setKnowledgeEnabled(enabled: boolean) { return invoke<KnowledgeSettings>("set_knowledge_enabled", { enabled }); }
+export function listKnowledgeCollections() { return invoke<KnowledgeCollection[]>("list_knowledge_collections"); }
+export function upsertKnowledgeCollection(request: UpsertKnowledgeCollectionRequest) { return invoke<KnowledgeCollection>("upsert_knowledge_collection", { request }); }
+export function deleteKnowledgeCollection(collectionId: string, confirmationToken: string) { return invoke<Record<string, unknown>>("delete_knowledge_collection", { collectionId, confirmationToken }); }
+export function addKnowledgeSource(request: AddKnowledgeSourceRequest) { return invoke<KnowledgeSource>("add_knowledge_source", { request }); }
+export function listKnowledgeSources(collectionId: string) { return invoke<KnowledgeSource[]>("list_knowledge_sources", { collectionId }); }
+export function deleteKnowledgeSource(sourceId: string, confirmationToken: string) { return invoke<Record<string, unknown>>("delete_knowledge_source", { sourceId, confirmationToken }); }
+export function refreshKnowledgeSource(sourceId: string) { return invoke<KnowledgeIndexJob>("refresh_knowledge_source", { sourceId }); }
+export function getKnowledgeIndexJob(jobId: string) { return invoke<KnowledgeIndexJob>("get_knowledge_index_job", { jobId }); }
+export function cancelKnowledgeIndexJob(jobId: string) { return invoke<KnowledgeIndexJob>("cancel_knowledge_index_job", { jobId }); }
+export function getEmbeddingSettings() { return invoke<EmbeddingSettings>("get_embedding_settings"); }
+export function setEmbeddingSettings(request: SetEmbeddingSettingsRequest) { return invoke<EmbeddingSettings>("set_embedding_settings", { request }); }
+export function setEmbeddingApiKey(apiKey: string) { return invoke<Record<string, unknown>>("set_embedding_api_key", { apiKey }); }
+export function deleteEmbeddingApiKey() { return invoke<Record<string, unknown>>("delete_embedding_api_key"); }
+export function testEmbeddingConnection() { return invoke<{ connected: boolean; latencyMs: number; httpStatus: number | null; model: string; vectorDimension: number; usage: Record<string, unknown> | null; traceId: string | null; errorCode: string | null }>("test_embedding_connection"); }
+export function searchKnowledge(query: string, limit = 6, threadId?: string, turnId?: string) { return invoke<KnowledgeSearchResponse>("search_knowledge", { query, limit, threadId, turnId }); }
+export function readKnowledgeCitation(citationId: string, threadId: string, turnId: string, before = 0, after = 0) { return invoke<KnowledgeCitation>("read_knowledge_citation", { citationId, threadId, turnId, before, after }); }
 export function getMemorySettings() { return invoke<MemorySettings>("get_memory_settings"); }
 export function setMemoryEnabled(enabled: boolean) { return invoke<MemorySettings>("set_memory_enabled", { enabled }); }
 export function listMemories() { return invoke<MemoryView[]>("list_memories"); }
@@ -322,6 +352,9 @@ export function renameThread(threadId: string, title: string) { return invoke<Th
 export function deleteThread(threadId: string) { return invoke<void>("delete_thread", { threadId }); }
 export function getUsageSummary() { return invoke<UsageSummary>("usage_summary"); }
 export function getExtensionOverview(refresh = false) { return invoke<ExtensionOverview>("extension_overview", { refresh }); }
+export function getUserRules(refresh = false) { return invoke<UserRulesView>("user_rules", { refresh }); }
+export function saveUserRule(request: SaveUserRuleRequest) { return invoke<UserRulesView>("save_user_rule", { request }); }
+export function deleteUserRule(id: string) { return invoke<UserRulesView>("delete_user_rule", { id }); }
 export function getPluginOverview(refresh = false) { return invoke<PluginOverview>("plugin_overview", { refresh }); }
 export function setPluginEnabled(pluginId: string, enabled: boolean) { return invoke<PluginOverview>("set_plugin_enabled", { pluginId, enabled }); }
 export function deletePlugin(pluginId: string) { return invoke<PluginOverview>("delete_plugin", { pluginId }); }

@@ -31,7 +31,7 @@ import "./McpSettingsPage.css";
 
 type McpScope = "global" | "project";
 
-interface StdioMcpServer {
+interface LegacyStdioMcpServer {
   id: string;
   enabled?: boolean;
   timeoutMs?: number;
@@ -40,17 +40,18 @@ interface StdioMcpServer {
   secret_env?: Record<string, string>;
 }
 
-interface HttpMcpServer {
+interface LegacyHttpMcpServer {
   id: string;
   enabled?: boolean;
   timeoutMs?: number;
   transport: "streamable_http";
   url: string;
+  headers?: Record<string, string>;
   secret_headers?: Record<string, string>;
 }
 
 interface McpConfigDocument {
-  mcpServers?: Array<StdioMcpServer | HttpMcpServer>;
+  mcpServers?: Record<string, unknown> | Array<LegacyStdioMcpServer | LegacyHttpMcpServer>;
 }
 
 interface EditableDocument {
@@ -98,6 +99,108 @@ function validateCredentialMap(
   }
 }
 
+function validateCommonServerFields(entry: Record<string, unknown>, label: string) {
+  if (entry.enabled !== undefined && typeof entry.enabled !== "boolean") {
+    throw new Error(`${label} 的 enabled 必须是布尔值`);
+  }
+  if (entry.timeoutMs !== undefined && entry.timeout_ms !== undefined) {
+    throw new Error(`${label} 不能同时设置 timeoutMs 和 timeout_ms`);
+  }
+  const timeout = entry.timeoutMs ?? entry.timeout_ms;
+  if (
+    timeout !== undefined
+    && (
+      typeof timeout !== "number"
+      || !Number.isInteger(timeout)
+      || timeout < 1
+      || timeout > 300_000
+    )
+  ) {
+    throw new Error(`${label} 的 timeoutMs 必须是 1-300000 之间的整数`);
+  }
+}
+
+function validateCommand(value: unknown, args: unknown, label: string) {
+  let command: string[];
+  if (typeof value === "string") {
+    if (!value.trim()) throw new Error(`${label} 的 command 不能为空`);
+    if (args !== undefined && !Array.isArray(args)) {
+      throw new Error(`${label} 的 args 必须是字符串数组`);
+    }
+    if (Array.isArray(args) && args.some((part) => typeof part !== "string")) {
+      throw new Error(`${label} 的 args 必须是字符串数组`);
+    }
+    command = [value, ...((args ?? []) as string[])];
+  } else if (Array.isArray(value)) {
+    if (Array.isArray(args) && args.length > 0) {
+      throw new Error(`${label} 不能同时使用数组 command 和 args`);
+    }
+    command = value as string[];
+  } else {
+    throw new Error(`${label} 的 command 必须是字符串或字符串数组`);
+  }
+  if (
+    command.length === 0
+    || command.length > 128
+    || command.some((part) => typeof part !== "string" || byteLength(part) > 8192)
+  ) {
+    throw new Error(`${label} 的 command 必须是 1-128 段字符串，单段不能超过 8192 字节`);
+  }
+}
+
+function isSensitiveFixedHeader(name: string) {
+  const normalized = name.toLowerCase();
+  return [
+    "authorization",
+    "proxy-authorization",
+    "cookie",
+    "set-cookie",
+    "host",
+    "content-length",
+    "transfer-encoding",
+    "connection",
+    "mcp-session-id",
+    "mcp-protocol-version",
+  ].includes(normalized)
+    || normalized.includes("api-key")
+    || normalized.includes("apikey")
+    || normalized.includes("token")
+    || normalized.includes("secret");
+}
+
+function validateFixedHeaders(value: unknown, field: string) {
+  if (value === undefined) return;
+  if (!isRecord(value)) throw new Error(`${field} 必须是对象`);
+  const names = new Set<string>();
+  for (const [name, headerValue] of Object.entries(value)) {
+    const normalized = name.toLowerCase();
+    if (!HEADER_PATTERN.test(name)) throw new Error(`${field}.${name || "<空>"} 不是有效的 Header 名称`);
+    if (names.has(normalized)) throw new Error(`${field} 不能重复 Header ${name}`);
+    names.add(normalized);
+    if (
+      typeof headerValue !== "string"
+      || byteLength(headerValue) > 8192
+      || /[\r\n\0]/.test(headerValue)
+    ) {
+      throw new Error(`${field}.${name} 不是有效的 Header 值`);
+    }
+    if (isSensitiveFixedHeader(name)) {
+      throw new Error(`${field}.${name} 是保留或凭据 Header，请改用 secret_headers`);
+    }
+  }
+}
+
+function validateHeaderCollision(
+  headers: unknown,
+  secretHeaders: unknown,
+  label: string,
+) {
+  if (!isRecord(headers) || !isRecord(secretHeaders)) return;
+  const fixed = new Set(Object.keys(headers).map((name) => name.toLowerCase()));
+  const collision = Object.keys(secretHeaders).find((name) => fixed.has(name.toLowerCase()));
+  if (collision) throw new Error(`${label} 重复设置 Header ${collision}`);
+}
+
 function validateHttpUrl(value: string, label: string) {
   let url: URL;
   try {
@@ -115,6 +218,138 @@ function validateHttpUrl(value: string, label: string) {
   }
 }
 
+function validateLegacyServer(entry: unknown, index: number, ids: Set<string>) {
+  const label = `服务器 ${index + 1}`;
+  if (!isRecord(entry)) throw new Error(`${label} 必须是对象`);
+  if (typeof entry.id !== "string" || !SERVER_ID_PATTERN.test(entry.id)) {
+    throw new Error(`${label} 的 id 必须使用 1-64 位小写字母、数字、下划线或连字符`);
+  }
+  if (ids.has(entry.id)) throw new Error(`服务器 id ${entry.id} 不能重复`);
+  ids.add(entry.id);
+  validateCommonServerFields(entry, label);
+
+  if (entry.transport === "stdio") {
+    assertKnownFields(
+      entry,
+      ["id", "enabled", "timeoutMs", "transport", "command", "secret_env"],
+      label,
+    );
+    validateCommand(entry.command, undefined, label);
+    validateCredentialMap(
+      entry.secret_env,
+      `${label}.secret_env`,
+      (target) => ENVIRONMENT_PATTERN.test(target),
+      "不是有效的环境变量名",
+    );
+    return;
+  }
+
+  if (entry.transport === "streamable_http") {
+    assertKnownFields(
+      entry,
+      ["id", "enabled", "timeoutMs", "transport", "url", "headers", "secret_headers"],
+      label,
+    );
+    if (typeof entry.url !== "string") throw new Error(`${label} 的 url 必须是字符串`);
+    validateHttpUrl(entry.url, label);
+    validateFixedHeaders(entry.headers, `${label}.headers`);
+    validateCredentialMap(
+      entry.secret_headers,
+      `${label}.secret_headers`,
+      (target) => HEADER_PATTERN.test(target),
+      "不是有效的 Header 名称",
+    );
+    validateHeaderCollision(entry.headers, entry.secret_headers, label);
+    return;
+  }
+
+  throw new Error(`${label} 的 transport 必须是 stdio 或 streamable_http`);
+}
+
+function validateNamedServer(id: string, entry: unknown) {
+  const label = `服务器 ${id || "<空>"}`;
+  if (!SERVER_ID_PATTERN.test(id)) {
+    throw new Error(`${label} 的名称必须使用 1-64 位小写字母、数字、下划线或连字符`);
+  }
+  if (!isRecord(entry)) throw new Error(`${label} 必须是对象`);
+  if (entry.type !== undefined && entry.transport !== undefined) {
+    throw new Error(`${label} 不能同时设置 type 和 transport`);
+  }
+  if (entry.secret_env !== undefined && entry.secretEnv !== undefined) {
+    throw new Error(`${label} 不能同时设置 secret_env 和 secretEnv`);
+  }
+  if (entry.secret_headers !== undefined && entry.secretHeaders !== undefined) {
+    throw new Error(`${label} 不能同时设置 secret_headers 和 secretHeaders`);
+  }
+  validateCommonServerFields(entry, label);
+
+  const type = entry.type ?? entry.transport;
+  if (type !== undefined && typeof type !== "string") {
+    throw new Error(`${label} 的 type 必须是字符串`);
+  }
+  const isHttp = ["http", "streamable-http", "streamable_http"].includes(type as string)
+    || (type === undefined && entry.url !== undefined && entry.command === undefined);
+  const isStdio = type === "stdio"
+    || (type === undefined && entry.command !== undefined && entry.url === undefined);
+  if (!isHttp && !isStdio) {
+    throw new Error(`${label} 必须设置 type，或只提供 command/url 其中一项`);
+  }
+
+  if (isStdio) {
+    assertKnownFields(
+      entry,
+      [
+        "type",
+        "transport",
+        "enabled",
+        "timeoutMs",
+        "timeout_ms",
+        "command",
+        "args",
+        "secret_env",
+        "secretEnv",
+      ],
+      label,
+    );
+    validateCommand(entry.command, entry.args, label);
+    const secretEnv = entry.secret_env ?? entry.secretEnv;
+    validateCredentialMap(
+      secretEnv,
+      `${label}.secret_env`,
+      (target) => ENVIRONMENT_PATTERN.test(target),
+      "不是有效的环境变量名",
+    );
+    return;
+  }
+
+  assertKnownFields(
+    entry,
+    [
+      "type",
+      "transport",
+      "enabled",
+      "timeoutMs",
+      "timeout_ms",
+      "url",
+      "headers",
+      "secret_headers",
+      "secretHeaders",
+    ],
+    label,
+  );
+  if (typeof entry.url !== "string") throw new Error(`${label} 的 url 必须是字符串`);
+  validateHttpUrl(entry.url, label);
+  validateFixedHeaders(entry.headers, `${label}.headers`);
+  const secretHeaders = entry.secret_headers ?? entry.secretHeaders;
+  validateCredentialMap(
+    secretHeaders,
+    `${label}.secret_headers`,
+    (target) => HEADER_PATTERN.test(target),
+    "不是有效的 Header 名称",
+  );
+  validateHeaderCollision(entry.headers, secretHeaders, label);
+}
+
 function parseMcpDocument(content: string): { document: McpConfigDocument | null; error: string } {
   try {
     if (byteLength(content) > MAX_CONFIG_BYTES) {
@@ -123,76 +358,15 @@ function parseMcpDocument(content: string): { document: McpConfigDocument | null
     const value = JSON.parse(content) as unknown;
     if (!isRecord(value)) throw new Error("mcp.json 顶层必须是对象");
     assertKnownFields(value, ["mcpServers"], "mcp.json");
-    if (value.mcpServers !== undefined && !Array.isArray(value.mcpServers)) {
-      throw new Error("mcpServers 必须是数组");
+    const servers = value.mcpServers ?? {};
+    if (Array.isArray(servers)) {
+      const ids = new Set<string>();
+      servers.forEach((entry, index) => validateLegacyServer(entry, index, ids));
+    } else if (isRecord(servers)) {
+      Object.entries(servers).forEach(([id, entry]) => validateNamedServer(id, entry));
+    } else {
+      throw new Error("mcpServers 必须是对象（旧版数组仍可读取）");
     }
-
-    const ids = new Set<string>();
-    (value.mcpServers ?? []).forEach((entry, index) => {
-      const label = `服务器 ${index + 1}`;
-      if (!isRecord(entry)) throw new Error(`${label} 必须是对象`);
-      if (typeof entry.id !== "string" || !SERVER_ID_PATTERN.test(entry.id)) {
-        throw new Error(`${label} 的 id 必须使用 1-64 位小写字母、数字、下划线或连字符`);
-      }
-      if (ids.has(entry.id)) throw new Error(`服务器 id ${entry.id} 不能重复`);
-      ids.add(entry.id);
-      if (entry.enabled !== undefined && typeof entry.enabled !== "boolean") {
-        throw new Error(`${label} 的 enabled 必须是布尔值`);
-      }
-      if (
-        entry.timeoutMs !== undefined
-        && (
-          typeof entry.timeoutMs !== "number"
-          || !Number.isInteger(entry.timeoutMs)
-          || entry.timeoutMs < 1
-          || entry.timeoutMs > 300_000
-        )
-      ) {
-        throw new Error(`${label} 的 timeoutMs 必须是 1-300000 之间的整数`);
-      }
-
-      if (entry.transport === "stdio") {
-        assertKnownFields(
-          entry,
-          ["id", "enabled", "timeoutMs", "transport", "command", "secret_env"],
-          label,
-        );
-        if (
-          !Array.isArray(entry.command)
-          || entry.command.length === 0
-          || entry.command.length > 128
-          || entry.command.some((part) => typeof part !== "string" || byteLength(part) > 8192)
-        ) {
-          throw new Error(`${label} 的 command 必须是 1-128 段字符串，单段不能超过 8192 字节`);
-        }
-        validateCredentialMap(
-          entry.secret_env,
-          `${label}.secret_env`,
-          (target) => ENVIRONMENT_PATTERN.test(target),
-          "不是有效的环境变量名",
-        );
-        return;
-      }
-
-      if (entry.transport === "streamable_http") {
-        assertKnownFields(
-          entry,
-          ["id", "enabled", "timeoutMs", "transport", "url", "secret_headers"],
-          label,
-        );
-        if (typeof entry.url !== "string") throw new Error(`${label} 的 url 必须是字符串`);
-        validateHttpUrl(entry.url, label);
-        validateCredentialMap(
-          entry.secret_headers,
-          `${label}.secret_headers`,
-          (target) => HEADER_PATTERN.test(target),
-          "不是有效的 Header 名称",
-        );
-        return;
-      }
-
-      throw new Error(`${label} 的 transport 必须是 stdio 或 streamable_http`);
-    });
 
     return { document: value as McpConfigDocument, error: "" };
   } catch (reason) {

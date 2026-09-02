@@ -6,6 +6,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
+use serde::de::Error as _;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -122,7 +123,9 @@ pub enum McpTransportConfig {
     },
     StreamableHttp {
         url: String,
-        #[serde(default)]
+        #[serde(default, deserialize_with = "deserialize_header_map")]
+        headers: HashMap<String, String>,
+        #[serde(default, deserialize_with = "deserialize_header_map")]
         secret_headers: HashMap<String, String>,
     },
 }
@@ -159,7 +162,9 @@ enum McpServerConfigWire {
         #[serde(default = "default_timeout", rename = "timeoutMs")]
         timeout_ms: u64,
         url: String,
-        #[serde(default)]
+        #[serde(default, deserialize_with = "deserialize_header_map")]
+        headers: HashMap<String, String>,
+        #[serde(default, deserialize_with = "deserialize_header_map")]
         secret_headers: HashMap<String, String>,
     },
 }
@@ -191,6 +196,7 @@ impl<'de> Deserialize<'de> for McpServerConfig {
                 enabled,
                 timeout_ms,
                 url,
+                headers,
                 secret_headers,
             } => Self {
                 id,
@@ -198,6 +204,7 @@ impl<'de> Deserialize<'de> for McpServerConfig {
                 timeout_ms,
                 transport: McpTransportConfig::StreamableHttp {
                     url,
+                    headers,
                     secret_headers,
                 },
             },
@@ -207,6 +214,40 @@ impl<'de> Deserialize<'de> for McpServerConfig {
 
 fn default_true() -> bool {
     true
+}
+
+pub(super) fn deserialize_header_map<'de, D>(
+    deserializer: D,
+) -> Result<HashMap<String, String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct HeaderMapVisitor;
+
+    impl<'de> serde::de::Visitor<'de> for HeaderMapVisitor {
+        type Value = HashMap<String, String>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("an object containing unique HTTP header names")
+        }
+
+        fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+        where
+            A: serde::de::MapAccess<'de>,
+        {
+            let mut names = HashSet::new();
+            let mut headers = HashMap::new();
+            while let Some((name, value)) = map.next_entry::<String, String>()? {
+                if !names.insert(name.to_ascii_lowercase()) {
+                    return Err(A::Error::custom(format!("duplicate HTTP header {name}")));
+                }
+                headers.insert(name, value);
+            }
+            Ok(headers)
+        }
+    }
+
+    deserializer.deserialize_map(HeaderMapVisitor)
 }
 
 fn default_timeout() -> u64 {
@@ -252,9 +293,20 @@ impl McpServerConfig {
             }
             McpTransportConfig::StreamableHttp {
                 url,
+                headers,
                 secret_headers,
             } => {
                 validate_http_url(url)?;
+                let mut names = HashSet::new();
+                for (header, value) in headers {
+                    validate_fixed_header(&self.id, header, value)?;
+                    if !names.insert(header.to_ascii_lowercase()) {
+                        return Err(McpError::Config(format!(
+                            "MCP server {} repeats header {}",
+                            self.id, header
+                        )));
+                    }
+                }
                 for (header, credential) in secret_headers {
                     HeaderName::from_bytes(header.as_bytes()).map_err(|_| {
                         McpError::Config(format!(
@@ -262,6 +314,12 @@ impl McpServerConfig {
                             self.id
                         ))
                     })?;
+                    if !names.insert(header.to_ascii_lowercase()) {
+                        return Err(McpError::Config(format!(
+                            "MCP server {} repeats header {}",
+                            self.id, header
+                        )));
+                    }
                     if !valid_credential_name(credential) {
                         return Err(McpError::Config(format!(
                             "MCP server {} has an invalid credential name",
@@ -425,10 +483,12 @@ pub async fn connect_with_options(
         ),
         McpTransportConfig::StreamableHttp {
             url,
+            headers,
             secret_headers,
         } => Arc::new(HttpClient::new(
             &config.id,
             url,
+            headers,
             secret_headers,
             &options.secret_header_prefixes,
             secrets,
@@ -731,6 +791,7 @@ impl HttpClient {
     fn new(
         server: &str,
         url: &str,
+        fixed_headers: &HashMap<String, String>,
         secret_headers: &HashMap<String, String>,
         secret_header_prefixes: &HashMap<String, String>,
         secrets: Arc<dyn McpSecretStore>,
@@ -738,6 +799,18 @@ impl HttpClient {
     ) -> Result<Self, McpError> {
         validate_http_url(url)?;
         let mut headers = HeaderMap::new();
+        for (name, value) in fixed_headers {
+            validate_fixed_header(server, name, value)?;
+            headers.insert(
+                HeaderName::from_bytes(name.as_bytes())
+                    .map_err(|error| McpError::Config(error.to_string()))?,
+                HeaderValue::from_str(value).map_err(|_| {
+                    McpError::Config(format!(
+                        "MCP server {server} has an invalid fixed header value"
+                    ))
+                })?,
+            );
+        }
         for (name, credential) in secret_headers {
             let value = secrets.get(server, credential)?.ok_or_else(|| {
                 McpError::Secret(format!(
@@ -1040,6 +1113,42 @@ fn valid_credential_name(value: &str) -> bool {
         })
 }
 
+fn validate_fixed_header(server: &str, name: &str, value: &str) -> Result<(), McpError> {
+    HeaderName::from_bytes(name.as_bytes()).map_err(|_| {
+        McpError::Config(format!(
+            "MCP server {server} has an invalid fixed header name"
+        ))
+    })?;
+    if value.len() > 8192 || HeaderValue::from_str(value).is_err() {
+        return Err(McpError::Config(format!(
+            "MCP server {server} has an invalid fixed header value"
+        )));
+    }
+    let normalized = name.to_ascii_lowercase();
+    if matches!(
+        normalized.as_str(),
+        "authorization"
+            | "proxy-authorization"
+            | "cookie"
+            | "set-cookie"
+            | "host"
+            | "content-length"
+            | "transfer-encoding"
+            | "connection"
+            | "mcp-session-id"
+            | "mcp-protocol-version"
+    ) || normalized.contains("api-key")
+        || normalized.contains("apikey")
+        || normalized.contains("token")
+        || normalized.contains("secret")
+    {
+        return Err(McpError::Config(format!(
+            "MCP server {server} fixed header {name} is reserved or credential-bearing; use secret_headers for credentials"
+        )));
+    }
+    Ok(())
+}
+
 fn validate_http_url(value: &str) -> Result<(), McpError> {
     let url = url::Url::parse(value).map_err(|error| McpError::Config(error.to_string()))?;
     let secure = url.scheme() == "https";
@@ -1227,6 +1336,33 @@ mod tests {
             },
         };
         assert!(invalid_credential.validate().is_err());
+
+        let fixed_accept = McpServerConfig {
+            id: "remote".into(),
+            enabled: true,
+            timeout_ms: 1000,
+            transport: McpTransportConfig::StreamableHttp {
+                url: "https://example.com/mcp".into(),
+                headers: HashMap::from([(
+                    "Accept".into(),
+                    "application/json, text/event-stream".into(),
+                )]),
+                secret_headers: HashMap::new(),
+            },
+        };
+        assert!(fixed_accept.validate().is_ok());
+
+        let plaintext_authorization = McpServerConfig {
+            id: "remote".into(),
+            enabled: true,
+            timeout_ms: 1000,
+            transport: McpTransportConfig::StreamableHttp {
+                url: "https://example.com/mcp".into(),
+                headers: HashMap::from([("Authorization".into(), "Bearer plaintext".into())]),
+                secret_headers: HashMap::new(),
+            },
+        };
+        assert!(plaintext_authorization.validate().is_err());
     }
 
     #[test]
@@ -1369,6 +1505,7 @@ mod tests {
             timeout_ms: 10_000,
             transport: McpTransportConfig::StreamableHttp {
                 url: format!("http://127.0.0.1:{}/mcp", port.trim()),
+                headers: HashMap::from([("X-Client-Name".into(), "k-coder-test".into())]),
                 secret_headers: HashMap::from([("Authorization".into(), "token".into())]),
             },
         };

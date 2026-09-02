@@ -2,7 +2,7 @@
 
 ## 状态
 
-已接受，2026-08-24。取代 ADR 0042。
+已接受，2026-08-24。取代 ADR 0042；第 5 项于 2026-08-31 由 ADR 0052 取代。
 
 ## 背景
 
@@ -18,7 +18,7 @@ ADR 0042 曾把活动 Turn 中的主发送定义为“先把新消息放入 mail
 2. 同一 thread 已有活动 Turn 时，`turn_start` 返回 `queued` handle。pending 输入继续只存在于 mailbox snapshot 中，不提前写入 `UserMessage`，也不提前显示为对话气泡。
 3. 主发送在活动 Turn 中保持当前生成状态，界面提示为“加入消息队列”，不得乐观切换为“正在停止”。
 4. 普通队列项的“发送到当前对话”只调用 `turn_steer_queued(threadId, expectedTurnId, queuedTurnId)`。后端从 mailbox 读取原始正文和附件，在精确活动 Turn 接受输入后原子删除 pending 项，并以原 `turnId` 发布 `turn_steered`。
-5. queued steer 不取消正在进行的 Provider 请求。输入在当前 Provider 响应后的安全边界进入同一个 AgentRuntime Turn，保留已产生的正文、工具事实、用量和审计边界。
+5. queued steer 不取消正在进行的 Provider 请求。输入在当前 Provider 响应后的安全边界进入同一个 AgentRuntime Turn，保留已产生的正文、工具事实、用量和审计边界。本项已由 ADR 0052 取代：queued steer 现在只取消当前 Provider 子请求，并在原 Turn 内保留部分输出后继续。
 6. 队列中的 retry 和内置工作流启动不能 steer；它们只能按 FIFO 启动或由用户删除。活动 Turn 已进入停止状态时，队列 steer 继续禁用。
 7. 取消只允许由独立停止、错误恢复等明确控制入口调用带 `expectedTurnId` 的 `turn_interrupt`。主发送和 queued steer 都不得组合或间接调用 interrupt。
 8. 兼容阻塞 Turn 没有 mailbox worker 时，普通入队可以创建等待中的 worker，但 worker 必须等活动 Turn 释放后再取项，不得取消或越过活动 Turn。

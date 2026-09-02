@@ -152,21 +152,35 @@ test.beforeEach(async ({ page }) => {
       audit: [{ timestampMs: 2, event: "extensions_ready", kind: "runtime", id: "all", success: true, detail: "extensions loaded" }],
       error: null,
     };
-    let mcpConfig = {
+    let userRules = {
       schemaVersion: 1,
+      path: "C:\\Users\\demo\\AppData\\Local\\k-coder\\runtime-data\\user-rules.json",
+      rules: [{
+        id: "11111111-1111-4111-8111-111111111111",
+        title: "方法注释",
+        content: "公共方法需要注释，实体缺少注释时需要提醒。",
+        createdAtMs: 1_785_000_000_000,
+        updatedAtMs: 1_785_000_000_000,
+      }],
+      error: null,
+    };
+    let mcpConfig = {
+      schemaVersion: 2,
       global: {
         scope: "global",
         path: "C:\\Users\\demo\\AppData\\Local\\k-coder\\runtime-data\\mcp.json",
         exists: true,
         content: `${JSON.stringify({
-          mcpServers: [{
-            id: "local",
-            enabled: true,
-            timeoutMs: 30_000,
-            transport: "stdio",
-            command: ["npx", "-y", "@modelcontextprotocol/server-filesystem", "D:\\code\\k-coder"],
-            secret_env: {},
-          }],
+          mcpServers: {
+            local: {
+              type: "stdio",
+              enabled: true,
+              timeoutMs: 30_000,
+              command: "npx",
+              args: ["-y", "@modelcontextprotocol/server-filesystem", "D:\\code\\k-coder"],
+              secret_env: {},
+            },
+          },
         }, null, 2)}\n`,
         error: null,
       },
@@ -174,7 +188,7 @@ test.beforeEach(async ({ page }) => {
         scope: "project",
         path: "D:\\code\\k-coder\\.k-coder\\mcp.json",
         exists: false,
-        content: `${JSON.stringify({ mcpServers: [] }, null, 2)}\n`,
+        content: `${JSON.stringify({ mcpServers: {} }, null, 2)}\n`,
         error: null,
       },
       overview: extensionOverview,
@@ -751,6 +765,43 @@ test.beforeEach(async ({ page }) => {
             };
             return pluginOverview;
           }
+          if (command === "user_rules") return userRules;
+          if (command === "save_user_rule") {
+            const request = (args?.request ?? {}) as { id?: string | null; title?: string; content?: string };
+            const timestamp = 1_785_000_060_000;
+            if (request.id) {
+              userRules = {
+                ...userRules,
+                rules: userRules.rules.map((rule) => rule.id === request.id
+                  ? {
+                      ...rule,
+                      title: String(request.title ?? ""),
+                      content: String(request.content ?? ""),
+                      updatedAtMs: timestamp,
+                    }
+                  : rule),
+              };
+            } else {
+              userRules = {
+                ...userRules,
+                rules: [...userRules.rules, {
+                  id: "22222222-2222-4222-8222-222222222222",
+                  title: String(request.title ?? ""),
+                  content: String(request.content ?? ""),
+                  createdAtMs: timestamp,
+                  updatedAtMs: timestamp,
+                }],
+              };
+            }
+            return userRules;
+          }
+          if (command === "delete_user_rule") {
+            userRules = {
+              ...userRules,
+              rules: userRules.rules.filter((rule) => rule.id !== String(args?.id ?? "")),
+            };
+            return userRules;
+          }
           if (command === "save_mcp_config") {
             const configScope = args?.scope === "project" ? "project" : "global";
             const content = String(args?.content ?? "");
@@ -1182,6 +1233,249 @@ test("uses composer quick actions for files, attachments, Skills, and extension 
   }
 });
 
+test("polls, cancels, and refreshes knowledge sources without layout overflow", async ({ page }, testInfo) => {
+  await page.goto("/");
+  await page.evaluate(() => {
+    const host = window as unknown as {
+      __TAURI_INTERNALS__: { invoke: (command: string, args?: Record<string, unknown>) => Promise<unknown> };
+      __knowledgeActions: string[];
+      __knowledgeAdds: Array<{ collectionId?: string; workspaceRelativePath?: string }>;
+    };
+    const originalInvoke = host.__TAURI_INTERNALS__.invoke;
+    host.__knowledgeActions = [];
+    host.__knowledgeAdds = [];
+    let primaryCollectionExists = true;
+    let sourceExists = true;
+    let sourceState = "queued";
+    let activeJobId: string | null = "knowledge-job-1";
+    let createdCollectionName: string | null = null;
+    const collection = (id: string, name: string, sourceCount: number, indexedChunkCount: number) => ({
+      id,
+      name,
+      scope: "workspace",
+      scopeKey: "D:\\code\\k-coder",
+      enabled: true,
+      sourceCount,
+      indexedChunkCount,
+      updatedAtMs: Date.now(),
+    });
+    const source = () => ({
+      sourceId: "knowledge-source-1",
+      relativePath: "docs/knowledge/architecture-and-operations-guide.md",
+      sizeBytes: 4096,
+      contentHashPrefix: "0123456789ab",
+      activeRevisionId: sourceState === "cancelled" ? null : "knowledge-revision-1",
+      activeEmbeddingModel: null,
+      activeEmbeddingDimension: 0,
+      activeEmbeddingEncodingFormat: "float",
+      embeddingStatus: "lexical_only",
+      state: sourceState,
+      chunkCount: sourceState === "cancelled" ? 0 : 3,
+      lastIndexedAtMs: null,
+      lastErrorCode: sourceState === "cancelled" ? "KC_CANCELLED" : null,
+      initialJobId: activeJobId,
+    });
+    host.__TAURI_INTERNALS__.invoke = async (command, args) => {
+      if (command === "get_knowledge_settings") {
+        return {
+          enabled: true,
+          autoSearch: false,
+          maxResults: 6,
+          maxChunkTokens: 1500,
+          knowledgeBudgetPercent: 8,
+          semanticEnabled: false,
+          embeddingProvider: "siliconflow",
+          embeddingModel: "BAAI/bge-m3",
+          embeddingDimension: 0,
+          embeddingConfigured: false,
+          embeddingStatus: "lexical_only",
+        };
+      }
+      if (command === "get_embedding_settings") {
+        return {
+          provider: "siliconflow",
+          endpoint: "https://api.siliconflow.cn/v1/embeddings",
+          model: "BAAI/bge-m3",
+          semanticEnabled: false,
+          encodingFormat: "float",
+          batchSize: 16,
+          timeoutMs: 30000,
+          maxVectorScanChunks: 10000,
+          modelMaxInputTokens: 8192,
+          vectorDimension: 0,
+          embeddingConfigured: false,
+          embeddingStatus: "lexical_only",
+        };
+      }
+      if (command === "list_knowledge_collections") {
+        return [
+          ...(primaryCollectionExists ? [collection("knowledge-collection-1", "项目知识", sourceExists ? 1 : 0, !sourceExists || sourceState === "cancelled" ? 0 : 3)] : []),
+          ...(createdCollectionName ? [collection("knowledge-collection-2", createdCollectionName, 0, 0)] : []),
+        ];
+      }
+      if (command === "upsert_knowledge_collection") {
+        host.__knowledgeActions.push(command);
+        const request = args?.request as { name?: string } | undefined;
+        createdCollectionName = String(request?.name ?? "");
+        return collection("knowledge-collection-2", createdCollectionName, 0, 0);
+      }
+      if (command === "list_knowledge_sources") {
+        return sourceExists && args?.collectionId === "knowledge-collection-1" ? [source()] : [];
+      }
+      if (command === "add_knowledge_source") {
+        const request = (args?.request ?? {}) as { collectionId?: string; workspaceRelativePath?: string };
+        if (request.workspaceRelativePath?.startsWith("../")) {
+          throw { code: "KC_PATH_OUTSIDE_WORKSPACE", message: "source path is outside workspace" };
+        }
+        host.__knowledgeActions.push(command);
+        host.__knowledgeAdds.push(request);
+        sourceExists = true;
+        return source();
+      }
+      if (command === "cancel_knowledge_index_job") {
+        host.__knowledgeActions.push(command);
+        sourceState = "cancelled";
+        activeJobId = null;
+        return { jobId: String(args?.jobId), sourceId: "knowledge-source-1", state: "cancelled" };
+      }
+      if (command === "refresh_knowledge_source") {
+        host.__knowledgeActions.push(command);
+        sourceState = "indexing";
+        activeJobId = "knowledge-job-2";
+        return { jobId: activeJobId, sourceId: "knowledge-source-1", state: "running" };
+      }
+      if (command === "delete_knowledge_source") {
+        host.__knowledgeActions.push(command);
+        sourceExists = false;
+        activeJobId = null;
+        return { deletedSourceId: "knowledge-source-1" };
+      }
+      if (command === "delete_knowledge_collection") {
+        host.__knowledgeActions.push(command);
+        primaryCollectionExists = false;
+        return { deletedCollectionId: "knowledge-collection-1" };
+      }
+      return originalInvoke(command, args);
+    };
+  });
+
+  await page.locator('button[aria-label="设置"]:visible').click();
+  const settings = page.getByRole("dialog", { name: "设置" });
+  await settings.getByRole("button", { name: /^知识库/ }).click();
+  await expect(settings.getByRole("heading", { name: "知识库", exact: true })).toBeVisible();
+  await expect(settings.getByText("等待索引", { exact: false })).toBeVisible();
+
+  const collectionName = settings.getByRole("textbox", { name: "Collection 名称" });
+  const createCollection = settings.getByRole("button", { name: "创建", exact: true });
+  await createCollection.click();
+  await expect(settings.getByText("请输入 Collection 名称", { exact: true })).toBeVisible();
+  await expect(collectionName).toBeFocused();
+  await expect(collectionName).toHaveAttribute("aria-invalid", "true");
+  await expect.poll(() => page.evaluate(() => (
+    window as unknown as { __knowledgeActions: string[] }
+  ).__knowledgeActions.filter((command) => command === "upsert_knowledge_collection").length)).toBe(0);
+
+  await collectionName.fill("  团队文档  ");
+  await expect(settings.getByText("请输入 Collection 名称", { exact: true })).toHaveCount(0);
+  await createCollection.click();
+  await expect(settings.getByText("团队文档", { exact: true })).toBeVisible();
+  await expect(collectionName).toHaveValue("");
+  await expect(collectionName).toHaveAttribute("aria-invalid", "false");
+  await expect.poll(() => page.evaluate(() => (
+    window as unknown as { __knowledgeActions: string[] }
+  ).__knowledgeActions.filter((command) => command === "upsert_knowledge_collection").length)).toBe(1);
+
+  const cancel = settings.getByRole("button", { name: /取消 .* 的索引/ });
+  const refresh = settings.getByRole("button", { name: /刷新 .*architecture-and-operations-guide\.md/ });
+  await expect(cancel).toBeVisible();
+  await expect(refresh).toBeDisabled();
+  await cancel.click();
+  await expect(settings.getByText("已取消", { exact: false })).toBeVisible();
+  await expect(cancel).toHaveCount(0);
+  await expect(refresh).toBeEnabled();
+
+  await page.evaluate(() => {
+    localStorage.setItem(
+      "kcoder_e2e_attachment_dialog_paths",
+      JSON.stringify(["D:\\code\\k-coder\\docs\\knowledge\\picked.md"]),
+    );
+  });
+  await settings.getByRole("button", { name: "选择文件" }).first().click();
+  await expect.poll(() => page.evaluate(() => (
+    window as unknown as { __knowledgeAdds: Array<{ workspaceRelativePath?: string }> }
+  ).__knowledgeAdds.length)).toBe(1);
+  expect(await page.evaluate(() => {
+    return (window as unknown as { __knowledgeAdds: Array<{ workspaceRelativePath?: string }> })
+      .__knowledgeAdds[0].workspaceRelativePath;
+  })).toBe("docs/knowledge/picked.md");
+
+  const createdCard = settings.locator(".knowledge-collection-card").filter({ hasText: "团队文档" });
+  await createdCard.getByLabel("来源路径").fill("../outside.md");
+  await createdCard.getByRole("button", { name: "添加路径" }).click();
+  await expect(settings.getByRole("alert")).toHaveText("KC_PATH_OUTSIDE_WORKSPACE：source path is outside workspace");
+
+  await settings.getByRole("button", { name: "关闭设置" }).click();
+  await expect(settings).toBeHidden();
+  await page.locator('button[aria-label="设置"]:visible').click();
+  const reopenedSettings = page.getByRole("dialog", { name: "设置" });
+  await reopenedSettings.getByRole("button", { name: /^知识库/ }).click();
+  await expect(reopenedSettings.getByText("docs/knowledge/architecture-and-operations-guide.md", { exact: true })).toBeVisible();
+  await expect(reopenedSettings.getByText("已取消", { exact: false })).toBeVisible();
+  await expect(reopenedSettings.getByRole("button", { name: "选择文件" }).first()).toBeVisible();
+
+  await refresh.click();
+  await expect(settings.getByText("正在索引", { exact: false })).toBeVisible();
+  await expect(settings.getByRole("button", { name: /取消 .* 的索引/ })).toBeVisible();
+  await expect(refresh).toBeDisabled();
+  await expect.poll(() => page.evaluate(() => {
+    const invoked = (window as unknown as { __knowledgeActions: string[] }).__knowledgeActions;
+    return {
+      cancelled: invoked.filter((command) => command === "cancel_knowledge_index_job").length,
+      refreshed: invoked.filter((command) => command === "refresh_knowledge_source").length,
+    };
+  })).toEqual({ cancelled: 1, refreshed: 1 });
+
+  const layout = await settings.evaluate((element) => {
+    const content = element.querySelector<HTMLElement>(".settings-content")!;
+    const sourceRow = element.querySelector<HTMLElement>(".knowledge-source-row")!;
+    const actions = element.querySelector<HTMLElement>(".knowledge-source-actions")!;
+    const rowBounds = sourceRow.getBoundingClientRect();
+    const actionBounds = actions.getBoundingClientRect();
+    return {
+      contentFits: content.scrollWidth <= content.clientWidth,
+      rowFits: sourceRow.scrollWidth <= sourceRow.clientWidth,
+      actionsInsideRow: actionBounds.left >= rowBounds.left && actionBounds.right <= rowBounds.right + 1,
+    };
+  });
+  expect(layout).toEqual({ contentFits: true, rowFits: true, actionsInsideRow: true });
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+  await page.screenshot({ path: testInfo.outputPath(`knowledge-settings-${testInfo.project.name}.png`), fullPage: true });
+
+  const deleteSource = settings.getByRole("button", { name: /删除知识来源 .*architecture-and-operations-guide\.md/ });
+  await deleteSource.click();
+  const sourceConfirmation = page.getByRole("dialog", { name: "删除知识来源" });
+  await expect(sourceConfirmation).toContainText("工作区原文件不会被删除");
+  await page.keyboard.press("Escape");
+  await expect(sourceConfirmation).toBeHidden();
+  await expect(settings).toBeVisible();
+  await deleteSource.click();
+  await page.getByRole("dialog", { name: "删除知识来源" }).getByRole("button", { name: "删除索引" }).click();
+  await expect(settings.getByText("docs/knowledge/architecture-and-operations-guide.md", { exact: true })).toHaveCount(0);
+
+  await settings.getByRole("button", { name: "删除 Collection 项目知识" }).click();
+  const collectionConfirmation = page.getByRole("dialog", { name: "删除 Collection" });
+  await expect(collectionConfirmation).toContainText("全部本地索引");
+  await collectionConfirmation.getByRole("button", { name: "删除索引" }).click();
+  await expect(settings.getByText("项目知识", { exact: true })).toHaveCount(0);
+  await expect.poll(() => page.evaluate(() => {
+    const invoked = (window as unknown as { __knowledgeActions: string[] }).__knowledgeActions;
+    return {
+      deletedSource: invoked.filter((command) => command === "delete_knowledge_source").length,
+      deletedCollection: invoked.filter((command) => command === "delete_knowledge_collection").length,
+    };
+  })).toEqual({ deletedSource: 1, deletedCollection: 1 });
+});
+
 test("disables project-only composer quick actions outside a project", async ({ page }) => {
   await page.goto("/");
   await page.evaluate(() => localStorage.setItem("kcoder_e2e_thread_override", JSON.stringify({
@@ -1377,8 +1671,67 @@ test("supports the primary workbench inspection flow", async ({ page }, testInfo
   await page.getByRole("button", { name: "MCP", exact: true }).click();
   await expect(page.getByRole("heading", { name: "MCP 配置", exact: true })).toBeVisible();
   await expect(page.locator(".mcp-runtime-server").filter({ hasText: "local" })).toBeVisible();
-  await page.getByRole("button", { name: /规则与审计/ }).click();
+  await page.getByRole("button", { name: "Rules", exact: true }).click();
+  await page.getByText("运行时来源与审计", { exact: true }).click();
   await expect(page.getByText("extensions_ready", { exact: true })).toBeVisible();
+});
+
+test("creates edits and deletes custom user rules", async ({ page }, testInfo) => {
+  await page.goto("/");
+  await page.locator('button[aria-label="设置"]:visible').click();
+  await page.getByRole("button", { name: "Rules", exact: true }).click();
+
+  const settings = page.getByRole("dialog", { name: "设置" });
+  await expect(settings.getByRole("heading", { name: "自定义规则", exact: true })).toBeVisible();
+  await expect(settings.getByText("方法注释", { exact: true })).toBeVisible();
+  await expect(settings.locator(".rule-row")).toHaveCount(1);
+
+  await settings.getByRole("button", { name: "新建", exact: true }).click();
+  await settings.getByLabel("名称").fill("😀".repeat(80));
+  await expect(settings.locator(".rule-field").filter({ hasText: "名称" }).getByText("80/80", { exact: true })).toBeVisible();
+  await expect(settings.getByLabel("名称")).toHaveAttribute("aria-invalid", "false");
+  await settings.getByLabel("名称").fill("审批流程");
+  await settings.getByLabel("规则内容").fill("审批通过后结束流程，并记录最终状态。");
+  await settings.getByRole("button", { name: "保存", exact: true }).click();
+  await expect(settings.getByText("审批流程", { exact: true })).toBeVisible();
+  await expect(settings.locator(".rule-row")).toHaveCount(2);
+  await expect.poll(() => page.evaluate(() => (
+    window as unknown as { __invocationArgs: Record<string, unknown> }
+  ).__invocationArgs.save_user_rule)).toEqual({
+    request: {
+      id: null,
+      title: "审批流程",
+      content: "审批通过后结束流程，并记录最终状态。",
+    },
+  });
+
+  await settings.getByRole("button", { name: "编辑 审批流程" }).click();
+  await settings.getByLabel("名称").fill("审批完成规则");
+  await settings.getByLabel("规则内容").fill("审批通过并完成审计后结束流程。");
+  await settings.getByRole("button", { name: "保存", exact: true }).click();
+  await expect(settings.getByText("审批完成规则", { exact: true })).toBeVisible();
+  await expect(settings.getByText("审批流程", { exact: true })).toHaveCount(0);
+
+  await settings.getByRole("button", { name: "删除 审批完成规则" }).click();
+  const confirmation = page.getByRole("dialog", { name: "删除规则" });
+  await expect(confirmation.getByText("审批完成规则", { exact: true })).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(confirmation).toHaveCount(0);
+  await expect(settings).toBeVisible();
+  await expect(settings.getByText("审批完成规则", { exact: true })).toBeVisible();
+
+  await settings.getByRole("button", { name: "删除 审批完成规则" }).click();
+  await confirmation.getByRole("button", { name: "删除", exact: true }).click();
+  await expect(settings.getByText("审批完成规则", { exact: true })).toHaveCount(0);
+  await expect(settings.locator(".rule-row")).toHaveCount(1);
+  await expect.poll(() => page.evaluate(() => (
+    window as unknown as { __invocationArgs: Record<string, { id?: string }> }
+  ).__invocationArgs.delete_user_rule?.id)).toBe("22222222-2222-4222-8222-222222222222");
+
+  expect(await settings.locator(".settings-content").evaluate((element) => (
+    element.scrollWidth <= element.clientWidth + 1
+  ))).toBe(true);
+  await page.screenshot({ path: testInfo.outputPath("custom-user-rules.png"), fullPage: true });
 });
 
 test("hides failed patch attempts after a matching retry succeeds", async ({ page }, testInfo) => {
@@ -1540,21 +1893,21 @@ test("edits global and project mcp.json directly", async ({ page }, testInfo) =>
 
   const globalEditor = dialog.getByLabel(/runtime-data\\mcp\.json JSON$/);
   await globalEditor.fill(JSON.stringify({
-    mcpServers: [
-      {
-        id: "local",
-        transport: "stdio",
-        command: ["npx", "-y", "@modelcontextprotocol/server-filesystem", "D:\\code\\k-coder"],
+    mcpServers: {
+      local: {
+        type: "stdio",
+        command: "npx",
+        args: ["-y", "@modelcontextprotocol/server-filesystem", "D:\\code\\k-coder"],
       },
-      {
-        id: "github",
+      github: {
         enabled: true,
         timeoutMs: 45000,
-        transport: "streamable_http",
+        type: "streamable-http",
         url: "https://example.com/mcp",
+        headers: { Accept: "application/json, text/event-stream" },
         secret_headers: { Authorization: "github-token" },
       },
-    ],
+    },
   }));
   await dialog.getByRole("button", { name: "格式化 JSON", exact: true }).click();
   await expect(globalEditor).toHaveValue(/"github"/);
@@ -1566,17 +1919,17 @@ test("edits global and project mcp.json directly", async ({ page }, testInfo) =>
       __invocationArgs: Record<string, { scope?: string; content?: string }>;
     }).__invocationArgs.save_mcp_config;
     const document = JSON.parse(args?.content ?? "{}") as {
-      mcpServers?: Array<Record<string, unknown>>;
+      mcpServers?: Record<string, Record<string, unknown>>;
     };
-    return { scope: args?.scope, server: document.mcpServers?.find((item) => item.id === "github") };
+    return { scope: args?.scope, server: document.mcpServers?.github };
   })).toEqual({
     scope: "global",
     server: {
-      id: "github",
       enabled: true,
       timeoutMs: 45000,
-      transport: "streamable_http",
+      type: "streamable-http",
       url: "https://example.com/mcp",
+      headers: { Accept: "application/json, text/event-stream" },
       secret_headers: { Authorization: "github-token" },
     },
   });
@@ -1595,7 +1948,12 @@ test("edits global and project mcp.json directly", async ({ page }, testInfo) =>
   await expect(projectPath).toHaveAttribute("title", /\.k-coder\\mcp\.json$/);
   await expect(projectPath).toContainText("尚未创建");
   const jsonEditor = dialog.getByLabel(/\.k-coder\\mcp\.json JSON$/);
-  await expect(jsonEditor).toHaveValue(/"mcpServers": \[\]/);
+  await expect(jsonEditor).toHaveValue(/"mcpServers": \{\}/);
+  await jsonEditor.fill(JSON.stringify({
+    mcpServers: [{ id: "legacy", transport: "stdio", command: ["node"] }],
+  }));
+  await expect(dialog.locator(".mcp-json-error")).toHaveCount(0);
+  await expect(dialog.getByRole("button", { name: "保存 JSON", exact: true })).toBeEnabled();
   await jsonEditor.fill("{");
   await expect(dialog.locator(".mcp-json-error")).toBeVisible();
   await expect(dialog.getByRole("button", { name: "保存 JSON", exact: true })).toBeDisabled();
@@ -2703,6 +3061,38 @@ test("primary send queues behind the active turn and the queued send steers it",
   });
   await expect(page.locator(".message--user").getByText("改为先修复发送逻辑，再继续验证", { exact: true })).toBeVisible();
   await expect(page.locator(".mode-label")).toHaveText("正在生成");
+
+  await page.getByRole("button", { name: "停止生成" }).click();
+  await expect.poll(() => page.evaluate(() => (
+    window as unknown as { __invoked: string[] }
+  ).__invoked.filter((command) => command === "turn_interrupt").length)).toBe(1);
+  await expect.poll(() => page.evaluate(() => (
+    window as unknown as { __runTurnCalls: unknown[] }
+  ).__runTurnCalls.length)).toBe(1);
+  await expect.poll(() => page.evaluate(() => (
+    window as unknown as { __invocationArgs: Record<string, unknown> }
+  ).__invocationArgs.turn_interrupt)).toEqual({
+    threadId: "thread-1",
+    turnId: "turn-primary-active",
+  });
+
+  await page.evaluate(() => {
+    (window as unknown as { __emitAgentEvent: (event: unknown) => void }).__emitAgentEvent({
+      schemaVersion: 4,
+      threadId: "thread-1",
+      turnId: "turn-primary-active",
+      type: "turn_cancelled",
+      phase: "cancelled",
+    });
+  });
+  await expect(page.locator(".message-queue")).toHaveCount(0);
+  await expect(page.locator(".message--user").getByText("改为先修复发送逻辑，再继续验证", { exact: true })).toHaveCount(1);
+  await expect.poll(() => page.evaluate(() => (
+    window as unknown as { __runTurnCalls: unknown[] }
+  ).__runTurnCalls.length)).toBe(1);
+  await expect.poll(() => page.evaluate(() => (
+    window as unknown as { __invoked: string[] }
+  ).__invoked.filter((command) => command === "turn_interrupt").length)).toBe(1);
 });
 
 test("atomically steers and removes a queued message from the backend mailbox", async ({ page }, testInfo) => {

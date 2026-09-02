@@ -1646,6 +1646,7 @@ fn map_plugin_http_mcp(
         timeout_ms: plugin_mcp_timeout(display_id, object)?,
         transport: McpTransportConfig::StreamableHttp {
             url: url.into(),
+            headers: HashMap::new(),
             secret_headers,
         },
     };

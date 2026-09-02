@@ -1220,10 +1220,11 @@ impl AgentRuntime {
             let mut protocol_retry_count = 0usize;
 
             // 声明需要在重试循环外部的变量
-            let response: String;
-            let response_images: Vec<ContentBlock>;
-            let pending_tool_calls: Vec<ToolCall>;
-            let completed: bool;
+            let mut response = String::new();
+            let mut response_images = Vec::<ContentBlock>::new();
+            let mut pending_tool_calls = Vec::<ToolCall>::new();
+            let mut completed = false;
+            let mut interrupted_for_steer = false;
             let assistant_item_id = Uuid::new_v4().to_string();
             self.start_item(
                 &thread_id,
@@ -1233,19 +1234,30 @@ impl AgentRuntime {
                 &publisher,
             )
             .await?;
+            let provider_cancellation = control
+                .as_ref()
+                .map(|control| control.begin_provider_request(&cancellation))
+                .unwrap_or_else(|| cancellation.child_token());
 
             // 外层循环：支持整个请求的重试
             'retry_loop: loop {
                 let call_index = provider_call_index;
                 provider_call_index = provider_call_index.saturating_add(1);
                 let provider_started = std::time::Instant::now();
-                let mut stream = match provider
-                    .stream(request.clone(), cancellation.clone())
-                    .await
-                {
+                let stream_result = tokio::select! {
+                    _ = provider_cancellation.cancelled() => Err(ProviderError::Cancelled),
+                    stream = provider.stream(request.clone(), provider_cancellation.clone()) => stream,
+                };
+                let mut stream = match stream_result {
                     Ok(stream) => stream,
                     Err(ProviderError::Cancelled) => {
                         self.record_provider_metric(provider_started, false, None);
+                        if !cancellation.is_cancelled()
+                            && provider_cancellation.is_cancelled()
+                        {
+                            interrupted_for_steer = true;
+                            break 'retry_loop;
+                        }
                         return self
                             .finish_cancelled(&thread_id, &turn_id, &publisher)
                             .await;
@@ -1266,7 +1278,13 @@ impl AgentRuntime {
                         };
 
                         if let Some((delay, transient)) = retry_delay {
-                            if !wait_for_provider_retry(delay, &cancellation).await {
+                            if !wait_for_provider_retry(delay, &provider_cancellation).await {
+                                if !cancellation.is_cancelled()
+                                    && provider_cancellation.is_cancelled()
+                                {
+                                    interrupted_for_steer = true;
+                                    break 'retry_loop;
+                                }
                                 return self
                                     .finish_cancelled(&thread_id, &turn_id, &publisher)
                                     .await;
@@ -1310,8 +1328,16 @@ impl AgentRuntime {
                 let mut attempt_had_output = false;
                 let completed_inner = loop {
                     let event = tokio::select! {
-                        _ = cancellation.cancelled() => {
-                            return self.finish_cancelled(&thread_id, &turn_id, &publisher).await;
+                        _ = provider_cancellation.cancelled() => {
+                            if cancellation.is_cancelled() {
+                                return self.finish_cancelled(&thread_id, &turn_id, &publisher).await;
+                            }
+                            self.record_provider_metric(
+                                provider_started,
+                                false,
+                                iteration_usage_inner,
+                            );
+                            break None;
                         }
                         event = stream.next() => event,
                     };
@@ -1560,7 +1586,7 @@ impl AgentRuntime {
                                 true,
                                 iteration_usage_inner,
                             );
-                            break true;
+                            break Some(true);
                         }
                         Some(Err(ProviderError::Cancelled)) => {
                             self.record_provider_metric(
@@ -1579,6 +1605,14 @@ impl AgentRuntime {
                                     &publisher,
                                 )
                                 .await?;
+                            }
+                            if cancellation.is_cancelled() {
+                                return self
+                                    .finish_cancelled(&thread_id, &turn_id, &publisher)
+                                    .await;
+                            }
+                            if provider_cancellation.is_cancelled() {
+                                break None;
                             }
                             return self
                                 .finish_cancelled(&thread_id, &turn_id, &publisher)
@@ -1620,7 +1654,13 @@ impl AgentRuntime {
                                 None
                             };
                             if let Some((delay, transient)) = retry_delay {
-                                if !wait_for_provider_retry(delay, &cancellation).await {
+                                if !wait_for_provider_retry(delay, &provider_cancellation).await {
+                                    if !cancellation.is_cancelled()
+                                        && provider_cancellation.is_cancelled()
+                                    {
+                                        interrupted_for_steer = true;
+                                        break 'retry_loop;
+                                    }
                                     return self
                                         .finish_cancelled(&thread_id, &turn_id, &publisher)
                                         .await;
@@ -1671,7 +1711,7 @@ impl AgentRuntime {
                                 .await?;
                                 iteration_usage_inner = None;
                             }
-                            break false;
+                            break Some(false);
                         }
                     }
                 };
@@ -1691,9 +1731,45 @@ impl AgentRuntime {
                 response = response_inner;
                 response_images = response_images_inner;
                 pending_tool_calls = pending_tool_calls_inner;
-                completed = completed_inner;
+                if let Some(provider_completed) = completed_inner {
+                    completed = provider_completed;
+                } else {
+                    interrupted_for_steer = true;
+                }
                 break;
             } // 'retry_loop 结束
+
+            if let Some(control) = &control {
+                control.end_provider_request();
+            }
+            if interrupted_for_steer {
+                if cancellation.is_cancelled() {
+                    return self
+                        .finish_cancelled(&thread_id, &turn_id, &publisher)
+                        .await;
+                }
+                let steered = control
+                    .as_ref()
+                    .map(|control| control.take_pending())
+                    .unwrap_or_default();
+                if steered.is_empty() {
+                    return self
+                        .finish_cancelled(&thread_id, &turn_id, &publisher)
+                        .await;
+                }
+                self.continue_after_provider_steer(
+                    &thread_id,
+                    &turn_id,
+                    &assistant_item_id,
+                    response,
+                    response_images,
+                    steered,
+                    &publisher,
+                )
+                .await?;
+                iteration = iteration.saturating_add(1);
+                continue;
+            }
 
             if !completed {
                 return self
@@ -1999,6 +2075,50 @@ impl AgentRuntime {
             }));
         }
         Ok(())
+    }
+
+    async fn continue_after_provider_steer(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        assistant_item_id: &str,
+        response: String,
+        response_images: Vec<ContentBlock>,
+        steered: Vec<ChatMessage>,
+        publisher: &Arc<dyn EventPublisher>,
+    ) -> Result<(), AgentRuntimeError> {
+        if !response.is_empty() || !response_images.is_empty() {
+            let message = assistant_message_with_content(
+                assistant_item_id.to_string(),
+                response,
+                response_images,
+            );
+            self.repository
+                .append(StoredEvent::new(
+                    thread_id,
+                    Some(turn_id.to_string()),
+                    StoredEventKind::AssistantMessage { message },
+                ))
+                .await?;
+        }
+        self.complete_active_non_message_items(
+            thread_id,
+            turn_id,
+            AgentItemStatus::Cancelled,
+            publisher,
+        )
+        .await?;
+        self.complete_item(
+            thread_id,
+            turn_id,
+            assistant_item_id,
+            AgentItemType::AgentMessage,
+            AgentItemStatus::Cancelled,
+            publisher,
+        )
+        .await?;
+        self.persist_steered_messages(thread_id, turn_id, steered, publisher)
+            .await
     }
 
     async fn execute_tool_with_progress(
@@ -4259,7 +4379,10 @@ mod tests {
             FakeProvider::script(vec![
                 vec![
                     Ok(ProviderEvent::TextDelta {
-                        delta: "first answer".into(),
+                        delta: "partial answer".into(),
+                    }),
+                    Ok(ProviderEvent::TextDelta {
+                        delta: " obsolete tail".into(),
                     }),
                     Ok(ProviderEvent::Completed),
                 ],
@@ -4270,7 +4393,7 @@ mod tests {
                     Ok(ProviderEvent::Completed),
                 ],
             ])
-            .with_delay(Duration::from_millis(20)),
+            .with_delay(Duration::from_millis(50)),
         );
         let publisher = Arc::new(RecordingPublisher::default());
         let control = TurnControl::new();
@@ -4299,7 +4422,12 @@ mod tests {
         });
 
         tokio::time::timeout(Duration::from_secs(1), async {
-            while provider.requests().is_empty() {
+            while !publisher.events.lock().unwrap().iter().any(|event| {
+                matches!(
+                    &event.event,
+                    AgentEvent::TextDelta { delta, .. } if delta == "partial answer"
+                )
+            }) {
                 tokio::time::sleep(Duration::from_millis(1)).await;
             }
         })
@@ -4318,13 +4446,144 @@ mod tests {
                 ProviderMessage::Text { role: MessageRole::User, text } if text == "adjust it"
             )
         }));
-        assert!(publisher.events.lock().unwrap().iter().any(|event| {
+        let published = publisher.events.lock().unwrap();
+        assert!(published.iter().any(|event| {
             matches!(
                 &event.event,
                 AgentEvent::TurnSteered { turn_id, message, .. }
                     if turn_id == "turn-steered" && message.visible_text() == "adjust it"
             )
         }));
+        assert_eq!(
+            published
+                .iter()
+                .filter(|event| matches!(&event.event, AgentEvent::TurnStarted { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            published
+                .iter()
+                .filter(|event| matches!(&event.event, AgentEvent::TurnCompleted { .. }))
+                .count(),
+            1
+        );
+        assert!(
+            !published
+                .iter()
+                .any(|event| matches!(&event.event, AgentEvent::TurnCancelled { .. }))
+        );
+        drop(published);
+        let stored = repository.load(&thread_id).await.unwrap();
+        assert_eq!(
+            stored
+                .iter()
+                .filter(|event| matches!(event.kind, StoredEventKind::UserMessage { .. }))
+                .count(),
+            2
+        );
+        let assistant_texts = stored
+            .iter()
+            .filter_map(|event| match &event.kind {
+                StoredEventKind::AssistantMessage { message } => Some(message.visible_text()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(assistant_texts, vec!["partial answer", "adjusted answer"]);
+    }
+
+    #[tokio::test]
+    async fn stopping_after_steer_cancels_the_same_turn_without_a_third_request() {
+        let (_directory, repository, runtime, thread_id) = runtime_fixture().await;
+        let provider = Arc::new(
+            FakeProvider::script(vec![
+                vec![
+                    Ok(ProviderEvent::TextDelta {
+                        delta: "obsolete answer".into(),
+                    }),
+                    Ok(ProviderEvent::Completed),
+                ],
+                vec![
+                    Ok(ProviderEvent::TextDelta {
+                        delta: "adjusted answer".into(),
+                    }),
+                    Ok(ProviderEvent::Completed),
+                ],
+            ])
+            .with_delay(Duration::from_millis(200)),
+        );
+        let publisher = Arc::new(RecordingPublisher::default());
+        let control = TurnControl::new();
+        let cancellation = CancellationToken::new();
+        let task_control = control.clone();
+        let task_provider = provider.clone();
+        let task_publisher = publisher.clone();
+        let task_thread_id = thread_id.clone();
+        let task_cancellation = cancellation.clone();
+
+        let task = tokio::spawn(async move {
+            runtime
+                .run_turn_with_attachments_id_and_control(
+                    task_provider,
+                    "fake-model".into(),
+                    RunTurnRequest {
+                        thread_id: task_thread_id,
+                        input: "initial request".into(),
+                        agent_mode: None,
+                    },
+                    Vec::new(),
+                    "turn-steer-then-stop".into(),
+                    task_cancellation,
+                    task_control,
+                    task_publisher,
+                )
+                .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while provider.requests().is_empty() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+        control
+            .steer(build_user_message("adjust it", Vec::new(), false).unwrap())
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while provider.requests().len() < 2 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        cancellation.cancel();
+        let outcome = task.await.unwrap().unwrap();
+
+        assert_eq!(outcome.state, TurnState::Cancelled);
+        assert_eq!(provider.requests().len(), 2);
+        let published = publisher.events.lock().unwrap();
+        assert_eq!(
+            published
+                .iter()
+                .filter(|event| matches!(&event.event, AgentEvent::TurnStarted { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            published
+                .iter()
+                .filter(|event| matches!(&event.event, AgentEvent::TurnCancelled { .. }))
+                .count(),
+            1
+        );
+        assert!(
+            !published
+                .iter()
+                .any(|event| matches!(&event.event, AgentEvent::TurnCompleted { .. }))
+        );
+        drop(published);
         assert_eq!(
             repository
                 .load(&thread_id)
