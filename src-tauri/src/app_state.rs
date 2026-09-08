@@ -2589,6 +2589,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn extension_prepare_registers_skill_resource_read_as_read_risk() {
+        let data = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let state = AppState::with_workspace_and_credentials(
+            data.path(),
+            workspace.path(),
+            Arc::new(FakeCredentials::default()),
+        )
+        .unwrap();
+
+        state.prepare_extensions(false).await.unwrap();
+        let registry = state.tool_registry();
+        let authorization = registry
+            .authorization(
+                "skill_resource_read",
+                &serde_json::json!({
+                    "skillId": "review",
+                    "path": "references/guide.md"
+                }),
+            )
+            .unwrap();
+
+        assert!(
+            registry
+                .definition_names()
+                .contains(&"skill_resource_read".to_string())
+        );
+        assert_eq!(authorization.decision, PolicyDecision::Allow);
+        assert_eq!(authorization.risk, ToolRisk::Read);
+    }
+
+    #[tokio::test]
     async fn undo_restores_the_snapshot_and_persists_the_audit_event() {
         let data = tempfile::tempdir().unwrap();
         let workspace = tempfile::tempdir().unwrap();

@@ -6,18 +6,21 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::hash::{Hash, Hasher};
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 
+use async_trait::async_trait;
 use serde::de::Error as _;
 use serde::ser::{SerializeMap, SerializeStruct};
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
 use crate::logging::StructuredLogger;
 use crate::persistence::ProjectionDb;
-use crate::protocol::{PluginOverview, PluginState, ToolRisk};
-use crate::tools::{ToolError, ToolHandler, ToolHookRunner};
+use crate::protocol::{PluginOverview, PluginState, ToolDefinition, ToolResult, ToolRisk};
+use crate::tools::{ToolContext, ToolError, ToolHandler, ToolHookRunner};
 
 use self::hooks::{HookConfig, HookPipeline};
 use self::mcp::{McpSecretStore, McpServerConfig};
@@ -26,6 +29,9 @@ use self::plugins::PluginHost;
 const MAX_INSTRUCTION_FILE_BYTES: usize = 256 * 1024;
 const MAX_RUNTIME_INSTRUCTION_BYTES: usize = 48 * 1024;
 const MAX_SKILL_BYTES: usize = 256 * 1024;
+const MAX_SKILL_RESOURCE_FILE_BYTES: usize = 256 * 1024;
+const MAX_SKILL_RESOURCE_READ_BYTES: usize = 64 * 1024;
+const DEFAULT_SKILL_RESOURCE_READ_BYTES: usize = 16 * 1024;
 const MAX_CONFIG_BYTES: usize = 1024 * 1024;
 const MAX_SELECTED_SKILLS: usize = 4;
 const MAX_AUDIT_RECORDS: usize = 200;
@@ -509,6 +515,39 @@ struct LoadedSkill {
     enabled: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) enum ResolvedSkillSource {
+    Ordinary { scope: String },
+    Plugin { plugin_id: String },
+    OrdinaryFallback { plugin_id: String, scope: String },
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct ResolvedSkill {
+    pub(crate) id: String,
+    pub(crate) source: ResolvedSkillSource,
+    pub(crate) risk: ToolRisk,
+    pub(crate) enabled: bool,
+    pub(crate) body: String,
+    pub(crate) bytes: usize,
+    pub(crate) sha256: String,
+}
+
+impl std::fmt::Debug for ResolvedSkill {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ResolvedSkill")
+            .field("id", &self.id)
+            .field("source", &self.source)
+            .field("risk", &self.risk)
+            .field("enabled", &self.enabled)
+            .field("bytes", &self.bytes)
+            .field("sha256", &self.sha256)
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SkillDiagnostic {
@@ -689,9 +728,12 @@ impl ExtensionService {
             &workspace,
             &self.projection,
         )?;
-        let mut handlers = Vec::<Arc<dyn ToolHandler>>::new();
-        let mut risks = HashMap::new();
-        let mut tool_names = HashSet::new();
+        let skill_resource_handler = Arc::new(SkillResourceReadTool {
+            service: self.clone(),
+        }) as Arc<dyn ToolHandler>;
+        let mut handlers = vec![skill_resource_handler];
+        let mut risks = HashMap::from([("skill_resource_read".to_string(), ToolRisk::Read)]);
+        let mut tool_names = HashSet::from(["skill_resource_read".to_string()]);
         let mut mcp_diagnostics = Vec::new();
 
         for server in &config.mcp_servers {
@@ -941,6 +983,137 @@ impl ExtensionService {
             )));
         }
         Ok(output)
+    }
+
+    pub(crate) fn resolve_ordinary_skill(
+        &self,
+        skill_id: &str,
+    ) -> Result<ResolvedSkill, ExtensionError> {
+        let skills = self.skills.read().expect("skill lock poisoned");
+        let skill = skills
+            .iter()
+            .find(|skill| skill.metadata.name == skill_id)
+            .ok_or_else(|| ExtensionError::Skill(format!("Skill {skill_id} is not available")))?;
+        Ok(resolved_ordinary_skill(skill))
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn resolve_plugin_skill(
+        &self,
+        plugin_id: &str,
+        skill_id: &str,
+        fallback_skill_id: Option<&str>,
+    ) -> Result<ResolvedSkill, ExtensionError> {
+        match self.plugins.resolve_skill(plugin_id, skill_id) {
+            Ok(skill) => Ok(ResolvedSkill {
+                id: skill.skill_id,
+                source: ResolvedSkillSource::Plugin {
+                    plugin_id: skill.plugin_id,
+                },
+                risk: skill.risk,
+                enabled: skill.enabled,
+                body: skill.body,
+                bytes: skill.bytes,
+                sha256: skill.sha256,
+            }),
+            Err(plugin_error) => {
+                let Some(fallback_skill_id) = fallback_skill_id else {
+                    return Err(ExtensionError::Skill(format!(
+                        "plugin Skill {plugin_id}/{skill_id} is unavailable and has no ordinary fallback: {plugin_error}"
+                    )));
+                };
+                let mut fallback = self.resolve_ordinary_skill(fallback_skill_id).map_err(|error| {
+                    ExtensionError::Skill(format!(
+                        "plugin Skill {plugin_id}/{skill_id} is unavailable ({plugin_error}); fallback {fallback_skill_id} failed: {error}"
+                    ))
+                })?;
+                if !fallback.enabled {
+                    return Err(ExtensionError::Skill(format!(
+                        "plugin Skill {plugin_id}/{skill_id} is unavailable ({plugin_error}); fallback {fallback_skill_id} is disabled"
+                    )));
+                }
+                let scope = match &fallback.source {
+                    ResolvedSkillSource::Ordinary { scope } => scope.clone(),
+                    _ => unreachable!("ordinary resolution must have an ordinary source"),
+                };
+                fallback.source = ResolvedSkillSource::OrdinaryFallback {
+                    plugin_id: plugin_id.to_string(),
+                    scope,
+                };
+                Ok(fallback)
+            }
+        }
+    }
+
+    fn read_skill_resource(
+        &self,
+        skill_id: &str,
+        raw_path: &str,
+        offset: Option<usize>,
+        limit: Option<usize>,
+    ) -> Result<ToolResult, ToolError> {
+        let resolved = self
+            .resolve_ordinary_skill(skill_id)
+            .map_err(|_| ToolError::Denied(format!("Skill {skill_id} is not available")))?;
+        if !resolved.enabled {
+            return Err(ToolError::Denied(format!("Skill {skill_id} is disabled")));
+        }
+        let skill_path = self
+            .skills
+            .read()
+            .expect("skill lock poisoned")
+            .iter()
+            .find(|skill| skill.metadata.name == skill_id)
+            .map(|skill| skill.path.clone())
+            .ok_or_else(|| ToolError::Denied(format!("Skill {skill_id} is not available")))?;
+        let relative = validate_skill_resource_path(raw_path)?;
+        let skill_root = skill_path
+            .parent()
+            .ok_or_else(|| ToolError::Execution("Skill root is unavailable".into()))?;
+        let path = resolve_skill_resource_path(skill_root, &relative)?;
+        let metadata =
+            fs::metadata(&path).map_err(|error| ToolError::InvalidArguments(error.to_string()))?;
+        if !metadata.is_file() {
+            return Err(ToolError::InvalidArguments(
+                "Skill resource path must identify a regular file".into(),
+            ));
+        }
+        if metadata.len() as usize > MAX_SKILL_RESOURCE_FILE_BYTES {
+            return Err(ToolError::InvalidArguments(format!(
+                "Skill resource exceeds the {MAX_SKILL_RESOURCE_FILE_BYTES} byte file limit"
+            )));
+        }
+        let bytes = fs::read(&path).map_err(|error| ToolError::Execution(error.to_string()))?;
+        let text = String::from_utf8(bytes)
+            .map_err(|_| ToolError::Execution("Skill resource must be UTF-8".into()))?;
+        let offset = offset.unwrap_or(0);
+        if offset > text.len() || !text.is_char_boundary(offset) {
+            return Err(ToolError::InvalidArguments(
+                "offset must be a UTF-8 byte boundary within the Skill resource".into(),
+            ));
+        }
+        let limit = limit.unwrap_or(DEFAULT_SKILL_RESOURCE_READ_BYTES);
+        if !(1..=MAX_SKILL_RESOURCE_READ_BYTES).contains(&limit) {
+            return Err(ToolError::InvalidArguments(format!(
+                "limit must be between 1 and {MAX_SKILL_RESOURCE_READ_BYTES} bytes"
+            )));
+        }
+        let mut end = offset.saturating_add(limit).min(text.len());
+        while end > offset && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        Ok(ToolResult {
+            success: true,
+            output: text[offset..end].to_string(),
+            metadata: json!({
+                "skillId": skill_id,
+                "path": raw_path,
+                "offset": offset,
+                "bytesReturned": end - offset,
+                "totalBytes": text.len(),
+                "truncated": offset > 0 || end < text.len(),
+            }),
+        })
     }
 
     pub fn overview(&self) -> ExtensionOverview {
@@ -1285,6 +1458,66 @@ impl ExtensionService {
             event,
             serde_json::json!({ "kind": kind, "id": id, "success": success, "detail": detail }),
         );
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SkillResourceReadArguments {
+    skill_id: String,
+    path: String,
+    #[serde(default)]
+    offset: Option<usize>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Clone)]
+struct SkillResourceReadTool {
+    service: ExtensionService,
+}
+
+#[async_trait]
+impl ToolHandler for SkillResourceReadTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "skill_resource_read".into(),
+            description: "Read a bounded UTF-8 reference resource from the current effective enabled ordinary Skill. This tool only reads files and never executes scripts.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "skillId": { "type": "string", "minLength": 1, "maxLength": 64 },
+                    "path": { "type": "string", "minLength": 1, "maxLength": 1024 },
+                    "offset": { "type": "integer", "minimum": 0 },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": MAX_SKILL_RESOURCE_READ_BYTES
+                    }
+                },
+                "required": ["skillId", "path"],
+                "additionalProperties": false
+            }),
+        }
+    }
+
+    async fn execute(
+        &self,
+        _context: &ToolContext,
+        arguments: Value,
+        cancellation: CancellationToken,
+    ) -> Result<ToolResult, ToolError> {
+        if cancellation.is_cancelled() {
+            return Err(ToolError::Cancelled);
+        }
+        let arguments: SkillResourceReadArguments = serde_json::from_value(arguments)
+            .map_err(|error| ToolError::InvalidArguments(error.to_string()))?;
+        self.service.read_skill_resource(
+            &arguments.skill_id,
+            &arguments.path,
+            arguments.offset,
+            arguments.limit,
+        )
     }
 }
 
@@ -1920,6 +2153,59 @@ fn reject_skill_link_or_reparse(path: &Path) -> Result<(), ExtensionError> {
     Ok(())
 }
 
+fn validate_skill_resource_path(raw_path: &str) -> Result<PathBuf, ToolError> {
+    let path = Path::new(raw_path);
+    if raw_path.trim().is_empty()
+        || path.is_absolute()
+        || path
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(ToolError::InvalidArguments(
+            "Skill resource path must be a non-empty relative path without parent traversal".into(),
+        ));
+    }
+    Ok(path.to_path_buf())
+}
+
+fn resolve_skill_resource_path(root: &Path, relative: &Path) -> Result<PathBuf, ToolError> {
+    let canonical_root = root
+        .canonicalize()
+        .map_err(|error| ToolError::Execution(error.to_string()))?;
+    let mut current = canonical_root.clone();
+    reject_skill_resource_link(&current)?;
+    for component in relative.components() {
+        let Component::Normal(component) = component else {
+            return Err(ToolError::InvalidArguments(
+                "Skill resource path contains an unsupported component".into(),
+            ));
+        };
+        current.push(component);
+        reject_skill_resource_link(&current)?;
+    }
+    let canonical = current
+        .canonicalize()
+        .map_err(|error| ToolError::InvalidArguments(error.to_string()))?;
+    if !canonical.starts_with(&canonical_root) {
+        return Err(ToolError::InvalidArguments(
+            "Skill resource path escapes its Skill root".into(),
+        ));
+    }
+    Ok(canonical)
+}
+
+fn reject_skill_resource_link(path: &Path) -> Result<(), ToolError> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| ToolError::InvalidArguments(error.to_string()))?;
+    if metadata.file_type().is_symlink() || skill_metadata_is_reparse_point(&metadata) {
+        return Err(ToolError::InvalidArguments(format!(
+            "Skill resource path {} must not contain a symbolic link or directory junction",
+            user_facing_path(path)
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(windows)]
 fn skill_metadata_is_reparse_point(metadata: &fs::Metadata) -> bool {
     use std::os::windows::fs::MetadataExt;
@@ -1982,7 +2268,35 @@ fn parse_skill(content: &str, path: &Path) -> Result<(SkillMetadata, String), Ex
             user_facing_path(path)
         )));
     }
-    Ok((metadata, body.trim().to_string()))
+    Ok((metadata, normalize_skill_body(body)))
+}
+
+fn resolved_ordinary_skill(skill: &LoadedSkill) -> ResolvedSkill {
+    ResolvedSkill {
+        id: skill.metadata.name.clone(),
+        source: ResolvedSkillSource::Ordinary {
+            scope: skill.scope.clone(),
+        },
+        risk: skill.metadata.risk,
+        enabled: skill.enabled,
+        body: skill.body.clone(),
+        bytes: skill.body.len(),
+        sha256: sha256_hex(skill.body.as_bytes()),
+    }
+}
+
+fn normalize_skill_body(body: &str) -> String {
+    body.replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .trim()
+        .to_string()
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 fn read_bounded_utf8(path: &Path, limit: usize) -> Result<String, ExtensionError> {
@@ -2084,6 +2398,31 @@ fn collect_extension_files(root: &Path, paths: &mut Vec<PathBuf>) -> Result<(), 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tool_context(workspace: &Path) -> crate::tools::ToolContext {
+        crate::tools::ToolContext {
+            thread_id: "thread-1".into(),
+            turn_id: "turn-1".into(),
+            call_id: "call-1".into(),
+            workspace_root: workspace.to_path_buf(),
+            approval: None,
+            progress: None,
+        }
+    }
+
+    async fn prepared_skill_resource_handler(
+        service: &ExtensionService,
+        workspace: &Path,
+    ) -> Arc<dyn ToolHandler> {
+        service
+            .prepare(workspace, CancellationToken::new())
+            .await
+            .unwrap()
+            .handlers
+            .into_iter()
+            .find(|handler| handler.definition().name == "skill_resource_read")
+            .expect("ordinary Skill resource handler")
+    }
 
     fn write_test_skill(root: &Path, name: &str, body: &str) {
         let directory = root.join(name);
@@ -2327,6 +2666,425 @@ mod tests {
         .unwrap();
         assert_eq!(skills[0].scope, "builtin");
         assert_eq!(skills[0].body, "BUILTIN-INSTRUCTIONS");
+    }
+
+    #[tokio::test]
+    async fn resolved_ordinary_skill_uses_the_effective_project_scope() {
+        let builtin = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        write_test_skill(builtin.path(), "review", "BUILTIN-INSTRUCTIONS");
+        write_test_skill(&data.path().join("skills"), "review", "GLOBAL-INSTRUCTIONS");
+        write_test_skill(
+            &workspace.path().join(".k-coder/skills"),
+            "review",
+            "PROJECT-INSTRUCTIONS",
+        );
+        let service = ExtensionService::with_builtin_skills(
+            data.path().into(),
+            Some(builtin.path().into()),
+            ProjectionDb::memory().unwrap(),
+            Arc::new(mcp::OsMcpSecretStore::new()),
+            StructuredLogger::new(data.path()).unwrap(),
+        );
+        service
+            .prepare(workspace.path(), CancellationToken::new())
+            .await
+            .unwrap();
+
+        let resolved = service.resolve_ordinary_skill("review").unwrap();
+
+        assert_eq!(resolved.id, "review");
+        assert_eq!(
+            resolved.source,
+            ResolvedSkillSource::Ordinary {
+                scope: "project".into()
+            }
+        );
+        assert_eq!(resolved.risk, ToolRisk::Read);
+        assert!(resolved.enabled);
+        assert_eq!(resolved.body, "PROJECT-INSTRUCTIONS");
+        assert_eq!(resolved.bytes, 20);
+    }
+
+    #[tokio::test]
+    async fn enabled_plugin_skill_is_preferred_over_its_ordinary_fallback() {
+        let data = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        write_test_skill(&data.path().join("skills"), "review", "FALLBACK-BODY");
+        write_test_plugin(data.path(), "review-package", "review-tools");
+        let service = ExtensionService::new(
+            data.path().into(),
+            ProjectionDb::memory().unwrap(),
+            Arc::new(mcp::OsMcpSecretStore::new()),
+            StructuredLogger::new(data.path()).unwrap(),
+        );
+        service.plugin_overview(true).unwrap();
+        service
+            .set_plugin_enabled("review-tools@local", true)
+            .unwrap();
+        service
+            .prepare(workspace.path(), CancellationToken::new())
+            .await
+            .unwrap();
+
+        let resolved = service
+            .resolve_plugin_skill("review-tools@local", "review", Some("review"))
+            .unwrap();
+
+        assert_eq!(resolved.id, "review");
+        assert_eq!(
+            resolved.source,
+            ResolvedSkillSource::Plugin {
+                plugin_id: "review-tools@local".into()
+            }
+        );
+        assert_eq!(resolved.body, "PLUGIN-REVIEW-BODY");
+        assert!(resolved.enabled);
+    }
+
+    #[tokio::test]
+    async fn missing_or_disabled_plugin_skill_uses_only_the_explicit_fallback() {
+        for create_disabled_plugin in [false, true] {
+            let data = tempfile::tempdir().unwrap();
+            let workspace = tempfile::tempdir().unwrap();
+            write_test_skill(&data.path().join("skills"), "review", "FALLBACK-BODY");
+            if create_disabled_plugin {
+                write_test_plugin(data.path(), "review-package", "review-tools");
+            }
+            let service = ExtensionService::new(
+                data.path().into(),
+                ProjectionDb::memory().unwrap(),
+                Arc::new(mcp::OsMcpSecretStore::new()),
+                StructuredLogger::new(data.path()).unwrap(),
+            );
+            service
+                .prepare(workspace.path(), CancellationToken::new())
+                .await
+                .unwrap();
+
+            let resolved = service
+                .resolve_plugin_skill("review-tools@local", "review", Some("review"))
+                .unwrap();
+
+            assert_eq!(
+                resolved.source,
+                ResolvedSkillSource::OrdinaryFallback {
+                    plugin_id: "review-tools@local".into(),
+                    scope: "global".into(),
+                }
+            );
+            assert_eq!(resolved.body, "FALLBACK-BODY");
+            assert!(resolved.enabled);
+        }
+    }
+
+    #[tokio::test]
+    async fn unavailable_plugin_skill_without_fallback_fails_closed() {
+        let data = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let service = ExtensionService::new(
+            data.path().into(),
+            ProjectionDb::memory().unwrap(),
+            Arc::new(mcp::OsMcpSecretStore::new()),
+            StructuredLogger::new(data.path()).unwrap(),
+        );
+        service
+            .prepare(workspace.path(), CancellationToken::new())
+            .await
+            .unwrap();
+
+        let error = service
+            .resolve_plugin_skill("review-tools@local", "review", None)
+            .unwrap_err();
+
+        assert!(error.to_string().contains("no ordinary fallback"));
+    }
+
+    #[tokio::test]
+    async fn equal_normalized_ordinary_and_plugin_bodies_have_the_same_sha256() {
+        let data = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        write_test_skill(
+            &data.path().join("skills"),
+            "review",
+            "\r\nSAME-INSTRUCTIONS\r\n",
+        );
+        let plugin = write_test_plugin(data.path(), "review-package", "review-tools");
+        fs::write(
+            plugin.join("skills/review/SKILL.md"),
+            "---\r\nname: review\r\ndescription: Review\r\n---\r\nSAME-INSTRUCTIONS\r\n",
+        )
+        .unwrap();
+        let service = ExtensionService::new(
+            data.path().into(),
+            ProjectionDb::memory().unwrap(),
+            Arc::new(mcp::OsMcpSecretStore::new()),
+            StructuredLogger::new(data.path()).unwrap(),
+        );
+        service.plugin_overview(true).unwrap();
+        service
+            .set_plugin_enabled("review-tools@local", true)
+            .unwrap();
+        service
+            .prepare(workspace.path(), CancellationToken::new())
+            .await
+            .unwrap();
+
+        let ordinary = service.resolve_ordinary_skill("review").unwrap();
+        let plugin = service
+            .resolve_plugin_skill("review-tools@local", "review", None)
+            .unwrap();
+
+        assert_eq!(ordinary.body, "SAME-INSTRUCTIONS");
+        assert_eq!(ordinary.sha256, plugin.sha256);
+        assert_eq!(
+            ordinary.sha256,
+            "52fecfbec62ca42116258d60a662c76fc7891a95b41709fe1816343dc7e9f495"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolved_skill_body_is_absent_from_debug_and_serialized_diagnostics() {
+        let data = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        write_test_skill(
+            &data.path().join("skills"),
+            "review",
+            "UNIQUE-PRIVATE-SKILL-BODY",
+        );
+        let service = ExtensionService::new(
+            data.path().into(),
+            ProjectionDb::memory().unwrap(),
+            Arc::new(mcp::OsMcpSecretStore::new()),
+            StructuredLogger::new(data.path()).unwrap(),
+        );
+        service
+            .prepare(workspace.path(), CancellationToken::new())
+            .await
+            .unwrap();
+
+        let resolved = service.resolve_ordinary_skill("review").unwrap();
+        let debug = format!("{resolved:?}");
+        let diagnostics = serde_json::to_string(&service.overview()).unwrap();
+
+        assert!(!debug.contains("UNIQUE-PRIVATE-SKILL-BODY"));
+        assert!(!diagnostics.contains("UNIQUE-PRIVATE-SKILL-BODY"));
+        assert!(diagnostics.contains("review"));
+    }
+
+    #[tokio::test]
+    async fn skill_resource_read_returns_a_bounded_utf8_range() {
+        let data = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let skill = data.path().join("skills/review");
+        write_test_skill(&data.path().join("skills"), "review", "REVIEW");
+        fs::create_dir_all(skill.join("references")).unwrap();
+        fs::write(skill.join("references/guide.md"), "0123456789").unwrap();
+        let service = ExtensionService::new(
+            data.path().into(),
+            ProjectionDb::memory().unwrap(),
+            Arc::new(mcp::OsMcpSecretStore::new()),
+            StructuredLogger::new(data.path()).unwrap(),
+        );
+        let handler = prepared_skill_resource_handler(&service, workspace.path()).await;
+
+        let result = handler
+            .execute(
+                &tool_context(workspace.path()),
+                serde_json::json!({
+                    "skillId": "review",
+                    "path": "references/guide.md",
+                    "offset": 2,
+                    "limit": 4
+                }),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result.output, "2345");
+        assert_eq!(result.metadata["skillId"], "review");
+        assert_eq!(result.metadata["path"], "references/guide.md");
+        assert_eq!(result.metadata["offset"], 2);
+        assert_eq!(result.metadata["bytesReturned"], 4);
+        assert_eq!(result.metadata["totalBytes"], 10);
+        assert_eq!(result.metadata["truncated"], true);
+    }
+
+    #[tokio::test]
+    async fn skill_resource_read_rejects_unknown_and_disabled_skills() {
+        let data = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let projection = ProjectionDb::memory().unwrap();
+        write_test_skill(&data.path().join("skills"), "review", "REVIEW");
+        projection
+            .set_setting("extension/skill/review", "false")
+            .unwrap();
+        let service = ExtensionService::new(
+            data.path().into(),
+            projection,
+            Arc::new(mcp::OsMcpSecretStore::new()),
+            StructuredLogger::new(data.path()).unwrap(),
+        );
+        let handler = prepared_skill_resource_handler(&service, workspace.path()).await;
+
+        for skill_id in ["missing", "review"] {
+            let error = handler
+                .execute(
+                    &tool_context(workspace.path()),
+                    serde_json::json!({ "skillId": skill_id, "path": "SKILL.md" }),
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(error, ToolError::Denied(_)));
+        }
+    }
+
+    #[tokio::test]
+    async fn skill_resource_read_rejects_absolute_parent_and_directory_paths() {
+        let data = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        write_test_skill(&data.path().join("skills"), "review", "REVIEW");
+        let skill = data.path().join("skills/review");
+        fs::create_dir_all(skill.join("references")).unwrap();
+        fs::write(outside.path().join("secret.md"), "SECRET").unwrap();
+        let service = ExtensionService::new(
+            data.path().into(),
+            ProjectionDb::memory().unwrap(),
+            Arc::new(mcp::OsMcpSecretStore::new()),
+            StructuredLogger::new(data.path()).unwrap(),
+        );
+        let handler = prepared_skill_resource_handler(&service, workspace.path()).await;
+
+        for path in [
+            outside
+                .path()
+                .join("secret.md")
+                .to_string_lossy()
+                .into_owned(),
+            "../secret.md".into(),
+            "references".into(),
+        ] {
+            let error = handler
+                .execute(
+                    &tool_context(workspace.path()),
+                    serde_json::json!({ "skillId": "review", "path": path }),
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(error, ToolError::InvalidArguments(_)));
+        }
+    }
+
+    #[tokio::test]
+    async fn skill_resource_read_rejects_binary_resources() {
+        let data = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        write_test_skill(&data.path().join("skills"), "review", "REVIEW");
+        let skill = data.path().join("skills/review");
+        fs::write(skill.join("binary.dat"), [0xff, 0xfe]).unwrap();
+        let service = ExtensionService::new(
+            data.path().into(),
+            ProjectionDb::memory().unwrap(),
+            Arc::new(mcp::OsMcpSecretStore::new()),
+            StructuredLogger::new(data.path()).unwrap(),
+        );
+        let handler = prepared_skill_resource_handler(&service, workspace.path()).await;
+
+        let error = handler
+            .execute(
+                &tool_context(workspace.path()),
+                serde_json::json!({ "skillId": "review", "path": "binary.dat" }),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, ToolError::Execution(_)));
+        assert!(error.to_string().contains("UTF-8"));
+    }
+
+    #[tokio::test]
+    async fn skill_resource_read_rejects_link_or_reparse_escape() {
+        let data = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        write_test_skill(&data.path().join("skills"), "review", "REVIEW");
+        fs::write(outside.path().join("secret.md"), "SECRET").unwrap();
+        let linked = data.path().join("skills/review/linked");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(outside.path(), &linked).unwrap();
+        #[cfg(windows)]
+        if std::os::windows::fs::symlink_dir(outside.path(), &linked).is_err() {
+            return;
+        }
+        let service = ExtensionService::new(
+            data.path().into(),
+            ProjectionDb::memory().unwrap(),
+            Arc::new(mcp::OsMcpSecretStore::new()),
+            StructuredLogger::new(data.path()).unwrap(),
+        );
+        let handler = prepared_skill_resource_handler(&service, workspace.path()).await;
+
+        let error = handler
+            .execute(
+                &tool_context(workspace.path()),
+                serde_json::json!({ "skillId": "review", "path": "linked/secret.md" }),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, ToolError::InvalidArguments(_)));
+        assert!(
+            error
+                .to_string()
+                .contains("symbolic link or directory junction")
+        );
+    }
+
+    #[tokio::test]
+    async fn skill_resource_read_enforces_file_and_requested_range_bounds() {
+        let data = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        write_test_skill(&data.path().join("skills"), "review", "REVIEW");
+        let skill = data.path().join("skills/review");
+        fs::write(
+            skill.join("large.txt"),
+            vec![b'x'; MAX_SKILL_RESOURCE_FILE_BYTES + 1],
+        )
+        .unwrap();
+        fs::write(skill.join("small.txt"), "small").unwrap();
+        let service = ExtensionService::new(
+            data.path().into(),
+            ProjectionDb::memory().unwrap(),
+            Arc::new(mcp::OsMcpSecretStore::new()),
+            StructuredLogger::new(data.path()).unwrap(),
+        );
+        let handler = prepared_skill_resource_handler(&service, workspace.path()).await;
+
+        for arguments in [
+            serde_json::json!({ "skillId": "review", "path": "large.txt" }),
+            serde_json::json!({
+                "skillId": "review",
+                "path": "small.txt",
+                "limit": MAX_SKILL_RESOURCE_READ_BYTES + 1
+            }),
+        ] {
+            let error = handler
+                .execute(
+                    &tool_context(workspace.path()),
+                    arguments,
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(error, ToolError::InvalidArguments(_)));
+        }
     }
 
     #[test]

@@ -81,9 +81,25 @@ fn default_true() -> bool {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct IndexedSkill {
     metadata: PluginSkillMetadata,
     path: PathBuf,
+    body: String,
+    bytes: usize,
+    sha256: String,
+}
+
+#[derive(Clone)]
+#[allow(dead_code)]
+pub(super) struct ResolvedPluginSkill {
+    pub(super) plugin_id: String,
+    pub(super) skill_id: String,
+    pub(super) risk: ToolRisk,
+    pub(super) enabled: bool,
+    pub(super) body: String,
+    pub(super) bytes: usize,
+    pub(super) sha256: String,
 }
 
 #[derive(Debug, Clone)]
@@ -1024,6 +1040,52 @@ impl PluginHost {
         ]
     }
 
+    #[allow(dead_code)]
+    pub(super) fn resolve_skill(
+        &self,
+        plugin_id: &str,
+        skill_id: &str,
+    ) -> Result<ResolvedPluginSkill, PluginError> {
+        if !self
+            .projection
+            .setting(&format!("extension/plugin/{plugin_id}"))
+            .map_err(|error| PluginError::Config(error.to_string()))?
+            .is_some_and(|value| value == "true")
+        {
+            return Err(PluginError::Config(format!(
+                "local plugin {plugin_id} is not enabled"
+            )));
+        }
+        let index = self.index.read().expect("plugin index lock poisoned");
+        let plugin = index.get(plugin_id).ok_or_else(|| {
+            PluginError::Config(format!("local plugin {plugin_id} is not indexed"))
+        })?;
+        if !plugin.diagnostic.enabled {
+            return Err(PluginError::Config(format!(
+                "local plugin {plugin_id} is not enabled"
+            )));
+        }
+        let skill = plugin.skills.get(skill_id).ok_or_else(|| {
+            PluginError::Config(format!(
+                "plugin {plugin_id} has no indexed Skill {skill_id}"
+            ))
+        })?;
+        if !skill.metadata.enabled {
+            return Err(PluginError::Config(format!(
+                "plugin Skill {plugin_id}/{skill_id} is disabled"
+            )));
+        }
+        Ok(ResolvedPluginSkill {
+            plugin_id: plugin_id.to_string(),
+            skill_id: skill_id.to_string(),
+            risk: skill.metadata.risk,
+            enabled: true,
+            body: skill.body.clone(),
+            bytes: skill.bytes,
+            sha256: skill.sha256.clone(),
+        })
+    }
+
     #[cfg(test)]
     fn indexed_mcp_for_test(&self, plugin_id: &str) -> Vec<IndexedMcpServer> {
         self.index
@@ -1793,7 +1855,7 @@ fn discover_plugin_skills(
         ensure_no_links(plugin_root, &directory)?;
         let path = directory.join("SKILL.md");
         let content = read_bounded_utf8(plugin_root, &path, MAX_PLUGIN_TEXT_BYTES, "plugin Skill")?;
-        let metadata = parse_plugin_skill(&content, &path)?;
+        let (metadata, body) = parse_plugin_skill(&content, &path)?;
         if skills.contains_key(&metadata.name) {
             return Err(format!(
                 "plugin contains duplicate Skill name {}",
@@ -1803,7 +1865,18 @@ fn discover_plugin_skills(
         if metadata.enabled {
             collect_plugin_resources(plugin_root, &directory, &path, &mut resources, &mut visited)?;
         }
-        skills.insert(metadata.name.clone(), IndexedSkill { metadata, path });
+        let bytes = body.len();
+        let sha256 = super::sha256_hex(body.as_bytes());
+        skills.insert(
+            metadata.name.clone(),
+            IndexedSkill {
+                metadata,
+                path,
+                body,
+                bytes,
+                sha256,
+            },
+        );
     }
     Ok((skills, resources))
 }
@@ -1936,7 +2009,7 @@ fn risk_name(risk: ToolRisk) -> &'static str {
     }
 }
 
-fn parse_plugin_skill(content: &str, path: &Path) -> Result<PluginSkillMetadata, String> {
+fn parse_plugin_skill(content: &str, path: &Path) -> Result<(PluginSkillMetadata, String), String> {
     let content = content.strip_prefix('\u{feff}').unwrap_or(content);
     let body = content
         .strip_prefix("---\n")
@@ -1977,7 +2050,7 @@ fn parse_plugin_skill(content: &str, path: &Path) -> Result<PluginSkillMetadata,
             user_facing_path(path)
         ));
     }
-    Ok(metadata)
+    Ok((metadata, super::normalize_skill_body(instructions)))
 }
 
 fn read_bounded_utf8(
