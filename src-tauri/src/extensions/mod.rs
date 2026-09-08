@@ -462,6 +462,27 @@ struct LoadedInstruction {
     content: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillCategory {
+    RequirementsPlanning,
+    DevelopmentDelivery,
+    QualityReview,
+    Testing,
+    DesignExperience,
+    DataDocuments,
+    Observability,
+    IntegrationAutomation,
+    ExtensionPlatform,
+    Other,
+}
+
+impl Default for SkillCategory {
+    fn default() -> Self {
+        Self::Other
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct SkillMetadata {
@@ -469,6 +490,8 @@ struct SkillMetadata {
     description: String,
     triggers: Vec<String>,
     risk: ToolRisk,
+    #[serde(default)]
+    category: SkillCategory,
     #[serde(default = "default_true")]
     enabled: bool,
 }
@@ -494,6 +517,7 @@ pub struct SkillDiagnostic {
     pub path: String,
     pub scope: String,
     pub risk: ToolRisk,
+    pub category: SkillCategory,
     pub triggers: Vec<String>,
     pub enabled: bool,
 }
@@ -1202,6 +1226,7 @@ impl ExtensionService {
                     path: user_facing_path(&skill.path),
                     scope: skill.scope.clone(),
                     risk: skill.metadata.risk,
+                    category: skill.metadata.category,
                     triggers: skill.metadata.triggers.clone(),
                     enabled: skill.enabled,
                 })
@@ -1750,6 +1775,7 @@ fn discover_skills(
         if !root.exists() {
             continue;
         }
+        reject_skill_link_or_reparse(&root)?;
         let canonical_root = root
             .canonicalize()
             .map_err(|error| ExtensionError::Io(error.to_string()))?;
@@ -1759,61 +1785,152 @@ fn discover_skills(
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| ExtensionError::Io(error.to_string()))?;
         directories.sort();
+        let mut scope_ids = HashSet::new();
         for directory in directories {
+            reject_skill_link_or_reparse(&directory)?;
             if !directory.is_dir() {
                 continue;
             }
             let file = directory.join("SKILL.md");
-            if !file.exists() {
+            if file.exists() {
+                load_skill_candidate(
+                    &canonical_root,
+                    &directory,
+                    &file,
+                    scope,
+                    projection,
+                    &mut scope_ids,
+                    &mut selected,
+                )?;
                 continue;
             }
-            let canonical = file
+
+            let canonical_group = directory
                 .canonicalize()
                 .map_err(|error| ExtensionError::Io(error.to_string()))?;
-            if !canonical.starts_with(&canonical_root) {
+            if !canonical_group.starts_with(&canonical_root) {
                 return Err(ExtensionError::Skill(format!(
                     "{} escapes the Skill root",
-                    user_facing_path(&file)
+                    user_facing_path(&directory)
                 )));
             }
-            let content = read_bounded_utf8(&canonical, MAX_SKILL_BYTES)?;
-            let (metadata, body) = parse_skill(&content, &canonical)?;
-            let directory_name = directory
-                .file_name()
-                .and_then(|value| value.to_str())
-                .unwrap_or("");
-            if metadata.name != directory_name || !valid_skill_name(&metadata.name) {
-                return Err(ExtensionError::Skill(format!(
-                    "{} name must match its directory and use lowercase kebab-case",
-                    user_facing_path(&canonical)
-                )));
-            }
-            let override_enabled = projection
-                .setting(&format!("extension/skill/{}", metadata.name))
-                .map_err(|error| ExtensionError::Config(error.to_string()))?;
-            let enabled = match metadata.risk {
-                ToolRisk::Read => override_enabled
-                    .map(|value| value == "true")
-                    .unwrap_or(metadata.enabled),
-                ToolRisk::Write | ToolRisk::Delete | ToolRisk::External => {
-                    override_enabled.as_deref() == Some("true")
+            let mut grouped_directories = fs::read_dir(&canonical_group)
+                .map_err(|error| ExtensionError::Io(error.to_string()))?
+                .map(|entry| entry.map(|value| value.path()))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| ExtensionError::Io(error.to_string()))?;
+            grouped_directories.sort();
+            for grouped_directory in grouped_directories {
+                reject_skill_link_or_reparse(&grouped_directory)?;
+                if !grouped_directory.is_dir() {
+                    continue;
                 }
-            };
-            selected.insert(
-                metadata.name.clone(),
-                LoadedSkill {
-                    metadata,
-                    path: canonical,
-                    scope: scope.into(),
-                    body,
-                    enabled,
-                },
-            );
+                let file = grouped_directory.join("SKILL.md");
+                if !file.exists() {
+                    continue;
+                }
+                load_skill_candidate(
+                    &canonical_root,
+                    &grouped_directory,
+                    &file,
+                    scope,
+                    projection,
+                    &mut scope_ids,
+                    &mut selected,
+                )?;
+            }
         }
     }
     let mut skills = selected.into_values().collect::<Vec<_>>();
     skills.sort_by(|left, right| left.metadata.name.cmp(&right.metadata.name));
     Ok(skills)
+}
+
+fn load_skill_candidate(
+    canonical_root: &Path,
+    directory: &Path,
+    file: &Path,
+    scope: &str,
+    projection: &ProjectionDb,
+    scope_ids: &mut HashSet<String>,
+    selected: &mut HashMap<String, LoadedSkill>,
+) -> Result<(), ExtensionError> {
+    reject_skill_link_or_reparse(directory)?;
+    reject_skill_link_or_reparse(file)?;
+    let canonical = file
+        .canonicalize()
+        .map_err(|error| ExtensionError::Io(error.to_string()))?;
+    if !canonical.starts_with(canonical_root) {
+        return Err(ExtensionError::Skill(format!(
+            "{} escapes the Skill root",
+            user_facing_path(file)
+        )));
+    }
+    let content = read_bounded_utf8(&canonical, MAX_SKILL_BYTES)?;
+    let (metadata, body) = parse_skill(&content, &canonical)?;
+    let directory_name = directory
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("");
+    if metadata.name != directory_name || !valid_skill_name(&metadata.name) {
+        return Err(ExtensionError::Skill(format!(
+            "{} name must match its directory and use lowercase kebab-case",
+            user_facing_path(&canonical)
+        )));
+    }
+    if !scope_ids.insert(metadata.name.clone()) {
+        return Err(ExtensionError::Skill(format!(
+            "duplicate Skill {} in {scope} scope",
+            metadata.name
+        )));
+    }
+    let override_enabled = projection
+        .setting(&format!("extension/skill/{}", metadata.name))
+        .map_err(|error| ExtensionError::Config(error.to_string()))?;
+    let enabled = match metadata.risk {
+        ToolRisk::Read => override_enabled
+            .map(|value| value == "true")
+            .unwrap_or(metadata.enabled),
+        ToolRisk::Write | ToolRisk::Delete | ToolRisk::External => {
+            override_enabled.as_deref() == Some("true")
+        }
+    };
+    selected.insert(
+        metadata.name.clone(),
+        LoadedSkill {
+            metadata,
+            path: canonical,
+            scope: scope.into(),
+            body,
+            enabled,
+        },
+    );
+    Ok(())
+}
+
+fn reject_skill_link_or_reparse(path: &Path) -> Result<(), ExtensionError> {
+    let metadata =
+        fs::symlink_metadata(path).map_err(|error| ExtensionError::Io(error.to_string()))?;
+    if metadata.file_type().is_symlink() || skill_metadata_is_reparse_point(&metadata) {
+        return Err(ExtensionError::Skill(format!(
+            "Skill path {} must not contain a symbolic link or directory junction",
+            user_facing_path(path)
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn skill_metadata_is_reparse_point(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(windows))]
+fn skill_metadata_is_reparse_point(_metadata: &fs::Metadata) -> bool {
+    false
 }
 
 fn parse_skill(content: &str, path: &Path) -> Result<(SkillMetadata, String), ExtensionError> {
@@ -1978,6 +2095,10 @@ mod tests {
             ),
         )
         .unwrap();
+    }
+
+    fn write_grouped_test_skill(root: &Path, group: &str, name: &str, body: &str) {
+        write_test_skill(&root.join(group), name, body);
     }
 
     fn write_test_plugin(data_root: &Path, folder: &str, name: &str) -> PathBuf {
@@ -2209,6 +2330,102 @@ mod tests {
     }
 
     #[test]
+    fn discovers_skill_in_one_group_deep_directory() {
+        let builtin = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        write_grouped_test_skill(
+            builtin.path(),
+            "robot-pack",
+            "review",
+            "GROUPED-INSTRUCTIONS",
+        );
+
+        let skills = discover_skills(
+            Some(builtin.path()),
+            data.path(),
+            workspace.path(),
+            &ProjectionDb::memory().unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].metadata.name, "review");
+        assert_eq!(skills[0].body, "GROUPED-INSTRUCTIONS");
+    }
+
+    #[test]
+    fn rejects_duplicate_skill_ids_within_one_scope() {
+        let builtin = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        write_test_skill(builtin.path(), "review", "FLAT-INSTRUCTIONS");
+        write_grouped_test_skill(
+            builtin.path(),
+            "robot-pack",
+            "review",
+            "GROUPED-INSTRUCTIONS",
+        );
+
+        let error = discover_skills(
+            Some(builtin.path()),
+            data.path(),
+            workspace.path(),
+            &ProjectionDb::memory().unwrap(),
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("duplicate Skill review in builtin scope")
+        );
+    }
+
+    #[test]
+    fn rejects_group_directory_link_that_escapes_skill_root() {
+        let builtin = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        write_test_skill(outside.path(), "review", "OUTSIDE-INSTRUCTIONS");
+
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(outside.path(), builtin.path().join("robot-pack")).unwrap();
+        #[cfg(windows)]
+        if std::os::windows::fs::symlink_dir(outside.path(), builtin.path().join("robot-pack"))
+            .is_err()
+        {
+            let link = builtin.path().join("robot-pack");
+            let output = std::process::Command::new("cmd")
+                .args([
+                    "/C",
+                    "mklink",
+                    "/J",
+                    link.to_str().unwrap(),
+                    outside.path().to_str().unwrap(),
+                ])
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "failed to create test junction");
+        }
+
+        let error = discover_skills(
+            Some(builtin.path()),
+            data.path(),
+            workspace.path(),
+            &ProjectionDb::memory().unwrap(),
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("symbolic link or directory junction")
+        );
+    }
+
+    #[test]
     fn rejects_builtin_skill_that_escapes_its_resource_root() {
         let builtin = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
@@ -2314,6 +2531,22 @@ mod tests {
         );
         let error = parse_skill(&content, Path::new("SKILL.md")).unwrap_err();
         assert!(error.to_string().contains("bounded Skill rules"));
+    }
+
+    #[test]
+    fn missing_skill_category_defaults_to_other() {
+        let content = "---\nname: review\ndescription: Review code\ntriggers: [review]\nrisk: read\n---\nInstructions";
+        let (metadata, _) = parse_skill(content, Path::new("SKILL.md")).unwrap();
+
+        assert_eq!(metadata.category, SkillCategory::Other);
+    }
+
+    #[test]
+    fn rejects_unknown_skill_category() {
+        let content = "---\nname: review\ndescription: Review code\ntriggers: [review]\nrisk: read\ncategory: imaginary\n---\nInstructions";
+        let error = parse_skill(content, Path::new("SKILL.md")).unwrap_err();
+
+        assert!(error.to_string().contains("metadata is invalid"));
     }
 
     #[test]

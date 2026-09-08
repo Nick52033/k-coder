@@ -43,7 +43,8 @@ export interface GitBranchView { current: string | null; branches: string[]; }
 export interface UsageSummary { inputTokens: number; outputTokens: number; totalTokens: number; providerCalls: number; }
 export interface ProviderConnectionTest { connected: boolean; latencyMs: number; usage: TokenUsage | null; }
 export interface InstructionSource { path: string; scope: string; priority: number; bytes: number; }
-export interface SkillDiagnostic { name: string; description: string; path: string; scope: string; risk: ToolRisk; triggers: string[]; enabled: boolean; }
+export type SkillCategory = "requirements_planning" | "development_delivery" | "quality_review" | "testing" | "design_experience" | "data_documents" | "observability" | "integration_automation" | "extension_platform" | "other";
+export interface SkillDiagnostic { name: string; description: string; path: string; scope: string; risk: ToolRisk; category: SkillCategory; triggers: string[]; enabled: boolean; }
 export interface CredentialDiagnostic { name: string; configured: boolean; }
 export interface McpDiagnostic { id: string; transport: string; enabled: boolean; state: string; toolCount: number; credentials: CredentialDiagnostic[]; error: string | null; }
 export interface HookDiagnostic { id: string; phase: string; tool: string; enabled: boolean; }
