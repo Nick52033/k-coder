@@ -6,6 +6,7 @@ triggers:
   - 同步 skill
 risk: external
 enabled: true
+category: extension_platform
 ---
 
 # Sync Skill To Cursor

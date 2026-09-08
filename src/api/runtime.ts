@@ -67,6 +67,7 @@ import type {
   CancelWorkflowRunRequest,
   WorkflowDefinitionView,
   WorkflowRunView,
+  WorkflowSkillReadinessView,
   LogQuery,
   LogQueryResult,
   KnowledgeSettings,
@@ -203,6 +204,10 @@ export function startTurn(
 
 export function listBuiltinWorkflows() {
   return invoke<WorkflowDefinitionView[]>("list_builtin_workflows");
+}
+
+export function getWorkflowSkillReadiness(workflowId: string) {
+  return invoke<WorkflowSkillReadinessView>("get_workflow_skill_readiness", { workflowId });
 }
 
 export function getWorkflowRun(threadId: string) {

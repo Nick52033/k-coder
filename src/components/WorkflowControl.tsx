@@ -15,6 +15,9 @@ export function WorkflowControl({ definition, run, turnBusy, onCancel }: Workflo
 
   const node = definition.nodes.find((item) => item.id === run.currentNodeId)
     ?? definition.nodes[run.currentNodeIndex];
+  const nodeSkillBindings = node
+    ? [...(node.localSkillBindings ?? []), ...(node.pluginSkillBindings ?? [])]
+    : [];
   const currentStep = Math.min(run.currentNodeIndex + 1, run.nodeCount);
   const progress = run.nodeCount > 0 ? (run.currentNodeIndex / run.nodeCount) * 100 : 0;
 
@@ -36,6 +39,11 @@ export function WorkflowControl({ definition, run, turnBusy, onCancel }: Workflo
           <span>{currentStep} / {run.nodeCount}</span>
         </div>
         <div className="workflow-control-node">{node?.title ?? "等待节点"}</div>
+        {nodeSkillBindings.length > 0 && (
+          <div className="workflow-control-skills" aria-label="当前节点 Skills">
+            {nodeSkillBindings.map((binding) => <span className="robot-skill-chip" key={binding.declaration}>{binding.declaration}</span>)}
+          </div>
+        )}
         <div
           className="workflow-control-progress"
           role="progressbar"

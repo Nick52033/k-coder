@@ -6,6 +6,7 @@ triggers:
   - review UI
 risk: read
 enabled: true
+category: design_experience
 ---
 
 # Web Interface Guidelines

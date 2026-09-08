@@ -7,6 +7,7 @@ triggers:
   - 禅道提缺陷
 risk: external
 enabled: true
+category: integration_automation
 ---
 
 # 禅道Bug创建

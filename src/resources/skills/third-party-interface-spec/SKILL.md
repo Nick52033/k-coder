@@ -6,6 +6,7 @@ triggers:
   - 第三方接口
 risk: external
 enabled: true
+category: integration_automation
 ---
 
 # 第三方接口开发规格

@@ -11,6 +11,7 @@ triggers:
   - 验证通过
 risk: external
 enabled: true
+category: integration_automation
 ---
 
 # 禅道 Bug 修复（文档先行 + 人工确认）

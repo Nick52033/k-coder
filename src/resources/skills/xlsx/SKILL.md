@@ -6,6 +6,7 @@ triggers:
   - spreadsheet
 risk: write
 enabled: true
+category: data_documents
 ---
 
 # Requirements for Outputs

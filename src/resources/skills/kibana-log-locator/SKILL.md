@@ -7,6 +7,7 @@ triggers:
   - trace id
 risk: external
 enabled: true
+category: observability
 ---
 
 # Kibana Log Locator

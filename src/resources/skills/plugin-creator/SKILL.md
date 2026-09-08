@@ -7,6 +7,7 @@ triggers:
   - 创建插件
 risk: write
 enabled: true
+category: extension_platform
 ---
 
 # Plugin Creator

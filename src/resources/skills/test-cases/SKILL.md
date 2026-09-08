@@ -6,6 +6,7 @@ triggers:
   - 测试用例
 risk: write
 enabled: true
+category: testing
 ---
 
 # Test Cases Generator

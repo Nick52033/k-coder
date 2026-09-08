@@ -7,6 +7,7 @@ triggers:
   - 开发详细设计
 risk: external
 enabled: true
+category: requirements_planning
 ---
 
 # 需求 → 开发详细设计

@@ -6,6 +6,7 @@ triggers:
   - UI设计
 risk: write
 enabled: true
+category: design_experience
 ---
 
 # UI/UX Pro Max - Design Intelligence

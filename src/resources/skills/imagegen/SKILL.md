@@ -7,6 +7,7 @@ triggers:
   - 生成图片
 risk: external
 enabled: true
+category: design_experience
 ---
 
 # Image Generation Skill

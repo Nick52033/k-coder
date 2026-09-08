@@ -5,6 +5,7 @@ triggers:
   - review fix
 risk: write
 enabled: true
+category: quality_review
 ---
 
 # Review Fix

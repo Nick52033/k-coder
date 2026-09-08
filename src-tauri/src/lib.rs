@@ -172,6 +172,7 @@ pub fn run() {
             commands::create_goal,
             commands::transition_goal,
             commands::list_builtin_workflows,
+            commands::get_workflow_skill_readiness,
             commands::get_workflow_run,
             commands::cancel_workflow_run,
             commands::list_scheduled_tasks,

@@ -7,6 +7,7 @@ triggers:
   - UI设计
 risk: write
 enabled: true
+category: design_experience
 ---
 
 # Frontend Design

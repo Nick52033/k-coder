@@ -7,6 +7,7 @@ triggers:
   - OpenAI API
 risk: external
 enabled: true
+category: extension_platform
 ---
 
 

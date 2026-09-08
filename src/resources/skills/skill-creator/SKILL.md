@@ -6,6 +6,7 @@ triggers:
   - create skill
 risk: write
 enabled: true
+category: extension_platform
 ---
 
 # Skill Creator

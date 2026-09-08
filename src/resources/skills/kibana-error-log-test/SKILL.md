@@ -7,6 +7,7 @@ triggers:
   - 测试环境错误日志
 risk: external
 enabled: true
+category: observability
 ---
 
 # Kibana Error Log Test

@@ -14,6 +14,7 @@ mod workflow;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::extensions::ExtensionService;
 use crate::protocol::ToolRisk;
 use crate::tools::ToolHandler;
 
@@ -32,7 +33,10 @@ pub use search::{RepositorySearchIndex, SearchResult};
 pub use todo::{TODO_WRITE_TOOL_NAME, TodoWriteArgs, TodoWriteToolHandler};
 pub use workflow::{
     COMPLETE_WORKFLOW_NODE_TOOL_NAME, CancelWorkflowRunRequest, WorkflowDefinitionView,
-    WorkflowNodeCompletion, WorkflowNodeView, WorkflowRunState, WorkflowRunView, WorkflowStore,
+    WorkflowNodeCompletion, WorkflowNodeSkillReadinessView, WorkflowNodeView, WorkflowRunState,
+    WorkflowRunView, WorkflowSkillBindingDefinition, WorkflowSkillBindingKind,
+    WorkflowSkillBindingReadinessView, WorkflowSkillBindingView, WorkflowSkillReadinessBlocker,
+    WorkflowSkillReadinessStatus, WorkflowSkillReadinessView, WorkflowStore,
 };
 
 #[derive(Clone)]
@@ -113,5 +117,13 @@ impl AdvancedServices {
         }
         instructions.push_str(&self.workflows.runtime_instructions(thread_id)?);
         Ok(instructions)
+    }
+
+    pub fn workflow_skill_readiness(
+        &self,
+        workflow_id: &str,
+        extensions: &ExtensionService,
+    ) -> Result<WorkflowSkillReadinessView, String> {
+        self.workflows.skill_readiness(workflow_id, extensions)
     }
 }

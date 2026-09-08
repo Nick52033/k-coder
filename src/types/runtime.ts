@@ -6,6 +6,12 @@ export interface RuntimeStatus {
   capabilities: string[];
 }
 
+export interface CommandError<TDetails = unknown> {
+  code: string;
+  message: string;
+  details?: TDetails;
+}
+
 export interface ProjectRecord { id: string; name: string; path: string; trusted: boolean; lastOpenedAtMs: number; }
 export interface WorkspaceState { current: ProjectRecord; recent: ProjectRecord[]; }
 export interface KnowledgeSettings { enabled: boolean; autoSearch: boolean; maxResults: number; maxChunkTokens: number; knowledgeBudgetPercent: number; semanticEnabled: boolean; embeddingProvider: string; embeddingModel: string; embeddingDimension: number; embeddingConfigured: boolean; embeddingStatus: string; }
@@ -44,7 +50,7 @@ export interface UsageSummary { inputTokens: number; outputTokens: number; total
 export interface ProviderConnectionTest { connected: boolean; latencyMs: number; usage: TokenUsage | null; }
 export interface InstructionSource { path: string; scope: string; priority: number; bytes: number; }
 export type SkillCategory = "requirements_planning" | "development_delivery" | "quality_review" | "testing" | "design_experience" | "data_documents" | "observability" | "integration_automation" | "extension_platform" | "other";
-export interface SkillDiagnostic { name: string; description: string; path: string; scope: string; risk: ToolRisk; category: SkillCategory; triggers: string[]; enabled: boolean; }
+export interface SkillDiagnostic { name: string; description: string; path: string; scope: string; risk: ToolRisk; category: SkillCategory; triggers: string[]; enabled: boolean; managedByRobot: boolean; }
 export interface CredentialDiagnostic { name: string; configured: boolean; }
 export interface McpDiagnostic { id: string; transport: string; enabled: boolean; state: string; toolCount: number; credentials: CredentialDiagnostic[]; error: string | null; }
 export interface HookDiagnostic { id: string; phase: string; tool: string; enabled: boolean; }
@@ -550,17 +556,85 @@ export interface GoalView {
 }
 export interface CreateGoalRequest { threadId: string; objective: string; tokenBudget: number | null; timeBudgetMs: number; }
 
+export type WorkflowSkillBindingKind = "skill" | "plugin_skill";
+export interface WorkflowSkillBindingView {
+  kind: WorkflowSkillBindingKind;
+  declaration: string;
+  skillId: string;
+  pluginId: string | null;
+  fallbackSkillId: string | null;
+}
+export type WorkflowSkillReadinessStatus =
+  | "builtin"
+  | "global"
+  | "project"
+  | "plugin"
+  | "builtin_fallback"
+  | "disabled"
+  | "missing"
+  | "oversized"
+  | "limit_exceeded";
+export interface WorkflowSkillBindingReadinessView {
+  binding: WorkflowSkillBindingView;
+  status: WorkflowSkillReadinessStatus;
+  resolvedSkillId: string | null;
+  resolvedScope: string | null;
+  bodySha256: string | null;
+  bodyBytes: number | null;
+  blocker: string | null;
+}
+export interface WorkflowSkillReadinessBlocker {
+  nodeId: string | null;
+  declaration: string | null;
+  status: WorkflowSkillReadinessStatus;
+  message: string;
+}
+export interface WorkflowNodeSkillReadinessView {
+  nodeId: string;
+  ready: boolean;
+  declarationCount: number;
+  uniqueBodyCount: number;
+  totalBodyBytes: number;
+  bindings: WorkflowSkillBindingReadinessView[];
+  blockers: WorkflowSkillReadinessBlocker[];
+}
+export interface WorkflowSkillReadinessView {
+  schemaVersion: number;
+  workflowId: string;
+  definitionVersion: number;
+  ready: boolean;
+  skillCount: number;
+  localSkillCount: number;
+  pluginSkillCount: number;
+  blockerCount: number;
+  bindings: WorkflowSkillBindingReadinessView[];
+  nodes: WorkflowNodeSkillReadinessView[];
+  blockers: WorkflowSkillReadinessBlocker[];
+}
+export type WorkflowSkillPreflightCommandError = CommandError<
+  WorkflowSkillReadinessView | { workflowId: string; ready: false }
+>;
 export type WorkflowRunState = "active" | "completed" | "cancelled";
 export interface WorkflowNodeView {
   id: string;
   title: string;
   description: string;
+  localSkillCount: number;
+  pluginSkillCount: number;
+  skillDeclarationCount: number;
+  localSkillBindings: WorkflowSkillBindingView[];
+  pluginSkillBindings: WorkflowSkillBindingView[];
 }
 export interface WorkflowDefinitionView {
   schemaVersion: number;
+  definitionVersion: number;
   id: string;
   name: string;
   description: string;
+  localSkillCount: number;
+  pluginSkillCount: number;
+  uniqueSkillCount: number;
+  skillCatalog: WorkflowSkillBindingView[];
   nodes: WorkflowNodeView[];
 }
 export interface WorkflowNodeCompletion {
@@ -571,6 +645,7 @@ export interface WorkflowNodeCompletion {
 }
 export interface WorkflowRunView {
   schemaVersion: number;
+  definitionVersion: number;
   id: string;
   threadId: string;
   workflowId: string;

@@ -597,6 +597,8 @@ pub enum AgentRuntimeError {
     Approval(#[from] ApprovalError),
     #[error(transparent)]
     UserInput(#[from] UserInputError),
+    #[error("runtime instructions could not be compiled: {0}")]
+    RuntimeInstructions(String),
     #[error("change audit failed: {storage_error}; rollback also failed: {rollback_error}")]
     AuditCompensation {
         storage_error: String,
@@ -608,6 +610,21 @@ pub trait EventPublisher: Send + Sync {
     fn publish(&self, event: AgentEventEnvelope);
 }
 
+pub trait RuntimeInstructionProvider: Send + Sync {
+    /// Compile one immutable snapshot for an outer provider request. A
+    /// transient retry of that request reuses the same snapshot.
+    fn compile(&self) -> Result<String, String>;
+}
+
+impl<F> RuntimeInstructionProvider for F
+where
+    F: Fn() -> Result<String, String> + Send + Sync,
+{
+    fn compile(&self) -> Result<String, String> {
+        self()
+    }
+}
+
 pub struct AgentRuntime {
     repository: Arc<dyn ThreadRepository>,
     tools: ToolRegistry,
@@ -615,7 +632,7 @@ pub struct AgentRuntime {
     approvals: Arc<ApprovalManager>,
     approval_mode: ApprovalMode,
     user_inputs: Arc<UserInputManager>,
-    runtime_instructions: String,
+    runtime_instruction_provider: Arc<dyn RuntimeInstructionProvider>,
     max_total_tokens: Option<u64>,
     soft_turn_limits: Option<SoftTurnLimits>,
     context_limit: usize,
@@ -664,7 +681,7 @@ impl AgentRuntime {
             user_inputs: Arc::new(UserInputManager::new(std::time::Duration::from_secs(
                 10 * 60,
             ))),
-            runtime_instructions: String::new(),
+            runtime_instruction_provider: Arc::new(|| Ok(String::new())),
             max_total_tokens: None,
             soft_turn_limits: None,
             context_limit: DEFAULT_CONTEXT_LIMIT,
@@ -682,7 +699,15 @@ impl AgentRuntime {
     }
 
     pub fn with_runtime_instructions(mut self, instructions: String) -> Self {
-        self.runtime_instructions = instructions;
+        self.runtime_instruction_provider = Arc::new(move || Ok(instructions.clone()));
+        self
+    }
+
+    pub fn with_runtime_instruction_provider(
+        mut self,
+        provider: Arc<dyn RuntimeInstructionProvider>,
+    ) -> Self {
+        self.runtime_instruction_provider = provider;
         self
     }
 
@@ -1193,7 +1218,10 @@ impl AgentRuntime {
                 last_snapshot = Some(current_snapshot);
             }
 
-            let mut request_runtime_instructions = self.runtime_instructions.clone();
+            let mut request_runtime_instructions = self
+                .runtime_instruction_provider
+                .compile()
+                .map_err(AgentRuntimeError::RuntimeInstructions)?;
             let mut delivered_read_recovery_keys = Vec::new();
             for instruction in pending_read_recovery_instructions.drain(..) {
                 if !request_runtime_instructions.trim().is_empty() {

@@ -1,0 +1,9 @@
+This directory bundles adapted public Skills from cn-codex/codey.
+
+Superpowers Skills are distributed under the MIT License; see
+LICENSE-SUPERPOWERS-MIT. Other bundled material is distributed under the
+Apache License, Version 2.0; see LICENSE-APACHE-2.0.
+
+The Skills are adapted for k-Coder's ExtensionService, workspace policy,
+bounded tools, and local-only persistence. Upstream executable helpers,
+credential files, and unavailable runtime integrations are not bundled.

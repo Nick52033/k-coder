@@ -6,6 +6,7 @@ triggers:
   - install skill
 risk: external
 enabled: true
+category: extension_platform
 ---
 
 # Skill Installer

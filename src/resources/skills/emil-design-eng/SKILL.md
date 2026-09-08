@@ -7,6 +7,7 @@ triggers:
   - 界面动效
 risk: read
 enabled: true
+category: design_experience
 ---
 
 # Design Engineering

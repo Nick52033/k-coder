@@ -5,6 +5,7 @@ triggers:
   - review agent
 risk: read
 enabled: true
+category: quality_review
 ---
 
 # Review Agent

@@ -8,7 +8,9 @@ use tokio::sync::{Mutex, Notify};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::advanced::{AdvancedServices, CancelWorkflowRunRequest, WorkflowRunView};
+use crate::advanced::{
+    AdvancedServices, CancelWorkflowRunRequest, WorkflowRunView, WorkflowSkillReadinessView,
+};
 use crate::agent::mailbox::{MailboxTurn, QueuedTurnSteerError, ThreadMailbox, TurnControl};
 use crate::agent::thread_operation::{ThreadOperationGate, ThreadOperationGuard};
 use crate::execution::{BundledTools, CommandRuntime, ExecutionError, NativePtyRuntime};
@@ -551,6 +553,16 @@ impl AppState {
         Ok(())
     }
 
+    pub async fn get_workflow_skill_readiness(
+        &self,
+        workflow_id: &str,
+    ) -> Result<WorkflowSkillReadinessView, AppStateError> {
+        self.prepare_extensions(false).await?;
+        self.advanced
+            .workflow_skill_readiness(workflow_id, &self.extensions)
+            .map_err(AppStateError::Advanced)
+    }
+
     fn base_tool_registry(&self, workspace: &Path) -> Result<ToolRegistry, AppStateError> {
         let (advanced_handlers, advanced_risks) = self.advanced.tool_handlers(workspace);
         Ok(ToolRegistry::workspace_tools_with_execution(
@@ -581,6 +593,10 @@ impl AppState {
 
     pub fn extension_instructions(&self, input: &str) -> Result<String, AppStateError> {
         Ok(self.extensions.runtime_instructions(input)?)
+    }
+
+    pub(crate) fn extension_service(&self) -> ExtensionService {
+        self.extensions.clone()
     }
 
     pub fn extension_overview(&self) -> ExtensionOverview {

@@ -511,7 +511,9 @@ struct LoadedSkill {
     metadata: SkillMetadata,
     path: PathBuf,
     resource_root: SkillResourceRoot,
+    definition_identity: SkillFileIdentity,
     scope: String,
+    robot_pack: bool,
     body: String,
     enabled: bool,
 }
@@ -535,6 +537,12 @@ struct SkillResourceRoot {
     path: PathBuf,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct SkillFileIdentity {
+    volume: u64,
+    file: u64,
+}
+
 impl std::fmt::Debug for SkillResourceRoot {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -552,8 +560,12 @@ impl SkillResourceRoot {
         })
     }
 
-    fn read(&self, relative: &Path) -> Result<(Vec<u8>, usize), ToolError> {
-        read_skill_resource_handle(self, relative)
+    fn read(
+        &self,
+        relative: &Path,
+        definition_identity: SkillFileIdentity,
+    ) -> Result<(Vec<u8>, usize), ToolError> {
+        read_skill_resource_handle(self, relative, definition_identity)
     }
 }
 
@@ -621,6 +633,7 @@ fn unix_open_directory_at(parent: &File, component: &std::ffi::OsStr) -> Result<
 fn read_skill_resource_handle(
     root: &SkillResourceRoot,
     relative: &Path,
+    definition_identity: SkillFileIdentity,
 ) -> Result<(Vec<u8>, usize), ToolError> {
     use std::ffi::CString;
     use std::os::fd::{AsRawFd, FromRawFd};
@@ -669,6 +682,11 @@ fn read_skill_resource_handle(
             ));
         }
     }
+    if skill_file_identity(&current).map_err(ToolError::Execution)? == definition_identity {
+        return Err(ToolError::InvalidArguments(
+            "Skill definition files cannot be read as persistent resources".into(),
+        ));
+    }
     read_bounded_skill_resource_file(current)
 }
 
@@ -715,6 +733,7 @@ fn open_windows_skill_directory(path: &Path) -> Result<File, String> {
 fn read_skill_resource_handle(
     root: &SkillResourceRoot,
     relative: &Path,
+    definition_identity: SkillFileIdentity,
 ) -> Result<(Vec<u8>, usize), ToolError> {
     use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
     use windows_sys::Win32::Storage::FileSystem::{
@@ -747,7 +766,43 @@ fn read_skill_resource_handle(
             "Skill resource path escapes its open Skill root".into(),
         ));
     }
+    if skill_file_identity(&file).map_err(ToolError::Execution)? == definition_identity {
+        return Err(ToolError::InvalidArguments(
+            "Skill definition files cannot be read as persistent resources".into(),
+        ));
+    }
     read_bounded_skill_resource_file(file)
+}
+
+#[cfg(unix)]
+fn skill_file_identity(file: &File) -> Result<SkillFileIdentity, String> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("Skill file identity cannot be read: {error}"))?;
+    Ok(SkillFileIdentity {
+        volume: metadata.dev(),
+        file: metadata.ino(),
+    })
+}
+
+#[cfg(windows)]
+fn skill_file_identity(file: &File) -> Result<SkillFileIdentity, String> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
+
+    let handle = file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
+    let mut information = BY_HANDLE_FILE_INFORMATION::default();
+    if unsafe { GetFileInformationByHandle(handle, &mut information) } == 0 {
+        return Err("Skill file identity cannot be read from its handle".into());
+    }
+    Ok(SkillFileIdentity {
+        volume: u64::from(information.dwVolumeSerialNumber),
+        file: (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow),
+    })
 }
 
 #[cfg(windows)]
@@ -827,7 +882,8 @@ fn read_bounded_skill_resource_file(mut file: File) -> Result<(Vec<u8>, usize), 
             "Skill resource exceeds the {MAX_SKILL_RESOURCE_FILE_BYTES} byte file limit"
         )));
     }
-    Ok((bytes, total_bytes))
+    let bytes_read = bytes.len();
+    Ok((bytes, bytes_read))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -874,6 +930,9 @@ pub struct SkillDiagnostic {
     pub category: SkillCategory,
     pub triggers: Vec<String>,
     pub enabled: bool,
+    /// Built-in robot bindings own these Skills; they are always enabled and
+    /// cannot be changed through the ordinary extension toggle.
+    pub managed_by_robot: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1251,6 +1310,21 @@ impl ExtensionService {
     }
 
     pub fn runtime_instructions(&self, input: &str) -> Result<String, ExtensionError> {
+        self.runtime_instructions_with_builtin_skills(input, true)
+    }
+
+    pub(crate) fn runtime_instructions_for_robot(
+        &self,
+        input: &str,
+    ) -> Result<String, ExtensionError> {
+        self.runtime_instructions_with_builtin_skills(input, false)
+    }
+
+    fn runtime_instructions_with_builtin_skills(
+        &self,
+        input: &str,
+        include_builtin_skills: bool,
+    ) -> Result<String, ExtensionError> {
         let instructions = self.instructions.read().expect("instruction lock poisoned");
         let skills = self.skills.read().expect("skill lock poisoned");
         let mut output = String::from(
@@ -1265,7 +1339,11 @@ impl ExtensionService {
         let lower_input = input.to_lowercase();
         let selected = skills
             .iter()
-            .filter(|skill| skill.enabled && skill_is_selected(&lower_input, skill))
+            .filter(|skill| {
+                skill.enabled
+                    && (include_builtin_skills || skill.scope != "builtin")
+                    && skill_is_selected(&lower_input, skill)
+            })
             .take(MAX_SELECTED_SKILLS)
             .collect::<Vec<_>>();
         if !selected.is_empty() {
@@ -1310,6 +1388,54 @@ impl ExtensionService {
             .find(|skill| skill.metadata.name == skill_id)
             .ok_or_else(|| ExtensionError::Skill(format!("Skill {skill_id} is not available")))?;
         Ok(resolved_ordinary_skill(skill))
+    }
+
+    /// Resolve the immutable Skill shipped for robot workflows. Robot-pack
+    /// entries are deliberately looked up by their built-in scope instead of
+    /// through the ordinary effective-scope map, so a global/project Skill
+    /// with the same id cannot replace the workflow contract.
+    pub(crate) fn resolve_robot_skill(
+        &self,
+        skill_id: &str,
+    ) -> Result<ResolvedSkill, ExtensionError> {
+        let skills = self.skills.read().expect("skill lock poisoned");
+        let skill = skills
+            .iter()
+            .find(|skill| {
+                skill.scope == "builtin" && skill.robot_pack && skill.metadata.name == skill_id
+            })
+            .or_else(|| {
+                // Test fixtures and older resource bundles may place built-in
+                // compatibility Skills directly under the built-in root.
+                skills
+                    .iter()
+                    .find(|skill| skill.scope == "builtin" && skill.metadata.name == skill_id)
+            })
+            .ok_or_else(|| {
+                ExtensionError::Skill(format!("robot Skill {skill_id} is not available"))
+            })?;
+        let mut resolved = resolved_ordinary_skill(skill);
+        // Robot-pack entries are part of the immutable workflow contract.
+        // Frontmatter and persisted ordinary-scope settings must not turn
+        // them into a readiness blocker.
+        resolved.enabled = true;
+        Ok(resolved)
+    }
+
+    pub(crate) fn record_robot_skill_selected(
+        &self,
+        declaration: &str,
+        source: &ResolvedSkillSource,
+        sha256: &str,
+        bytes: usize,
+    ) {
+        self.record(
+            "robot_skill_selected",
+            "skill",
+            declaration,
+            true,
+            &format!("source={:?}, sha256={sha256}, bytes={bytes}", source),
+        );
     }
 
     #[allow(dead_code)]
@@ -1373,20 +1499,20 @@ impl ExtensionService {
         if !resolved.enabled {
             return Err(ToolError::Denied(format!("Skill {skill_id} is disabled")));
         }
-        let resource_root = self
+        let (resource_root, definition_identity) = self
             .skills
             .read()
             .expect("skill lock poisoned")
             .iter()
             .find(|skill| skill.metadata.name == skill_id)
-            .map(|skill| skill.resource_root.clone())
+            .map(|skill| (skill.resource_root.clone(), skill.definition_identity))
             .ok_or_else(|| ToolError::Denied(format!("Skill {skill_id} is not available")))?;
         let relative = validate_skill_resource_path(raw_path)?;
         let skill_root = resource_root.path.as_path();
         resolve_skill_resource_path(skill_root, &relative)?;
         #[cfg(test)]
         run_skill_resource_before_open_hook(skill_root);
-        let (bytes, total_bytes) = resource_root.read(&relative)?;
+        let (bytes, total_bytes) = resource_root.read(&relative, definition_identity)?;
         let text = String::from_utf8(bytes)
             .map_err(|_| ToolError::Execution("Skill resource must be UTF-8".into()))?;
         let offset = offset.unwrap_or(0);
@@ -1636,6 +1762,14 @@ impl ExtensionService {
         if !matches!(kind, "skill" | "mcp" | "hook") || id.trim().is_empty() {
             return Err(ExtensionError::Config("invalid extension toggle".into()));
         }
+        if kind == "skill" && self.is_robot_pack_skill_id(id) {
+            if enabled {
+                return Ok(());
+            }
+            return Err(ExtensionError::Config(
+                "robot-pack Skills are required by built-in robots and cannot be disabled".into(),
+            ));
+        }
         self.projection
             .set_setting(
                 &format!("extension/{kind}/{id}"),
@@ -1650,6 +1784,24 @@ impl ExtensionService {
             if enabled { "enabled" } else { "disabled" },
         );
         Ok(())
+    }
+
+    fn is_robot_pack_skill_id(&self, id: &str) -> bool {
+        let id = id.trim();
+        if !valid_skill_name(id) {
+            return false;
+        }
+        let Some(root) = self.builtin_skills_root.as_deref() else {
+            return false;
+        };
+        let direct = root.join(id).join("SKILL.md");
+        let grouped = root.join("robot-pack").join(id).join("SKILL.md");
+        (direct.is_file()
+            && root
+                .file_name()
+                .and_then(|value| value.to_str())
+                .is_some_and(|value| value.eq_ignore_ascii_case("robot-pack")))
+            || grouped.is_file()
     }
 
     pub fn save_secret(&self, server: &str, name: &str, value: &str) -> Result<(), ExtensionError> {
@@ -1705,6 +1857,7 @@ impl ExtensionService {
                     category: skill.metadata.category,
                     triggers: skill.metadata.triggers.clone(),
                     enabled: skill.enabled,
+                    managed_by_robot: skill.robot_pack,
                 })
                 .collect(),
             mcp_servers,
@@ -2321,7 +2474,7 @@ fn discover_skills(
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| ExtensionError::Io(error.to_string()))?;
         directories.sort();
-        let mut scope_ids = HashSet::new();
+        let mut scope_ids = HashSet::<String>::new();
         for directory in directories {
             reject_skill_link_or_reparse(&directory)?;
             if !directory.is_dir() {
@@ -2402,7 +2555,9 @@ fn load_skill_candidate(
             user_facing_path(file)
         )));
     }
-    let content = read_bounded_utf8(&canonical, MAX_SKILL_BYTES)?;
+    let robot_pack = scope == "builtin" && is_robot_pack_directory(canonical_root, directory);
+    let (content, definition_identity) =
+        read_bounded_skill_utf8_with_identity(&canonical, MAX_SKILL_BYTES)?;
     let (metadata, body) = parse_skill(&content, &canonical)?;
     let directory_name = directory
         .file_name()
@@ -2423,12 +2578,18 @@ fn load_skill_candidate(
     let override_enabled = projection
         .setting(&format!("extension/skill/{}", metadata.name))
         .map_err(|error| ExtensionError::Config(error.to_string()))?;
-    let enabled = match metadata.risk {
-        ToolRisk::Read => override_enabled
-            .map(|value| value == "true")
-            .unwrap_or(metadata.enabled),
-        ToolRisk::Write | ToolRisk::Delete | ToolRisk::External => {
-            override_enabled.as_deref() == Some("true")
+    let enabled = if robot_pack {
+        // Robot-pack Skills are part of a built-in workflow contract. A
+        // persisted ordinary toggle or frontmatter value must not disable it.
+        true
+    } else {
+        match metadata.risk {
+            ToolRisk::Read => override_enabled
+                .map(|value| value == "true")
+                .unwrap_or(metadata.enabled),
+            ToolRisk::Write | ToolRisk::Delete | ToolRisk::External => {
+                override_enabled.as_deref() == Some("true")
+            }
         }
     };
     let resource_root = SkillResourceRoot::open(
@@ -2437,18 +2598,40 @@ fn load_skill_candidate(
             ExtensionError::Skill("Skill definition has no parent directory".into())
         })?,
     )?;
-    selected.insert(
-        metadata.name.clone(),
-        LoadedSkill {
-            metadata,
-            path: canonical,
-            resource_root,
-            scope: scope.into(),
-            body,
-            enabled,
-        },
-    );
+    let loaded = LoadedSkill {
+        metadata,
+        path: canonical,
+        resource_root,
+        definition_identity,
+        scope: scope.into(),
+        robot_pack,
+        body,
+        enabled,
+    };
+    let should_replace = selected
+        .get(&loaded.metadata.name)
+        .is_none_or(|existing| !existing.robot_pack || loaded.robot_pack);
+    if should_replace {
+        selected.insert(loaded.metadata.name.clone(), loaded);
+    }
     Ok(())
+}
+
+fn is_robot_pack_directory(canonical_root: &Path, directory: &Path) -> bool {
+    if canonical_root
+        .file_name()
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| value.eq_ignore_ascii_case("robot-pack"))
+    {
+        return true;
+    }
+    directory
+        .strip_prefix(canonical_root)
+        .ok()
+        .and_then(|relative| relative.components().next())
+        .is_some_and(|component| {
+            matches!(component, Component::Normal(value) if value.to_string_lossy().eq_ignore_ascii_case("robot-pack"))
+        })
 }
 
 fn reject_skill_link_or_reparse(path: &Path) -> Result<(), ExtensionError> {
@@ -2478,6 +2661,14 @@ fn validate_skill_resource_path(raw_path: &str) -> Result<PathBuf, ToolError> {
     if path.components().count() == 1 && raw_path.eq_ignore_ascii_case("SKILL.md") {
         return Err(ToolError::InvalidArguments(
             "Skill definition files cannot be read as persistent resources".into(),
+        ));
+    }
+    #[cfg(windows)]
+    if path.components().any(|component| {
+        matches!(component, Component::Normal(value) if value.to_string_lossy().contains(':'))
+    }) {
+        return Err(ToolError::InvalidArguments(
+            "Skill resource path components must not contain Windows stream separators".into(),
         ));
     }
     Ok(path.to_path_buf())
@@ -2640,6 +2831,53 @@ fn sha256_hex(bytes: &[u8]) -> String {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
+}
+
+fn read_bounded_skill_utf8_with_identity(
+    path: &Path,
+    limit: usize,
+) -> Result<(String, SkillFileIdentity), ExtensionError> {
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt;
+    #[cfg(windows)]
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+    #[cfg(windows)]
+    options.custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT);
+    let mut file = options
+        .open(path)
+        .map_err(|error| ExtensionError::Io(error.to_string()))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| ExtensionError::Io(error.to_string()))?;
+    if !metadata.is_file()
+        || skill_metadata_is_reparse_point(&metadata)
+        || metadata.len() > limit as u64
+    {
+        return Err(ExtensionError::Config(format!(
+            "{} must be a real file no larger than {limit} bytes",
+            user_facing_path(path)
+        )));
+    }
+    let identity = skill_file_identity(&file).map_err(ExtensionError::Io)?;
+    let mut bytes = Vec::with_capacity((metadata.len() as usize).min(limit));
+    Read::by_ref(&mut file)
+        .take((limit + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|error| ExtensionError::Io(error.to_string()))?;
+    if bytes.len() > limit {
+        return Err(ExtensionError::Config(format!(
+            "{} must be a file no larger than {limit} bytes",
+            user_facing_path(path)
+        )));
+    }
+    let content = String::from_utf8(bytes)
+        .map_err(|_| ExtensionError::Config(format!("{} must be UTF-8", user_facing_path(path))))?;
+    Ok((content, identity))
 }
 
 fn read_bounded_utf8(path: &Path, limit: usize) -> Result<String, ExtensionError> {
@@ -3052,6 +3290,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn robot_pack_skills_are_reserved_enabled_and_not_overridable() {
+        let builtin = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        write_test_skill(
+            &builtin.path().join("robot-pack"),
+            "review",
+            "ROBOT-CONTRACT",
+        );
+        write_test_skill(&data.path().join("skills"), "review", "GLOBAL-OVERRIDE");
+        write_test_skill(
+            &workspace.path().join(".k-coder/skills"),
+            "review",
+            "PROJECT-OVERRIDE",
+        );
+        let projection = ProjectionDb::memory().unwrap();
+        projection
+            .set_setting("extension/skill/review", "false")
+            .unwrap();
+        let service = ExtensionService::with_builtin_skills(
+            data.path().into(),
+            Some(builtin.path().into()),
+            projection.clone(),
+            Arc::new(mcp::OsMcpSecretStore::new()),
+            StructuredLogger::new(data.path()).unwrap(),
+        );
+        service
+            .prepare(workspace.path(), CancellationToken::new())
+            .await
+            .unwrap();
+
+        let resolved = service.resolve_robot_skill("review").unwrap();
+        assert_eq!(resolved.body, "ROBOT-CONTRACT");
+        assert!(resolved.enabled);
+        assert_eq!(
+            resolved.source,
+            ResolvedSkillSource::Ordinary {
+                scope: "builtin".into()
+            }
+        );
+        let effective = service.resolve_ordinary_skill("review").unwrap();
+        assert_eq!(effective.body, "ROBOT-CONTRACT");
+        assert!(effective.enabled);
+
+        let error = service.set_enabled("skill", "review", false).unwrap_err();
+        assert!(error.to_string().contains("cannot be disabled"));
+        service.set_enabled("skill", "review", true).unwrap();
+        assert_eq!(
+            projection
+                .setting("extension/skill/review")
+                .unwrap()
+                .as_deref(),
+            Some("false")
+        );
+
+        let diagnostic = service
+            .overview()
+            .skills
+            .into_iter()
+            .find(|skill| skill.name == "review")
+            .unwrap();
+        assert!(diagnostic.managed_by_robot);
+        assert!(diagnostic.enabled);
+    }
+
+    #[tokio::test]
     async fn enabled_plugin_skill_is_preferred_over_its_ordinary_fallback() {
         let data = tempfile::tempdir().unwrap();
         let workspace = tempfile::tempdir().unwrap();
@@ -3331,6 +3635,88 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn skill_resource_read_rejects_windows_definition_ads_aliases() {
+        let data = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        write_test_skill(
+            &data.path().join("skills"),
+            "review",
+            "UNIQUE-PRIVATE-SKILL-BODY",
+        );
+        let service = ExtensionService::new(
+            data.path().into(),
+            ProjectionDb::memory().unwrap(),
+            Arc::new(mcp::OsMcpSecretStore::new()),
+            StructuredLogger::new(data.path()).unwrap(),
+        );
+        let handler = prepared_skill_resource_handler(&service, workspace.path()).await;
+
+        let validation_error = validate_skill_resource_path("SKILL.md::$DATA").unwrap_err();
+        assert!(matches!(
+            validation_error,
+            ToolError::Denied(_) | ToolError::InvalidArguments(_)
+        ));
+        let error = handler
+            .execute(
+                &tool_context(workspace.path()),
+                serde_json::json!({
+                    "skillId": "review",
+                    "path": "SKILL.md::$DATA"
+                }),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ToolError::Denied(_) | ToolError::InvalidArguments(_)
+        ));
+        assert!(!error.to_string().contains("UNIQUE-PRIVATE-SKILL-BODY"));
+    }
+
+    #[tokio::test]
+    async fn skill_resource_read_rejects_a_definition_file_hard_link() {
+        let data = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        write_test_skill(
+            &data.path().join("skills"),
+            "review",
+            "UNIQUE-PRIVATE-SKILL-BODY",
+        );
+        let skill = data.path().join("skills/review");
+        fs::create_dir_all(skill.join("references")).unwrap();
+        fs::hard_link(
+            skill.join("SKILL.md"),
+            skill.join("references/definition-alias.md"),
+        )
+        .unwrap();
+        let service = ExtensionService::new(
+            data.path().into(),
+            ProjectionDb::memory().unwrap(),
+            Arc::new(mcp::OsMcpSecretStore::new()),
+            StructuredLogger::new(data.path()).unwrap(),
+        );
+        let handler = prepared_skill_resource_handler(&service, workspace.path()).await;
+
+        let error = handler
+            .execute(
+                &tool_context(workspace.path()),
+                serde_json::json!({
+                    "skillId": "review",
+                    "path": "references/definition-alias.md"
+                }),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, ToolError::InvalidArguments(_)));
+        assert!(!error.to_string().contains("UNIQUE-PRIVATE-SKILL-BODY"));
+    }
+
     #[tokio::test]
     async fn skill_resource_read_rejects_binary_resources() {
         let data = tempfile::tempdir().unwrap();
@@ -3524,6 +3910,22 @@ mod tests {
                 .unwrap_err();
             assert!(matches!(error, ToolError::InvalidArguments(_)));
         }
+    }
+
+    #[test]
+    fn bounded_skill_resource_reader_reports_actual_bytes_read() {
+        use std::io::{Seek, SeekFrom};
+
+        let data = tempfile::tempdir().unwrap();
+        let path = data.path().join("resource.txt");
+        fs::write(&path, "0123456789").unwrap();
+        let mut file = File::open(path).unwrap();
+        file.seek(SeekFrom::Start(3)).unwrap();
+
+        let (bytes, total_bytes) = read_bounded_skill_resource_file(file).unwrap();
+
+        assert_eq!(bytes, b"3456789");
+        assert_eq!(total_bytes, 7);
     }
 
     #[test]

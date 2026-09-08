@@ -15,47 +15,129 @@ test.beforeEach(async ({ page }) => {
     const openAiProvider = { schemaVersion: 1, id: "openai", kind: "open_ai_compatible", transport: "open_ai_chat_completions", name: "OpenAI", baseUrl: "https://api.openai.com/v1", model: "gpt-4.1", models: [{ id: "gpt-4.1", displayName: "GPT-4.1", contextWindow: 128000, fallback: false }, { id: "gpt-4o", displayName: "GPT-4 Omni", contextWindow: 64000, fallback: false }], endpoints: [], hasApiKey: true };
     const ziccProvider = { schemaVersion: 1, id: "zicc", kind: "open_ai_compatible", transport: "open_ai_responses", name: "zicc", baseUrl: "https://zicc.example.com/v1", model: "gpt-5.6-terra", models: [{ id: "gpt-5.6-terra", displayName: "gpt-5.6-terra", contextWindow: 128000, fallback: false }, { id: "gpt-5.5", displayName: "gpt-5.5", contextWindow: 128000, fallback: false }], endpoints: [], hasApiKey: true };
     const pendingProvider = { schemaVersion: 1, id: "pending", kind: "open_ai_compatible", transport: "anthropic_messages", name: "待配置供应商", baseUrl: "https://pending.example.com/v1", model: "claude-test", models: [{ id: "claude-test", displayName: "Claude Test", contextWindow: 128000, fallback: false }], endpoints: [], hasApiKey: false };
+    const makeBinding = (declaration: string, kind: "skill" | "plugin_skill") => {
+      const slash = declaration.indexOf("/");
+      const pluginId = slash > 0 ? declaration.slice(0, slash) : null;
+      const skillId = slash > 0 ? declaration.slice(slash + 1) : declaration;
+      return {
+        kind,
+        declaration,
+        skillId,
+        pluginId,
+        fallbackSkillId: kind === "plugin_skill" ? skillId : null,
+      };
+    };
+    const makeWorkflow = ({ id, name, description, localSkills, pluginSkills, nodes }: {
+      id: string;
+      name: string;
+      description: string;
+      localSkills: string[];
+      pluginSkills: string[];
+      nodes: Array<[string, string, string]>;
+    }) => ({
+      schemaVersion: 1,
+      definitionVersion: 2,
+      id,
+      name,
+      description,
+      localSkillCount: localSkills.length,
+      pluginSkillCount: pluginSkills.length,
+      uniqueSkillCount: localSkills.length + pluginSkills.length,
+      skillCatalog: [
+        ...localSkills.map((skill) => makeBinding(skill, "skill")),
+        ...pluginSkills.map((skill) => makeBinding(skill, "plugin_skill")),
+      ],
+      nodes: nodes.map(([nodeId, title, nodeDescription]) => ({
+        id: nodeId,
+        title,
+        description: nodeDescription,
+        localSkillCount: Math.min(localSkills.length, 1),
+        pluginSkillCount: Math.min(pluginSkills.length, 1),
+        skillDeclarationCount: Math.min(localSkills.length, 1) + Math.min(pluginSkills.length, 1),
+        localSkillBindings: localSkills.slice(0, 1).map((skill) => makeBinding(skill, "skill")),
+        pluginSkillBindings: pluginSkills.slice(0, 1).map((skill) => makeBinding(skill, "plugin_skill")),
+      })),
+    });
     const workflowDefinitions = [
-      {
-        schemaVersion: 1,
+      makeWorkflow({
         id: "fullstack-delivery",
-        name: "全栈开发",
-        description: "从仓库探索、方案、实现到验证和交付的完整开发流程。",
+        name: "全栈开发机器人",
+        description: "覆盖需求分析、界面与架构设计、原型 HTML、前后端开发、全面测试、构建发布和代码交付。",
+        localSkills: ["brainstorming", "writing-plans", "executing-plans", "test-driven-development", "requesting-code-review", "verification-before-completion", "dispatching-parallel-agents", "taste-skill", "awesome-design-md"],
+        pluginSkills: ["browser/control-in-app-browser", "superpowers/brainstorming", "superpowers/dispatching-parallel-agents", "superpowers/executing-plans", "superpowers/finishing-a-development-branch", "superpowers/receiving-code-review", "superpowers/requesting-code-review", "superpowers/subagent-driven-development", "superpowers/systematic-debugging", "superpowers/test-driven-development", "superpowers/using-git-worktrees", "superpowers/verification-before-completion", "superpowers/writing-plans", "documents/documents"],
         nodes: [
-          ["repository-discovery", "仓库探索", "确认项目约束、现状、影响范围和验收入口。"],
-          ["solution-plan", "方案与计划", "形成符合现有架构的实施方案和可验证计划。"],
-          ["implementation", "实现", "按仓库惯例完成代码与必要文档变更。"],
-          ["verification", "验证", "执行针对性和仓库规定的验证命令。"],
-          ["review-handoff", "审查与交付", "复查差异、安全边界和交付说明。"],
-        ].map(([id, title, description]) => ({ id, title, description })),
-      },
-      {
-        schemaVersion: 1,
+          ["requirements-analysis", "需求理解与分析", "澄清目标、约束、现状与可验证的交付范围。"],
+          ["interface-architecture-design", "界面与架构设计", "确定界面体验、模块职责、公共契约和安全边界。"],
+          ["html-prototype", "原型 HTML", "以可检查的 HTML 原型验证关键布局和交互。"],
+          ["backend-development", "后端开发", "实现后端领域逻辑、边界契约与安全测试。"],
+          ["frontend-development", "前端开发", "实现与现有设计一致的完整界面和交互状态。"],
+          ["comprehensive-testing", "全面测试", "覆盖功能、边界、失败、恢复和桌面工作流。"],
+          ["build-release", "构建与发布", "完成规定构建门槛并准备可审计的发布结果。"],
+          ["code-review-delivery", "代码审查与交付", "复查正确性、安全性、兼容性和最终交付说明。"],
+        ],
+      }),
+      makeWorkflow({
         id: "quality-assurance",
-        name: "质量保障",
-        description: "面向风险的测试设计、执行、分析和报告流程。",
+        name: "软件测试机器人",
+        description: "覆盖测试策略、用例设计、单元测试、集成与 API、E2E/UI、性能、安全和测试报告。",
+        localSkills: ["test-strategy-planning", "test-case-design", "api-testing", "performance-testing", "security-testing", "test-report-generation", "webapp-testing"],
+        pluginSkills: ["superpowers/test-driven-development", "superpowers/systematic-debugging", "superpowers/verification-before-completion", "superpowers/writing-plans", "superpowers/executing-plans", "superpowers/dispatching-parallel-agents", "superpowers/subagent-driven-development", "browser/control-in-app-browser", "documents/documents"],
         nodes: [
-          ["scope-confirmation", "范围确认", "确认测试对象、风险、环境和验收口径。"],
-          ["test-design", "测试设计", "设计正常、边界、失败和恢复路径。"],
-          ["test-execution", "测试执行", "执行测试并保留可复核结果。"],
-          ["result-analysis", "结果分析", "定位失败根因并判断回归风险。"],
-          ["test-report", "测试报告", "输出结构化测试结论和残余风险。"],
-        ].map(([id, title, description]) => ({ id, title, description })),
-      },
-      {
-        schemaVersion: 1,
+          ["test-strategy", "测试策略制定", "确定测试目标、风险分层、范围、环境和验收口径。"],
+          ["test-case-design", "测试用例设计", "设计正常、边界、失败、恢复和安全路径的用例。"],
+          ["unit-testing", "单元测试", "实现并执行聚焦领域逻辑和公共契约的单元测试。"],
+          ["integration-api-testing", "集成/API 测试", "验证模块协作、类型化边界、API 失败与恢复语义。"],
+          ["e2e-ui-testing", "E2E/UI 测试", "验证真实用户工作流、响应式布局和交互终态。"],
+          ["nonfunctional-testing", "非功能测试", "评估性能、安全、资源边界和故障韧性。"],
+          ["test-report-delivery", "测试报告与交付", "汇总覆盖、结果、缺陷、限制与残余风险。"],
+        ],
+      }),
+      makeWorkflow({
         id: "requirements-design",
-        name: "需求设计",
-        description: "把需求与仓库约束转化为可实施、可验收的详细设计。",
+        name: "需求设计机器人",
+        description: "通过需求采集、边界划定、用户故事、交互流程、PRD 审查、文档输出和钉钉发布形成可交付需求文档。",
+        localSkills: ["requirements-intake", "prd-story-modeler", "prd-delivery-review", "create-plan", "dingtalk-document"],
+        pluginSkills: ["superpowers/brainstorming", "superpowers/verification-before-completion", "superpowers/writing-plans", "documents/documents"],
         nodes: [
-          ["context-collection", "上下文收集", "收集需求来源、仓库现状和既有约束。"],
-          ["requirement-clarification", "需求澄清", "消除会改变方案或验收结果的歧义。"],
-          ["architecture-impact", "架构影响", "映射模块边界、数据契约和安全影响。"],
-          ["detailed-design", "详细设计", "形成可直接实施的版本化设计。"],
-          ["acceptance-definition", "验收定义", "给出可执行的验收条件和后续任务。"],
-        ].map(([id, title, description]) => ({ id, title, description })),
-      },
+          ["requirements-intake", "需求采集与理解", "与用户沟通需求，通过渐进式问答提炼核心需求。"],
+          ["business-boundary", "业务边界划定", "明确做什么、不做什么、约束条件和实现路径。"],
+          ["user-story-modeling", "用户故事与功能建模", "将需求拆解为带可验证验收标准的用户故事和功能需求。"],
+          ["interaction-flow-design", "交互流程设计", "设计核心交互流程、页面跳转和状态机。"],
+          ["prd-review", "PRD 整合与审查", "汇总阶段产物并进行覆盖性、一致性、可执行性和风险审查。"],
+          ["document-formatting", "文档格式化输出", "输出最终 Markdown 文档和可选结构化文档。"],
+          ["dingtalk-publishing", "发布到钉钉知识库", "通过已配置并授权的钉钉能力发布最终 PRD。"],
+        ],
+      }),
     ];
+    const workflowReadiness = (definition: typeof workflowDefinitions[number]) => ({
+      schemaVersion: 1,
+      workflowId: definition.id,
+      definitionVersion: definition.definitionVersion,
+      ready: true,
+      skillCount: definition.skillCatalog.length,
+      localSkillCount: definition.localSkillCount,
+      pluginSkillCount: definition.pluginSkillCount,
+      blockerCount: 0,
+      bindings: definition.skillCatalog.map((binding) => ({
+        binding,
+        status: binding.kind === "plugin_skill" ? "builtin_fallback" : "builtin",
+        resolvedSkillId: binding.skillId,
+        resolvedScope: "builtin",
+        bodySha256: `fixture-${binding.declaration}`,
+        bodyBytes: 100,
+        blocker: null,
+      })),
+      nodes: definition.nodes.map((node) => ({
+        nodeId: node.id,
+        ready: true,
+        declarationCount: node.skillDeclarationCount,
+        uniqueBodyCount: node.skillDeclarationCount,
+        totalBodyBytes: node.skillDeclarationCount * 100,
+        bindings: [],
+        blockers: [],
+      })),
+      blockers: [],
+    });
     let workflowRun = JSON.parse(localStorage.getItem("kcoder_e2e_workflow_run") ?? "null") as null | {
       schemaVersion: number;
       id: string;
@@ -144,8 +226,9 @@ test.beforeEach(async ({ page }) => {
       ],
       instructions: [{ path: "D:\\code\\k-coder\\AGENTS.md", scope: "project", priority: 200, bytes: 120 }],
       skills: [
-        { name: "workspace-review", description: "Built-in workspace review", path: "D:\\apps\\k-coder\\resources\\skills\\workspace-review\\SKILL.md", scope: "builtin", risk: "read", triggers: ["workspace review"], enabled: true },
-        { name: "review", description: "Review code safely", path: "D:\\code\\k-coder\\.k-coder\\skills\\review\\SKILL.md", scope: "project", risk: "read", triggers: ["review"], enabled: true },
+        { name: "workspace-review", description: "Built-in workspace review", path: "D:\\apps\\k-coder\\resources\\skills\\workspace-review\\SKILL.md", scope: "builtin", risk: "read", category: "quality_review", triggers: ["workspace review"], enabled: true, managedByRobot: false },
+        { name: "review", description: "Review code safely", path: "D:\\code\\k-coder\\.k-coder\\skills\\review\\SKILL.md", scope: "project", risk: "read", category: "quality_review", triggers: ["review"], enabled: true, managedByRobot: false },
+        { name: "requirements-intake", description: "Robot requirements intake", path: "D:\\apps\\k-coder\\resources\\skills\\robot-pack\\requirements-intake\\SKILL.md", scope: "builtin", risk: "read", category: "requirements_planning", triggers: ["requirements"], enabled: true, managedByRobot: true },
       ],
       mcpServers: [{ id: "local", transport: "stdio", enabled: true, state: "ready", toolCount: 2, credentials: [], error: null }],
       hooks: [{ id: "guard", phase: "before", tool: "mcp__local__*", enabled: true }],
@@ -438,6 +521,11 @@ test.beforeEach(async ({ page }) => {
           }
           if (command === "get_provider_catalog") return providerCatalog;
           if (command === "list_builtin_workflows") return workflowDefinitions;
+          if (command === "get_workflow_skill_readiness") {
+            const workflow = workflowDefinitions.find((item) => item.id === args?.workflowId);
+            if (!workflow) throw new Error("workflow not found");
+            return workflowReadiness(workflow);
+          }
           if (command === "get_workflow_run") {
             const restored = localStorage.getItem("kcoder_e2e_workflow_run");
             if (restored) workflowRun = JSON.parse(restored);
@@ -1034,8 +1122,8 @@ test("starts a built-in robot workflow from the composer and cancels it after th
   await robotSelector.click();
   const robotMenu = page.getByRole("menu", { name: "机器人列表" });
   await expect(robotMenu.getByRole("menuitemradio")).toHaveCount(4);
-  await robotMenu.getByRole("menuitemradio", { name: /质量保障/ }).click();
-  await expect(robotSelector).toContainText("质量保障");
+  await robotMenu.getByRole("menuitemradio", { name: /软件测试机器人/ }).click();
+  await expect(robotSelector).toContainText("软件测试机器人");
   await expect(page.getByRole("button", { name: "选择模式" })).toBeDisabled();
 
   await page.getByRole("textbox", { name: "消息" }).fill("验证机器人工作流");
@@ -1051,10 +1139,11 @@ test("starts a built-in robot workflow from the composer and cancels it after th
     input: "验证机器人工作流",
   });
 
-  const control = page.getByLabel("机器人工作流 质量保障");
+  const control = page.getByLabel("机器人工作流 软件测试机器人");
   await expect(control).toBeVisible();
-  await expect(control).toContainText("范围确认");
-  await expect(control).toContainText("1 / 5");
+  await expect(control).toContainText("测试策略制定");
+  await expect(control).toContainText("1 / 7");
+  await expect(control.locator(".workflow-control-skills")).toContainText("test-strategy-planning");
   await expect(control.getByRole("progressbar", { name: "工作流进度" })).toHaveAttribute("aria-valuenow", "0");
   await page.screenshot({ path: testInfo.outputPath("builtin-robot-running.png"), fullPage: true });
 
@@ -1086,17 +1175,18 @@ test("restores persisted robot node progress and lists built-in definitions", as
   await page.addInitScript(() => {
     localStorage.setItem("kcoder_e2e_workflow_run", JSON.stringify({
       schemaVersion: 1,
+      definitionVersion: 2,
       id: "workflow-restored",
       threadId: "thread-1",
       workflowId: "requirements-design",
       objective: "形成设计",
       state: "active",
-      currentNodeId: "architecture-impact",
+      currentNodeId: "user-story-modeling",
       currentNodeIndex: 2,
-      nodeCount: 5,
+      nodeCount: 7,
       completedNodes: [
-        { nodeId: "context-collection", summary: "done", evidence: ["docs"], completedAtMs: 2 },
-        { nodeId: "requirement-clarification", summary: "done", evidence: ["scope"], completedAtMs: 3 },
+        { nodeId: "requirements-intake", summary: "done", evidence: ["docs"], completedAtMs: 2 },
+        { nodeId: "business-boundary", summary: "done", evidence: ["scope"], completedAtMs: 3 },
       ],
       createdAtMs: 1,
       updatedAtMs: 3,
@@ -1106,8 +1196,8 @@ test("restores persisted robot node progress and lists built-in definitions", as
   await page.goto("/");
 
   const control = page.getByLabel("机器人工作流 需求设计");
-  await expect(control).toContainText("架构影响");
-  await expect(control).toContainText("3 / 5");
+  await expect(control).toContainText("用户故事与功能建模");
+  await expect(control).toContainText("3 / 7");
   await expect(control.getByRole("progressbar", { name: "工作流进度" })).toHaveAttribute("aria-valuenow", "2");
   await expect(page.getByRole("button", { name: "选择机器人" })).toBeDisabled();
   await expect(page.getByRole("button", { name: "选择模式" })).toBeDisabled();
@@ -1116,8 +1206,24 @@ test("restores persisted robot node progress and lists built-in definitions", as
   await page.getByRole("button", { name: "机器人", exact: true }).click();
   await expect(page.getByRole("heading", { name: "内置机器人" })).toBeVisible();
   await expect(page.locator(".robot-row")).toHaveCount(3);
-  await expect(page.locator(".robot-row--active")).toContainText("架构影响");
+  await expect(page.locator(".robot-row--active")).toContainText("用户故事与功能建模");
+  await expect(page.locator(".robot-row--active .robot-skill-summary")).toContainText("5 本地技能");
+  await expect(page.locator(".robot-row--active .robot-skill-summary")).toContainText("4 插件技能");
+  await expect(page.locator(".robot-row--active")).toContainText("requirements-intake");
   await page.screenshot({ path: testInfo.outputPath("builtin-robots-settings.png"), fullPage: true });
+});
+
+test("groups Skills and locks robot-managed Skills", async ({ page }, testInfo) => {
+  await page.goto("/");
+  await page.locator('button[aria-label="设置"]:visible').click();
+  await page.getByRole("button", { name: /Skills/ }).click();
+
+  await expect(page.getByRole("region", { name: "需求与规划" })).toBeVisible();
+  await expect(page.getByRole("region", { name: "质量与评审" })).toBeVisible();
+  const managedSkill = page.locator(".extension-row").filter({ hasText: "Robot requirements intake" });
+  await expect(managedSkill.getByText("机器人必需", { exact: true })).toBeVisible();
+  await expect(managedSkill.getByRole("checkbox")).toHaveCount(0);
+  await page.screenshot({ path: testInfo.outputPath("robot-managed-skills.png"), fullPage: true });
 });
 
 test("restores a queued robot identity from the mailbox snapshot", async ({ page }) => {
@@ -1140,7 +1246,7 @@ test("restores a queued robot identity from the mailbox snapshot", async ({ page
   await page.goto("/");
 
   const selector = page.getByRole("button", { name: "选择机器人" });
-  await expect(selector).toContainText("质量保障");
+  await expect(selector).toContainText("软件测试机器人");
   await expect(selector).toBeDisabled();
   await expect(page.getByRole("button", { name: "选择模式" })).toBeDisabled();
   await page.getByRole("button", { name: "队列 (1)" }).click();

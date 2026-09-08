@@ -7,6 +7,7 @@ triggers:
   - 界面优化
 risk: write
 enabled: true
+category: design_experience
 ---
 
 Designs and iterates production-grade frontend interfaces. Real working code, committed design choices, exceptional craft.

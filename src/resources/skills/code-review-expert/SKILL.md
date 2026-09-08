@@ -7,6 +7,7 @@ triggers:
   - 专家代码评审
 risk: read
 enabled: true
+category: quality_review
 ---
 
 # Code Review Expert

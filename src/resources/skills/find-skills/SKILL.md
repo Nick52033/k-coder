@@ -7,6 +7,7 @@ triggers:
   - 安装 skill
 risk: external
 enabled: true
+category: extension_platform
 ---
 
 # Find Skills

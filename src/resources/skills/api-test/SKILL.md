@@ -7,6 +7,7 @@ triggers:
   - 接口测试
 risk: write
 enabled: true
+category: testing
 ---
 # REST API 接口测试
 

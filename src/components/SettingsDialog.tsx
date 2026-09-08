@@ -2,6 +2,7 @@ import { FormEvent, useEffect, useRef, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
   getExtensionOverview,
+  getWorkflowSkillReadiness,
   getUsageSummary,
   setExtensionEnabled,
   testProviderConnection,
@@ -72,6 +73,10 @@ import {
   Moon,
   Terminal,
   Waves,
+  ChevronDown,
+  ChevronRight,
+  Search,
+  LockKeyhole,
 } from "lucide-react";
 import type {
   ProviderConfigView,
@@ -90,6 +95,8 @@ import type {
   GoalView,
   WorkflowDefinitionView,
   WorkflowRunView,
+  WorkflowSkillReadinessView,
+  SkillCategory,
   KnowledgeSettings,
   EmbeddingSettings,
   KnowledgeCollection,
@@ -1188,6 +1195,35 @@ function RobotsPage({
   workflows: WorkflowDefinitionView[];
   workflowRun: WorkflowRunView | null;
 }) {
+  const [expandedId, setExpandedId] = useState<string | null>(
+    workflowRun?.state === "active" ? workflowRun.workflowId : workflows[0]?.id ?? null,
+  );
+  const [readiness, setReadiness] = useState<Record<string, WorkflowSkillReadinessView>>({});
+  const [loading, setLoading] = useState(false);
+  const [readinessError, setReadinessError] = useState("");
+
+  useEffect(() => {
+    let disposed = false;
+    if (!workflows.length) return undefined;
+    setLoading(true);
+    void Promise.all(workflows.map(async (workflow) => [
+      workflow.id,
+      await getWorkflowSkillReadiness(workflow.id),
+    ] as const))
+      .then((entries) => {
+        if (disposed) return;
+        setReadiness(Object.fromEntries(entries));
+        setReadinessError("");
+      })
+      .catch((reason) => {
+        if (!disposed) setReadinessError(String(reason));
+      })
+      .finally(() => {
+        if (!disposed) setLoading(false);
+      });
+    return () => { disposed = true; };
+  }, [workflows]);
+
   return (
     <section className="settings-page" aria-labelledby="robots-page-title">
       <div className="settings-page-header">
@@ -1197,37 +1233,152 @@ function RobotsPage({
         </div>
         <span className="settings-count">{workflows.length}</span>
       </div>
+      <p className="settings-page-description">
+        每个机器人按固定步骤运行。当前步骤需要的内置 Skills 始终启用；插件可选，未安装或停用时自动使用内置兼容实现。
+      </p>
+      {readinessError && <div className="settings-error" role="alert">{readinessError}</div>}
       <div className="robot-list">
         {workflows.map((workflow) => {
           const active = workflowRun?.state === "active" && workflowRun.workflowId === workflow.id;
+          const expanded = expandedId === workflow.id;
+          const workflowReadiness = readiness[workflow.id];
+          const readinessByDeclaration = new Map(
+            workflowReadiness?.bindings.map((item) => [item.binding.declaration, item]) ?? [],
+          );
           return (
             <article className={`robot-row ${active ? "robot-row--active" : ""}`} key={workflow.id}>
-              <div className="robot-row-header">
+              <button
+                className="robot-row-header"
+                type="button"
+                aria-expanded={expanded}
+                onClick={() => setExpandedId((current) => current === workflow.id ? null : workflow.id)}
+              >
                 <Bot size={17} />
-                <div>
+                <span className="robot-row-copy">
                   <strong>{workflow.name}</strong>
                   <span>{workflow.description}</span>
+                  <small>{workflow.uniqueSkillCount} 个技能 · {workflow.nodes.length} 个步骤</small>
+                </span>
+                <span className="robot-row-state">
+                  {active ? (
+                    <span className="robot-active-state">运行中</span>
+                  ) : workflowReadiness?.ready ? (
+                    <span className="robot-ready-state">可运行</span>
+                  ) : workflowReadiness ? (
+                    <span className="robot-blocked-state">{workflowReadiness.blockerCount} 项异常</span>
+                  ) : loading ? (
+                    <span className="robot-loading-state">检查中</span>
+                  ) : null}
+                  {expanded ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
+                </span>
+              </button>
+
+              {expanded && (
+                <div className="robot-details">
+                  <div className="robot-skill-summary" aria-label={`${workflow.name} 技能组成`}>
+                    <span><strong>{workflow.localSkillCount}</strong> 本地技能</span>
+                    <span><strong>{workflow.pluginSkillCount}</strong> 插件技能</span>
+                    <span><strong>{workflow.nodes.length}</strong> 工作流步骤</span>
+                  </div>
+
+                  <RobotSkillGroup
+                    title="本地技能"
+                    bindings={workflow.skillCatalog.filter((binding) => binding.kind === "skill")}
+                    readinessByDeclaration={readinessByDeclaration}
+                  />
+                  <RobotSkillGroup
+                    title="插件技能"
+                    bindings={workflow.skillCatalog.filter((binding) => binding.kind === "plugin_skill")}
+                    readinessByDeclaration={readinessByDeclaration}
+                  />
+
+                  <div className="robot-section-heading">
+                    <span>工作流</span>
+                    <small>{workflow.nodes.length} 步，按次执行</small>
+                  </div>
+                  <ol className="robot-node-list">
+                    {workflow.nodes.map((node, index) => {
+                      const completed = active && index < workflowRun.currentNodeIndex;
+                      const current = active && index === workflowRun.currentNodeIndex;
+                      const nodeReadiness = workflowReadiness?.nodes.find((item) => item.nodeId === node.id);
+                      return (
+                        <li className={completed ? "robot-node--completed" : current ? "robot-node--current" : ""} key={node.id}>
+                          <span>{completed ? <Check size={12} /> : index + 1}</span>
+                          <div>
+                            <strong>{index + 1}. {node.title}</strong>
+                            <small>{node.description}</small>
+                            <div className="robot-node-skills">
+                              {[...node.localSkillBindings, ...node.pluginSkillBindings].map((binding) => {
+                                const bindingReadiness = readinessByDeclaration.get(binding.declaration);
+                                return (
+                                  <span
+                                    className={`robot-skill-chip robot-skill-chip--${bindingReadiness?.status ?? "unknown"}`}
+                                    title={robotSkillStatusTitle(bindingReadiness)}
+                                    key={`${node.id}-${binding.declaration}`}
+                                  >
+                                    {binding.declaration}
+                                  </span>
+                                );
+                              })}
+                            </div>
+                            {nodeReadiness && !nodeReadiness.ready && (
+                              <small className="robot-node-warning"><AlertCircle size={12} />{nodeReadiness.blockers.length} 项技能异常</small>
+                            )}
+                          </div>
+                        </li>
+                      );
+                    })}
+                  </ol>
                 </div>
-                {active && <span className="robot-active-state">运行中</span>}
-              </div>
-              <ol className="robot-node-list">
-                {workflow.nodes.map((node, index) => {
-                  const completed = active && index < workflowRun.currentNodeIndex;
-                  const current = active && index === workflowRun.currentNodeIndex;
-                  return (
-                    <li className={completed ? "robot-node--completed" : current ? "robot-node--current" : ""} key={node.id}>
-                      <span>{completed ? <Check size={12} /> : index + 1}</span>
-                      <div><strong>{node.title}</strong><small>{node.description}</small></div>
-                    </li>
-                  );
-                })}
-              </ol>
+              )}
             </article>
           );
         })}
       </div>
     </section>
   );
+}
+
+function RobotSkillGroup({
+  title,
+  bindings,
+  readinessByDeclaration,
+}: {
+  title: string;
+  bindings: WorkflowDefinitionView["skillCatalog"];
+  readinessByDeclaration: Map<string, WorkflowSkillReadinessView["bindings"][number]>;
+}) {
+  return <div className="robot-skill-group">
+    <div className="robot-section-heading"><span>{title}</span><small>{bindings.length}</small></div>
+    <div className="robot-skill-cloud">
+      {bindings.map((binding) => {
+        const bindingReadiness = readinessByDeclaration.get(binding.declaration);
+        return <span
+          className={`robot-skill-chip robot-skill-chip--${bindingReadiness?.status ?? "unknown"}`}
+          title={robotSkillStatusTitle(bindingReadiness)}
+          key={binding.declaration}
+        >
+          {binding.declaration}
+          {bindingReadiness?.status === "builtin_fallback" && <small>内置兼容</small>}
+        </span>;
+      })}
+    </div>
+  </div>;
+}
+
+function robotSkillStatusTitle(
+  binding: WorkflowSkillReadinessView["bindings"][number] | undefined,
+) {
+  if (!binding) return "正在解析技能来源";
+  if (binding.blocker) return binding.blocker;
+  switch (binding.status) {
+    case "plugin": return "使用已启用插件";
+    case "builtin_fallback": return "插件未启用或不可用，使用内置兼容 Skill";
+    case "builtin": return "机器人内置 Skill，始终启用";
+    case "global": return "使用全局 Skill";
+    case "project": return "使用项目 Skill";
+    default: return binding.status;
+  }
 }
 
 function knowledgeSourceStateLabel(state: string) {
@@ -1523,6 +1674,9 @@ function ExtensionsPage() {
   const [overview, setOverview] = useState<ExtensionOverview | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+  const [query, setQuery] = useState("");
+  const [category, setCategory] = useState<SkillCategory | "all">("all");
+  const [scope, setScope] = useState<"all" | "builtin" | "global" | "project">("all");
 
   async function load(refresh = false) {
     setLoading(true);
@@ -1550,12 +1704,72 @@ function ExtensionsPage() {
     }
   }
 
+  const normalizedQuery = query.trim().toLocaleLowerCase();
+  const filtered = (overview?.skills ?? []).filter((skill) => {
+    const matchesQuery = !normalizedQuery
+      || skill.name.toLocaleLowerCase().includes(normalizedQuery)
+      || skill.description.toLocaleLowerCase().includes(normalizedQuery)
+      || skill.triggers.some((trigger) => trigger.toLocaleLowerCase().includes(normalizedQuery));
+    return matchesQuery
+      && (category === "all" || skill.category === category)
+      && (scope === "all" || skill.scope === scope);
+  });
+  const groups = SKILL_CATEGORIES
+    .map((item) => ({ ...item, skills: filtered.filter((skill) => skill.category === item.id) }))
+    .filter((item) => item.skills.length > 0);
+
   return <section className="settings-page extensions-page" aria-labelledby="skills-page-title">
-    <div className="settings-page-header"><div><p className="settings-eyebrow">可控扩展</p><h3 id="skills-page-title">Skills</h3></div><button className="icon-button" type="button" aria-label="刷新扩展" title="刷新扩展" disabled={loading} onClick={() => void load(true)}><RefreshCw className={loading ? "spin" : ""} size={16} /></button></div>
+    <div className="settings-page-header">
+      <div><p className="settings-eyebrow">扩展</p><h3 id="skills-page-title">Skills</h3></div>
+      <span className="settings-count">{overview?.skills.length ?? 0}</span>
+      <button className="icon-button" type="button" aria-label="刷新扩展" title="刷新扩展" disabled={loading} onClick={() => void load(true)}><RefreshCw className={loading ? "spin" : ""} size={16} /></button>
+    </div>
+    <p className="settings-page-description">按职责浏览本地、全局和项目 Skills。机器人包属于内置工作流契约，默认启用且不能关闭。</p>
+    <div className="skill-filters" aria-label="筛选 Skills">
+      <label className="skill-search"><Search size={15} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索名称、说明或触发词" aria-label="搜索 Skills" /></label>
+      <select value={category} onChange={(event) => setCategory(event.target.value as SkillCategory | "all")} aria-label="按分类筛选">
+        <option value="all">全部分类</option>
+        {SKILL_CATEGORIES.map((item) => <option value={item.id} key={item.id}>{item.label}</option>)}
+      </select>
+      <select value={scope} onChange={(event) => setScope(event.target.value as typeof scope)} aria-label="按来源筛选">
+        <option value="all">全部来源</option>
+        <option value="builtin">内置</option>
+        <option value="global">全局</option>
+        <option value="project">项目</option>
+      </select>
+    </div>
     {(error || overview?.error) && <div className="settings-error" role="alert">{error || overview?.error}</div>}
-    <div className="extension-list">{overview?.skills.length ? overview.skills.map((skill) => <div className="extension-row" key={skill.name}><div className={`skill-risk skill-risk--${skill.risk}`}>{riskText(skill.risk)}</div><div className="extension-row-main"><strong>{skill.name}</strong><span>{skill.description}</span><small>{skillScopeText(skill.scope)} · {skill.triggers.join("、")}</small></div><label className="extension-toggle"><input type="checkbox" checked={skill.enabled} disabled={loading} onChange={(event) => void toggle("skill", skill.name, event.target.checked)} /><span>启用</span></label></div>) : <ExtensionEmpty text="未发现有效的 SKILL.md" />}</div>
+    {groups.length ? <div className="skill-category-list">
+      {groups.map((group) => <section className="skill-category-group" aria-labelledby={`skill-category-${group.id}`} key={group.id}>
+        <div className="skill-category-heading"><div><strong id={`skill-category-${group.id}`}>{group.label}</strong><span>{group.description}</span></div><small>{group.skills.length}</small></div>
+        <div className="extension-list">
+          {group.skills.map((skill) => <div className="extension-row" key={`${skill.scope}-${skill.path}-${skill.name}`}>
+            <div className={`skill-risk skill-risk--${skill.risk}`}>{riskText(skill.risk)}</div>
+            <div className="extension-row-main"><strong>{skill.name}</strong><span>{skill.description}</span><small>{skillScopeText(skill.scope)} · {skill.triggers.join("、")}</small></div>
+            {skill.managedByRobot ? (
+              <span className="skill-managed-state" title="机器人工作流运行所需，不能停用"><LockKeyhole size={13} />机器人必需</span>
+            ) : (
+              <label className="extension-toggle"><input type="checkbox" checked={skill.enabled} disabled={loading} onChange={(event) => void toggle("skill", skill.name, event.target.checked)} /><span>启用</span></label>
+            )}
+          </div>)}
+        </div>
+      </section>)}
+    </div> : <ExtensionEmpty text={overview?.skills.length ? "没有符合筛选条件的 Skill" : "未发现有效的 SKILL.md"} />}
   </section>;
 }
+
+const SKILL_CATEGORIES: Array<{ id: SkillCategory; label: string; description: string }> = [
+  { id: "requirements_planning", label: "需求与规划", description: "需求澄清、方案设计与实施计划" },
+  { id: "development_delivery", label: "开发与交付", description: "编码、协作、分支与交付流程" },
+  { id: "quality_review", label: "质量与评审", description: "调试、验证与代码评审" },
+  { id: "testing", label: "测试工程", description: "用例、接口、性能、安全与报告" },
+  { id: "design_experience", label: "设计与体验", description: "界面设计、交互与视觉质量" },
+  { id: "data_documents", label: "数据与文档", description: "结构化数据与文档产出" },
+  { id: "observability", label: "可观测性", description: "日志、诊断与运行状态" },
+  { id: "integration_automation", label: "集成与自动化", description: "浏览器和外部服务集成" },
+  { id: "extension_platform", label: "扩展平台", description: "Skill 与插件的创建、安装和同步" },
+  { id: "other", label: "其他", description: "尚未归入固定职责的 Skill" },
+];
 
 function ExtensionEmpty({ text }: { text: string }) {
   return <div className="extension-empty">{text}</div>;

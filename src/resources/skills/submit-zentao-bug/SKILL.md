@@ -6,6 +6,7 @@ triggers:
   - 提交禅道
 risk: external
 enabled: true
+category: integration_automation
 ---
 
 # 提交禅道 Bug

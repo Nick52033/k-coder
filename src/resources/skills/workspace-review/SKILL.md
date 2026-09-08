@@ -8,6 +8,7 @@ triggers:
   - 审查修改
 risk: read
 enabled: true
+category: requirements_planning
 ---
 
 # Workspace Review

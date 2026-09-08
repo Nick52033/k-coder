@@ -6,6 +6,7 @@ triggers:
   - 测试报告
 risk: external
 enabled: true
+category: testing
 ---
 
 # 测试执行报告

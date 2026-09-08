@@ -12,12 +12,14 @@ use crate::advanced::{
     CreateGoalRequest, DocumentContent, EvaluationReport, GoalTransitionRequest, GoalView,
     MemorySettings, MemoryUpsertRequest, MemoryView, MetricsSnapshot, PlanUpdateRequest, PlanView,
     RepositorySearchIndex, SearchResult, WorkflowDefinitionView, WorkflowRunState, WorkflowRunView,
-    extract_document, extract_document_data_url, run_recorded_evaluation,
+    WorkflowSkillReadinessView, extract_document, extract_document_data_url,
+    run_recorded_evaluation,
 };
 use crate::agent::mailbox::{MailboxTurn, MailboxTurnKind, QueuedTurnSteerError};
 use crate::agent::thread_operation::ThreadOperationGuard;
 use crate::agent::{
-    AgentRuntime, EventPublisher, RunTurnRequest, SoftTurnLimits, TurnOutcome, build_user_message,
+    AgentRuntime, EventPublisher, RunTurnRequest, RuntimeInstructionProvider, SoftTurnLimits,
+    TurnOutcome, build_user_message,
 };
 use crate::app_state::{AppState, AppStateError};
 use crate::execution::{
@@ -194,6 +196,67 @@ fn validate_workflow_turn_context(
     Ok(())
 }
 
+fn normalize_workflow_id(workflow_id: Option<&str>) -> CommandResult<Option<&str>> {
+    let normalized = workflow_id.map(str::trim).filter(|value| !value.is_empty());
+    if workflow_id.is_some() && normalized.is_none() {
+        return Err(CommandError::new(
+            "workflow",
+            "workflowId must not be empty when provided",
+        ));
+    }
+    Ok(normalized)
+}
+
+async fn require_workflow_skill_preflight(
+    state: &AppState,
+    workflow_id: &str,
+) -> CommandResult<()> {
+    let readiness = state
+        .get_workflow_skill_readiness(workflow_id)
+        .await
+        .map_err(|error| {
+            CommandError::new("workflow_skill_preflight_failed", error).with_details(
+                serde_json::json!({
+                    "workflowId": workflow_id,
+                    "ready": false,
+                }),
+            )
+        })?;
+    if readiness.ready {
+        return Ok(());
+    }
+    Err(CommandError::new(
+        "workflow_skill_preflight_failed",
+        format!(
+            "workflow `{workflow_id}` is not ready: {} skill blocker(s); resolve every blocker before starting or resuming it",
+            readiness.blocker_count
+        ),
+    )
+    .with_details(serde_json::json!(readiness)))
+}
+
+async fn preflight_requested_or_active_workflow(
+    state: &AppState,
+    thread_id: &str,
+    requested_workflow_id: Option<&str>,
+) -> CommandResult<()> {
+    let requested_workflow_id = normalize_workflow_id(requested_workflow_id)?;
+    let current_workflow = state
+        .advanced()
+        .workflows
+        .current(thread_id)
+        .map_err(|error| CommandError::new("workflow", error))?;
+    let workflow_id = requested_workflow_id.map(str::to_owned).or_else(|| {
+        current_workflow
+            .filter(|run| run.state == WorkflowRunState::Active)
+            .map(|run| run.workflow_id)
+    });
+    if let Some(workflow_id) = workflow_id {
+        require_workflow_skill_preflight(state, &workflow_id).await?;
+    }
+    Ok(())
+}
+
 fn require_queued_workflow_steerable(workflow_id: Option<&str>) -> CommandResult<()> {
     if workflow_id.is_some() {
         Err(CommandError::new(
@@ -245,6 +308,8 @@ fn retry_mode(events: &[StoredEvent]) -> AgentMode {
 pub struct CommandError {
     code: &'static str,
     message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    details: Option<serde_json::Value>,
 }
 
 impl CommandError {
@@ -252,7 +317,13 @@ impl CommandError {
         Self {
             code,
             message: error.to_string(),
+            details: None,
         }
+    }
+
+    fn with_details(mut self, details: impl Into<serde_json::Value>) -> Self {
+        self.details = Some(details.into());
+        self
     }
 
     fn internal(error: impl std::fmt::Display) -> Self {
@@ -440,6 +511,60 @@ fn build_system_prompt(
     sections.join("\n\n")
 }
 
+fn live_runtime_instruction_provider(
+    state: &AppState,
+    thread_id: String,
+    input: String,
+    workspace_root: Option<std::path::PathBuf>,
+    mode_instructions: String,
+    tool_names: Vec<String>,
+) -> Arc<dyn RuntimeInstructionProvider> {
+    let advanced = state.advanced();
+    let extensions = state.extension_service();
+    Arc::new(move || {
+        let workflow_active = advanced
+            .workflows
+            .current(&thread_id)
+            .map_err(|error| format!("workflow state: {error}"))?
+            .is_some_and(|run| run.state == WorkflowRunState::Active);
+        let extension_instructions = if workspace_root.is_some() {
+            let result = if workflow_active {
+                extensions.runtime_instructions_for_robot(&input)
+            } else {
+                extensions.runtime_instructions(&input)
+            };
+            result.map_err(|error| format!("extensions: {error}"))?
+        } else {
+            String::new()
+        };
+        let mut advanced_instructions = advanced
+            .runtime_instructions(&thread_id)
+            .map_err(|error| format!("advanced runtime: {error}"))?;
+        let workflow_skills = advanced
+            .workflows
+            .runtime_skill_instructions(&thread_id, &extensions)
+            .map_err(|error| format!("workflow Skills: {error}"))?;
+        if !workflow_skills.trim().is_empty() {
+            if !advanced_instructions.trim().is_empty() {
+                advanced_instructions.push_str("\n\n");
+            }
+            advanced_instructions.push_str(&workflow_skills);
+        }
+        let memory_instructions = advanced
+            .memory
+            .context()
+            .map_err(|error| format!("memory: {error}"))?;
+        Ok(build_system_prompt(
+            workspace_root.as_deref(),
+            &extension_instructions,
+            &advanced_instructions,
+            &memory_instructions,
+            &mode_instructions,
+            &tool_names,
+        ))
+    })
+}
+
 async fn turn_tokens(state: &AppState, thread_id: &str, turn_id: &str) -> u64 {
     state
         .runtime_repository()
@@ -621,6 +746,19 @@ pub fn list_builtin_workflows(
     state: State<'_, AppState>,
 ) -> CommandResult<Vec<WorkflowDefinitionView>> {
     Ok(state.advanced().workflows.definitions())
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn get_workflow_skill_readiness(
+    state: State<'_, AppState>,
+    workflow_id: String,
+) -> CommandResult<WorkflowSkillReadinessView> {
+    let workflow_id = normalize_workflow_id(Some(&workflow_id))?
+        .expect("a provided workflow id is normalized or rejected");
+    state
+        .get_workflow_skill_readiness(workflow_id)
+        .await
+        .map_err(|error| CommandError::new("workflow_skill_readiness", error))
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -1612,6 +1750,12 @@ pub async fn turn_start(
     attachments: Vec<ImageAttachment>,
     workflow_id: Option<String>,
 ) -> CommandResult<TurnHandle> {
+    preflight_requested_or_active_workflow(
+        state.inner(),
+        &request.thread_id,
+        workflow_id.as_deref(),
+    )
+    .await?;
     let turn_id = Uuid::new_v4().to_string();
     let thread_id = request.thread_id.clone();
     let (signal, started) = oneshot::channel();
@@ -1656,6 +1800,7 @@ pub async fn turn_retry(
     state: State<'_, AppState>,
     thread_id: String,
 ) -> CommandResult<TurnHandle> {
+    preflight_requested_or_active_workflow(state.inner(), &thread_id, None).await?;
     let turn_id = Uuid::new_v4().to_string();
     let (signal, started) = oneshot::channel();
     let handle = TurnHandle {
@@ -2023,20 +2168,17 @@ async fn execute_turn(
         .as_deref()
         .map(AgentMode::from_str)
         .unwrap_or_default();
-    let requested_workflow_id = workflow_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-    if workflow_id.is_some() && requested_workflow_id.is_none() {
-        return Err(CommandError::new(
-            "workflow",
-            "workflowId must not be empty when provided",
-        ));
-    }
+    let requested_workflow_id = normalize_workflow_id(workflow_id.as_deref())?;
     let current_workflow = advanced
         .workflows
         .current(&thread_id)
         .map_err(|error| CommandError::new("workflow", error))?;
+    let workflow_preflight_id = requested_workflow_id.map(str::to_owned).or_else(|| {
+        current_workflow
+            .as_ref()
+            .filter(|run| run.state == WorkflowRunState::Active)
+            .map(|run| run.workflow_id.clone())
+    });
     validate_workflow_turn_context(
         has_project,
         agent_mode,
@@ -2058,24 +2200,14 @@ async fn execute_turn(
                 .iter()
                 .any(|block| matches!(block, crate::protocol::ContentBlock::Image { .. }))
         });
-    if has_project {
+    if let Some(workflow_id) = workflow_preflight_id.as_deref() {
+        require_workflow_skill_preflight(state, workflow_id).await?;
+    } else if has_project {
         state
             .prepare_extensions(false)
             .await
             .map_err(|error| CommandError::new("extensions", error))?;
     }
-    let extension_instructions = if has_project {
-        state
-            .extension_instructions(&request.input)
-            .map_err(|error| CommandError::new("extensions", error))?
-    } else {
-        String::new()
-    };
-    let memory_instructions = advanced
-        .memory
-        .context()
-        .map_err(|error| CommandError::new("memory", error))?;
-
     // 根据协作模式注入指令并限制可用工具
     let mode_instructions = instructions_for_mode(agent_mode).to_string();
 
@@ -2133,18 +2265,13 @@ async fn execute_turn(
             .start_or_resume(&thread_id, workflow_id, objective)
             .map_err(|error| CommandError::new("workflow", error))?;
     }
-    let advanced_instructions = advanced
-        .runtime_instructions(&thread_id)
-        .map_err(|error| CommandError::new("advanced_runtime", error))?;
-
-    // 分层拼接 system prompt（identity/workspace/mode/tools/memory/context/extension）
-    let runtime_instructions = build_system_prompt(
-        project_workspace.as_deref(),
-        &extension_instructions,
-        &advanced_instructions,
-        &memory_instructions,
-        &mode_instructions,
-        &tool_names,
+    let runtime_instruction_provider = live_runtime_instruction_provider(
+        state,
+        thread_id.clone(),
+        request.input.clone(),
+        project_workspace.clone(),
+        mode_instructions,
+        tool_names,
     );
     let turn_id = assigned_turn_id.unwrap_or_else(|| Uuid::new_v4().to_string());
     let begin_result = match operation_guard.as_ref() {
@@ -2209,7 +2336,7 @@ async fn execute_turn(
         state.approvals(),
     )
     .with_approval_mode(state.approval_mode())
-    .with_runtime_instructions(runtime_instructions)
+    .with_runtime_instruction_provider(runtime_instruction_provider)
     .with_context_limit(context_limit)
     .with_metrics(advanced.metrics.clone())
     .with_reasoning_effort(state.reasoning_effort())
@@ -2285,12 +2412,6 @@ async fn execute_retry(
         .clone()
         .unwrap_or_else(|| state.workspace_root());
     let has_project = project_workspace.is_some();
-    if has_project {
-        state
-            .prepare_extensions(false)
-            .await
-            .map_err(|error| CommandError::new("extensions", error))?;
-    }
     let repository = state.repository();
     let events = repository
         .load(&thread_id)
@@ -2323,26 +2444,22 @@ async fn execute_retry(
             .any(|block| matches!(block, crate::protocol::ContentBlock::Image { .. }))
     });
     let advanced = state.advanced();
-    let workflow_active = advanced
+    let active_workflow_id = advanced
         .workflows
         .current(&thread_id)
         .map_err(|error| CommandError::new("workflow", error))?
-        .is_some_and(|run| run.state == WorkflowRunState::Active);
+        .filter(|run| run.state == WorkflowRunState::Active)
+        .map(|run| run.workflow_id);
+    let workflow_active = active_workflow_id.is_some();
     validate_workflow_turn_context(has_project, agent_mode, false, workflow_active)?;
-    let extension_instructions = if has_project {
+    if let Some(workflow_id) = active_workflow_id.as_deref() {
+        require_workflow_skill_preflight(state, workflow_id).await?;
+    } else if has_project {
         state
-            .extension_instructions(&retry_input)
-            .map_err(|error| CommandError::new("extensions", error))?
-    } else {
-        String::new()
-    };
-    let advanced_instructions = advanced
-        .runtime_instructions(&thread_id)
-        .map_err(|error| CommandError::new("advanced_runtime", error))?;
-    let memory_instructions = advanced
-        .memory
-        .context()
-        .map_err(|error| CommandError::new("memory", error))?;
+            .prepare_extensions(false)
+            .await
+            .map_err(|error| CommandError::new("extensions", error))?;
+    }
     let mode_instructions = instructions_for_mode(agent_mode).to_string();
     let mode_tools = tools_for_mode(state.tool_registry(), agent_mode)
         .map_err(|error| CommandError::new("agent_mode", error))?;
@@ -2353,13 +2470,13 @@ async fn execute_retry(
             .map_err(|error| CommandError::new("workspace_tools", error))?
     };
     let tool_names = base_tools.definition_names();
-    let runtime_instructions = build_system_prompt(
-        project_workspace.as_deref(),
-        &extension_instructions,
-        &advanced_instructions,
-        &memory_instructions,
-        &mode_instructions,
-        &tool_names,
+    let runtime_instruction_provider = live_runtime_instruction_provider(
+        state,
+        thread_id.clone(),
+        retry_input,
+        project_workspace.clone(),
+        mode_instructions,
+        tool_names,
     );
     let goal_budget = advanced
         .goals
@@ -2432,7 +2549,7 @@ async fn execute_retry(
         state.approvals(),
     )
     .with_approval_mode(state.approval_mode())
-    .with_runtime_instructions(runtime_instructions)
+    .with_runtime_instruction_provider(runtime_instruction_provider)
     .with_context_limit(context_limit)
     .with_metrics(advanced.metrics.clone())
     .with_reasoning_effort(state.reasoning_effort())
@@ -2905,11 +3022,12 @@ mod tests {
     use super::{
         CRAFT_MODE_INSTRUCTIONS, CommandError, TurnStartPublisher, build_system_prompt,
         extract_local_document, ordinary_turn_soft_limits, plugin_command_error,
-        require_project_thread_for_subagent, require_project_thread_for_workflow,
-        require_queued_workflow_steerable, retry_mode, tools_for_mode, tools_without_project,
-        validate_workflow_turn_context,
+        preflight_requested_or_active_workflow, require_project_thread_for_subagent,
+        require_project_thread_for_workflow, require_queued_workflow_steerable, retry_mode,
+        tools_for_mode, tools_without_project, validate_workflow_turn_context,
     };
     use crate::agent::EventPublisher;
+    use crate::app_state::AppState;
     use crate::protocol::{AgentEvent, AgentEventEnvelope, AgentMode, PROTOCOL_VERSION};
     use crate::storage::{StoredEvent, StoredEventKind, ThreadSummary};
     use crate::{patch::PatchService, tools::ToolRegistry};
@@ -2996,6 +3114,41 @@ mod tests {
 
         let error = started.await.unwrap().unwrap_err();
         assert_eq!(error, "already running");
+    }
+
+    #[tokio::test]
+    async fn workflow_preflight_returns_all_blockers_before_state_or_turn_events() {
+        let data = tempfile::tempdir().unwrap();
+        let builtin = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let state = AppState::new_with_builtin_skills(data.path(), builtin.path()).unwrap();
+        state.switch_workspace(workspace.path()).await.unwrap();
+        let publisher = RecordingPublisher::default();
+
+        let error = preflight_requested_or_active_workflow(
+            &state,
+            "thread-without-run",
+            Some("quality-assurance"),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.code, "workflow_skill_preflight_failed");
+        let details = error.details.as_ref().unwrap();
+        assert_eq!(details["workflowId"], "quality-assurance");
+        assert_eq!(details["ready"], false);
+        assert_eq!(details["blockerCount"], 16);
+        assert_eq!(details["blockers"].as_array().unwrap().len(), 16);
+        assert!(!serde_json::to_string(details).unwrap().contains("\"body\""));
+        assert!(
+            state
+                .advanced()
+                .workflows
+                .current("thread-without-run")
+                .unwrap()
+                .is_none()
+        );
+        assert!(publisher.events.lock().unwrap().is_empty());
     }
 
     #[test]

@@ -7,6 +7,7 @@ triggers:
   - 浏览器会话爬取
 risk: external
 enabled: true
+category: integration_automation
 ---
 
 # Browser Session Crawler

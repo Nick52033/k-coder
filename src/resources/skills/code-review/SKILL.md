@@ -7,6 +7,7 @@ triggers:
   - 代码评审
 risk: read
 enabled: true
+category: quality_review
 ---
 
 # 代码评审流程

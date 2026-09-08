@@ -7,6 +7,7 @@ triggers:
   - 实体数据库对比
 risk: external
 enabled: true
+category: integration_automation
 ---
 
 # Paypro Entity Schema Sync

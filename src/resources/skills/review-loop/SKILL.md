@@ -5,6 +5,7 @@ triggers:
   - review loop
 risk: write
 enabled: true
+category: quality_review
 ---
 
 # Review Loop
