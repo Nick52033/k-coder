@@ -47,6 +47,7 @@ use crate::protocol::{
 use crate::providers::{
     ProviderConfigView, ProviderEvent, ProviderMessage, ProviderRequest, SaveProviderConfigRequest,
 };
+use crate::scheduled_tasks::{ScheduledTaskError, ScheduledTaskView, UpsertScheduledTaskRequest};
 use crate::storage::{StoredEvent, StoredEventKind, ThreadRepository, ThreadSummary};
 use crate::workbench::{
     self, AttachmentContent, FileEntry, FilePreview, GitBranchView, GitStatusView,
@@ -657,6 +658,132 @@ pub async fn cancel_workflow_run(
             }
             other => CommandError::new("workflow", other),
         })
+}
+
+fn scheduled_task_command_error(error: ScheduledTaskError) -> CommandError {
+    let code = match &error {
+        ScheduledTaskError::NotFound => "scheduled_task_not_found",
+        ScheduledTaskError::Invalid(_) => "scheduled_task_invalid",
+        ScheduledTaskError::Storage(_) => "scheduled_task_storage",
+    };
+    CommandError::new(code, error)
+}
+
+#[tauri::command]
+pub fn list_scheduled_tasks(state: State<'_, AppState>) -> CommandResult<Vec<ScheduledTaskView>> {
+    state
+        .scheduled_tasks()
+        .list()
+        .map_err(scheduled_task_command_error)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn upsert_scheduled_task(
+    state: State<'_, AppState>,
+    request: UpsertScheduledTaskRequest,
+) -> CommandResult<ScheduledTaskView> {
+    if let Some(thread_id) = request
+        .thread_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        state
+            .repository()
+            .read_thread(thread_id)
+            .await
+            .map_err(|error| CommandError::new("scheduled_task_thread", error))?;
+    }
+    state
+        .scheduled_tasks()
+        .upsert(request, &state.workspace_root())
+        .map_err(scheduled_task_command_error)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub fn delete_scheduled_task(state: State<'_, AppState>, task_id: String) -> CommandResult<()> {
+    state
+        .scheduled_tasks()
+        .delete(&task_id)
+        .map_err(scheduled_task_command_error)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub fn set_scheduled_task_enabled(
+    state: State<'_, AppState>,
+    task_id: String,
+    enabled: bool,
+) -> CommandResult<ScheduledTaskView> {
+    state
+        .scheduled_tasks()
+        .set_enabled(&task_id, enabled)
+        .map_err(scheduled_task_command_error)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub fn trigger_scheduled_task(
+    state: State<'_, AppState>,
+    task_id: String,
+) -> CommandResult<ScheduledTaskView> {
+    state
+        .scheduled_tasks()
+        .trigger_now(&task_id)
+        .map_err(scheduled_task_command_error)
+}
+
+/// Execute one claimed schedule using the same command-level Turn path as a
+/// user request.  This function is called by the scheduler worker and is not a
+/// second agent loop.
+pub(crate) async fn execute_scheduled_task(
+    app: AppHandle,
+    task: ScheduledTaskView,
+) -> Result<TurnOutcome, String> {
+    let state_app = app.clone();
+    let state = state_app.state::<AppState>();
+    let workspace = std::path::PathBuf::from(&task.workspace_path)
+        .canonicalize()
+        .map_err(|error| format!("scheduled workspace is unavailable: {error}"))?;
+    if workspace != state.workspace_root() {
+        return Err(
+            "scheduled task workspace is not the active workspace; switch projects before it runs"
+                .into(),
+        );
+    }
+    let thread_id = match task.mode {
+        crate::scheduled_tasks::ScheduledTaskMode::Thread => task
+            .thread_id
+            .clone()
+            .ok_or_else(|| "scheduled task has no target conversation".to_string())?,
+        crate::scheduled_tasks::ScheduledTaskMode::Background => {
+            let thread = state
+                .repository()
+                .create_thread_in_workspace(&workspace)
+                .await
+                .map_err(|error| error.to_string())?;
+            let _ = state
+                .repository()
+                .rename_thread(&thread.id, task.name.clone())
+                .await;
+            thread.id
+        }
+    };
+    let publisher: Arc<dyn EventPublisher> = Arc::new(TauriEventPublisher { app: app.clone() });
+    execute_turn(
+        app,
+        state.inner(),
+        RunTurnRequest {
+            thread_id,
+            input: task.prompt,
+            agent_mode: Some("craft".into()),
+        },
+        Vec::new(),
+        None,
+        None,
+        None,
+        publisher,
+    )
+    .await
+    .map_err(|error| error.message)
 }
 
 #[tauri::command(rename_all = "camelCase")]

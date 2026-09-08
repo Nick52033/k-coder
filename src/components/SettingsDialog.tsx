@@ -66,6 +66,12 @@ import {
   FileText,
   CheckCircle2,
   AlertCircle,
+  Cloud,
+  Flame,
+  Monitor,
+  Moon,
+  Terminal,
+  Waves,
 } from "lucide-react";
 import type {
   ProviderConfigView,
@@ -93,6 +99,7 @@ import { toUserFacingPath, workspacePathKey } from "../lib/path";
 import { McpSettingsPage } from "./McpSettingsPage";
 import { PluginSettingsPage } from "./PluginSettingsPage";
 import { RuleSettingsPage } from "./RuleSettingsPage";
+import { THEME_OPTIONS, themeLabel, type ThemeId } from "../lib/theme";
 
 const DEFAULT_BASE_URL = "https://api.openai.com/v1";
 
@@ -167,8 +174,6 @@ export type SettingsSection =
   | "browser"
   | "goal";
 
-type ThemeMode = "light" | "dark";
-
 interface SettingsDefinition {
   id: SettingsSection;
   label: string;
@@ -187,9 +192,9 @@ interface SettingsDialogProps {
   workflows: WorkflowDefinitionView[];
   workflowRun: WorkflowRunView | null;
   error: string;
-  themeMode: ThemeMode;
+  themeMode: ThemeId;
   onClose: () => void;
-  onToggleTheme: () => void;
+  onSelectTheme: (theme: ThemeId) => void;
   onSaveProvider: (request: SaveProviderConfigRequest) => Promise<boolean>;
   onActivateProvider: (providerId: string) => Promise<boolean>;
   onDeleteProvider: (providerId: string) => Promise<boolean>;
@@ -226,7 +231,7 @@ export function SettingsDialog({
   error,
   themeMode,
   onClose,
-  onToggleTheme,
+  onSelectTheme,
   onSaveProvider,
   onActivateProvider,
   onDeleteProvider,
@@ -313,7 +318,7 @@ export function SettingsDialog({
                 onDelete={onDeleteProvider}
               />
             ) : section === "appearance" ? (
-              <AppearancePage themeMode={themeMode} onToggleTheme={onToggleTheme} />
+              <AppearancePage themeMode={themeMode} onSelectTheme={onSelectTheme} />
             ) : section === "usage" ? (
               <UsagePage />
             ) : section === "knowledge" ? (
@@ -1566,41 +1571,73 @@ function skillScopeText(scope: string) {
 
 function AppearancePage({
   themeMode,
-  onToggleTheme,
+  onSelectTheme,
 }: {
-  themeMode: ThemeMode;
-  onToggleTheme: () => void;
+  themeMode: ThemeId;
+  onSelectTheme: (theme: ThemeId) => void;
 }) {
+  const iconForTheme = {
+    sun: Sun,
+    moon: Moon,
+    cloud: Cloud,
+    monitor: Monitor,
+    flame: Flame,
+    sparkles: Sparkles,
+    terminal: Terminal,
+    waves: Waves,
+  } as const;
+
   return (
-    <section className="settings-page" aria-labelledby="appearance-page-title">
+    <section className="settings-page appearance-page" aria-labelledby="appearance-page-title">
       <div className="settings-page-header">
         <div>
           <p className="settings-eyebrow">应用</p>
           <h3 id="appearance-page-title">外观</h3>
+          <p className="settings-page-description">
+            跟随系统，或强制使用浅色、深色与主题皮肤。顶部的切换按钮是浅色和深色模式的快捷方式。
+          </p>
         </div>
       </div>
 
-      <div style={{ marginBottom: 28 }}>
-        <p className="settings-eyebrow" style={{ marginBottom: 12 }}>模式</p>
-        <div style={{ display: "flex", gap: 10 }}>
-          <button
-            className={`secondary-button ${themeMode === "light" ? "primary-button" : ""}`}
-            type="button"
-            onClick={() => themeMode === "dark" && onToggleTheme()}
-            style={{ minWidth: 100 }}
-          >
-            <Sun size={15} style={{ marginRight: 6 }} />
-            浅色
-          </button>
-          <button
-            className={`secondary-button ${themeMode === "dark" ? "primary-button" : ""}`}
-            type="button"
-            onClick={() => themeMode === "light" && onToggleTheme()}
-            style={{ minWidth: 100 }}
-          >
-            <Sun size={15} style={{ marginRight: 6, opacity: 0.4 }} />
-            深色
-          </button>
+      <div className="appearance-theme-section">
+        <div className="appearance-section-heading">
+          <div>
+            <p className="settings-eyebrow">主题</p>
+            <h4>选择工作区氛围</h4>
+          </div>
+          <span className="appearance-current-theme" role="status">
+            当前：{themeLabel(themeMode)}
+          </span>
+        </div>
+
+        <div className="theme-picker" role="radiogroup" aria-label="选择主题">
+          {THEME_OPTIONS.map((option) => {
+            const Icon = iconForTheme[option.icon];
+            const selected = option.id === themeMode;
+            return (
+              <button
+                className={`theme-option ${selected ? "theme-option--selected" : ""}`}
+                type="button"
+                role="radio"
+                aria-checked={selected}
+                aria-label={`${option.label}：${option.description}`}
+                onClick={() => onSelectTheme(option.id)}
+                key={option.id}
+              >
+                <span
+                  className="theme-option-swatch"
+                  aria-hidden="true"
+                  style={{ background: `linear-gradient(135deg, ${option.swatch[0]} 0 58%, ${option.swatch[1]} 58% 100%)` }}
+                />
+                <span className="theme-option-icon" aria-hidden="true"><Icon size={15} /></span>
+                <span className="theme-option-copy">
+                  <strong>{option.label}</strong>
+                  <small>{option.description}</small>
+                </span>
+                {selected && <Check className="theme-option-check" size={14} aria-hidden="true" />}
+              </button>
+            );
+          })}
         </div>
       </div>
     </section>

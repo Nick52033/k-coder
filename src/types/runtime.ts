@@ -596,6 +596,45 @@ export interface DocumentContent { path: string; name: string; mediaType: string
 export interface MetricsSnapshot { providerCalls: number; providerFailures: number; averageProviderLatencyMs: number; inputTokens: number; outputTokens: number; compactionCount: number; compactedMessages: number; estimatedContextTokensSaved: number; toolCalls: number; toolSuccessRate: number; fallbackCount: number; retryCount: number; completedTasks: number; failedTasks: number; estimatedCostUsd: number | null; }
 export interface EvaluationReport { total: number; passed: number; passRate: number; failures: string[]; }
 
+export type ScheduledTaskKind = "once" | "daily" | "weekly";
+export interface ScheduledTaskSchedule {
+  kind: ScheduledTaskKind;
+  atMs?: number | null;
+  hour?: number | null;
+  minute?: number | null;
+  weekday?: number | null;
+}
+export type ScheduledTaskMode = "background" | "thread";
+export interface ScheduledTaskView {
+  schemaVersion: number;
+  id: string;
+  name: string;
+  schedule: ScheduledTaskSchedule;
+  prompt: string;
+  mode: ScheduledTaskMode;
+  threadId: string | null;
+  workspacePath: string;
+  enabled: boolean;
+  nextRunAtMs: number | null;
+  lastRunAtMs: number | null;
+  lastRunState: "running" | "completed" | "failed" | null;
+  lastError: string | null;
+  runCount: number;
+  createdAtMs: number;
+  updatedAtMs: number;
+  revision: number;
+}
+export interface UpsertScheduledTaskRequest {
+  id?: string | null;
+  name: string;
+  schedule: ScheduledTaskSchedule;
+  prompt: string;
+  mode: ScheduledTaskMode;
+  threadId?: string | null;
+  workspacePath?: string | null;
+  enabled?: boolean;
+}
+
 export interface TurnOutcome {
   schemaVersion: number;
   threadId: string;

@@ -35,6 +35,7 @@ use crate::providers::{
     ProviderConfigError, ProviderConfigStore, ProviderConfigView, ProviderTransport,
     SaveProviderConfigRequest,
 };
+use crate::scheduled_tasks::ScheduledTaskStore;
 use crate::storage::{
     JsonlThreadRepository, StorageError, StoredEvent, StoredEventKind, ThreadRepository,
 };
@@ -67,6 +68,7 @@ pub struct AppState {
     subagents: MultiAgentCoordinator,
     advanced: AdvancedServices,
     knowledge: KnowledgeService,
+    scheduled_tasks: ScheduledTaskStore,
 }
 
 #[derive(Debug)]
@@ -181,6 +183,8 @@ impl AppState {
             NativePtyRuntime::new_with_bundled_tools(&workspace_root, bundled_tools.clone())?;
         let repository = Arc::new(JsonlThreadRepository::new(&data_root)?);
         let knowledge = KnowledgeService::new(repository.projection(), credentials.clone());
+        let scheduled_tasks = ScheduledTaskStore::new(&data_root)
+            .map_err(|error| AppStateError::Workspace(error.to_string()))?;
         let approval_mode = repository
             .projection()
             .setting("approval_mode")
@@ -249,6 +253,7 @@ impl AppState {
             subagents,
             advanced,
             knowledge,
+            scheduled_tasks,
         })
     }
 
@@ -354,6 +359,10 @@ impl AppState {
 
     pub fn knowledge(&self) -> KnowledgeService {
         self.knowledge.clone()
+    }
+
+    pub fn scheduled_tasks(&self) -> ScheduledTaskStore {
+        self.scheduled_tasks.clone()
     }
 
     pub fn patch_service(&self) -> PatchService {

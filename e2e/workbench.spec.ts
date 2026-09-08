@@ -2152,6 +2152,50 @@ test("supports a light CodeBuddy appearance", async ({ page }) => {
   await expect.poll(() => page.evaluate(() => getComputedStyle(document.documentElement).getPropertyValue("--color-surface").trim())).toBe("#f8fafc");
 });
 
+test("selects and persists the extended appearance themes", async ({ page }) => {
+  await page.goto("/");
+  await page.locator('button[aria-label="设置"]:visible').click();
+
+  const settings = page.getByRole("dialog", { name: "设置" });
+  await settings.getByRole("button", { name: "外观" }).click();
+  const picker = settings.getByRole("radiogroup", { name: "选择主题" });
+  await expect(picker.getByRole("radio", { name: "Synthwave：霓虹夜色" })).toBeVisible();
+
+  const themes = [
+    ["arctic", "Arctic：冰川蓝白", "#1687a7"],
+    ["crt-green", "CRT Green：荧光绿屏", "#78f6a5"],
+    ["ember", "Ember：炭火橙红", "#f97316"],
+    ["miami", "Miami：海盐珊瑚", "#e66064"],
+    ["synthwave", "Synthwave：霓虹夜色", "#f472b6"],
+    ["terminal", "Terminal：琥珀终端", "#f5b94c"],
+    ["vapor", "Vapor：雾紫柔光", "#8b73d6"],
+  ] as const;
+  for (const [id, name, brand] of themes) {
+    await picker.getByRole("radio", { name }).click();
+    await expect(page.locator("html")).toHaveAttribute("data-theme", id);
+    await expect.poll(() => page.evaluate(() => getComputedStyle(document.documentElement).getPropertyValue("--color-brand").trim())).toBe(brand);
+  }
+
+  await picker.getByRole("radio", { name: "Synthwave：霓虹夜色" }).click();
+  await expect(page.locator("html")).toHaveAttribute("data-theme", "synthwave");
+  await expect(page.locator("html")).toHaveAttribute("data-theme-preference", "synthwave");
+
+  await page.reload();
+  await expect(page.locator("html")).toHaveAttribute("data-theme", "synthwave");
+  await expect(page.locator("html")).toHaveAttribute("data-theme-preference", "synthwave");
+});
+
+test("resolves the system appearance and follows system changes", async ({ page }) => {
+  await page.emulateMedia({ colorScheme: "dark" });
+  await page.addInitScript(() => localStorage.setItem("kcoder_theme", "system"));
+  await page.goto("/");
+  await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
+  await expect(page.locator("html")).toHaveAttribute("data-theme-preference", "system");
+
+  await page.emulateMedia({ colorScheme: "light" });
+  await expect.poll(() => page.locator("html").getAttribute("data-theme")).toBe("light");
+});
+
 test("keeps the K brand and renders a distinct command-pulse welcome mark", async ({ page }, testInfo) => {
   await page.addInitScript(() => {
     const emptyThread = {

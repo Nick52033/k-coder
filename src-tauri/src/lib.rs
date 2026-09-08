@@ -14,6 +14,7 @@ pub mod persistence;
 pub mod policy;
 pub mod protocol;
 pub mod providers;
+pub mod scheduled_tasks;
 pub mod storage;
 pub mod tools;
 pub mod workbench;
@@ -105,6 +106,7 @@ pub fn run() {
             )
             .map_err(|error| std::io::Error::other(error.to_string()))?;
             app.manage(state);
+            scheduled_tasks::spawn_scheduler(app.handle().clone());
 
             // 创建系统托盘
             let show = MenuItem::with_id(app, "show", "显示窗口", true, None::<&str>)?;
@@ -172,6 +174,11 @@ pub fn run() {
             commands::list_builtin_workflows,
             commands::get_workflow_run,
             commands::cancel_workflow_run,
+            commands::list_scheduled_tasks,
+            commands::upsert_scheduled_task,
+            commands::delete_scheduled_task,
+            commands::set_scheduled_task_enabled,
+            commands::trigger_scheduled_task,
             commands::search_repository,
             commands::get_knowledge_settings,
             commands::set_knowledge_enabled,

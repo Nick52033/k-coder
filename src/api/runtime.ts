@@ -79,6 +79,8 @@ import type {
   SetEmbeddingSettingsRequest,
   KnowledgeSearchResponse,
   KnowledgeCitation,
+  ScheduledTaskView,
+  UpsertScheduledTaskRequest,
 } from "../types/runtime";
 
 export function getRuntimeStatus() {
@@ -209,6 +211,26 @@ export function getWorkflowRun(threadId: string) {
 
 export function cancelWorkflowRun(request: CancelWorkflowRunRequest) {
   return invoke<WorkflowRunView>("cancel_workflow_run", { request });
+}
+
+export function listScheduledTasks() {
+  return invoke<ScheduledTaskView[]>("list_scheduled_tasks");
+}
+
+export function upsertScheduledTask(request: UpsertScheduledTaskRequest) {
+  return invoke<ScheduledTaskView>("upsert_scheduled_task", { request });
+}
+
+export function deleteScheduledTask(taskId: string) {
+  return invoke<void>("delete_scheduled_task", { taskId });
+}
+
+export function setScheduledTaskEnabled(taskId: string, enabled: boolean) {
+  return invoke<ScheduledTaskView>("set_scheduled_task_enabled", { taskId, enabled });
+}
+
+export function triggerScheduledTask(taskId: string) {
+  return invoke<ScheduledTaskView>("trigger_scheduled_task", { taskId });
 }
 
 export function readThreadMailbox(threadId: string) {

@@ -2510,6 +2510,7 @@ dependencies = [
  "base64 0.22.1",
  "calamine",
  "chromiumoxide",
+ "chrono",
  "futures-util",
  "image",
  "jsonschema",

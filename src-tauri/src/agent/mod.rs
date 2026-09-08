@@ -49,7 +49,7 @@ const MAX_PROVIDER_CONTEXT_BYTES: usize = 512 * 1024;
 const MAX_TOOL_OUTPUT_BYTES: usize = 128 * 1024;
 const MAX_IDENTICAL_TOOL_CALLS: usize = 2;
 const SUBSTANTIAL_READ_OVERLAP_PERCENT: usize = 80;
-const MAX_RECOVERABLE_REDUNDANT_READ_OBSERVATIONS: usize = 2;
+const MAX_RECOVERABLE_REDUNDANT_READ_BATCHES: usize = 2;
 const MAX_READ_RECOVERY_INSTRUCTIONS: usize = 4;
 const PROGRESS_CHECK_WINDOW: usize = 5;
 const MAX_NO_PROGRESS_WINDOWS: usize = 3;
@@ -148,10 +148,27 @@ struct ReadRevisionKey {
     revision: String,
 }
 
+impl ReadRevisionKey {
+    fn new(path: &str, revision: &str) -> Self {
+        Self {
+            path: if cfg!(windows) {
+                path.to_lowercase()
+            } else {
+                path.to_string()
+            },
+            revision: revision.to_string(),
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 struct ReadRevisionCoverage {
     intervals: Vec<(usize, usize)>,
-    redundant_observations: usize,
+    redundant_batches: usize,
+    last_redundant_batch: Option<usize>,
+    recovery_delivered: bool,
+    rehydration_available: bool,
+    rehydrated_batch: Option<usize>,
 }
 
 #[derive(Debug, Default)]
@@ -162,6 +179,13 @@ struct ReadObservationTracker {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ReadObservationDecision {
     NewCoverage,
+    RehydratedAfterCompaction {
+        path: String,
+        revision: String,
+        start_line: usize,
+        end_line: usize,
+        overlap_percent: usize,
+    },
     AlreadyCovered {
         path: String,
         revision: String,
@@ -186,7 +210,11 @@ enum ReadObservationDecision {
 }
 
 impl ReadObservationTracker {
-    fn observe(&mut self, result: &ToolResult) -> Option<ReadObservationDecision> {
+    fn observe(
+        &mut self,
+        result: &ToolResult,
+        provider_batch: usize,
+    ) -> Option<ReadObservationDecision> {
         if !result.success {
             return None;
         }
@@ -198,17 +226,9 @@ impl ReadObservationTracker {
             return None;
         }
 
-        let normalized_path = if cfg!(windows) {
-            path.to_lowercase()
-        } else {
-            path.clone()
-        };
+        let key = ReadRevisionKey::new(&path, &revision);
         self.coverage
-            .retain(|key, _| key.path != normalized_path || key.revision == revision);
-        let key = ReadRevisionKey {
-            path: normalized_path,
-            revision: revision.clone(),
-        };
+            .retain(|existing, _| existing.path != key.path || existing.revision == revision);
         let coverage = self.coverage.entry(key).or_default();
         let requested_lines = end_line.saturating_sub(start_line).saturating_add(1);
         let covered_lines = coverage
@@ -226,40 +246,57 @@ impl ReadObservationTracker {
         let overlap_percent = covered_lines.saturating_mul(100) / requested_lines.max(1);
 
         if overlap_percent >= SUBSTANTIAL_READ_OVERLAP_PERCENT {
-            coverage.redundant_observations = coverage.redundant_observations.saturating_add(1);
             let observation = (path, revision, start_line, end_line, overlap_percent);
-            return Some(
-                if coverage.redundant_observations > MAX_RECOVERABLE_REDUNDANT_READ_OBSERVATIONS {
-                    ReadObservationDecision::RepeatedLoop {
-                        path: observation.0,
-                        revision: observation.1,
-                        start_line: observation.2,
-                        end_line: observation.3,
-                        overlap_percent: observation.4,
-                    }
-                } else if coverage.redundant_observations
-                    == MAX_RECOVERABLE_REDUNDANT_READ_OBSERVATIONS
-                {
-                    ReadObservationDecision::RecoveryRequired {
-                        path: observation.0,
-                        revision: observation.1,
-                        start_line: observation.2,
-                        end_line: observation.3,
-                        overlap_percent: observation.4,
-                    }
-                } else {
-                    ReadObservationDecision::AlreadyCovered {
-                        path: observation.0,
-                        revision: observation.1,
-                        start_line: observation.2,
-                        end_line: observation.3,
-                        overlap_percent: observation.4,
-                    }
-                },
-            );
+
+            if coverage.rehydration_available || coverage.rehydrated_batch == Some(provider_batch) {
+                coverage.rehydration_available = false;
+                coverage.rehydrated_batch = Some(provider_batch);
+                coverage.redundant_batches = 0;
+                coverage.last_redundant_batch = None;
+                coverage.recovery_delivered = false;
+                return Some(ReadObservationDecision::RehydratedAfterCompaction {
+                    path: observation.0,
+                    revision: observation.1,
+                    start_line: observation.2,
+                    end_line: observation.3,
+                    overlap_percent: observation.4,
+                });
+            }
+
+            if coverage.last_redundant_batch != Some(provider_batch) {
+                coverage.redundant_batches = coverage.redundant_batches.saturating_add(1);
+                coverage.last_redundant_batch = Some(provider_batch);
+            }
+            return Some(if coverage.recovery_delivered {
+                ReadObservationDecision::RepeatedLoop {
+                    path: observation.0,
+                    revision: observation.1,
+                    start_line: observation.2,
+                    end_line: observation.3,
+                    overlap_percent: observation.4,
+                }
+            } else if coverage.redundant_batches >= MAX_RECOVERABLE_REDUNDANT_READ_BATCHES {
+                ReadObservationDecision::RecoveryRequired {
+                    path: observation.0,
+                    revision: observation.1,
+                    start_line: observation.2,
+                    end_line: observation.3,
+                    overlap_percent: observation.4,
+                }
+            } else {
+                ReadObservationDecision::AlreadyCovered {
+                    path: observation.0,
+                    revision: observation.1,
+                    start_line: observation.2,
+                    end_line: observation.3,
+                    overlap_percent: observation.4,
+                }
+            });
         }
 
-        coverage.redundant_observations = 0;
+        coverage.redundant_batches = 0;
+        coverage.last_redundant_batch = None;
+        coverage.recovery_delivered = false;
         coverage.intervals.push((start_line, end_line));
         coverage
             .intervals
@@ -267,12 +304,32 @@ impl ReadObservationTracker {
         coverage.intervals = merge_line_intervals(&coverage.intervals);
         Some(ReadObservationDecision::NewCoverage)
     }
+
+    fn mark_compacted(&mut self) {
+        for coverage in self.coverage.values_mut() {
+            if coverage.rehydrated_batch.is_none() {
+                coverage.rehydration_available = true;
+            }
+        }
+    }
+
+    fn mark_recovery_delivered(&mut self, key: &ReadRevisionKey) {
+        if let Some(coverage) = self.coverage.get_mut(key) {
+            coverage.recovery_delivered = true;
+        }
+    }
+}
+
+#[derive(Debug)]
+struct PendingReadRecoveryInstruction {
+    key: ReadRevisionKey,
+    text: String,
 }
 
 #[derive(Debug)]
 struct ReadObservationOutcome {
     result: ToolResult,
-    recovery_instruction: Option<String>,
+    recovery_instruction: Option<PendingReadRecoveryInstruction>,
     stop_reason: Option<String>,
 }
 
@@ -307,6 +364,30 @@ fn read_observation_result(
         ReadObservationDecision::NewCoverage => {
             return ReadObservationOutcome {
                 result: original,
+                recovery_instruction: None,
+                stop_reason: None,
+            };
+        }
+        ReadObservationDecision::RehydratedAfterCompaction {
+            path: _,
+            revision: _,
+            start_line: _,
+            end_line: _,
+            overlap_percent,
+        } => {
+            let mut result = original;
+            if !result.metadata.is_object() {
+                result.metadata = json!({});
+            }
+            result.metadata["observationStatus"] =
+                Value::String("read_observation_rehydrated_after_compaction".to_string());
+            result.metadata["overlapPercent"] = Value::from(overlap_percent as u64);
+            result.metadata["contentSuppressed"] = Value::Bool(false);
+            result.metadata["recoveryRequired"] = Value::Bool(false);
+            result.metadata["rehydratedAfterCompaction"] = Value::Bool(true);
+            result.metadata["turnContinues"] = Value::Bool(true);
+            return ReadObservationOutcome {
+                result,
                 recovery_instruction: None,
                 stop_reason: None,
             };
@@ -398,10 +479,11 @@ fn read_observation_result(
         serde_json::to_string(&path).unwrap_or_else(|_| "\"<invalid path>\"".into());
     let recovery_revision =
         serde_json::to_string(&revision).unwrap_or_else(|_| "\"<invalid revision>\"".into());
-    let recovery_instruction = recovery_required.then(|| {
-        format!(
+    let recovery_instruction = recovery_required.then(|| PendingReadRecoveryInstruction {
+        key: ReadRevisionKey::new(&path, &revision),
+        text: format!(
             "[Host-enforced read recovery]\nThe unchanged workspace file whose JSON-encoded path is {recovery_path} at JSON-encoded revision {recovery_revision} has already been observed for lines {start_line}-{end_line} ({overlap_percent}% overlap). The duplicate read returned no new evidence. Do not request read_file for an overlapping range of this revision and do not bypass this boundary with shell commands or repository search. Reuse the existing observation already present in the conversation or compacted context. Continue with a genuinely unresolved non-overlapping fact, make the requested change, run focused validation, or give the final answer."
-        )
+        ),
     });
     ReadObservationOutcome {
         result: ToolResult {
@@ -1002,7 +1084,7 @@ impl AgentRuntime {
         let mut last_call_signature = None::<String>;
         let mut identical_call_streak = 0usize;
         let mut read_observations = ReadObservationTracker::default();
-        let mut pending_read_recovery_instructions = Vec::<String>::new();
+        let mut pending_read_recovery_instructions = Vec::<PendingReadRecoveryInstruction>::new();
         let token_budget = self.max_total_tokens;
         let mut soft_turn_segment = self
             .soft_turn_limits
@@ -1112,11 +1194,13 @@ impl AgentRuntime {
             }
 
             let mut request_runtime_instructions = self.runtime_instructions.clone();
+            let mut delivered_read_recovery_keys = Vec::new();
             for instruction in pending_read_recovery_instructions.drain(..) {
                 if !request_runtime_instructions.trim().is_empty() {
                     request_runtime_instructions.push_str("\n\n");
                 }
-                request_runtime_instructions.push_str(&instruction);
+                request_runtime_instructions.push_str(&instruction.text);
+                delivered_read_recovery_keys.push(instruction.key);
             }
 
             let events = self.repository.load(&thread_id).await?;
@@ -1192,6 +1276,7 @@ impl AgentRuntime {
                         &publisher,
                     )
                     .await?;
+                    read_observations.mark_compacted();
                     history = compacted;
                 }
             }
@@ -1211,6 +1296,9 @@ impl AgentRuntime {
                 messages: history,
                 tools: tool_definitions.clone(),
             };
+            for key in &delivered_read_recovery_keys {
+                read_observations.mark_recovery_delivered(key);
+            }
             publisher.publish(AgentEventEnvelope::new(AgentEvent::ActivityStatusChanged {
                 thread_id: thread_id.clone(),
                 turn_id: turn_id.clone(),
@@ -1982,14 +2070,16 @@ impl AgentRuntime {
                 };
 
                 if call.name == "read_file"
-                    && let Some(decision) = read_observations.observe(&result)
+                    && let Some(decision) = read_observations.observe(&result, iteration)
                 {
                     let outcome = read_observation_result(result, decision);
                     result = outcome.result;
                     if let Some(instruction) = outcome.recovery_instruction
                         && pending_read_recovery_instructions.len()
                             < MAX_READ_RECOVERY_INSTRUCTIONS
-                        && !pending_read_recovery_instructions.contains(&instruction)
+                        && !pending_read_recovery_instructions
+                            .iter()
+                            .any(|pending| pending.key == instruction.key)
                     {
                         pending_read_recovery_instructions.push(instruction);
                     }
@@ -3991,43 +4081,104 @@ mod tests {
     fn semantic_read_tracker_recovers_once_before_stopping_overlap_loops() {
         let mut tracker = ReadObservationTracker::default();
         assert_eq!(
-            tracker.observe(&versioned_read_result("src/file.rs", "revision-a", 1, 400)),
+            tracker.observe(
+                &versioned_read_result("src/file.rs", "revision-a", 1, 400),
+                0
+            ),
             Some(ReadObservationDecision::NewCoverage)
         );
         assert_eq!(
-            tracker.observe(&versioned_read_result(
-                "src/file.rs",
-                "revision-a",
-                401,
-                800
-            )),
+            tracker.observe(
+                &versioned_read_result("src/file.rs", "revision-a", 401, 800),
+                0
+            ),
             Some(ReadObservationDecision::NewCoverage)
         );
         assert!(matches!(
-            tracker.observe(&versioned_read_result("src/file.rs", "revision-a", 2, 399)),
+            tracker.observe(
+                &versioned_read_result("src/file.rs", "revision-a", 2, 399),
+                1
+            ),
             Some(ReadObservationDecision::AlreadyCovered {
                 overlap_percent: 100,
                 ..
             })
         ));
         assert!(matches!(
-            tracker.observe(&versioned_read_result("src/file.rs", "revision-a", 3, 398)),
+            tracker.observe(
+                &versioned_read_result("src/file.rs", "revision-a", 3, 398),
+                2
+            ),
             Some(ReadObservationDecision::RecoveryRequired {
                 overlap_percent: 100,
                 ..
             })
         ));
         assert!(matches!(
-            tracker.observe(&versioned_read_result("src/file.rs", "revision-a", 4, 397)),
+            tracker.observe(
+                &versioned_read_result("src/file.rs", "revision-a", 4, 397),
+                2
+            ),
+            Some(ReadObservationDecision::RecoveryRequired {
+                overlap_percent: 100,
+                ..
+            })
+        ));
+        tracker.mark_recovery_delivered(&ReadRevisionKey::new("src/file.rs", "revision-a"));
+        assert!(matches!(
+            tracker.observe(
+                &versioned_read_result("src/file.rs", "revision-a", 5, 396),
+                3
+            ),
             Some(ReadObservationDecision::RepeatedLoop {
                 overlap_percent: 100,
                 ..
             })
         ));
         assert_eq!(
-            tracker.observe(&versioned_read_result("src/file.rs", "revision-b", 1, 400)),
+            tracker.observe(
+                &versioned_read_result("src/file.rs", "revision-b", 1, 400),
+                4
+            ),
             Some(ReadObservationDecision::NewCoverage)
         );
+    }
+
+    #[test]
+    fn semantic_read_tracker_rehydrates_only_one_post_compaction_batch() {
+        let mut tracker = ReadObservationTracker::default();
+        assert_eq!(
+            tracker.observe(
+                &versioned_read_result("src/file.rs", "revision-a", 1, 400),
+                0
+            ),
+            Some(ReadObservationDecision::NewCoverage)
+        );
+
+        tracker.mark_compacted();
+        assert!(matches!(
+            tracker.observe(
+                &versioned_read_result("src/file.rs", "revision-a", 2, 399),
+                1
+            ),
+            Some(ReadObservationDecision::RehydratedAfterCompaction { .. })
+        ));
+        assert!(matches!(
+            tracker.observe(
+                &versioned_read_result("src/file.rs", "revision-a", 3, 398),
+                1
+            ),
+            Some(ReadObservationDecision::RehydratedAfterCompaction { .. })
+        ));
+
+        tracker.mark_compacted();
+        assert!(matches!(
+            tracker.observe(
+                &versioned_read_result("src/file.rs", "revision-a", 4, 397),
+                2
+            ),
+            Some(ReadObservationDecision::AlreadyCovered { .. })
+        ));
     }
 
     #[tokio::test]
@@ -4116,6 +4267,84 @@ mod tests {
         assert_eq!(results["read-3"].metadata["contentSuppressed"], true);
         assert_eq!(results["read-3"].metadata["recoveryRequired"], true);
         assert_eq!(results["read-3"].metadata["turnContinues"], true);
+    }
+
+    #[tokio::test]
+    async fn one_provider_batch_cannot_skip_from_recovery_to_hard_stop() {
+        let (directory, repository, runtime, thread_id) = runtime_fixture().await;
+        std::fs::write(directory.path().join("loop.txt"), "line 1\nline 2\nline 3").unwrap();
+        let read_call = |id: &str, start_line: usize, line_count: usize| ProviderEvent::ToolCall {
+            call: ToolCall {
+                id: id.into(),
+                name: "read_file".into(),
+                arguments: json!({
+                    "path": "loop.txt",
+                    "startLine": start_line,
+                    "lineCount": line_count
+                }),
+                metadata: json!({}),
+            },
+        };
+        let provider = Arc::new(FakeProvider::script(vec![
+            vec![Ok(read_call("read-1", 1, 3)), Ok(ProviderEvent::Completed)],
+            vec![Ok(read_call("read-2", 1, 3)), Ok(ProviderEvent::Completed)],
+            vec![
+                Ok(read_call("read-3", 1, 3)),
+                Ok(read_call("read-4", 2, 2)),
+                Ok(ProviderEvent::Completed),
+            ],
+            vec![
+                Ok(ProviderEvent::TextDelta {
+                    delta: "continued after receiving the correction".into(),
+                }),
+                Ok(ProviderEvent::Completed),
+            ],
+        ]));
+
+        let outcome = runtime
+            .run_turn(
+                provider.clone(),
+                "fake".into(),
+                RunTurnRequest {
+                    thread_id: thread_id.clone(),
+                    input: "inspect without looping".into(),
+                    agent_mode: None,
+                },
+                CancellationToken::new(),
+                Arc::new(RecordingPublisher::default()),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.state, TurnState::Completed);
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 4);
+        assert!(requests[3].messages.iter().any(|message| matches!(
+            message,
+            ProviderMessage::Text {
+                role: MessageRole::System,
+                text,
+            } if text.matches("[Host-enforced read recovery]").count() == 1
+        )));
+        let results = repository
+            .load(&thread_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter_map(|event| match event.kind {
+                StoredEventKind::ToolResult {
+                    call_id, result, ..
+                } => Some((call_id, result)),
+                _ => None,
+            })
+            .collect::<HashMap<_, _>>();
+        for call_id in ["read-3", "read-4"] {
+            assert!(results[call_id].success);
+            assert_eq!(
+                results[call_id].metadata["observationStatus"],
+                "read_observation_recovery_required"
+            );
+        }
     }
 
     #[tokio::test]
@@ -5937,6 +6166,133 @@ mod tests {
                         }
                     )
                 })
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_and_continue_rehydrates_one_read_batch_without_reopening_the_lifetime_limit() {
+        let (directory, repository, runtime, thread_id) = runtime_fixture().await;
+        let contents = (1..=2_000)
+            .map(|line| format!("line {line:04} carries context {}", "x".repeat(12)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(directory.path().join("context.txt"), contents).unwrap();
+        let read_call = |id: &str, start_line: usize, line_count: usize| ProviderEvent::ToolCall {
+            call: ToolCall {
+                id: id.into(),
+                name: "read_file".into(),
+                arguments: json!({
+                    "path": "context.txt",
+                    "startLine": start_line,
+                    "lineCount": line_count
+                }),
+                metadata: json!({}),
+            },
+        };
+        let provider = Arc::new(FakeProvider::script(vec![
+            vec![
+                Ok(read_call("read-before-compaction", 1, 2_000)),
+                Ok(ProviderEvent::Completed),
+            ],
+            vec![
+                Ok(read_call("read-already-covered", 2, 1_999)),
+                Ok(ProviderEvent::Completed),
+            ],
+            vec![
+                Ok(read_call("read-rehydrated", 3, 1_998)),
+                Ok(ProviderEvent::Completed),
+            ],
+            vec![
+                Ok(read_call("read-after-rehydration", 4, 1_997)),
+                Ok(ProviderEvent::Completed),
+            ],
+            vec![
+                Ok(read_call("read-after-second-compaction", 5, 1_996)),
+                Ok(ProviderEvent::Completed),
+            ],
+            vec![
+                Ok(ProviderEvent::TextDelta {
+                    delta: "used the rehydrated context".into(),
+                }),
+                Ok(ProviderEvent::Completed),
+            ],
+        ]));
+        let publisher = Arc::new(UserInputResolvingPublisher::new(
+            runtime.user_input_manager(),
+            TURN_COMPACT_AND_CONTINUE,
+        ));
+
+        let outcome = runtime
+            .with_context_limit(64_000)
+            .with_soft_turn_limits(SoftTurnLimits::new(2, u64::MAX, u64::MAX))
+            .run_turn(
+                provider.clone(),
+                "fake".into(),
+                RunTurnRequest {
+                    thread_id: thread_id.clone(),
+                    input: "read, compact, and continue".into(),
+                    agent_mode: None,
+                },
+                CancellationToken::new(),
+                publisher,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.state, TurnState::Completed);
+        let events = repository.load(&thread_id).await.unwrap();
+        let continuation_requests = events
+            .iter()
+            .filter(|event| matches!(event.kind, StoredEventKind::UserInputRequested { .. }))
+            .count();
+        let initial_output_bytes = events
+            .iter()
+            .find_map(|event| match &event.kind {
+                StoredEventKind::ToolResult {
+                    call_id, result, ..
+                } if call_id == "read-before-compaction" => Some(result.output.len()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        assert_eq!(provider.requests().len(), 6);
+        assert_eq!(continuation_requests, 2);
+        assert!(initial_output_bytes > 35_200);
+        assert!(events.iter().any(|event| matches!(
+            event.kind,
+            StoredEventKind::ContextCompacted {
+                automatic: true,
+                ..
+            }
+        )));
+        let results = events
+            .into_iter()
+            .filter_map(|event| match event.kind {
+                StoredEventKind::ToolResult {
+                    call_id, result, ..
+                } => Some((call_id, result)),
+                _ => None,
+            })
+            .collect::<HashMap<_, _>>();
+        assert_eq!(
+            results["read-already-covered"].metadata["observationStatus"],
+            "read_observation_already_covered"
+        );
+        let rehydrated = &results["read-rehydrated"];
+        assert!(rehydrated.success);
+        assert!(rehydrated.output.contains("line 0003 carries context"));
+        assert_eq!(
+            rehydrated.metadata["observationStatus"],
+            "read_observation_rehydrated_after_compaction"
+        );
+        assert_eq!(rehydrated.metadata["contentSuppressed"], false);
+        assert_eq!(rehydrated.metadata["rehydratedAfterCompaction"], true);
+        assert_eq!(
+            results["read-after-rehydration"].metadata["observationStatus"],
+            "read_observation_already_covered"
+        );
+        assert_eq!(
+            results["read-after-second-compaction"].metadata["observationStatus"],
+            "read_observation_recovery_required"
         );
     }
 

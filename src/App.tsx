@@ -5,6 +5,7 @@ import {
   ArrowUp,
   AtSign,
   BookOpen,
+  CalendarClock,
   ChevronDown,
   ChevronRight,
   Check,
@@ -67,8 +68,10 @@ import { useToast } from "./components/Toast";
 import { ProjectSelector } from "./components/ProjectSelector";
 import { WorkflowControl } from "./components/WorkflowControl";
 import { WorkflowSelector } from "./components/WorkflowSelector";
+import { ScheduledTasksPage } from "./components/ScheduledTasksPage";
 import { findComposerTrigger, type ComposerTrigger } from "./lib/composerTrigger";
 import { workspacePathKey, workspacePathsEqual } from "./lib/path";
+import { THEME_STORAGE_KEY, parseThemePreference, resolveTheme, type ThemeId } from "./lib/theme";
 import "./App.css";
 import "./enhanced-animations.css"; // UI 增强动画
 import "./components/ModeSelector.css";
@@ -128,9 +131,6 @@ function WelcomeGlyph({ size = 48 }: { size?: number }) {
   );
 }
 
-type ThemeMode = "light" | "dark";
-
-const STORAGE_THEME = "kcoder_theme";
 const THREAD_PROJECT_KEY = "kcoder_thread_project_map";
 const KNOWN_PROJECTS_KEY = "kcoder_known_projects";
 const HIDDEN_PROJECT_GROUPS_KEY = "kcoder_hidden_project_groups";
@@ -334,6 +334,7 @@ function App() {
   const [composerSuggestionsLoading, setComposerSuggestionsLoading] = useState(false);
   const [composerSuggestionsError, setComposerSuggestionsError] = useState("");
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [activePage, setActivePage] = useState<"conversation" | "scheduled">("conversation");
   const [logViewerOpen, setLogViewerOpen] = useState(false);
   const [settingsSection, setSettingsSection] = useState<SettingsSection>("providers");
   const [selectedChangeId, setSelectedChangeId] = useState<string | null>(null);
@@ -345,8 +346,11 @@ function App() {
   const [workbenchOpen, setWorkbenchOpen] = useState(false);
   const [agentPanelOpen, setAgentPanelOpen] = useState(false);
   const [workspaceRevision, setWorkspaceRevision] = useState(0);
-  const [themeMode, setThemeModeState] = useState<ThemeMode>(() =>
-    readStored(STORAGE_THEME, "light"),
+  const [themeMode, setThemeModeState] = useState<ThemeId>(() =>
+    parseThemePreference(readStored<string>(THEME_STORAGE_KEY, "light")),
+  );
+  const [systemPrefersDark, setSystemPrefersDark] = useState(() =>
+    typeof window !== "undefined" && window.matchMedia?.("(prefers-color-scheme: dark)").matches === true,
   );
   const [subagentThreadIds, setSubagentThreadIds] = useState<Set<string>>(new Set());
   const [sideView, setSideView] = useState<"conversations" | "projects">("conversations");
@@ -605,9 +609,21 @@ function App() {
   }, [activeThreadId]);
 
   useEffect(() => {
+    const media = window.matchMedia?.("(prefers-color-scheme: dark)");
+    if (!media) return undefined;
+    const handleChange = () => setSystemPrefersDark(media.matches);
+    handleChange();
+    media.addEventListener?.("change", handleChange);
+    return () => media.removeEventListener?.("change", handleChange);
+  }, []);
+
+  const resolvedTheme = resolveTheme(themeMode, systemPrefersDark);
+
+  useEffect(() => {
     document.documentElement.setAttribute("data-skin", "codebuddy");
-    document.documentElement.setAttribute("data-theme", themeMode);
-  }, [themeMode]);
+    document.documentElement.setAttribute("data-theme", resolvedTheme);
+    document.documentElement.setAttribute("data-theme-preference", themeMode);
+  }, [resolvedTheme, themeMode]);
 
   // ===== 线程-项目关联管理 =====
   const saveThreadProjectMap = (map: Record<string, string>) => {
@@ -664,6 +680,7 @@ function App() {
   };
 
   const selectSessionThread = async (thread: (typeof threads)[number]) => {
+    setActivePage("conversation");
     const targetWorkspace = threadProjectPath(thread, threadProjectMap);
     try {
       if (targetWorkspace) await ensureProjectWorkspace(targetWorkspace);
@@ -676,6 +693,7 @@ function App() {
   // 在指定项目（路径）下创建一个新会话。
   // 不传项目路径时创建显式无项目会话；传入路径时先切换工作区，再创建不可变绑定的项目会话。
   const createSessionUnderProject = async (projectPath: string | null) => {
+    setActivePage("conversation");
     let newThreadId: string;
     try {
       if (projectPath) await ensureProjectWorkspace(projectPath);
@@ -936,9 +954,14 @@ function App() {
   };
 
   const toggleTheme = () => {
-    const next = themeMode === "light" ? "dark" : "light";
+    const next: ThemeId = resolvedTheme === "light" ? "dark" : "light";
     setThemeModeState(next);
-    try { localStorage.setItem(STORAGE_THEME, next); } catch { /* noop */ }
+    try { localStorage.setItem(THEME_STORAGE_KEY, next); } catch { /* noop */ }
+  };
+
+  const selectTheme = (next: ThemeId) => {
+    setThemeModeState(next);
+    try { localStorage.setItem(THEME_STORAGE_KEY, next); } catch { /* noop */ }
   };
 
   const effectiveWorkspacePath = activeThreadIsStandalone
@@ -1743,6 +1766,7 @@ function App() {
 
   function openSettingsSection(section: SettingsSection) {
     clearError();
+    setActivePage("conversation");
     setWorkbenchOpen(false);
     setAgentPanelOpen(false);
     setSettingsSection(section);
@@ -1755,6 +1779,14 @@ function App() {
 
   function openGoalSettings() {
     openSettingsSection("goal");
+  }
+
+  function openScheduledTasks() {
+    clearError();
+    setSettingsOpen(false);
+    setWorkbenchOpen(false);
+    setAgentPanelOpen(false);
+    setActivePage("scheduled");
   }
 
   return (
@@ -1800,11 +1832,11 @@ function App() {
           <button
             className="icon-button"
             type="button"
-            aria-label={themeMode === "light" ? "切换到深色模式" : "切换到浅色模式"}
-            title={themeMode === "light" ? "深色模式" : "浅色模式"}
+            aria-label={resolvedTheme === "light" ? "切换到深色模式" : "切换到浅色模式"}
+            title={resolvedTheme === "light" ? "深色模式" : "浅色模式"}
             onClick={toggleTheme}
           >
-            {themeMode === "light" ? <Moon size={17} /> : <Sun size={17} />}
+            {resolvedTheme === "light" ? <Moon size={17} /> : <Sun size={17} />}
           </button>
           <button
             className="icon-button mobile-settings-button"
@@ -1848,6 +1880,17 @@ function App() {
       </header>
 
       <aside className="sidebar">
+        <nav className="sidebar-primary-nav" aria-label="主导航">
+          <button
+            type="button"
+            className={cn("sidebar-primary-nav-button", activePage === "scheduled" && "is-active")}
+            aria-current={activePage === "scheduled" ? "page" : undefined}
+            onClick={openScheduledTasks}
+          >
+            <CalendarClock size={16} />
+            <span>定时任务</span>
+          </button>
+        </nav>
         <section className="thread-section" aria-labelledby="thread-section-title">
           <div className="thread-section-heading">
             <div className="sidebar-segmented" role="tablist" aria-label="侧边栏视图">
@@ -1856,7 +1899,7 @@ function App() {
                 role="tab"
                 aria-selected={sideView === "conversations"}
                 className={cn(sideView === "conversations" && "is-active")}
-                onClick={() => setSideView("conversations")}
+                onClick={() => { setSideView("conversations"); setActivePage("conversation"); }}
               >
                 <MessageSquare size={15} />
                 <span>会话</span>
@@ -1866,7 +1909,7 @@ function App() {
                 role="tab"
                 aria-selected={sideView === "projects"}
                 className={cn(sideView === "projects" && "is-active")}
-                onClick={() => setSideView("projects")}
+                onClick={() => { setSideView("projects"); setActivePage("conversation"); }}
               >
                 <Folder size={15} />
                 <span>项目</span>
@@ -2097,7 +2140,9 @@ function App() {
         </div>
       </aside>
 
-      <section className="conversation">
+      <section className={cn("conversation", activePage === "scheduled" && "conversation--scheduled")}>
+        {activePage === "scheduled" ? <ScheduledTasksPage /> : (
+        <>
         <div className="conversation-header">
           <div>
             <h1>{activeThread?.title ?? "新会话"}</h1>
@@ -2688,6 +2733,8 @@ function App() {
             </div>
           </div>
         </form>
+        </>
+        )}
       </section>
 
       <WorkbenchPanel key={workspaceRevision} open={workbenchOpen} onAttach={(attachment) => appendAttachments([attachment])} />
@@ -2779,7 +2826,7 @@ function App() {
           error={error}
           themeMode={themeMode}
           onClose={() => setSettingsOpen(false)}
-          onToggleTheme={toggleTheme}
+          onSelectTheme={selectTheme}
           onSaveProvider={saveProvider}
           onActivateProvider={activateProvider}
           onDeleteProvider={deleteProvider}
