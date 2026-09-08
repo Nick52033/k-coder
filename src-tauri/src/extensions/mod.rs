@@ -3,9 +3,9 @@ pub mod mcp;
 pub mod plugins;
 
 use std::collections::{HashMap, HashSet};
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::hash::{Hash, Hasher};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -506,13 +506,328 @@ fn default_true() -> bool {
     true
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct LoadedSkill {
     metadata: SkillMetadata,
     path: PathBuf,
+    resource_root: SkillResourceRoot,
     scope: String,
     body: String,
     enabled: bool,
+}
+
+impl std::fmt::Debug for LoadedSkill {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LoadedSkill")
+            .field("metadata", &self.metadata)
+            .field("scope", &self.scope)
+            .field("enabled", &self.enabled)
+            .field("bytes", &self.body.len())
+            .field("sha256", &sha256_hex(self.body.as_bytes()))
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone)]
+struct SkillResourceRoot {
+    handle: Arc<File>,
+    path: PathBuf,
+}
+
+impl std::fmt::Debug for SkillResourceRoot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SkillResourceRoot")
+            .finish_non_exhaustive()
+    }
+}
+
+impl SkillResourceRoot {
+    fn open(scope_root: &Path, path: &Path) -> Result<Self, ExtensionError> {
+        let handle = open_skill_resource_root(scope_root, path).map_err(ExtensionError::Skill)?;
+        Ok(Self {
+            handle: Arc::new(handle),
+            path: path.to_path_buf(),
+        })
+    }
+
+    fn read(&self, relative: &Path) -> Result<(Vec<u8>, usize), ToolError> {
+        read_skill_resource_handle(self, relative)
+    }
+}
+
+#[cfg(unix)]
+fn open_skill_resource_root(scope_root: &Path, path: &Path) -> Result<File, String> {
+    let relative = path
+        .strip_prefix(scope_root)
+        .map_err(|_| "Skill resource root escapes its scope".to_string())?;
+    let mut current = unix_open_absolute_directory(scope_root)?;
+    for component in relative.components() {
+        let Component::Normal(component) = component else {
+            return Err("Skill resource root contains an unsupported component".into());
+        };
+        current = unix_open_directory_at(&current, component)?;
+    }
+    Ok(current)
+}
+
+#[cfg(unix)]
+fn unix_open_absolute_directory(path: &Path) -> Result<File, String> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    if !path.is_absolute() {
+        return Err("Skill scope root must be absolute".into());
+    }
+    let mut current = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(Path::new("/"))
+        .map_err(|error| format!("filesystem root cannot be opened safely: {error}"))?;
+    for component in path.components() {
+        match component {
+            Component::RootDir => {}
+            Component::Normal(component) => {
+                current = unix_open_directory_at(&current, component)?;
+            }
+            _ => return Err("Skill scope root contains an unsupported component".into()),
+        }
+    }
+    Ok(current)
+}
+
+#[cfg(unix)]
+fn unix_open_directory_at(parent: &File, component: &std::ffi::OsStr) -> Result<File, String> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+
+    let component = CString::new(component.as_bytes())
+        .map_err(|_| "Skill directory contains a null byte".to_string())?;
+    let descriptor = unsafe {
+        libc::openat(
+            parent.as_raw_fd(),
+            component.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW,
+        )
+    };
+    if descriptor < 0 {
+        return Err("Skill directory cannot be opened without following links".into());
+    }
+    Ok(unsafe { File::from_raw_fd(descriptor) })
+}
+
+#[cfg(unix)]
+fn read_skill_resource_handle(
+    root: &SkillResourceRoot,
+    relative: &Path,
+) -> Result<(Vec<u8>, usize), ToolError> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+
+    let duplicated = unsafe { libc::fcntl(root.handle.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+    if duplicated < 0 {
+        return Err(ToolError::Execution(
+            "Skill resource root handle cannot be duplicated".into(),
+        ));
+    }
+    let mut current = unsafe { File::from_raw_fd(duplicated) };
+    let components = relative.components().collect::<Vec<_>>();
+    for (index, component) in components.iter().enumerate() {
+        let Component::Normal(component) = component else {
+            return Err(ToolError::InvalidArguments(
+                "Skill resource path contains an unsupported component".into(),
+            ));
+        };
+        let component = CString::new(component.as_bytes()).map_err(|_| {
+            ToolError::InvalidArguments("Skill resource path contains a null byte".into())
+        })?;
+        let final_component = index + 1 == components.len();
+        let flags = libc::O_RDONLY
+            | libc::O_CLOEXEC
+            | libc::O_NOFOLLOW
+            | libc::O_NONBLOCK
+            | if final_component {
+                0
+            } else {
+                libc::O_DIRECTORY
+            };
+        let descriptor = unsafe { libc::openat(current.as_raw_fd(), component.as_ptr(), flags) };
+        if descriptor < 0 {
+            return Err(ToolError::InvalidArguments(
+                "Skill resource path cannot be opened without following links".into(),
+            ));
+        }
+        current = unsafe { File::from_raw_fd(descriptor) };
+        let metadata = current
+            .metadata()
+            .map_err(|error| ToolError::Execution(error.to_string()))?;
+        if final_component && !metadata.is_file() {
+            return Err(ToolError::InvalidArguments(
+                "Skill resource path must identify a regular file".into(),
+            ));
+        }
+    }
+    read_bounded_skill_resource_file(current)
+}
+
+#[cfg(windows)]
+fn open_skill_resource_root(scope_root: &Path, path: &Path) -> Result<File, String> {
+    let scope_handle = open_windows_skill_directory(scope_root)?;
+    let handle = open_windows_skill_directory(path)?;
+    let scope_final = windows_final_path(&scope_handle)?;
+    let opened = windows_final_path(&handle)?;
+    let expected_scope = normalize_windows_final_path(scope_root);
+    let expected = normalize_windows_final_path(path);
+    if scope_final != expected_scope || opened != expected {
+        return Err("Skill resource root changed while it was opened".into());
+    }
+    let prefix = format!("{}\\", scope_final.trim_end_matches('\\'));
+    if !opened.starts_with(&prefix) {
+        return Err("Skill resource root escapes its open scope".into());
+    }
+    Ok(handle)
+}
+
+#[cfg(windows)]
+fn open_windows_skill_directory(path: &Path) -> Result<File, String> {
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+    };
+
+    let handle = OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .map_err(|error| format!("Skill resource root cannot be opened safely: {error}"))?;
+    let metadata = handle
+        .metadata()
+        .map_err(|error| format!("Skill resource root metadata cannot be read: {error}"))?;
+    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 || !metadata.is_dir() {
+        return Err("Skill resource root must be a real directory, not a reparse point".into());
+    }
+    Ok(handle)
+}
+
+#[cfg(windows)]
+fn read_skill_resource_handle(
+    root: &SkillResourceRoot,
+    relative: &Path,
+) -> Result<(Vec<u8>, usize), ToolError> {
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT,
+    };
+
+    let candidate = root.path.join(relative);
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(&candidate)
+        .map_err(|_| {
+            ToolError::InvalidArguments(
+                "Skill resource path cannot be opened without following links".into(),
+            )
+        })?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| ToolError::Execution(error.to_string()))?;
+    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 || !metadata.is_file() {
+        return Err(ToolError::InvalidArguments(
+            "Skill resource path must identify a regular non-reparse file".into(),
+        ));
+    }
+    let root_path = windows_final_path(&root.handle).map_err(ToolError::Execution)?;
+    let resource_path = windows_final_path(&file).map_err(ToolError::Execution)?;
+    let prefix = format!("{}\\", root_path.trim_end_matches('\\'));
+    if !resource_path.starts_with(&prefix) {
+        return Err(ToolError::InvalidArguments(
+            "Skill resource path escapes its open Skill root".into(),
+        ));
+    }
+    read_bounded_skill_resource_file(file)
+}
+
+#[cfg(windows)]
+fn windows_final_path(file: &File) -> Result<String, String> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_NAME_NORMALIZED, GetFinalPathNameByHandleW, VOLUME_NAME_DOS,
+    };
+
+    let handle = file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
+    let required = unsafe {
+        GetFinalPathNameByHandleW(
+            handle,
+            std::ptr::null_mut(),
+            0,
+            FILE_NAME_NORMALIZED | VOLUME_NAME_DOS,
+        )
+    };
+    if required == 0 || required > 32_768 {
+        return Err("open Skill resource path cannot be resolved from its handle".into());
+    }
+    let mut buffer = vec![0u16; required as usize + 1];
+    let written = unsafe {
+        GetFinalPathNameByHandleW(
+            handle,
+            buffer.as_mut_ptr(),
+            buffer.len() as u32,
+            FILE_NAME_NORMALIZED | VOLUME_NAME_DOS,
+        )
+    };
+    if written == 0 || written as usize >= buffer.len() {
+        return Err("open Skill resource path cannot be resolved from its handle".into());
+    }
+    Ok(normalize_windows_path_text(&String::from_utf16_lossy(
+        &buffer[..written as usize],
+    )))
+}
+
+#[cfg(windows)]
+fn normalize_windows_final_path(path: &Path) -> String {
+    normalize_windows_path_text(&path.to_string_lossy())
+}
+
+#[cfg(windows)]
+fn normalize_windows_path_text(path: &str) -> String {
+    path.strip_prefix(r"\\?\")
+        .unwrap_or(path)
+        .replace('/', "\\")
+        .trim_end_matches('\\')
+        .to_ascii_lowercase()
+}
+
+fn read_bounded_skill_resource_file(mut file: File) -> Result<(Vec<u8>, usize), ToolError> {
+    let metadata = file
+        .metadata()
+        .map_err(|error| ToolError::Execution(error.to_string()))?;
+    if !metadata.is_file() {
+        return Err(ToolError::InvalidArguments(
+            "Skill resource path must identify a regular file".into(),
+        ));
+    }
+    let total_bytes = usize::try_from(metadata.len()).map_err(|_| {
+        ToolError::InvalidArguments("Skill resource size cannot be represented".into())
+    })?;
+    if total_bytes > MAX_SKILL_RESOURCE_FILE_BYTES {
+        return Err(ToolError::InvalidArguments(format!(
+            "Skill resource exceeds the {MAX_SKILL_RESOURCE_FILE_BYTES} byte file limit"
+        )));
+    }
+    let mut bytes = Vec::with_capacity(total_bytes.min(MAX_SKILL_RESOURCE_FILE_BYTES));
+    Read::by_ref(&mut file)
+        .take((MAX_SKILL_RESOURCE_FILE_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|error| ToolError::Execution(error.to_string()))?;
+    if bytes.len() > MAX_SKILL_RESOURCE_FILE_BYTES {
+        return Err(ToolError::InvalidArguments(format!(
+            "Skill resource exceeds the {MAX_SKILL_RESOURCE_FILE_BYTES} byte file limit"
+        )));
+    }
+    Ok((bytes, total_bytes))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1058,32 +1373,20 @@ impl ExtensionService {
         if !resolved.enabled {
             return Err(ToolError::Denied(format!("Skill {skill_id} is disabled")));
         }
-        let skill_path = self
+        let resource_root = self
             .skills
             .read()
             .expect("skill lock poisoned")
             .iter()
             .find(|skill| skill.metadata.name == skill_id)
-            .map(|skill| skill.path.clone())
+            .map(|skill| skill.resource_root.clone())
             .ok_or_else(|| ToolError::Denied(format!("Skill {skill_id} is not available")))?;
         let relative = validate_skill_resource_path(raw_path)?;
-        let skill_root = skill_path
-            .parent()
-            .ok_or_else(|| ToolError::Execution("Skill root is unavailable".into()))?;
-        let path = resolve_skill_resource_path(skill_root, &relative)?;
-        let metadata =
-            fs::metadata(&path).map_err(|error| ToolError::InvalidArguments(error.to_string()))?;
-        if !metadata.is_file() {
-            return Err(ToolError::InvalidArguments(
-                "Skill resource path must identify a regular file".into(),
-            ));
-        }
-        if metadata.len() as usize > MAX_SKILL_RESOURCE_FILE_BYTES {
-            return Err(ToolError::InvalidArguments(format!(
-                "Skill resource exceeds the {MAX_SKILL_RESOURCE_FILE_BYTES} byte file limit"
-            )));
-        }
-        let bytes = fs::read(&path).map_err(|error| ToolError::Execution(error.to_string()))?;
+        let skill_root = resource_root.path.as_path();
+        resolve_skill_resource_path(skill_root, &relative)?;
+        #[cfg(test)]
+        run_skill_resource_before_open_hook(skill_root);
+        let (bytes, total_bytes) = resource_root.read(&relative)?;
         let text = String::from_utf8(bytes)
             .map_err(|_| ToolError::Execution("Skill resource must be UTF-8".into()))?;
         let offset = offset.unwrap_or(0);
@@ -1110,7 +1413,7 @@ impl ExtensionService {
                 "path": raw_path,
                 "offset": offset,
                 "bytesReturned": end - offset,
-                "totalBytes": text.len(),
+                "totalBytes": total_bytes,
                 "truncated": offset > 0 || end < text.len(),
             }),
         })
@@ -2128,11 +2431,18 @@ fn load_skill_candidate(
             override_enabled.as_deref() == Some("true")
         }
     };
+    let resource_root = SkillResourceRoot::open(
+        canonical_root,
+        canonical.parent().ok_or_else(|| {
+            ExtensionError::Skill("Skill definition has no parent directory".into())
+        })?,
+    )?;
     selected.insert(
         metadata.name.clone(),
         LoadedSkill {
             metadata,
             path: canonical,
+            resource_root,
             scope: scope.into(),
             body,
             enabled,
@@ -2165,7 +2475,40 @@ fn validate_skill_resource_path(raw_path: &str) -> Result<PathBuf, ToolError> {
             "Skill resource path must be a non-empty relative path without parent traversal".into(),
         ));
     }
+    if path.components().count() == 1 && raw_path.eq_ignore_ascii_case("SKILL.md") {
+        return Err(ToolError::InvalidArguments(
+            "Skill definition files cannot be read as persistent resources".into(),
+        ));
+    }
     Ok(path.to_path_buf())
+}
+
+#[cfg(test)]
+type SkillResourceBeforeOpenHook = Arc<dyn Fn(&Path) + Send + Sync>;
+
+#[cfg(test)]
+fn skill_resource_before_open_hook() -> &'static Mutex<Option<SkillResourceBeforeOpenHook>> {
+    static HOOK: std::sync::OnceLock<Mutex<Option<SkillResourceBeforeOpenHook>>> =
+        std::sync::OnceLock::new();
+    HOOK.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(test)]
+fn set_skill_resource_before_open_hook(hook: Option<SkillResourceBeforeOpenHook>) {
+    *skill_resource_before_open_hook()
+        .lock()
+        .expect("Skill resource hook lock poisoned") = hook;
+}
+
+#[cfg(test)]
+fn run_skill_resource_before_open_hook(root: &Path) {
+    let hook = skill_resource_before_open_hook()
+        .lock()
+        .expect("Skill resource hook lock poisoned")
+        .clone();
+    if let Some(hook) = hook {
+        hook(root);
+    }
 }
 
 fn resolve_skill_resource_path(root: &Path, relative: &Path) -> Result<PathBuf, ToolError> {
@@ -2398,6 +2741,7 @@ fn collect_extension_files(root: &Path, paths: &mut Vec<PathBuf>) -> Result<(), 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     fn tool_context(workspace: &Path) -> crate::tools::ToolContext {
         crate::tools::ToolContext {
@@ -2865,9 +3209,14 @@ mod tests {
             .unwrap();
 
         let resolved = service.resolve_ordinary_skill("review").unwrap();
+        let loaded_debug = format!(
+            "{:?}",
+            service.skills.read().expect("skill lock poisoned")[0]
+        );
         let debug = format!("{resolved:?}");
         let diagnostics = serde_json::to_string(&service.overview()).unwrap();
 
+        assert!(!loaded_debug.contains("UNIQUE-PRIVATE-SKILL-BODY"));
         assert!(!debug.contains("UNIQUE-PRIVATE-SKILL-BODY"));
         assert!(!diagnostics.contains("UNIQUE-PRIVATE-SKILL-BODY"));
         assert!(diagnostics.contains("review"));
@@ -2967,6 +3316,8 @@ mod tests {
                 .into_owned(),
             "../secret.md".into(),
             "references".into(),
+            "SKILL.md".into(),
+            "skill.MD".into(),
         ] {
             let error = handler
                 .execute(
@@ -3020,8 +3371,24 @@ mod tests {
         std::os::unix::fs::symlink(outside.path(), &linked).unwrap();
         #[cfg(windows)]
         if std::os::windows::fs::symlink_dir(outside.path(), &linked).is_err() {
-            return;
+            let linked = linked.to_string_lossy().replace('/', "\\");
+            let outside = outside.path().to_string_lossy().replace('/', "\\");
+            let output = std::process::Command::new("cmd")
+                .args(["/C", "mklink", "/J", &linked, &outside])
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "failed to create test junction: stdout={}, stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
         }
+        let linked_metadata = fs::symlink_metadata(&linked).unwrap();
+        assert!(
+            linked_metadata.file_type().is_symlink()
+                || skill_metadata_is_reparse_point(&linked_metadata)
+        );
         let service = ExtensionService::new(
             data.path().into(),
             ProjectionDb::memory().unwrap(),
@@ -3045,6 +3412,78 @@ mod tests {
                 .to_string()
                 .contains("symbolic link or directory junction")
         );
+    }
+
+    #[tokio::test]
+    async fn skill_resource_read_never_follows_a_parent_replaced_after_validation() {
+        let data = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        write_test_skill(&data.path().join("skills"), "review", "REVIEW");
+        let skill = data.path().join("skills/review");
+        fs::create_dir_all(skill.join("references")).unwrap();
+        fs::write(skill.join("references/guide.md"), "ORIGINAL-CONTENT").unwrap();
+        fs::create_dir_all(outside.path().join("references")).unwrap();
+        fs::write(
+            outside.path().join("references/guide.md"),
+            "EXTERNAL-SECRET-CONTENT",
+        )
+        .unwrap();
+        let service = ExtensionService::new(
+            data.path().into(),
+            ProjectionDb::memory().unwrap(),
+            Arc::new(mcp::OsMcpSecretStore::new()),
+            StructuredLogger::new(data.path()).unwrap(),
+        );
+        let handler = prepared_skill_resource_handler(&service, workspace.path()).await;
+        let moved = data.path().join("skills/review-original");
+        let expected_root = skill.canonicalize().unwrap();
+        let swapped = Arc::new(AtomicBool::new(false));
+        let swapped_for_hook = swapped.clone();
+        let skill_for_hook = skill.clone();
+        let moved_for_hook = moved.clone();
+        let outside_for_hook = outside.path().to_path_buf();
+        set_skill_resource_before_open_hook(Some(Arc::new(move |root| {
+            if root != expected_root || swapped_for_hook.swap(true, Ordering::SeqCst) {
+                return;
+            }
+            fs::rename(&skill_for_hook, &moved_for_hook).unwrap();
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(&outside_for_hook, &skill_for_hook).unwrap();
+            #[cfg(windows)]
+            {
+                let skill = skill_for_hook.to_string_lossy().replace('/', "\\");
+                let outside = outside_for_hook.to_string_lossy().replace('/', "\\");
+                let output = std::process::Command::new("cmd")
+                    .args(["/C", "mklink", "/J", &skill, &outside])
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "failed to create race junction: link={skill}, target={outside}, stdout={}, stderr={}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        })));
+
+        let result = handler
+            .execute(
+                &tool_context(workspace.path()),
+                serde_json::json!({
+                    "skillId": "review",
+                    "path": "references/guide.md"
+                }),
+                CancellationToken::new(),
+            )
+            .await;
+        set_skill_resource_before_open_hook(None);
+
+        assert!(swapped.load(Ordering::SeqCst));
+        match result {
+            Ok(result) => assert_eq!(result.output, "ORIGINAL-CONTENT"),
+            Err(error) => assert!(!error.to_string().contains("EXTERNAL-SECRET-CONTENT")),
+        }
     }
 
     #[tokio::test]

@@ -80,7 +80,7 @@ fn default_true() -> bool {
     true
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 #[allow(dead_code)]
 struct IndexedSkill {
     metadata: PluginSkillMetadata,
@@ -88,6 +88,17 @@ struct IndexedSkill {
     body: String,
     bytes: usize,
     sha256: String,
+}
+
+impl std::fmt::Debug for IndexedSkill {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("IndexedSkill")
+            .field("metadata", &self.metadata)
+            .field("bytes", &self.bytes)
+            .field("sha256", &self.sha256)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Clone)]
@@ -2794,6 +2805,33 @@ mod tests {
         assert_eq!(overview.plugins[0].components.skill_count, 1);
         assert_eq!(overview.plugins[0].state, PluginState::Disabled);
         assert!(overview.plugins[0].warnings.is_empty());
+    }
+
+    #[test]
+    fn indexed_skill_debug_never_contains_its_body() {
+        let data = tempfile::tempdir().unwrap();
+        let plugin = data.path().join("plugins/review");
+        write_manifest(
+            &plugin,
+            json!({
+                "name": "review-tools",
+                "version": "1.0.0",
+                "description": "Review helpers"
+            }),
+        );
+        write_skill(
+            &plugin,
+            "review",
+            "---\nname: review\ndescription: Review\n---\nUNIQUE-PRIVATE-PLUGIN-BODY",
+        );
+        let host = PluginHost::new(data.path().to_path_buf(), ProjectionDb::memory().unwrap());
+        host.scan().unwrap();
+
+        let index = host.index.read().expect("plugin index lock poisoned");
+        let debug = format!("{:?}", index["review-tools@local"].skills["review"]);
+
+        assert!(!debug.contains("UNIQUE-PRIVATE-PLUGIN-BODY"));
+        assert!(debug.contains("review"));
     }
 
     #[test]
