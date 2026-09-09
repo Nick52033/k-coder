@@ -46,7 +46,37 @@ export interface ImageAttachment { name: string; dataUrl: string; ocrText?: stri
 export interface GitFileStatus { path: string; indexStatus: string; worktreeStatus: string; }
 export interface GitStatusView { isRepository: boolean; branch: string | null; upstream: string | null; ahead: number; behind: number; files: GitFileStatus[]; }
 export interface GitBranchView { current: string | null; branches: string[]; }
-export interface UsageSummary { inputTokens: number; outputTokens: number; totalTokens: number; providerCalls: number; }
+export interface DailyUsageSummary {
+  date: string;
+  providerCalls: number;
+  inputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+}
+export interface UsageTokenBreakdown {
+  inputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+  cachedInputTokens: number | null;
+  uncachedInputTokens: number | null;
+  cacheWriteInputTokens: number | null;
+  reasoningOutputTokens: number | null;
+  replyOutputTokens: number | null;
+  cacheHitRate: number | null;
+  estimatedCostUsd: number | null;
+}
+export interface ModelUsageSummary extends UsageTokenBreakdown {
+  provider: string | null;
+  model: string | null;
+  providerCalls: number;
+}
+export interface UsageSummary extends UsageTokenBreakdown {
+  schemaVersion: number;
+  trendDays: number;
+  providerCalls: number;
+  daily: DailyUsageSummary[];
+  models: ModelUsageSummary[];
+}
 export interface ProviderConnectionTest { connected: boolean; latencyMs: number; usage: TokenUsage | null; }
 export interface InstructionSource { path: string; scope: string; priority: number; bytes: number; }
 export type SkillCategory = "requirements_planning" | "development_delivery" | "quality_review" | "testing" | "design_experience" | "data_documents" | "observability" | "integration_automation" | "extension_platform" | "other";
@@ -96,6 +126,10 @@ export interface CreateSubagentRequest {
   capabilities?: string[];
   tokenBudget?: number;
   timeoutMs?: number;
+  /** `"none"` (default) | `"all"` | positive integer of parent turns to replay. */
+  forkTurns?: string;
+  /** Omit for a direct child; set to a subagent id to delegate one level deeper. */
+  parentAgentId?: string;
 }
 export interface SubagentView {
   schemaVersion: number;
@@ -107,6 +141,11 @@ export interface SubagentView {
   task: string;
   state: SubagentState;
   depth: number;
+  /** Canonical path in the delegation tree, e.g. `/root/1a2b3c`. */
+  agentPath: string;
+  /** How the thread was seeded from the parent: `null`, `"all"`, or `"<n>"`. */
+  forkMode: string | null;
+  turnCount: number;
   workspaceRoot: string;
   capabilities: string[];
   tokenBudget: number | null;

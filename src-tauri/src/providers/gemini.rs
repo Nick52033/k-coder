@@ -14,7 +14,7 @@ use super::{
     Provider, ProviderConfig, ProviderError, ProviderEvent, ProviderMessage, ProviderRequest,
     ProviderStream,
 };
-use crate::protocol::{MessageRole, ReasoningEffort, TokenUsage, ToolCall};
+use crate::protocol::{MessageRole, ReasoningEffort, TokenUsage, TokenUsageDetails, ToolCall};
 
 pub struct GoogleGeminiProvider {
     client: Client,
@@ -93,6 +93,8 @@ struct GeminiUsage {
     prompt_token_count: u64,
     #[serde(default)]
     candidates_token_count: u64,
+    cached_content_token_count: Option<u64>,
+    thoughts_token_count: Option<u64>,
     total_token_count: Option<u64>,
 }
 
@@ -390,14 +392,31 @@ fn parse_sse_data(data: &str, reasoning_item_id: &str) -> Result<ParsedGeminiEve
         }
     }
     if let Some(usage) = response.usage_metadata {
-        events.push(ProviderEvent::Usage {
-            usage: TokenUsage {
-                input_tokens: usage.prompt_token_count,
-                output_tokens: usage.candidates_token_count,
-                total_tokens: usage
-                    .total_token_count
-                    .unwrap_or(usage.prompt_token_count + usage.candidates_token_count),
-            },
+        let output_tokens = usage
+            .candidates_token_count
+            .saturating_add(usage.thoughts_token_count.unwrap_or(0));
+        let token_usage = TokenUsage {
+            input_tokens: usage.prompt_token_count,
+            output_tokens,
+            total_tokens: usage
+                .total_token_count
+                .unwrap_or(usage.prompt_token_count.saturating_add(output_tokens)),
+        };
+        let details = TokenUsageDetails {
+            cached_input_tokens: usage.cached_content_token_count,
+            uncached_input_tokens: usage
+                .cached_content_token_count
+                .and_then(|cached| usage.prompt_token_count.checked_sub(cached)),
+            cache_write_input_tokens: None,
+            reasoning_output_tokens: usage.thoughts_token_count,
+        };
+        events.push(if details.is_empty() {
+            ProviderEvent::Usage { usage: token_usage }
+        } else {
+            ProviderEvent::DetailedUsage {
+                usage: token_usage,
+                details,
+            }
         });
     }
     let finish_reason = candidate
@@ -469,6 +488,25 @@ mod tests {
             matches!(&parsed.events[1], ProviderEvent::ToolCall { call } if call.id == "call-1" && call.metadata["thoughtSignature"] == "opaque")
         );
         assert!(parsed.completed);
+    }
+
+    #[test]
+    fn parses_gemini_cache_and_thought_usage() {
+        let parsed = parse_sse_data(
+            r#"{"candidates":[{"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":100,"cachedContentTokenCount":30,"candidatesTokenCount":20,"thoughtsTokenCount":10,"totalTokenCount":130}}"#,
+            "reasoning-1",
+        )
+        .unwrap();
+
+        assert!(matches!(
+            parsed.events.as_slice(),
+            [ProviderEvent::DetailedUsage { usage, details }]
+                if *usage == TokenUsage { input_tokens: 100, output_tokens: 30, total_tokens: 130 }
+                    && details.cached_input_tokens == Some(30)
+                    && details.uncached_input_tokens == Some(70)
+                    && details.cache_write_input_tokens.is_none()
+                    && details.reasoning_output_tokens == Some(10)
+        ));
     }
 
     #[test]

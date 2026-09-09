@@ -942,14 +942,10 @@ impl AppState {
                 label,
             });
         }
-        let provider = if targets.len() == 1 {
-            targets.remove(0).provider
-        } else {
-            Arc::new(FallbackProvider::new(
-                targets,
-                self.advanced.metrics.clone(),
-            )?) as Arc<dyn Provider>
-        };
+        let provider = Arc::new(FallbackProvider::new(
+            targets,
+            self.advanced.metrics.clone(),
+        )?) as Arc<dyn Provider>;
         Ok((provider, model, context_limit))
     }
 
@@ -1496,7 +1492,7 @@ fn provider_target_specs(
         candidates.push((
             config.base_url.clone(),
             fallback.id.clone(),
-            format!("{} / {}", config.name, fallback.display_name),
+            config.name.clone(),
             model_supports_vision(config, fallback),
         ));
     }
@@ -1511,7 +1507,7 @@ fn provider_target_specs(
             candidates.push((
                 endpoint.base_url.clone(),
                 fallback.id.clone(),
-                format!("{} / {}", endpoint.name, fallback.display_name),
+                endpoint.name.clone(),
                 model_supports_vision(config, fallback),
             ));
         }

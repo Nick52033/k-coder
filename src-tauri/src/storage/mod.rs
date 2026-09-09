@@ -25,8 +25,8 @@ use crate::protocol::{
     ApprovalResolution, ApprovalSnapshot, ChangeSet, ChatMessage, ContentBlock,
     HistorySortDirection, MessageRole, PROTOCOL_VERSION, ThreadHistorySnapshot, ThreadItem,
     ThreadItemEntry, ThreadItemPayload, ThreadItemsPage, ThreadTurn, ThreadTurnsPage, TodoItem,
-    TokenUsage, ToolCall, ToolResult, TurnError, TurnItemsView, TurnState, UserInputAction,
-    UserInputRequest, UserInputResolution,
+    TokenUsage, TokenUsageDetails, ToolCall, ToolResult, TurnError, TurnItemsView, TurnState,
+    UserInputAction, UserInputRequest, UserInputResolution,
 };
 
 mod history_pagination;
@@ -34,7 +34,7 @@ mod writer;
 
 use writer::ThreadWriters;
 
-pub const EVENT_SCHEMA_VERSION: u32 = 9;
+pub const EVENT_SCHEMA_VERSION: u32 = 10;
 
 fn default_in_project() -> bool {
     true
@@ -136,6 +136,12 @@ pub enum StoredEventKind {
     ProviderCallUsage {
         call_index: u32,
         usage: TokenUsage,
+        #[serde(default, skip_serializing_if = "TokenUsageDetails::is_empty")]
+        details: TokenUsageDetails,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
     },
     ContextCompacted {
         summary: CompactionSummary,
@@ -1136,7 +1142,9 @@ fn project_thread(thread_id: &str, events: &[StoredEvent]) -> Result<ThreadDetai
                     Some(format!("{provider} · {context_type}{provider_item_id}")),
                 );
             }
-            StoredEventKind::ProviderCallUsage { call_index, usage } => {
+            StoredEventKind::ProviderCallUsage {
+                call_index, usage, ..
+            } => {
                 last_usage = Some(add_token_usage(last_usage.unwrap_or_default(), *usage));
                 context_usage = Some(*usage);
                 push_timeline_event(
@@ -2540,10 +2548,16 @@ mod tests {
             StoredEventKind::ProviderCallUsage {
                 call_index: 0,
                 usage: first_usage,
+                details: TokenUsageDetails::default(),
+                provider: None,
+                model: None,
             },
             StoredEventKind::ProviderCallUsage {
                 call_index: 1,
                 usage: latest_usage,
+                details: TokenUsageDetails::default(),
+                provider: None,
+                model: None,
             },
         ] {
             repository
@@ -3650,6 +3664,48 @@ mod tests {
         fs::remove_file(directory.path().join("k-coder.db")).unwrap();
         let rebuilt = JsonlThreadRepository::new(directory.path()).unwrap();
         assert_eq!(rebuilt.list_threads().await.unwrap()[0].id, thread_id);
+    }
+
+    #[test]
+    fn legacy_provider_usage_event_defaults_new_tracking_fields() {
+        let event = StoredEvent::new(
+            "thread-1",
+            Some("turn-1".into()),
+            StoredEventKind::ProviderCallUsage {
+                call_index: 0,
+                usage: TokenUsage {
+                    input_tokens: 10,
+                    output_tokens: 2,
+                    total_tokens: 12,
+                },
+                details: TokenUsageDetails {
+                    cached_input_tokens: Some(4),
+                    uncached_input_tokens: Some(6),
+                    cache_write_input_tokens: None,
+                    reasoning_output_tokens: Some(1),
+                },
+                provider: Some("openai".into()),
+                model: Some("gpt-test".into()),
+            },
+        );
+        let mut legacy = serde_json::to_value(event).unwrap();
+        legacy["schemaVersion"] = serde_json::json!(9);
+        let data = legacy["data"].as_object_mut().unwrap();
+        data.remove("details");
+        data.remove("provider");
+        data.remove("model");
+
+        let restored: StoredEvent = serde_json::from_value(legacy).unwrap();
+
+        assert!(matches!(
+            restored.kind,
+            StoredEventKind::ProviderCallUsage {
+                details,
+                provider: None,
+                model: None,
+                ..
+            } if details.is_empty()
+        ));
     }
 
     #[tokio::test]

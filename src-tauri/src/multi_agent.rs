@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -12,25 +12,72 @@ use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use crate::agent::mailbox::TurnControl;
 use crate::agent::{AgentRuntime, EventPublisher, RunTurnRequest};
 use crate::logging::StructuredLogger;
 use crate::policy::ApprovalManager;
 use crate::protocol::{
-    AgentEvent, AgentEventEnvelope, ApprovalMode, ReasoningEffort, TokenUsage, ToolDefinition,
-    ToolResult, ToolRisk, TurnState,
+    AgentEvent, AgentEventEnvelope, ApprovalMode, ChatMessage, ContentBlock, MessageRole,
+    PROTOCOL_VERSION, ReasoningEffort, TokenUsage, ToolDefinition, ToolResult, ToolRisk, TurnState,
 };
 use crate::providers::Provider;
 use crate::storage::{JsonlThreadRepository, StoredEventKind, ThreadRepository, now_ms};
 use crate::tools::{ToolContext, ToolError, ToolHandler, ToolRegistry};
 
-pub const MAX_SUBAGENT_DEPTH: u8 = 1;
+/// Soft delegation depth. Sub-agents may spawn their own sub-agents, but the tree is
+/// capped so recursive delegation cannot run away with the budget or the cancellation scope.
+pub const MAX_SUBAGENT_DEPTH: u8 = 3;
 pub const MAX_ACTIVE_SUBAGENTS: usize = 4;
 pub const MAX_SUBAGENT_RUNTIME_MS: u64 = 30 * 60 * 1_000;
 const DEFAULT_SUBAGENT_RUNTIME_MS: u64 = 10 * 60 * 1_000;
 const MAX_TASK_BYTES: usize = 100_000;
 const MAX_MESSAGE_BYTES: usize = 100_000;
 const MAX_SUMMARY_BYTES: usize = 32 * 1024;
+const MAX_QUEUED_MESSAGES: usize = 32;
 const STORE_SCHEMA_VERSION: u32 = 1;
+const ROOT_AGENT_PATH: &str = "/root";
+
+/// How much of the parent conversation a sub-agent inherits at creation time.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ForkMode {
+    /// Start from an empty thread: only the task text is visible.
+    None,
+    /// Replay the whole parent history.
+    All,
+    /// Replay only the last `n` parent turns.
+    LastNTurns(usize),
+}
+
+impl ForkMode {
+    /// Parses the model-facing `forkTurns` argument (`"none"`, `"all"`, or a positive integer).
+    pub fn parse(value: Option<&str>) -> Result<Self, MultiAgentError> {
+        let raw = value.map(str::trim).unwrap_or("none");
+        if raw.is_empty() || raw.eq_ignore_ascii_case("none") {
+            return Ok(Self::None);
+        }
+        if raw.eq_ignore_ascii_case("all") {
+            return Ok(Self::All);
+        }
+        let turns = raw.parse::<usize>().map_err(|_| {
+            MultiAgentError::Invalid("forkTurns must be `none`, `all`, or a positive integer".into())
+        })?;
+        if turns == 0 {
+            return Err(MultiAgentError::Invalid(
+                "forkTurns must be `none`, `all`, or a positive integer".into(),
+            ));
+        }
+        Ok(Self::LastNTurns(turns))
+    }
+
+    fn as_stored(self) -> Option<String> {
+        match self {
+            Self::None => None,
+            Self::All => Some("all".into()),
+            Self::LastNTurns(turns) => Some(turns.to_string()),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -63,10 +110,17 @@ pub struct CreateSubagentRequest {
     pub token_budget: Option<u64>,
     #[serde(default = "default_timeout_ms")]
     pub timeout_ms: u64,
+    /// `"none"` (default), `"all"`, or a positive integer of parent turns to replay.
+    #[serde(default)]
+    pub fork_turns: Option<String>,
 }
 
 fn default_timeout_ms() -> u64 {
     DEFAULT_SUBAGENT_RUNTIME_MS
+}
+
+fn default_agent_path() -> String {
+    ROOT_AGENT_PATH.to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -81,6 +135,14 @@ pub struct SubagentView {
     pub task: String,
     pub state: SubagentState,
     pub depth: u8,
+    /// Canonical path in the delegation tree, e.g. `/root/1a2b3c/9f8e7d`.
+    #[serde(default = "default_agent_path")]
+    pub agent_path: String,
+    /// How the thread was seeded from the parent: `None`, `"all"`, or `"<n>"`.
+    #[serde(default)]
+    pub fork_mode: Option<String>,
+    #[serde(default)]
+    pub turn_count: u32,
     pub workspace_root: String,
     pub capabilities: Vec<String>,
     pub token_budget: Option<u64>,
@@ -129,7 +191,55 @@ pub struct SubagentExecutionContext {
 struct ActiveSubagent {
     cancellation: CancellationToken,
     notify: Arc<Notify>,
+    /// Steer channel for the running turn. Used for `trigger_turn` delivery while active.
+    control: Arc<TurnControl>,
+    /// Queue-only delivery: drained into the next turn's input instead of interrupting.
+    mailbox: Arc<Mutex<VecDeque<String>>>,
     _permit: OwnedSemaphorePermit,
+}
+
+fn user_text_message(text: String) -> ChatMessage {
+    ChatMessage {
+        schema_version: PROTOCOL_VERSION,
+        id: Uuid::new_v4().to_string(),
+        role: MessageRole::User,
+        content: vec![ContentBlock::Text { text }],
+        created_at_ms: now_ms(),
+    }
+}
+
+/// Prepends queued queue-only messages to the input of the next turn.
+fn merge_queued_input(
+    input: Option<String>,
+    mailbox: &Arc<Mutex<VecDeque<String>>>,
+) -> Result<Option<String>, MultiAgentError> {
+    let queued = {
+        let mut queue = mailbox
+            .lock()
+            .map_err(|_| MultiAgentError::Storage("subagent mailbox lock poisoned".into()))?;
+        queue.drain(..).collect::<Vec<_>>()
+    };
+    if queued.is_empty() {
+        return Ok(input);
+    }
+    let mut parts = queued;
+    if let Some(input) = input {
+        if !input.trim().is_empty() {
+            parts.push(input);
+        }
+    }
+    Ok(Some(parts.join("\n\n")))
+}
+
+/// Resolves the turn id that ends the `n`-th-from-last turn of a thread.
+fn turn_id_n_from_end(events: &[crate::storage::StoredEvent], turns: usize) -> Option<String> {
+    let started = events
+        .iter()
+        .filter(|event| matches!(event.kind, StoredEventKind::TurnStarted))
+        .filter_map(|event| event.turn_id.clone())
+        .collect::<Vec<_>>();
+    let index = started.len().checked_sub(turns)?;
+    started.get(index).cloned()
 }
 
 struct SubagentStore {
@@ -209,6 +319,8 @@ struct CoordinatorInner {
     store: SubagentStore,
     records: Mutex<HashMap<String, SubagentView>>,
     active: Mutex<HashMap<String, ActiveSubagent>>,
+    /// Queue-only messages, kept across turns so a follow-up survives until it is delivered.
+    mailboxes: Mutex<HashMap<String, Arc<Mutex<VecDeque<String>>>>>,
     permits: Arc<Semaphore>,
 }
 
@@ -238,6 +350,7 @@ impl MultiAgentCoordinator {
                 store,
                 records: Mutex::new(records),
                 active: Mutex::new(HashMap::new()),
+                mailboxes: Mutex::new(HashMap::new()),
                 permits: Arc::new(Semaphore::new(MAX_ACTIVE_SUBAGENTS)),
             }),
         })
@@ -286,16 +399,38 @@ impl MultiAgentCoordinator {
     ) -> Result<SubagentView, MultiAgentError> {
         validate_request(&request, &context.tools, parent_agent_id.as_deref(), self)?;
         let permit = self.acquire_permit()?;
-        let thread = context
-            .repository
-            .create_thread()
-            .await
-            .map_err(|error| MultiAgentError::Runtime(error.to_string()))?;
+        let fork_mode = ForkMode::parse(request.fork_turns.as_deref())?;
+        let parent_path = parent_agent_id
+            .as_deref()
+            .map(|id| self.get(id).map(|parent| parent.agent_path.clone()))
+            .transpose()?;
         let depth = parent_agent_id
             .as_deref()
             .map(|id| self.get(id).map(|parent| parent.depth + 1))
             .transpose()?
             .unwrap_or(1);
+        let thread = match fork_mode {
+            ForkMode::None => context.repository.create_thread().await,
+            ForkMode::All => {
+                context
+                    .repository
+                    .fork_thread(&request.parent_thread_id, None)
+                    .await
+            }
+            ForkMode::LastNTurns(turns) => {
+                let events = context
+                    .repository
+                    .load(&request.parent_thread_id)
+                    .await
+                    .map_err(|error| MultiAgentError::Runtime(error.to_string()))?;
+                let last_turn_id = turn_id_n_from_end(&events, turns);
+                context
+                    .repository
+                    .fork_thread(&request.parent_thread_id, last_turn_id.as_deref())
+                    .await
+            }
+        }
+        .map_err(|error| MultiAgentError::Runtime(error.to_string()))?;
         let id = Uuid::new_v4().to_string();
         let timestamp = now_ms();
         let capabilities = normalized_capabilities(&request.capabilities);
@@ -312,6 +447,13 @@ impl MultiAgentCoordinator {
             task: request.task.trim().to_string(),
             state: SubagentState::Queued,
             depth,
+            agent_path: format!(
+                "{}/{}",
+                parent_path.as_deref().unwrap_or(ROOT_AGENT_PATH),
+                &id[..6]
+            ),
+            fork_mode: fork_mode.as_stored(),
+            turn_count: 0,
             workspace_root: context.workspace_root.to_string_lossy().into_owned(),
             capabilities,
             token_budget: request.token_budget,
@@ -335,22 +477,32 @@ impl MultiAgentCoordinator {
         self.get(&record.id)
     }
 
+    /// Delivers a message to a sub-agent.
+    ///
+    /// A running sub-agent receives the message in place: `trigger_turn` steers the active
+    /// turn immediately, while queue-only delivery is drained into the next turn's input.
+    /// An inactive sub-agent starts a fresh turn and therefore needs a concurrency permit.
     pub async fn send_message(
         &self,
         id: &str,
         message: String,
         context: SubagentExecutionContext,
+        trigger_turn: bool,
     ) -> Result<SubagentView, MultiAgentError> {
         if message.trim().is_empty() || message.len() > MAX_MESSAGE_BYTES {
             return Err(MultiAgentError::Invalid(
                 "message must contain 1 to 100000 bytes".into(),
             ));
         }
+        let trimmed = message.trim().to_string();
+        if let Some(view) = self.try_deliver_to_active(id, trimmed.clone(), trigger_turn)? {
+            return Ok(view);
+        }
         self.ensure_inactive(id)?;
         let permit = self.acquire_permit()?;
         self.launch(
             id.to_string(),
-            Some(message.trim().into()),
+            Some(trimmed),
             false,
             context,
             CancellationToken::new(),
@@ -358,6 +510,44 @@ impl MultiAgentCoordinator {
         )
         .await?;
         self.get(id)
+    }
+
+    /// Returns `None` when the sub-agent is not currently running.
+    fn try_deliver_to_active(
+        &self,
+        id: &str,
+        message: String,
+        trigger_turn: bool,
+    ) -> Result<Option<SubagentView>, MultiAgentError> {
+        let handle = {
+            let active = self
+                .inner
+                .active
+                .lock()
+                .map_err(|_| MultiAgentError::Storage("subagent active lock poisoned".into()))?;
+            active
+                .get(id)
+                .map(|active| (Arc::clone(&active.control), Arc::clone(&active.mailbox)))
+        };
+        let Some((control, mailbox)) = handle else {
+            return Ok(None);
+        };
+        if trigger_turn {
+            control.steer(user_text_message(message)).map_err(|_| {
+                MultiAgentError::Runtime("subagent no longer accepts input".to_string())
+            })?;
+        } else {
+            let mut queue = mailbox
+                .lock()
+                .map_err(|_| MultiAgentError::Storage("subagent mailbox lock poisoned".into()))?;
+            if queue.len() >= MAX_QUEUED_MESSAGES {
+                return Err(MultiAgentError::Limit(format!(
+                    "at most {MAX_QUEUED_MESSAGES} messages may be queued for a running subagent"
+                )));
+            }
+            queue.push_back(message);
+        }
+        self.get(id).map(Some)
     }
 
     pub async fn resume(
@@ -405,9 +595,28 @@ impl MultiAgentCoordinator {
         permit: OwnedSemaphorePermit,
     ) -> Result<(), MultiAgentError> {
         let record = self.get(&id)?;
-        let allowed_tools = context.tools.restricted_to(&record.capabilities)?;
+        // Delegation tools are re-injected per subagent so a child can delegate one level
+        // deeper. Its own children inherit this set, which keeps delegation recursive while
+        // every capability still has to be a subset of what the parent registry exposes.
+        let available_tools = {
+            let child_context = SubagentExecutionContext {
+                tools: context.tools.clone(),
+                ..context.clone()
+            };
+            let (handlers, risks) = delegation_tools(
+                self.clone(),
+                child_context,
+                record.thread_id.clone(),
+                parent_cancellation.child_token(),
+            );
+            context.tools.with_additional_handlers(handlers, risks)?
+        };
+        let allowed_tools = available_tools.restricted_to(&record.capabilities)?;
         let cancellation = parent_cancellation.child_token();
         let notify = Arc::new(Notify::new());
+        let control = TurnControl::new();
+        let mailbox = self.mailbox_for(&id)?;
+        let input = merge_queued_input(input, &mailbox)?;
         self.inner
             .active
             .lock()
@@ -417,6 +626,8 @@ impl MultiAgentCoordinator {
                 ActiveSubagent {
                     cancellation: cancellation.clone(),
                     notify: notify.clone(),
+                    control: Arc::clone(&control),
+                    mailbox: Arc::clone(&mailbox),
                     _permit: permit,
                 },
             );
@@ -466,7 +677,7 @@ impl MultiAgentCoordinator {
                         .await
                 } else {
                     runtime
-                        .run_turn(
+                        .run_turn_with_attachments_id_and_control(
                             context.provider.clone(),
                             context.model.clone(),
                             RunTurnRequest {
@@ -474,7 +685,10 @@ impl MultiAgentCoordinator {
                                 input: input.unwrap_or_default(),
                                 agent_mode: None,
                             },
+                            Vec::new(),
+                            Uuid::new_v4().to_string(),
                             cancellation.clone(),
+                            Arc::clone(&control),
                             publisher,
                         )
                         .await
@@ -521,6 +735,7 @@ impl MultiAgentCoordinator {
                 Some(record.tokens_used.saturating_add(usage.total_tokens)),
                 &context.lifecycle_events,
             );
+            let _ = manager.bump_turn_count(&id, &context.lifecycle_events);
             if let Ok(mut active) = manager.inner.active.lock() {
                 active.remove(&id);
             }
@@ -585,6 +800,37 @@ impl MultiAgentCoordinator {
                 }
             }
         }
+    }
+
+    fn mailbox_for(&self, id: &str) -> Result<Arc<Mutex<VecDeque<String>>>, MultiAgentError> {
+        let mut mailboxes = self
+            .inner
+            .mailboxes
+            .lock()
+            .map_err(|_| MultiAgentError::Storage("subagent mailbox lock poisoned".into()))?;
+        Ok(Arc::clone(mailboxes.entry(id.to_string()).or_default()))
+    }
+
+    fn bump_turn_count(
+        &self,
+        id: &str,
+        publisher: &Arc<dyn SubagentEventPublisher>,
+    ) -> Result<(), MultiAgentError> {
+        let record = {
+            let mut records = self
+                .inner
+                .records
+                .lock()
+                .map_err(|_| MultiAgentError::Storage("subagent record lock poisoned".into()))?;
+            let record = records
+                .get_mut(id)
+                .ok_or_else(|| MultiAgentError::NotFound(id.into()))?;
+            record.turn_count = record.turn_count.saturating_add(1);
+            record.clone()
+        };
+        self.inner.store.append(&record)?;
+        publisher.publish(record);
+        Ok(())
     }
 
     fn ensure_inactive(&self, id: &str) -> Result<(), MultiAgentError> {
@@ -879,7 +1125,7 @@ impl ToolHandler for AgentToolHandler {
             AgentToolOperation::Create => (
                 "create_agent",
                 "Create a bounded subagent for an independent task.",
-                json!({"task":{"type":"string"},"label":{"type":"string"},"capabilities":{"type":"array","items":{"type":"string"}},"tokenBudget":{"type":"integer","minimum":1},"timeoutMs":{"type":"integer","minimum":1}}),
+                json!({"task":{"type":"string"},"label":{"type":"string"},"capabilities":{"type":"array","items":{"type":"string"}},"tokenBudget":{"type":"integer","minimum":1},"timeoutMs":{"type":"integer","minimum":1},"forkTurns":{"type":"string","description":"`none` (default) starts an empty thread, `all` replays the parent history, or a positive integer replays the last N parent turns."},"parentAgentId":{"type":"string","description":"Omit for a direct child of this agent; set to a subagent id to delegate one level deeper."}}),
                 vec!["task"],
             ),
             AgentToolOperation::Wait => (
@@ -890,8 +1136,8 @@ impl ToolHandler for AgentToolHandler {
             ),
             AgentToolOperation::Send => (
                 "send_agent_message",
-                "Send a follow-up message to an inactive subagent.",
-                json!({"agentId":{"type":"string"},"message":{"type":"string"}}),
+                "Send a follow-up message to a subagent. While it is running, `triggerTurn` steers the active turn immediately; otherwise the message is queued for its next turn.",
+                json!({"agentId":{"type":"string"},"message":{"type":"string"},"triggerTurn":{"type":"boolean","description":"Defaults to true: interrupt and steer the running turn. Set false to queue without interrupting."}}),
                 vec!["agentId", "message"],
             ),
             AgentToolOperation::Resume => (
@@ -952,8 +1198,9 @@ impl ToolHandler for AgentToolHandler {
                                 .get("timeoutMs")
                                 .and_then(Value::as_u64)
                                 .unwrap_or(DEFAULT_SUBAGENT_RUNTIME_MS),
+                            fork_turns: optional_string_arg(&arguments, "forkTurns"),
                         },
-                        None,
+                        optional_string_arg(&arguments, "parentAgentId"),
                         self.context.clone(),
                         self.parent_cancellation.child_token(),
                     )
@@ -979,6 +1226,10 @@ impl ToolHandler for AgentToolHandler {
                         &agent_id,
                         string_arg(&arguments, "message")?,
                         self.context.clone(),
+                        arguments
+                            .get("triggerTurn")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(true),
                     )
                     .await
             }
@@ -1083,6 +1334,7 @@ mod tests {
             capabilities: Vec::new(),
             token_budget: None,
             timeout_ms: DEFAULT_SUBAGENT_RUNTIME_MS,
+            fork_turns: None,
         }
     }
 
@@ -1124,8 +1376,10 @@ mod tests {
         let data = tempfile::tempdir().unwrap();
         let workspace = tempfile::tempdir().unwrap();
         let repository = Arc::new(JsonlThreadRepository::new(data.path()).unwrap());
+        // Each scripted turn sleeps once per event, so a serial run costs ~4 delays and a
+        // concurrent run ~2. The budget sits between them to keep the assertion meaningful.
         let provider = Arc::new(
-            FakeProvider::text(&["parallel result"]).with_delay(Duration::from_millis(100)),
+            FakeProvider::text(&["parallel result"]).with_delay(Duration::from_millis(200)),
         );
         let lifecycle = Arc::new(RecordingLifecycle::default());
         let manager = MultiAgentCoordinator::new(data.path()).unwrap();
@@ -1162,7 +1416,9 @@ mod tests {
 
         assert_eq!(first.unwrap().state, SubagentState::Completed);
         assert_eq!(second.unwrap().summary.as_deref(), Some("parallel result"));
-        assert!(started.elapsed() < Duration::from_millis(350));
+        // Serial execution would take at least two provider delays; keep the budget wide
+        // enough that a loaded CI machine does not turn this into a flake.
+        assert!(started.elapsed() < Duration::from_millis(600));
     }
 
     #[tokio::test]
@@ -1271,17 +1527,6 @@ mod tests {
                 .await,
             Err(MultiAgentError::Limit(_))
         ));
-        assert!(matches!(
-            manager
-                .create(
-                    request("parent", "nested"),
-                    Some(active[0].id.clone()),
-                    runtime_context,
-                    parent_cancel.child_token(),
-                )
-                .await,
-            Err(MultiAgentError::Limit(_))
-        ));
         parent_cancel.cancel();
         for agent in active {
             let stopped = manager
@@ -1290,6 +1535,90 @@ mod tests {
                 .unwrap();
             assert_eq!(stopped.state, SubagentState::Cancelled);
         }
+    }
+
+    #[tokio::test]
+    async fn nested_delegation_is_allowed_up_to_the_depth_limit() {
+        let data = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let repository = Arc::new(JsonlThreadRepository::new(data.path()).unwrap());
+        let provider = Arc::new(FakeProvider::text(&["late"]).with_delay(Duration::from_secs(10)));
+        let manager = MultiAgentCoordinator::new(data.path()).unwrap();
+        let parent_cancel = CancellationToken::new();
+        let runtime_context = context(
+            repository,
+            workspace.path(),
+            provider,
+            Arc::new(NoopSubagentPublisher),
+        );
+
+        let mut parent_agent_id: Option<String> = None;
+        let mut deepest = 0u8;
+        for attempt in 0..MAX_SUBAGENT_DEPTH as usize + 1 {
+            let result = manager
+                .create(
+                    request("parent", &format!("nested {attempt}")),
+                    parent_agent_id.clone(),
+                    runtime_context.clone(),
+                    parent_cancel.child_token(),
+                )
+                .await;
+            match result {
+                Ok(view) => {
+                    assert!(view.agent_path.starts_with("/root/"));
+                    assert_eq!(
+                        view.agent_path.matches('/').count() - 1,
+                        view.depth as usize
+                    );
+                    deepest = view.depth;
+                    parent_agent_id = Some(view.id);
+                }
+                Err(MultiAgentError::Limit(_)) => break,
+                Err(error) => panic!("unexpected subagent error: {error:?}"),
+            }
+        }
+        assert_eq!(deepest, MAX_SUBAGENT_DEPTH);
+        parent_cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn queue_only_message_is_delivered_without_interrupting_the_active_turn() {
+        let data = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let repository = Arc::new(JsonlThreadRepository::new(data.path()).unwrap());
+        let provider = Arc::new(FakeProvider::text(&["late"]).with_delay(Duration::from_secs(10)));
+        let manager = MultiAgentCoordinator::new(data.path()).unwrap();
+        let parent_cancel = CancellationToken::new();
+        let runtime_context = context(
+            repository,
+            workspace.path(),
+            provider,
+            Arc::new(NoopSubagentPublisher),
+        );
+        let agent = manager
+            .create(
+                request("parent", "slow task"),
+                None,
+                runtime_context.clone(),
+                parent_cancel.child_token(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(agent.state, SubagentState::Running);
+
+        // A running subagent accepts the message in place and keeps running.
+        let queued = manager
+            .send_message(&agent.id, "remember this".into(), runtime_context, false)
+            .await
+            .unwrap();
+        assert_eq!(queued.state, SubagentState::Running);
+
+        parent_cancel.cancel();
+        let stopped = manager
+            .wait(&agent.id, 2_000, CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(stopped.state, SubagentState::Cancelled);
     }
 
     #[tokio::test]
@@ -1367,7 +1696,7 @@ mod tests {
         assert_eq!(completed.summary.as_deref(), Some("first result"));
 
         manager
-            .send_message(&agent.id, "follow up".into(), runtime_context)
+            .send_message(&agent.id, "follow up".into(), runtime_context, true)
             .await
             .unwrap();
         let failed = manager

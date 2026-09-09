@@ -345,8 +345,12 @@ export function waitSubagent(agentId: string, timeoutMs = 30_000) {
   return invoke<SubagentView>("wait_subagent", { agentId, timeoutMs });
 }
 
-export function sendSubagentMessage(agentId: string, message: string) {
-  return invoke<SubagentView>("send_subagent_message", { agentId, message });
+export function sendSubagentMessage(
+  agentId: string,
+  message: string,
+  triggerTurn = true,
+) {
+  return invoke<SubagentView>("send_subagent_message", { agentId, message, triggerTurn });
 }
 
 export function resumeSubagent(agentId: string, message?: string) {

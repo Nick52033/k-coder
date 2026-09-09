@@ -5353,10 +5353,62 @@ button {
 .attachment-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .attachment-truncated { display: grid; flex: 0 0 auto; place-items: center; color: var(--color-warning); }
 .attachment-strip button { display: grid; width: 20px; height: 20px; padding: 0; place-items: center; border: 0; background: transparent; cursor: pointer; }
-.usage-summary-grid { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 10px; }
-.usage-summary-grid > div { display: flex; min-height: 92px; padding: 14px; flex-direction: column; justify-content: space-between; border: 1px solid var(--color-border); border-radius: 7px; background: var(--color-surface-raised); }
+.usage-page { padding-bottom: 36px; }
+.usage-page .settings-page-header { margin-bottom: 8px; }
+.usage-loading { padding: 16px 0; color: var(--color-ink-subtle); font-size: var(--font-size-sm); }
+.usage-section { min-width: 0; padding: 20px 0; border-top: 1px solid var(--color-border); }
+.usage-section-header { display: flex; min-width: 0; margin-bottom: 14px; align-items: baseline; justify-content: space-between; gap: 12px; }
+.usage-section-header h4 { margin: 0; color: var(--color-ink); font-size: 14px; font-weight: 680; }
+.usage-section-header > span { flex: 0 0 auto; color: var(--color-ink-subtle); font-size: var(--font-size-xs); }
+.usage-token-list { display: flex; flex-direction: column; }
+.usage-detail-row { display: grid; min-height: 34px; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 16px; color: var(--color-ink-muted); }
+.usage-detail-row > span { min-width: 0; font-size: var(--font-size-base); overflow-wrap: anywhere; }
+.usage-detail-row > strong { color: var(--color-ink); font-family: var(--font-family-mono, monospace); font-size: var(--font-size-base); font-weight: 650; font-variant-numeric: tabular-nums; }
+.usage-detail-row--nested { min-height: 30px; padding-left: 22px; color: var(--color-ink-subtle); }
+.usage-detail-row--nested > span { font-size: var(--font-size-sm); }
+.usage-detail-row--nested > strong { color: var(--color-ink-muted); font-size: var(--font-size-sm); }
+.usage-detail-row--emphasis > span, .usage-detail-row--emphasis > strong { color: var(--color-ink); font-weight: 700; }
+.usage-detail-row--emphasis:first-child > strong { color: var(--color-brand); font-size: 18px; }
+.usage-detail-divider { height: 1px; margin: 4px 0; background: var(--color-border); }
+.usage-trend-chart { min-width: 0; padding: 15px 14px 10px; border: 1px solid var(--color-border); border-radius: 7px; background: var(--color-surface-raised); }
+.usage-trend-plot { display: grid; height: 184px; grid-template-columns: repeat(30, minmax(3px, 1fr)); align-items: end; gap: 4px; border-bottom: 1px solid var(--color-border-strong); }
+.usage-trend-column { display: flex; height: 100%; min-width: 0; align-items: flex-end; justify-content: center; }
+.usage-trend-bar { display: block; width: min(100%, 18px); min-height: 0; border-radius: 3px 3px 0 0; background: var(--color-brand); transition: height var(--transition-fast); }
+.usage-trend-bar[data-has-usage="false"] { height: 2px !important; background: var(--color-border-strong); }
+.usage-trend-labels { display: grid; min-height: 25px; padding-top: 7px; grid-template-columns: repeat(30, minmax(3px, 1fr)); gap: 4px; color: var(--color-ink-subtle); font-size: 10px; font-variant-numeric: tabular-nums; }
+.usage-trend-labels span { overflow: visible; white-space: nowrap; }
+.usage-trend-labels span:last-child { justify-self: end; }
+.usage-model-table-scroll { width: 100%; min-width: 0; overflow-x: auto; border-top: 1px solid var(--color-border); border-bottom: 1px solid var(--color-border); }
+.usage-model-table { width: 100%; min-width: 650px; border-collapse: collapse; color: var(--color-ink-muted); font-size: var(--font-size-sm); font-variant-numeric: tabular-nums; }
+.usage-model-table th { height: 38px; padding: 0 7px; color: var(--color-ink-subtle); font-size: var(--font-size-xs); font-weight: 650; text-align: right; white-space: nowrap; }
+.usage-model-table th:first-child { padding-left: 6px; text-align: left; }
+.usage-model-table td { height: 54px; padding: 8px 7px; border-top: 1px solid var(--color-border); text-align: right; white-space: nowrap; }
+.usage-model-table td:first-child { padding-left: 6px; text-align: left; }
+.usage-model-name { display: grid; min-width: 165px; grid-template-columns: 8px minmax(0, 1fr); align-items: center; gap: 9px; }
+.usage-model-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--color-success); }
+.usage-model-name > div { display: flex; min-width: 0; flex-direction: column; gap: 2px; }
+.usage-model-name strong { max-width: 220px; overflow: hidden; color: var(--color-ink); font-size: var(--font-size-sm); text-overflow: ellipsis; white-space: nowrap; }
+.usage-model-name div > span { color: var(--color-ink-subtle); font-size: var(--font-size-xs); }
+.usage-model-empty { height: 72px !important; color: var(--color-ink-subtle); text-align: center !important; }
+.usage-summary-grid { display: grid; grid-template-columns: repeat(5, minmax(110px, 1fr)); gap: 8px; }
+.usage-summary-grid > div { display: flex; min-height: 76px; padding: 12px; flex-direction: column; justify-content: space-between; border: 1px solid var(--color-border); border-radius: 7px; background: var(--color-surface-raised); }
 .usage-summary-grid span { color: var(--color-ink-subtle); font-size: var(--font-size-sm); }
-.usage-summary-grid strong { color: var(--color-brand); font-size: 22px; font-weight: 650; }
+.usage-summary-grid strong { color: var(--color-brand); font-size: 18px; font-weight: 650; }
+
+@media (max-width: 900px) {
+  .usage-summary-grid { grid-template-columns: repeat(3, minmax(110px, 1fr)); }
+}
+
+@media (max-width: 720px) {
+  .usage-page .settings-page-header { align-items: stretch; flex-direction: column; }
+  .usage-page .settings-command { align-self: flex-start; }
+  .usage-section { padding: 17px 0; }
+  .usage-trend-chart { padding-right: 8px; padding-left: 8px; }
+  .usage-trend-plot { height: 150px; gap: 2px; }
+  .usage-trend-labels { gap: 2px; }
+  .usage-summary-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .usage-summary-grid > div { min-height: 70px; }
+}
 
 .extensions-page { gap: 0; }
 .extensions-page .settings-page-header { margin-bottom: 16px; }

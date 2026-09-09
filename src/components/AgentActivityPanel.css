@@ -1,0 +1,373 @@
+/* Right-hand subagent drawer. Mirrors the workbench panel grid placement so the
+   conversation column keeps its minimum width when the drawer opens. */
+
+.subagent-drawer {
+  grid-column: 3;
+  grid-row: 2;
+  display: none;
+  flex-direction: column;
+  min-height: 0;
+  min-width: 0;
+  overflow: hidden;
+  background: var(--color-surface-panel, var(--color-surface));
+  border-left: 1px solid var(--color-border);
+}
+
+.workbench--panel-open .subagent-drawer {
+  display: flex;
+}
+
+.subagent-drawer-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--color-border);
+}
+
+.subagent-drawer-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: var(--font-size-sm, 13px);
+  font-weight: 600;
+  color: var(--color-ink);
+}
+
+.subagent-drawer-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.subagent-create-form {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--color-border);
+}
+
+.subagent-create-form textarea,
+.subagent-detail-composer textarea {
+  width: 100%;
+  resize: vertical;
+  padding: 8px;
+  border: 1px solid var(--color-border-input, var(--color-border));
+  border-radius: var(--radius-md, 6px);
+  background: var(--color-surface);
+  color: var(--color-ink);
+  font: inherit;
+  font-size: var(--font-size-sm, 13px);
+}
+
+.subagent-create-options {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.subagent-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: var(--font-size-xs, 11px);
+  color: var(--color-ink-muted);
+}
+
+.subagent-field input {
+  padding: 6px 8px;
+  border: 1px solid var(--color-border-input, var(--color-border));
+  border-radius: var(--radius-md, 6px);
+  background: var(--color-surface);
+  color: var(--color-ink);
+  font: inherit;
+}
+
+.subagent-capabilities {
+  display: flex;
+  gap: 12px;
+  font-size: var(--font-size-xs, 11px);
+  color: var(--color-ink-muted);
+}
+
+.subagent-capabilities label {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.subagent-create-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+.subagent-list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.subagent-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 4px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md, 6px);
+  background: var(--color-surface);
+  transition: border-color var(--transition-fast, 120ms ease);
+}
+
+.subagent-row:hover {
+  border-color: var(--color-border-strong, var(--color-brand));
+}
+
+.subagent-row-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 8px;
+  background: none;
+  border: 0;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.subagent-row-icon {
+  display: flex;
+  padding-top: 2px;
+}
+
+.subagent-row-body {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.subagent-row-label {
+  font-size: var(--font-size-sm, 13px);
+  font-weight: 600;
+  color: var(--color-ink);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.subagent-row-meta {
+  font-size: var(--font-size-xs, 11px);
+  color: var(--color-ink-muted);
+}
+
+.subagent-row-summary {
+  font-size: var(--font-size-xs, 11px);
+  color: var(--color-ink-subtle, var(--color-ink-muted));
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.subagent-row-chevron {
+  flex-shrink: 0;
+  margin-top: 2px;
+  color: var(--color-ink-faint, var(--color-ink-muted));
+}
+
+.subagent-row-actions {
+  display: flex;
+  padding: 8px 8px 0 0;
+}
+
+/* Detail view ---------------------------------------------------------- */
+
+.subagent-detail {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  flex: 1;
+}
+
+.subagent-detail-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--color-border);
+}
+
+.subagent-detail-title {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: var(--font-size-sm, 13px);
+}
+
+.subagent-detail-title strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.subagent-detail-state {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: var(--font-size-xs, 11px);
+  white-space: nowrap;
+}
+
+.subagent-detail-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+  margin: 0;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--color-border);
+  font-size: var(--font-size-xs, 11px);
+  color: var(--color-ink-muted);
+}
+
+.subagent-detail-meta div {
+  display: flex;
+  gap: 4px;
+}
+
+.subagent-detail-meta dt {
+  opacity: 0.7;
+}
+
+.subagent-detail-meta dd {
+  margin: 0;
+  color: var(--color-ink);
+}
+
+.subagent-path {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.subagent-detail-stream {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.subagent-message {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.subagent-message-role {
+  font-size: var(--font-size-xs, 11px);
+  color: var(--color-ink-subtle, var(--color-ink-muted));
+}
+
+.subagent-message-body {
+  font-size: var(--font-size-sm, 13px);
+  line-height: 1.55;
+  color: var(--color-ink);
+  overflow-wrap: anywhere;
+}
+
+.subagent-message--user .subagent-message-body {
+  padding: 6px 8px;
+  border-radius: var(--radius-md, 6px);
+  background: var(--color-surface-subtle, var(--color-surface-hover));
+}
+
+.subagent-stream-note {
+  font-size: var(--font-size-xs, 11px);
+  color: var(--color-ink-muted);
+}
+
+.subagent-stream-note--tool {
+  padding-left: 8px;
+  border-left: 2px solid var(--color-border-strong, var(--color-brand));
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.subagent-detail-summary {
+  padding: 8px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md, 6px);
+  background: var(--color-surface-subtle, var(--color-surface));
+  font-size: var(--font-size-sm, 13px);
+}
+
+.subagent-detail-summary p {
+  margin: 4px 0 0;
+  color: var(--color-ink-muted);
+  white-space: pre-wrap;
+}
+
+.subagent-detail-composer {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px 10px;
+  border-top: 1px solid var(--color-border);
+}
+
+.subagent-detail-composer-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: var(--font-size-xs, 11px);
+  color: var(--color-ink-muted);
+}
+
+.subagent-detail-composer-actions label {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.subagent-row--selected {
+  border-color: var(--color-brand);
+  background: var(--color-item-active-bg, var(--color-surface-hover));
+}
+
+/* The thread-list badge becomes a button so a subagent thread can open the drawer. */
+button.subagent-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  cursor: pointer;
+}
+
+button.subagent-badge:hover {
+  color: var(--color-brand);
+}
+
+@media (max-width: 720px) {
+  .subagent-drawer {
+    position: fixed;
+    top: 48px;
+    right: 0;
+    bottom: 0;
+    z-index: 30;
+    width: min(720px, 96vw);
+    box-shadow: -12px 0 28px rgba(0, 0, 0, 0.28);
+  }
+}

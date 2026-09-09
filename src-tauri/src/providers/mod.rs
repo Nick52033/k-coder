@@ -18,7 +18,9 @@ use futures_util::Stream;
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
-use crate::protocol::{MessageRole, ReasoningEffort, TokenUsage, ToolCall, ToolDefinition};
+use crate::protocol::{
+    MessageRole, ReasoningEffort, TokenUsage, TokenUsageDetails, ToolCall, ToolDefinition,
+};
 
 pub use anthropic::AnthropicMessagesProvider;
 pub use config::{
@@ -114,6 +116,14 @@ pub enum ProviderEvent {
     },
     Usage {
         usage: TokenUsage,
+    },
+    DetailedUsage {
+        usage: TokenUsage,
+        details: TokenUsageDetails,
+    },
+    ModelSelected {
+        provider: String,
+        model: String,
     },
     Completed,
 }

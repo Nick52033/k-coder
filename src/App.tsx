@@ -353,6 +353,8 @@ function App() {
     typeof window !== "undefined" && window.matchMedia?.("(prefers-color-scheme: dark)").matches === true,
   );
   const [subagentThreadIds, setSubagentThreadIds] = useState<Set<string>>(new Set());
+  const [subagentByThread, setSubagentByThread] = useState<Record<string, string>>({});
+  const [selectedSubagentId, setSelectedSubagentId] = useState<string | null>(null);
   const [sideView, setSideView] = useState<"conversations" | "projects">("conversations");
   const [workspacePath, setWorkspacePath] = useState("");
   const [recentProjects, setRecentProjects] = useState<ProjectRecord[]>([]);
@@ -518,6 +520,9 @@ function App() {
         if (!disposed) {
           const threadIds = new Set(subagents.map(subagent => subagent.threadId));
           setSubagentThreadIds(threadIds);
+          setSubagentByThread(
+            Object.fromEntries(subagents.map((subagent) => [subagent.threadId, subagent.id])),
+          );
         }
       } catch (error) {
         if (!disposed) setRuntimeError(String(error));
@@ -1790,7 +1795,7 @@ function App() {
   }
 
   return (
-    <main className={cn("workbench", workbenchOpen && "workbench--panel-open")}>
+    <main className={cn("workbench", (workbenchOpen || agentPanelOpen) && "workbench--panel-open")}>
       <header className="titlebar" data-tauri-drag-region>
         <div className="brand" data-tauri-drag-region>
           <span className="brand-mark" aria-hidden="true">
@@ -1960,9 +1965,22 @@ function App() {
                       <MessageSquare size={15} />
                       <span>{thread.title}</span>
                       {isSubagentThread && (
-                        <span className="subagent-badge" title="子智能体线程">
+                        <button
+                          type="button"
+                          className="subagent-badge"
+                          title="在右侧面板查看该子智能体"
+                          aria-label={`查看子智能体 ${thread.title}`}
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            const agentId = subagentByThread[thread.id];
+                            if (!agentId) return;
+                            setWorkbenchOpen(false);
+                            setAgentPanelOpen(true);
+                            setSelectedSubagentId(agentId);
+                          }}
+                        >
                           <Bot size={12} />
-                        </span>
+                        </button>
                       )}
                     </button>
                     <span className="thread-actions">
@@ -2091,9 +2109,22 @@ function App() {
                                     <MessageSquare size={14} />
                                     <span>{thread.title}</span>
                                     {isSubagentThread && (
-                                      <span className="subagent-badge" title="子智能体线程">
+                                      <button
+                                        type="button"
+                                        className="subagent-badge"
+                                        title="在右侧面板查看该子智能体"
+                                        aria-label={`查看子智能体 ${thread.title}`}
+                                        onClick={(event) => {
+                                          event.stopPropagation();
+                                          const agentId = subagentByThread[thread.id];
+                                          if (!agentId) return;
+                                          setWorkbenchOpen(false);
+                                          setAgentPanelOpen(true);
+                                          setSelectedSubagentId(agentId);
+                                        }}
+                                      >
                                         <Bot size={12} />
-                                      </span>
+                                      </button>
                                     )}
                                   </button>
                                   <span className="thread-actions">
@@ -2738,7 +2769,13 @@ function App() {
       </section>
 
       <WorkbenchPanel key={workspaceRevision} open={workbenchOpen} onAttach={(attachment) => appendAttachments([attachment])} />
-      <AgentActivityPanel open={agentPanelOpen} parentThreadId={activeThreadId} onClose={() => setAgentPanelOpen(false)} />
+      <AgentActivityPanel
+        open={agentPanelOpen}
+        parentThreadId={activeThreadId}
+        selectedId={selectedSubagentId}
+        onSelectId={setSelectedSubagentId}
+        onClose={() => setAgentPanelOpen(false)}
+      />
       <ImagePreviewDialog image={previewImage} onClose={() => setPreviewImage(null)} />
       <aside className="activity-panel activity-panel--overlay" aria-hidden="true">
         <div className="activity-list activity-list--hidden">

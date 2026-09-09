@@ -1361,7 +1361,8 @@ pub async fn test_provider_connection(
         .map_err(|_| CommandError::new("provider_timeout", "connection test stream timed out"))?
     {
         match event.map_err(|error| CommandError::new("provider", error))? {
-            ProviderEvent::Usage { usage: value } => usage = Some(value),
+            ProviderEvent::Usage { usage: value }
+            | ProviderEvent::DetailedUsage { usage: value, .. } => usage = Some(value),
             ProviderEvent::Completed => break,
             _ => {}
         }
@@ -2666,6 +2667,7 @@ pub async fn send_subagent_message(
     state: State<'_, AppState>,
     agent_id: String,
     message: String,
+    trigger_turn: Option<bool>,
 ) -> CommandResult<SubagentView> {
     let (provider, model, context_limit) = state
         .build_provider()
@@ -2680,7 +2682,12 @@ pub async fn send_subagent_message(
     );
     state
         .subagents()
-        .send_message(&agent_id, message, context)
+        .send_message(
+            &agent_id,
+            message,
+            context,
+            trigger_turn.unwrap_or(true),
+        )
         .await
         .map_err(multi_agent_command_error)
 }

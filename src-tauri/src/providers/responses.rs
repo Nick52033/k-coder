@@ -16,7 +16,7 @@ use super::{
     Provider, ProviderConfig, ProviderError, ProviderEvent, ProviderMessage, ProviderRequest,
     ProviderStream,
 };
-use crate::protocol::{MessageRole, TokenUsage, ToolCall};
+use crate::protocol::{MessageRole, TokenUsage, TokenUsageDetails, ToolCall};
 
 pub struct OpenAiResponsesProvider {
     client: Client,
@@ -69,6 +69,18 @@ struct ResponsesUsage {
     input_tokens: u64,
     output_tokens: u64,
     total_tokens: Option<u64>,
+    input_tokens_details: Option<ResponsesInputTokenDetails>,
+    output_tokens_details: Option<ResponsesOutputTokenDetails>,
+}
+
+#[derive(Deserialize)]
+struct ResponsesInputTokenDetails {
+    cached_tokens: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct ResponsesOutputTokenDetails {
+    reasoning_tokens: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -362,14 +374,34 @@ fn parse_sse_data(data: &str) -> Result<ParsedResponsesEvent, ProviderError> {
         .as_ref()
         .and_then(|response| response.usage.as_ref())
     {
-        events.push(ProviderEvent::Usage {
-            usage: TokenUsage {
-                input_tokens: usage.input_tokens,
-                output_tokens: usage.output_tokens,
-                total_tokens: usage
-                    .total_tokens
-                    .unwrap_or(usage.input_tokens + usage.output_tokens),
-            },
+        let token_usage = TokenUsage {
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            total_tokens: usage
+                .total_tokens
+                .unwrap_or(usage.input_tokens.saturating_add(usage.output_tokens)),
+        };
+        let cached_input_tokens = usage
+            .input_tokens_details
+            .as_ref()
+            .and_then(|details| details.cached_tokens);
+        let details = TokenUsageDetails {
+            cached_input_tokens,
+            uncached_input_tokens: cached_input_tokens
+                .and_then(|cached| usage.input_tokens.checked_sub(cached)),
+            cache_write_input_tokens: None,
+            reasoning_output_tokens: usage
+                .output_tokens_details
+                .as_ref()
+                .and_then(|details| details.reasoning_tokens),
+        };
+        events.push(if details.is_empty() {
+            ProviderEvent::Usage { usage: token_usage }
+        } else {
+            ProviderEvent::DetailedUsage {
+                usage: token_usage,
+                details,
+            }
         });
     }
     let completed = event.event_type == "response.completed";
@@ -411,6 +443,24 @@ mod tests {
             ProviderEvent::ProviderContext { provider, .. } if provider == "openai_responses"
         ));
         assert!(parse_sse_data(r#"{"type":"response.completed","response":{"usage":{"input_tokens":3,"output_tokens":2}}}"#).unwrap().completed);
+    }
+
+    #[test]
+    fn parses_responses_usage_breakdown() {
+        let parsed = parse_sse_data(
+            r#"{"type":"response.completed","response":{"usage":{"input_tokens":120,"output_tokens":35,"total_tokens":155,"input_tokens_details":{"cached_tokens":70},"output_tokens_details":{"reasoning_tokens":15}}}}"#,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            parsed.events.as_slice(),
+            [ProviderEvent::DetailedUsage { usage, details }]
+                if *usage == TokenUsage { input_tokens: 120, output_tokens: 35, total_tokens: 155 }
+                    && details.cached_input_tokens == Some(70)
+                    && details.uncached_input_tokens == Some(50)
+                    && details.cache_write_input_tokens.is_none()
+                    && details.reasoning_output_tokens == Some(15)
+        ));
     }
 
     #[test]

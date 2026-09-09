@@ -8,6 +8,14 @@ test.beforeEach(async ({ page }) => {
     let callbackId = 1;
     let agentEventCallbackId: number | null = null;
     let mailboxEventCallbackId: number | null = null;
+    const localDate = (offsetDays: number) => {
+      const date = new Date();
+      date.setDate(date.getDate() + offsetDays);
+      const year = date.getFullYear();
+      const month = String(date.getMonth() + 1).padStart(2, "0");
+      const day = String(date.getDate()).padStart(2, "0");
+      return `${year}-${month}-${day}`;
+    };
     const threadFixture = { schemaVersion: 1, id: "thread-1", title: "Phase 6 workbench", createdAtMs: 1, updatedAtMs: 2, archived: false, inProject: true, workspacePath: "D:\\code\\k-coder" };
     const threadOverride = localStorage.getItem("kcoder_e2e_thread_override");
     const thread = threadOverride ? { ...threadFixture, ...JSON.parse(threadOverride) } : threadFixture;
@@ -368,6 +376,40 @@ test.beforeEach(async ({ page }) => {
       list_browser_audit: [{ timestampMs: 3, action: "navigate", target: "https://example.com", success: true, detail: "ok" }],
       list_browser_artifacts: [{ id: "shot-1", name: "shot-1.png", mediaType: "image/png", sizeBytes: 2048, createdAtMs: 3 }],
       advanced_metrics: { providerCalls: 2, providerFailures: 0, averageProviderLatencyMs: 120, inputTokens: 100, outputTokens: 20, toolCalls: 2, toolSuccessRate: 1, fallbackCount: 0, retryCount: 2, completedTasks: 1, failedTasks: 0, estimatedCostUsd: null },
+      usage_summary: {
+        schemaVersion: 2,
+        trendDays: 30,
+        providerCalls: 14,
+        inputTokens: 190300,
+        outputTokens: 3300,
+        totalTokens: 193600,
+        cachedInputTokens: 96500,
+        uncachedInputTokens: 93800,
+        cacheWriteInputTokens: 0,
+        reasoningOutputTokens: 2100,
+        replyOutputTokens: 1200,
+        cacheHitRate: 96500 / 190300,
+        estimatedCostUsd: null,
+        daily: [
+          { date: localDate(-1), providerCalls: 4, inputTokens: 42000, outputTokens: 800, totalTokens: 42800 },
+          { date: localDate(0), providerCalls: 10, inputTokens: 148300, outputTokens: 2500, totalTokens: 150800 },
+        ],
+        models: [{
+          provider: "DeepSeek",
+          model: "deepseek-v4-pro-0813",
+          providerCalls: 14,
+          inputTokens: 190300,
+          outputTokens: 3300,
+          totalTokens: 193600,
+          cachedInputTokens: 96500,
+          uncachedInputTokens: 93800,
+          cacheWriteInputTokens: 0,
+          reasoningOutputTokens: 2100,
+          replyOutputTokens: 1200,
+          cacheHitRate: 96500 / 190300,
+          estimatedCostUsd: null,
+        }],
+      },
       run_regression_evaluation: { total: 3, passed: 3, passRate: 1, failures: [] },
       cancel_turn: true,
       create_thread: secondThread,
@@ -4917,6 +4959,33 @@ test("exposes opt-in memory, browser audit, and advanced metrics", async ({ page
   await page.getByRole("button", { name: "运行回归评估" }).click();
   await expect(page.getByText(/回归评估 3\/3/)).toBeVisible();
   await page.screenshot({ path: testInfo.outputPath(`phase9-${testInfo.project.name}.png`), fullPage: true });
+});
+
+test("shows detailed usage tracking by token, day, and model", async ({ page }, testInfo) => {
+  await page.goto("/");
+  await page.locator('button[aria-label="设置"]:visible').click();
+  await page.getByRole("button", { name: /用量追踪/ }).click();
+
+  await expect(page.getByRole("heading", { name: "用量追踪" })).toBeVisible();
+  const details = page.getByRole("region", { name: "Token 明细" });
+  await expect(details.getByText("193.6K", { exact: true })).toBeVisible();
+  await expect(details.getByText("96.5K", { exact: true })).toBeVisible();
+  await expect(details.getByText("50.7%", { exact: true })).toBeVisible();
+
+  const trend = page.getByRole("img", { name: "最近 30 天 Token 趋势" });
+  await expect(trend.locator(".usage-trend-bar")).toHaveCount(30);
+  await expect(trend.locator('.usage-trend-bar[data-has-usage="true"]')).toHaveCount(2);
+
+  const modelTable = page.getByRole("table", { name: "按模型统计" });
+  await expect(modelTable.getByText("deepseek-v4-pro-0813", { exact: true })).toBeVisible();
+  await expect(modelTable.getByText("DeepSeek", { exact: true })).toBeVisible();
+  await expect(modelTable.getByText("未知", { exact: true })).toBeVisible();
+  await expect(modelTable.getByText("14", { exact: true })).toBeVisible();
+
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+  await page.screenshot({ path: testInfo.outputPath(`usage-tracking-${testInfo.project.name}.png`), fullPage: true });
+  await modelTable.scrollIntoViewIfNeeded();
+  await page.screenshot({ path: testInfo.outputPath(`usage-models-${testInfo.project.name}.png`), fullPage: true });
 });
 
 test("colors file formats and wires complete Git actions", async ({ page }, testInfo) => {

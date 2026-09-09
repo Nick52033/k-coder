@@ -1169,23 +1169,160 @@ function UsagePage() {
   const [usage, setUsage] = useState<UsageSummary | null>(null);
   const [metrics, setMetrics] = useState<MetricsSnapshot | null>(null);
   const [evaluation, setEvaluation] = useState<EvaluationReport | null>(null);
-  useEffect(() => { void Promise.all([getUsageSummary(), getAdvancedMetrics()]).then(([nextUsage, nextMetrics]) => { setUsage(nextUsage); setMetrics(nextMetrics); }); }, []);
-  return <section className="settings-page" aria-labelledby="usage-page-title">
-    <div className="settings-page-header"><div><p className="settings-eyebrow">模型与用量</p><h3 id="usage-page-title">运行指标</h3></div><button className="secondary-button settings-command" type="button" onClick={() => void runRegressionEvaluation().then(setEvaluation)}><PlayCircle size={15} />运行回归评估</button></div>
-    <div className="usage-summary-grid">
-      <div><span>Provider 调用</span><strong>{usage?.providerCalls ?? 0}</strong></div>
-      <div><span>输入 Token</span><strong>{usage?.inputTokens ?? 0}</strong></div>
-      <div><span>输出 Token</span><strong>{usage?.outputTokens ?? 0}</strong></div>
-      <div><span>总 Token</span><strong>{usage?.totalTokens ?? 0}</strong></div>
-      <div><span>平均延迟</span><strong>{metrics?.averageProviderLatencyMs ?? 0} ms</strong></div>
-      <div><span>Provider 失败</span><strong>{metrics?.providerFailures ?? 0}</strong></div>
-      <div><span>自动重试</span><strong>{metrics?.retryCount ?? 0}</strong></div>
-      <div><span>工具成功率</span><strong>{Math.round((metrics?.toolSuccessRate ?? 0) * 100)}%</strong></div>
-      <div><span>故障切换</span><strong>{metrics?.fallbackCount ?? 0}</strong></div>
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  useEffect(() => {
+    let active = true;
+    void Promise.allSettled([getUsageSummary(), getAdvancedMetrics()]).then(([usageResult, metricsResult]) => {
+      if (!active) return;
+      if (usageResult.status === "fulfilled") setUsage(usageResult.value);
+      else setError("无法读取用量统计");
+      if (metricsResult.status === "fulfilled") setMetrics(metricsResult.value);
+      setLoading(false);
+    });
+    return () => { active = false; };
+  }, []);
+
+  const daily = usageDailySeries(usage);
+  const maxDailyTokens = Math.max(0, ...daily.map((entry) => entry.totalTokens));
+  const estimatedCostUsd = usage?.estimatedCostUsd ?? metrics?.estimatedCostUsd ?? null;
+
+  return <section className="settings-page usage-page" aria-labelledby="usage-page-title">
+    <div className="settings-page-header">
+      <div><p className="settings-eyebrow">模型与用量</p><h3 id="usage-page-title">用量追踪</h3></div>
+      <button className="secondary-button settings-command" type="button" onClick={() => void runRegressionEvaluation().then(setEvaluation)}><PlayCircle size={15} />运行回归评估</button>
     </div>
-    <div className="settings-note">成本：{metrics?.estimatedCostUsd == null ? "未知（供应商未提供价格元数据）" : `$${metrics.estimatedCostUsd.toFixed(4)}`}</div>
+    {error && <div className="settings-error" role="alert">{error}</div>}
+    {loading && <div className="usage-loading">正在读取用量...</div>}
+
+    <section className="usage-section usage-token-section" aria-labelledby="usage-token-title">
+      <header className="usage-section-header">
+        <h4 id="usage-token-title">Token 明细</h4>
+        <span>{formatInteger(usage?.providerCalls ?? 0)} 次调用</span>
+      </header>
+      <div className="usage-token-list">
+        <UsageDetailRow label="总 Token" value={usage?.totalTokens} emphasis />
+        <div className="usage-detail-divider" />
+        <UsageDetailRow label="输入 Token" value={usage?.inputTokens} />
+        <UsageDetailRow label="缓存命中" value={usage?.cachedInputTokens} nested />
+        <UsageDetailRow label="缓存未命中" value={usage?.uncachedInputTokens} nested />
+        <UsageDetailRow label="缓存写入" value={usage?.cacheWriteInputTokens} nested />
+        <div className="usage-detail-divider" />
+        <UsageDetailRow label="输出 Token" value={usage?.outputTokens} />
+        <UsageDetailRow label="推理 Token" value={usage?.reasoningOutputTokens} nested />
+        <UsageDetailRow label="回复 Token" value={usage?.replyOutputTokens} nested />
+        <div className="usage-detail-divider" />
+        <UsageDetailRow label="缓存命中率" value={usage?.cacheHitRate} percentage emphasis />
+      </div>
+    </section>
+
+    <section className="usage-section" aria-labelledby="usage-trend-title">
+      <header className="usage-section-header">
+        <h4 id="usage-trend-title">每日趋势</h4>
+        <span>最近 {usage?.trendDays ?? 30} 天</span>
+      </header>
+      <div className="usage-trend-chart" role="img" aria-label="最近 30 天 Token 趋势">
+        <div className="usage-trend-plot">
+          {daily.map((entry) => {
+            const height = entry.totalTokens > 0 && maxDailyTokens > 0
+              ? Math.max(3, (entry.totalTokens / maxDailyTokens) * 100)
+              : 0;
+            return <div className="usage-trend-column" key={entry.date} title={`${entry.date} · ${formatTokenCount(entry.totalTokens)} Token · ${formatInteger(entry.providerCalls)} 次调用`}>
+              <span className="usage-trend-bar" data-has-usage={entry.totalTokens > 0 ? "true" : "false"} style={{ height: `${height}%` }} />
+            </div>;
+          })}
+        </div>
+        <div className="usage-trend-labels" aria-hidden="true">
+          {daily.map((entry, index) => <span key={entry.date}>{(index % 7 === 0 && index < daily.length - 2) || index === daily.length - 1 ? entry.date.slice(5) : ""}</span>)}
+        </div>
+      </div>
+    </section>
+
+    <section className="usage-section" aria-labelledby="usage-model-title">
+      <header className="usage-section-header"><h4 id="usage-model-title">按模型统计</h4><span>{usage?.models?.length ?? 0} 个模型</span></header>
+      <div className="usage-model-table-scroll">
+        <table className="usage-model-table" aria-label="按模型统计">
+          <thead><tr><th>模型</th><th>请求</th><th>输入 Token</th><th>输出 Token</th><th>缓存命中</th><th>总 Token</th><th>费用</th></tr></thead>
+          <tbody>
+            {(usage?.models ?? []).map((model, index) => <tr key={`${model.provider ?? "unknown"}:${model.model ?? "unknown"}:${index}`}>
+              <td><div className="usage-model-name"><span className="usage-model-dot" /><div><strong title={model.model ?? "未记录模型"}>{model.model ?? "未记录模型"}</strong><span>{model.provider ?? "未记录 Provider"}</span></div></div></td>
+              <td>{formatInteger(model.providerCalls)}</td>
+              <td title={formatInteger(model.inputTokens)}>{formatTokenCount(model.inputTokens)}</td>
+              <td title={formatInteger(model.outputTokens)}>{formatTokenCount(model.outputTokens)}</td>
+              <td title={model.cachedInputTokens == null ? undefined : formatInteger(model.cachedInputTokens)}>{formatTokenCount(model.cachedInputTokens)}</td>
+              <td title={formatInteger(model.totalTokens)}>{formatTokenCount(model.totalTokens)}</td>
+              <td>{formatCost(model.estimatedCostUsd)}</td>
+            </tr>)}
+            {!loading && (usage?.models?.length ?? 0) === 0 && <tr><td className="usage-model-empty" colSpan={7}>暂无用量记录</td></tr>}
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section className="usage-section" aria-labelledby="usage-runtime-title">
+      <header className="usage-section-header"><h4 id="usage-runtime-title">运行指标</h4></header>
+      <div className="usage-summary-grid">
+        <div><span>平均延迟</span><strong>{metrics?.averageProviderLatencyMs ?? 0} ms</strong></div>
+        <div><span>Provider 失败</span><strong>{metrics?.providerFailures ?? 0}</strong></div>
+        <div><span>自动重试</span><strong>{metrics?.retryCount ?? 0}</strong></div>
+        <div><span>工具成功率</span><strong>{Math.round((metrics?.toolSuccessRate ?? 0) * 100)}%</strong></div>
+        <div><span>故障切换</span><strong>{metrics?.fallbackCount ?? 0}</strong></div>
+      </div>
+      <div className="settings-note">成本：{estimatedCostUsd == null ? "未知（供应商未提供价格元数据）" : formatCost(estimatedCostUsd)}</div>
+    </section>
     {evaluation && <div className={evaluation.failures.length ? "settings-error" : "settings-success"}>回归评估 {evaluation.passed}/{evaluation.total} · {Math.round(evaluation.passRate * 100)}%{evaluation.failures.map((failure) => <small key={failure}>{failure}</small>)}</div>}
   </section>;
+}
+
+function UsageDetailRow({ label, value, nested = false, emphasis = false, percentage = false }: { label: string; value: number | null | undefined; nested?: boolean; emphasis?: boolean; percentage?: boolean }) {
+  const displayValue = percentage ? formatPercentage(value) : formatTokenCount(value);
+  return <div className={`usage-detail-row${nested ? " usage-detail-row--nested" : ""}${emphasis ? " usage-detail-row--emphasis" : ""}`}>
+    <span>{label}</span>
+    <strong title={value == null ? "无数据" : percentage ? formatPercentage(value) : formatInteger(value)}>{displayValue}</strong>
+  </div>;
+}
+
+function formatTokenCount(value: number | null | undefined) {
+  if (value == null) return "无数据";
+  if (value >= 1_000_000) return `${trimDecimal(value / 1_000_000)}M`;
+  if (value >= 1_000) return `${trimDecimal(value / 1_000)}K`;
+  return formatInteger(value);
+}
+
+function trimDecimal(value: number) {
+  return value.toFixed(1).replace(/\.0$/, "");
+}
+
+function formatInteger(value: number) {
+  return new Intl.NumberFormat("zh-CN", { maximumFractionDigits: 0 }).format(value);
+}
+
+function formatPercentage(value: number | null | undefined) {
+  return value == null ? "无数据" : `${(value * 100).toFixed(1)}%`;
+}
+
+function formatCost(value: number | null | undefined) {
+  return value == null ? "未知" : `$${value.toFixed(4)}`;
+}
+
+function localDateKey(date: Date) {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+function usageDailySeries(usage: UsageSummary | null) {
+  const days = Math.max(1, usage?.trendDays ?? 30);
+  const byDate = new Map((usage?.daily ?? []).map((entry) => [entry.date, entry]));
+  const today = new Date();
+  today.setHours(12, 0, 0, 0);
+  return Array.from({ length: days }, (_, index) => {
+    const date = new Date(today);
+    date.setDate(today.getDate() - (days - index - 1));
+    const key = localDateKey(date);
+    return byDate.get(key) ?? { date: key, providerCalls: 0, inputTokens: 0, outputTokens: 0, totalTokens: 0 };
+  });
 }
 
 function RobotsPage({

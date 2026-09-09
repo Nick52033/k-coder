@@ -1,9 +1,10 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use futures_util::StreamExt;
 use tokio_util::sync::CancellationToken;
 
-use super::{Provider, ProviderError, ProviderRequest, ProviderStream};
+use super::{Provider, ProviderError, ProviderEvent, ProviderRequest, ProviderStream};
 use crate::advanced::RuntimeMetrics;
 
 #[derive(Clone)]
@@ -55,7 +56,13 @@ impl Provider for FallbackProvider {
                     if index > 0 {
                         self.metrics.fallback();
                     }
-                    return Ok(stream);
+                    let selection = ProviderEvent::ModelSelected {
+                        provider: target.label.clone(),
+                        model: target.model.clone(),
+                    };
+                    return Ok(Box::pin(
+                        futures_util::stream::once(async move { Ok(selection) }).chain(stream),
+                    ));
                 }
                 Err(error) if retryable(&error) && index + 1 < self.targets.len() => {
                     last_error = Some(error);
@@ -167,12 +174,15 @@ mod tests {
             messages: vec![],
             tools: vec![],
         };
-        assert!(
-            provider
-                .stream(request, CancellationToken::new())
-                .await
-                .is_ok()
-        );
+        let mut stream = provider
+            .stream(request, CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(matches!(
+            stream.next().await,
+            Some(Ok(ProviderEvent::ModelSelected { provider, model }))
+                if provider == "fallback" && model == "fallback"
+        ));
         assert_eq!(first_calls.load(Ordering::SeqCst), 1);
         assert_eq!(second_calls.load(Ordering::SeqCst), 1);
         assert_eq!(metrics.snapshot().unwrap().fallback_count, 1);

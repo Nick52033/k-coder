@@ -15,7 +15,7 @@ use super::{
     Provider, ProviderConfig, ProviderError, ProviderEvent, ProviderMessage, ProviderRequest,
     ProviderStream,
 };
-use crate::protocol::{MessageRole, TokenUsage, ToolCall};
+use crate::protocol::{MessageRole, TokenUsage, TokenUsageDetails, ToolCall};
 
 const DEFAULT_MAX_TOKENS: u64 = 8192;
 
@@ -77,6 +77,8 @@ struct AnthropicStartedMessage {
 struct AnthropicUsage {
     input_tokens: Option<u64>,
     output_tokens: Option<u64>,
+    cache_creation_input_tokens: Option<u64>,
+    cache_read_input_tokens: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -97,6 +99,8 @@ struct ParsedAnthropicEvent {
     tool_stop: Option<u64>,
     input_tokens: Option<u64>,
     output_tokens: Option<u64>,
+    cache_creation_input_tokens: Option<u64>,
+    cache_read_input_tokens: Option<u64>,
     completed: bool,
     stop_reason: Option<String>,
 }
@@ -105,6 +109,63 @@ struct PendingTool {
     id: String,
     name: String,
     arguments: String,
+}
+
+#[derive(Default)]
+struct AnthropicUsageAccumulator {
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    cache_creation_input_tokens: Option<u64>,
+    cache_read_input_tokens: Option<u64>,
+}
+
+impl AnthropicUsageAccumulator {
+    fn update(&mut self, parsed: &ParsedAnthropicEvent) -> Option<(TokenUsage, TokenUsageDetails)> {
+        let changed = parsed.input_tokens.is_some()
+            || parsed.output_tokens.is_some()
+            || parsed.cache_creation_input_tokens.is_some()
+            || parsed.cache_read_input_tokens.is_some();
+        if !changed {
+            return None;
+        }
+        if let Some(value) = parsed.input_tokens {
+            self.input_tokens = Some(value);
+        }
+        if let Some(value) = parsed.output_tokens {
+            self.output_tokens = Some(value);
+        }
+        if let Some(value) = parsed.cache_creation_input_tokens {
+            self.cache_creation_input_tokens = Some(value);
+        }
+        if let Some(value) = parsed.cache_read_input_tokens {
+            self.cache_read_input_tokens = Some(value);
+        }
+
+        let input_tokens = self
+            .input_tokens
+            .unwrap_or(0)
+            .saturating_add(self.cache_creation_input_tokens.unwrap_or(0))
+            .saturating_add(self.cache_read_input_tokens.unwrap_or(0));
+        let output_tokens = self.output_tokens.unwrap_or(0);
+        Some((
+            TokenUsage {
+                input_tokens,
+                output_tokens,
+                total_tokens: input_tokens.saturating_add(output_tokens),
+            },
+            TokenUsageDetails {
+                cached_input_tokens: self.cache_read_input_tokens,
+                uncached_input_tokens: self.input_tokens,
+                cache_write_input_tokens: self.cache_creation_input_tokens,
+                reasoning_output_tokens: None,
+            },
+        ))
+    }
+}
+
+#[cfg(test)]
+fn anthropic_usage(parsed: &ParsedAnthropicEvent) -> Option<(TokenUsage, TokenUsageDetails)> {
+    AnthropicUsageAccumulator::default().update(parsed)
 }
 
 #[async_trait]
@@ -186,7 +247,7 @@ impl Provider for AnthropicMessagesProvider {
         Ok(Box::pin(async_stream::stream! {
             let mut body = response.bytes_stream();
             let mut decoder = SseDecoder::default();
-            let mut usage = TokenUsage::default();
+            let mut usage = AnthropicUsageAccumulator::default();
             let mut pending_tools = BTreeMap::<u64, PendingTool>::new();
             let mut stop_reason = None::<String>;
             loop {
@@ -199,6 +260,7 @@ impl Provider for AnthropicMessagesProvider {
                         Ok(frames) => for frame in frames {
                             match parse_sse_data(&frame) {
                                 Ok(parsed) => {
+                                    let parsed_usage = usage.update(&parsed);
                                     if let Some(delta) = parsed.delta { yield Ok(redact_event(ProviderEvent::TextDelta { delta }, &secret)); }
                                     if let Some(start) = parsed.tool_start {
                                         pending_tools.insert(start.index, PendingTool { id: start.id, name: start.name, arguments: String::new() });
@@ -226,11 +288,12 @@ impl Provider for AnthropicMessagesProvider {
                                             } });
                                         }
                                     }
-                                    if parsed.input_tokens.is_some() || parsed.output_tokens.is_some() {
-                                        if let Some(value) = parsed.input_tokens { usage.input_tokens = value; }
-                                        if let Some(value) = parsed.output_tokens { usage.output_tokens = value; }
-                                        usage.total_tokens = usage.input_tokens + usage.output_tokens;
-                                        yield Ok(ProviderEvent::Usage { usage });
+                                    if let Some((token_usage, details)) = parsed_usage {
+                                        yield Ok(if details.is_empty() {
+                                            ProviderEvent::Usage { usage: token_usage }
+                                        } else {
+                                            ProviderEvent::DetailedUsage { usage: token_usage, details }
+                                        });
                                     }
                                     if let Some(reason) = parsed.stop_reason {
                                         if !matches!(reason.as_str(), "end_turn" | "stop_sequence" | "tool_use") {
@@ -369,7 +432,25 @@ fn parse_sse_data(data: &str) -> Result<ParsedAnthropicEvent, ProviderError> {
         .usage
         .as_ref()
         .and_then(|usage| usage.output_tokens)
-        .or_else(|| started_usage.and_then(|usage| usage.output_tokens));
+        .or_else(|| started_usage.as_ref().and_then(|usage| usage.output_tokens));
+    let cache_creation_input_tokens = started_usage
+        .as_ref()
+        .and_then(|usage| usage.cache_creation_input_tokens)
+        .or_else(|| {
+            event
+                .usage
+                .as_ref()
+                .and_then(|usage| usage.cache_creation_input_tokens)
+        });
+    let cache_read_input_tokens = started_usage
+        .as_ref()
+        .and_then(|usage| usage.cache_read_input_tokens)
+        .or_else(|| {
+            event
+                .usage
+                .as_ref()
+                .and_then(|usage| usage.cache_read_input_tokens)
+        });
     let stop_reason = event
         .delta
         .as_ref()
@@ -381,6 +462,8 @@ fn parse_sse_data(data: &str) -> Result<ParsedAnthropicEvent, ProviderError> {
         tool_stop,
         input_tokens,
         output_tokens,
+        cache_creation_input_tokens,
+        cache_read_input_tokens,
         completed: event.event_type == "message_stop",
         stop_reason,
     })
@@ -410,6 +493,31 @@ mod tests {
         .unwrap();
         assert_eq!(truncated.stop_reason.as_deref(), Some("max_tokens"));
         assert_eq!(truncated.output_tokens, Some(12));
+    }
+
+    #[test]
+    fn parses_anthropic_cache_creation_and_read_usage() {
+        let parsed = parse_sse_data(
+            r#"{"type":"message_start","message":{"usage":{"input_tokens":60,"cache_creation_input_tokens":25,"cache_read_input_tokens":15,"output_tokens":1}}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(parsed.input_tokens, Some(60));
+        assert_eq!(parsed.cache_creation_input_tokens, Some(25));
+        assert_eq!(parsed.cache_read_input_tokens, Some(15));
+        let (usage, details) = anthropic_usage(&parsed).unwrap();
+        assert_eq!(
+            usage,
+            TokenUsage {
+                input_tokens: 100,
+                output_tokens: 1,
+                total_tokens: 101,
+            }
+        );
+        assert_eq!(details.cached_input_tokens, Some(15));
+        assert_eq!(details.uncached_input_tokens, Some(60));
+        assert_eq!(details.cache_write_input_tokens, Some(25));
+        assert_eq!(details.reasoning_output_tokens, None);
     }
 
     #[test]

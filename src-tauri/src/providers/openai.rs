@@ -14,7 +14,7 @@ use super::{
     Provider, ProviderConfig, ProviderError, ProviderEvent, ProviderMessage, ProviderRequest,
     ProviderStream,
 };
-use crate::protocol::{MessageRole, ReasoningEffort, TokenUsage, ToolCall};
+use crate::protocol::{MessageRole, ReasoningEffort, TokenUsage, TokenUsageDetails, ToolCall};
 
 const OPENAI_REQUEST_TIMEOUT_SECONDS: u64 = 120;
 const DEEPSEEK_REQUEST_TIMEOUT_SECONDS: u64 = 300;
@@ -317,6 +317,20 @@ struct OpenAiUsage {
     prompt_tokens: u64,
     completion_tokens: u64,
     total_tokens: Option<u64>,
+    prompt_tokens_details: Option<OpenAiPromptTokensDetails>,
+    completion_tokens_details: Option<OpenAiCompletionTokensDetails>,
+    prompt_cache_hit_tokens: Option<u64>,
+    prompt_cache_miss_tokens: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct OpenAiPromptTokensDetails {
+    cached_tokens: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct OpenAiCompletionTokensDetails {
+    reasoning_tokens: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -897,14 +911,35 @@ fn parse_sse_data(data: &str) -> Result<ParsedSseData, ProviderError> {
         tool_deltas.extend(choice.delta.tool_calls);
     }
     if let Some(usage) = chunk.usage {
-        events.push(ProviderEvent::Usage {
-            usage: TokenUsage {
-                input_tokens: usage.prompt_tokens,
-                output_tokens: usage.completion_tokens,
-                total_tokens: usage
-                    .total_tokens
-                    .unwrap_or(usage.prompt_tokens + usage.completion_tokens),
-            },
+        let token_usage = TokenUsage {
+            input_tokens: usage.prompt_tokens,
+            output_tokens: usage.completion_tokens,
+            total_tokens: usage
+                .total_tokens
+                .unwrap_or(usage.prompt_tokens.saturating_add(usage.completion_tokens)),
+        };
+        let cached_input_tokens = usage.prompt_cache_hit_tokens.or_else(|| {
+            usage
+                .prompt_tokens_details
+                .and_then(|details| details.cached_tokens)
+        });
+        let details = TokenUsageDetails {
+            cached_input_tokens,
+            uncached_input_tokens: usage.prompt_cache_miss_tokens.or_else(|| {
+                cached_input_tokens.and_then(|cached| usage.prompt_tokens.checked_sub(cached))
+            }),
+            cache_write_input_tokens: None,
+            reasoning_output_tokens: usage
+                .completion_tokens_details
+                .and_then(|details| details.reasoning_tokens),
+        };
+        events.push(if details.is_empty() {
+            ProviderEvent::Usage { usage: token_usage }
+        } else {
+            ProviderEvent::DetailedUsage {
+                usage: token_usage,
+                details,
+            }
         });
     }
     Ok(ParsedSseData {
@@ -1092,6 +1127,37 @@ mod tests {
         let calls = accumulator.take().unwrap();
         assert_eq!(calls[0].name, "read_file");
         assert_eq!(calls[0].arguments, json!({ "path": "README.md" }));
+    }
+
+    #[test]
+    fn parses_openai_and_deepseek_usage_breakdowns() {
+        let openai = parse_sse_data(
+            r#"{"choices":[],"usage":{"prompt_tokens":100,"completion_tokens":30,"total_tokens":130,"prompt_tokens_details":{"cached_tokens":40},"completion_tokens_details":{"reasoning_tokens":10}}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            openai.events.as_slice(),
+            [ProviderEvent::DetailedUsage { usage, details }]
+                if *usage == TokenUsage { input_tokens: 100, output_tokens: 30, total_tokens: 130 }
+                    && details.cached_input_tokens == Some(40)
+                    && details.uncached_input_tokens == Some(60)
+                    && details.cache_write_input_tokens.is_none()
+                    && details.reasoning_output_tokens == Some(10)
+        ));
+
+        let deepseek = parse_sse_data(
+            r#"{"choices":[],"usage":{"prompt_tokens":90,"completion_tokens":15,"prompt_cache_hit_tokens":50,"prompt_cache_miss_tokens":40}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            deepseek.events.as_slice(),
+            [ProviderEvent::DetailedUsage { usage, details }]
+                if usage.total_tokens == 105
+                    && details.cached_input_tokens == Some(50)
+                    && details.uncached_input_tokens == Some(40)
+                    && details.cache_write_input_tokens.is_none()
+                    && details.reasoning_output_tokens.is_none()
+        ));
     }
 
     #[test]

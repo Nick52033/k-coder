@@ -3,10 +3,12 @@ use std::sync::{Arc, Mutex};
 
 use rusqlite::{Connection, OptionalExtension, params};
 
-use crate::protocol::{HistorySortDirection, ThreadItem, ThreadTurn, TodoItem, TokenUsage};
+use crate::protocol::{
+    HistorySortDirection, ThreadItem, ThreadTurn, TodoItem, TokenUsage, TokenUsageDetails,
+};
 use crate::storage::{StoredEvent, StoredEventKind, ThreadSummary, TurnSnapshot};
 
-pub const DATABASE_SCHEMA_VERSION: u32 = 8;
+pub const DATABASE_SCHEMA_VERSION: u32 = 9;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -18,13 +20,76 @@ pub struct ProjectRecord {
     pub last_opened_at_ms: u64,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageSummary {
+    pub schema_version: u32,
+    pub trend_days: u32,
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub total_tokens: u64,
     pub provider_calls: u64,
+    pub cached_input_tokens: Option<u64>,
+    pub uncached_input_tokens: Option<u64>,
+    pub cache_write_input_tokens: Option<u64>,
+    pub reasoning_output_tokens: Option<u64>,
+    pub reply_output_tokens: Option<u64>,
+    pub cache_hit_rate: Option<f64>,
+    pub estimated_cost_usd: Option<f64>,
+    pub daily: Vec<DailyUsageSummary>,
+    pub models: Vec<ModelUsageSummary>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DailyUsageSummary {
+    pub date: String,
+    pub provider_calls: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub total_tokens: u64,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelUsageSummary {
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub provider_calls: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub total_tokens: u64,
+    pub cached_input_tokens: Option<u64>,
+    pub uncached_input_tokens: Option<u64>,
+    pub cache_write_input_tokens: Option<u64>,
+    pub reasoning_output_tokens: Option<u64>,
+    pub reply_output_tokens: Option<u64>,
+    pub cache_hit_rate: Option<f64>,
+    pub estimated_cost_usd: Option<f64>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct UsageAggregate {
+    input_tokens: u64,
+    output_tokens: u64,
+    total_tokens: u64,
+    provider_calls: u64,
+    cached_input_tokens: Option<u64>,
+    uncached_input_tokens: Option<u64>,
+    cache_write_input_tokens: Option<u64>,
+    reasoning_output_tokens: Option<u64>,
+}
+
+impl UsageAggregate {
+    fn reply_output_tokens(self) -> Option<u64> {
+        self.reasoning_output_tokens
+            .map(|reasoning| self.output_tokens.saturating_sub(reasoning))
+    }
+
+    fn cache_hit_rate(self) -> Option<f64> {
+        let cached = self.cached_input_tokens?;
+        (self.input_tokens > 0).then_some(cached as f64 / self.input_tokens as f64)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -150,14 +215,26 @@ impl ProjectionDb {
         )?;
         for (sequence, event) in events.iter().enumerate() {
             insert_indexed_event(&transaction, sequence as u64, event)?;
-            let (turn_id, call_index, usage) = match &event.kind {
-                StoredEventKind::ProviderCallUsage { call_index, usage } => {
-                    (event.turn_id.as_deref(), *call_index, Some(*usage))
-                }
-                _ => (None, 0, None),
-            };
-            if let (Some(turn_id), Some(usage)) = (turn_id, usage) {
-                insert_usage(&transaction, &summary.id, turn_id, call_index, usage)?;
+            if let StoredEventKind::ProviderCallUsage {
+                call_index,
+                usage,
+                details,
+                provider,
+                model,
+            } = &event.kind
+                && let Some(turn_id) = event.turn_id.as_deref()
+            {
+                insert_usage(
+                    &transaction,
+                    &summary.id,
+                    turn_id,
+                    *call_index,
+                    event.created_at_ms,
+                    *usage,
+                    *details,
+                    provider.as_deref(),
+                    model.as_deref(),
+                )?;
             }
         }
         transaction.commit()?;
@@ -232,10 +309,26 @@ impl ProjectionDb {
             |row| row.get(0),
         )?;
         insert_indexed_event(&transaction, sequence, event)?;
-        if let StoredEventKind::ProviderCallUsage { call_index, usage } = event.kind
+        if let StoredEventKind::ProviderCallUsage {
+            call_index,
+            usage,
+            details,
+            provider,
+            model,
+        } = &event.kind
             && let Some(turn_id) = event.turn_id.as_deref()
         {
-            insert_usage(&transaction, &event.thread_id, turn_id, call_index, usage)?;
+            insert_usage(
+                &transaction,
+                &event.thread_id,
+                turn_id,
+                *call_index,
+                event.created_at_ms,
+                *usage,
+                *details,
+                provider.as_deref(),
+                model.as_deref(),
+            )?;
         }
         transaction.commit()?;
         Ok(())
@@ -627,10 +720,97 @@ impl ProjectionDb {
     }
 
     pub fn usage_summary(&self) -> Result<UsageSummary, ProjectionError> {
-        Ok(self.connection.lock().map_err(|_| ProjectionError::Poisoned)?.query_row(
-            "SELECT COALESCE(SUM(input_tokens),0),COALESCE(SUM(output_tokens),0),COALESCE(SUM(total_tokens),0),COUNT(*) FROM usage",
-            [], |row| Ok(UsageSummary { input_tokens: row.get(0)?, output_tokens: row.get(1)?,
-                total_tokens: row.get(2)?, provider_calls: row.get(3)? }))?)
+        const AGGREGATE_COLUMNS: &str = "COALESCE(SUM(input_tokens),0),
+             COALESCE(SUM(output_tokens),0),
+             COALESCE(SUM(total_tokens),0),
+             COUNT(*),
+             CASE WHEN COUNT(*) > 0 AND COUNT(cached_input_tokens) = COUNT(*)
+               THEN SUM(cached_input_tokens) END,
+             CASE WHEN COUNT(*) > 0 AND COUNT(uncached_input_tokens) = COUNT(*)
+               THEN SUM(uncached_input_tokens) END,
+             CASE WHEN COUNT(*) > 0 AND COUNT(cache_write_input_tokens) = COUNT(*)
+               THEN SUM(cache_write_input_tokens) END,
+             CASE WHEN COUNT(*) > 0 AND COUNT(reasoning_output_tokens) = COUNT(*)
+               THEN SUM(reasoning_output_tokens) END";
+
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| ProjectionError::Poisoned)?;
+        let totals = connection.query_row(
+            &format!("SELECT {AGGREGATE_COLUMNS} FROM usage"),
+            [],
+            |row| usage_aggregate_from_row(row, 0),
+        )?;
+
+        let mut daily_statement = connection.prepare(
+            "SELECT date(created_at_ms / 1000, 'unixepoch', 'localtime'),
+                    COUNT(*), SUM(input_tokens), SUM(output_tokens), SUM(total_tokens)
+             FROM usage
+             WHERE created_at_ms > 0
+               AND date(created_at_ms / 1000, 'unixepoch', 'localtime') >=
+                   date('now', 'localtime', '-29 days')
+               AND date(created_at_ms / 1000, 'unixepoch', 'localtime') <=
+                   date('now', 'localtime')
+             GROUP BY date(created_at_ms / 1000, 'unixepoch', 'localtime')
+             ORDER BY date(created_at_ms / 1000, 'unixepoch', 'localtime') ASC",
+        )?;
+        let daily = daily_statement
+            .query_map([], |row| {
+                Ok(DailyUsageSummary {
+                    date: row.get(0)?,
+                    provider_calls: row.get(1)?,
+                    input_tokens: row.get(2)?,
+                    output_tokens: row.get(3)?,
+                    total_tokens: row.get(4)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let mut model_statement = connection.prepare(&format!(
+            "SELECT provider, model, {AGGREGATE_COLUMNS}
+             FROM usage
+             GROUP BY provider, model
+             ORDER BY SUM(total_tokens) DESC, provider ASC, model ASC"
+        ))?;
+        let models = model_statement
+            .query_map([], |row| {
+                let aggregate = usage_aggregate_from_row(row, 2)?;
+                Ok(ModelUsageSummary {
+                    provider: row.get(0)?,
+                    model: row.get(1)?,
+                    provider_calls: aggregate.provider_calls,
+                    input_tokens: aggregate.input_tokens,
+                    output_tokens: aggregate.output_tokens,
+                    total_tokens: aggregate.total_tokens,
+                    cached_input_tokens: aggregate.cached_input_tokens,
+                    uncached_input_tokens: aggregate.uncached_input_tokens,
+                    cache_write_input_tokens: aggregate.cache_write_input_tokens,
+                    reasoning_output_tokens: aggregate.reasoning_output_tokens,
+                    reply_output_tokens: aggregate.reply_output_tokens(),
+                    cache_hit_rate: aggregate.cache_hit_rate(),
+                    estimated_cost_usd: None,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(UsageSummary {
+            schema_version: 2,
+            trend_days: 30,
+            input_tokens: totals.input_tokens,
+            output_tokens: totals.output_tokens,
+            total_tokens: totals.total_tokens,
+            provider_calls: totals.provider_calls,
+            cached_input_tokens: totals.cached_input_tokens,
+            uncached_input_tokens: totals.uncached_input_tokens,
+            cache_write_input_tokens: totals.cache_write_input_tokens,
+            reasoning_output_tokens: totals.reasoning_output_tokens,
+            reply_output_tokens: totals.reply_output_tokens(),
+            cache_hit_rate: totals.cache_hit_rate(),
+            estimated_cost_usd: None,
+            daily,
+            models,
+        })
     }
 
     #[cfg(test)]
@@ -646,6 +826,22 @@ impl ProjectionDb {
             .query_map([thread_id], |row| row.get(0))?
             .collect::<Result<Vec<_>, _>>()?)
     }
+}
+
+fn usage_aggregate_from_row(
+    row: &rusqlite::Row<'_>,
+    offset: usize,
+) -> Result<UsageAggregate, rusqlite::Error> {
+    Ok(UsageAggregate {
+        input_tokens: row.get(offset)?,
+        output_tokens: row.get(offset + 1)?,
+        total_tokens: row.get(offset + 2)?,
+        provider_calls: row.get(offset + 3)?,
+        cached_input_tokens: row.get(offset + 4)?,
+        uncached_input_tokens: row.get(offset + 5)?,
+        cache_write_input_tokens: row.get(offset + 6)?,
+        reasoning_output_tokens: row.get(offset + 7)?,
+    })
 }
 
 fn insert_indexed_event(
@@ -696,22 +892,43 @@ fn insert_usage(
     thread_id: &str,
     turn_id: &str,
     call_index: u32,
+    created_at_ms: u64,
     usage: TokenUsage,
+    details: TokenUsageDetails,
+    provider: Option<&str>,
+    model: Option<&str>,
 ) -> Result<(), rusqlite::Error> {
     connection.execute(
-        "INSERT INTO usage(thread_id,turn_id,call_index,input_tokens,output_tokens,total_tokens)
-         VALUES(?1,?2,?3,?4,?5,?6)
+        "INSERT INTO usage(
+           thread_id,turn_id,call_index,input_tokens,output_tokens,total_tokens,created_at_ms,
+           provider,model,cached_input_tokens,uncached_input_tokens,cache_write_input_tokens,
+           reasoning_output_tokens)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)
          ON CONFLICT(thread_id,turn_id,call_index) DO UPDATE SET
            input_tokens=excluded.input_tokens,
            output_tokens=excluded.output_tokens,
-           total_tokens=excluded.total_tokens",
+           total_tokens=excluded.total_tokens,
+           created_at_ms=excluded.created_at_ms,
+           provider=excluded.provider,
+           model=excluded.model,
+           cached_input_tokens=excluded.cached_input_tokens,
+           uncached_input_tokens=excluded.uncached_input_tokens,
+           cache_write_input_tokens=excluded.cache_write_input_tokens,
+           reasoning_output_tokens=excluded.reasoning_output_tokens",
         params![
             thread_id,
             turn_id,
             call_index,
             usage.input_tokens,
             usage.output_tokens,
-            usage.total_tokens
+            usage.total_tokens,
+            created_at_ms,
+            provider,
+            model,
+            details.cached_input_tokens,
+            details.uncached_input_tokens,
+            details.cache_write_input_tokens,
+            details.reasoning_output_tokens,
         ],
     )?;
     Ok(())
@@ -917,6 +1134,36 @@ fn migrate(connection: &Connection) -> Result<(), rusqlite::Error> {
              COMMIT;",
         )?;
     }
+    if version < 9 {
+        connection.execute_batch(
+            "BEGIN;
+             ALTER TABLE usage ADD COLUMN created_at_ms INTEGER NOT NULL DEFAULT 0;
+             ALTER TABLE usage ADD COLUMN provider TEXT;
+             ALTER TABLE usage ADD COLUMN model TEXT;
+             ALTER TABLE usage ADD COLUMN cached_input_tokens INTEGER;
+             ALTER TABLE usage ADD COLUMN uncached_input_tokens INTEGER;
+             ALTER TABLE usage ADD COLUMN cache_write_input_tokens INTEGER;
+             ALTER TABLE usage ADD COLUMN reasoning_output_tokens INTEGER;
+             UPDATE usage
+             SET created_at_ms = COALESCE((
+               SELECT indexed_events.created_at_ms
+               FROM indexed_events
+               WHERE indexed_events.thread_id = usage.thread_id
+                 AND indexed_events.turn_id = usage.turn_id
+                 AND json_extract(indexed_events.event_json, '$.type') = 'provider_call_usage'
+                 AND COALESCE(
+                   json_extract(indexed_events.event_json, '$.data.call_index'),
+                   json_extract(indexed_events.event_json, '$.data.callIndex')
+                 ) = usage.call_index
+               ORDER BY indexed_events.sequence ASC
+               LIMIT 1
+             ), 0);
+             CREATE INDEX usage_created_at ON usage(created_at_ms);
+             CREATE INDEX usage_provider_model ON usage(provider,model);
+             INSERT INTO schema_migrations(version,applied_at) VALUES(9,datetime('now'));
+             COMMIT;",
+        )?;
+    }
     Ok(())
 }
 
@@ -986,6 +1233,30 @@ mod tests {
             .unwrap();
         assert!(columns.iter().any(|column| column == "workspace_path"));
         assert!(columns.iter().any(|column| column == "in_project"));
+        let usage_columns = db
+            .connection
+            .lock()
+            .unwrap()
+            .prepare("PRAGMA table_info(usage)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        for required in [
+            "created_at_ms",
+            "provider",
+            "model",
+            "cached_input_tokens",
+            "uncached_input_tokens",
+            "cache_write_input_tokens",
+            "reasoning_output_tokens",
+        ] {
+            assert!(
+                usage_columns.iter().any(|column| column == required),
+                "usage table should contain {required}"
+            );
+        }
         let tables = db
             .connection
             .lock()
@@ -1029,5 +1300,244 @@ mod tests {
             )
             .unwrap();
         assert!(embedding_table_exists);
+    }
+
+    #[test]
+    fn usage_summary_exposes_detailed_totals_models_and_recent_daily_series() {
+        let db = ProjectionDb::memory().unwrap();
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        db.with_connection(|connection| {
+            for values in [
+                (
+                    "thread-1", "turn-1", 0, 100_u64, 30_u64, 130_u64, now_ms, "openai",
+                    "gpt-test", 40_u64, 40_u64, 20_u64, 10_u64,
+                ),
+                (
+                    "thread-1",
+                    "turn-1",
+                    1,
+                    200_u64,
+                    50_u64,
+                    250_u64,
+                    now_ms - 86_400_000,
+                    "openai",
+                    "gpt-test",
+                    100_u64,
+                    100_u64,
+                    0_u64,
+                    20_u64,
+                ),
+                (
+                    "thread-2",
+                    "turn-2",
+                    0,
+                    50_u64,
+                    20_u64,
+                    70_u64,
+                    now_ms,
+                    "google",
+                    "gemini-test",
+                    10_u64,
+                    40_u64,
+                    0_u64,
+                    5_u64,
+                ),
+                (
+                    "thread-1",
+                    "turn-old",
+                    0,
+                    8_u64,
+                    2_u64,
+                    10_u64,
+                    now_ms - 31 * 86_400_000,
+                    "openai",
+                    "gpt-test",
+                    2_u64,
+                    6_u64,
+                    0_u64,
+                    1_u64,
+                ),
+            ] {
+                connection.execute(
+                    "INSERT INTO usage(
+                       thread_id,turn_id,call_index,input_tokens,output_tokens,total_tokens,
+                       created_at_ms,provider,model,cached_input_tokens,uncached_input_tokens,
+                       cache_write_input_tokens,reasoning_output_tokens)
+                     VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+                    params![
+                        values.0, values.1, values.2, values.3, values.4, values.5, values.6,
+                        values.7, values.8, values.9, values.10, values.11, values.12
+                    ],
+                )?;
+            }
+            Ok(())
+        })
+        .unwrap();
+
+        let value = serde_json::to_value(db.usage_summary().unwrap()).unwrap();
+        assert_eq!(value["schemaVersion"], 2);
+        assert_eq!(value["trendDays"], 30);
+        assert_eq!(value["providerCalls"], 4);
+        assert_eq!(value["inputTokens"], 358);
+        assert_eq!(value["outputTokens"], 102);
+        assert_eq!(value["totalTokens"], 460);
+        assert_eq!(value["cachedInputTokens"], 152);
+        assert_eq!(value["uncachedInputTokens"], 186);
+        assert_eq!(value["cacheWriteInputTokens"], 20);
+        assert_eq!(value["reasoningOutputTokens"], 36);
+        assert_eq!(value["replyOutputTokens"], 66);
+        assert_eq!(value["estimatedCostUsd"], serde_json::Value::Null);
+        assert!((value["cacheHitRate"].as_f64().unwrap() - (152.0 / 358.0)).abs() < 1e-9);
+
+        let models = value["models"].as_array().unwrap();
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0]["provider"], "openai");
+        assert_eq!(models[0]["model"], "gpt-test");
+        assert_eq!(models[0]["providerCalls"], 3);
+        assert_eq!(models[0]["totalTokens"], 390);
+        assert_eq!(models[1]["provider"], "google");
+        assert_eq!(models[1]["model"], "gemini-test");
+
+        let daily = value["daily"].as_array().unwrap();
+        assert_eq!(daily.len(), 2);
+        assert_eq!(
+            daily
+                .iter()
+                .map(|day| day["totalTokens"].as_u64().unwrap())
+                .sum::<u64>(),
+            450
+        );
+    }
+
+    #[test]
+    fn usage_summary_keeps_unreported_detail_unknown() {
+        let db = ProjectionDb::memory().unwrap();
+        db.with_connection(|connection| {
+            connection.execute(
+                "INSERT INTO usage(
+                   thread_id,turn_id,call_index,input_tokens,output_tokens,total_tokens,created_at_ms)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7)",
+                params![
+                    "legacy-thread",
+                    "legacy-turn",
+                    0,
+                    12_u64,
+                    3_u64,
+                    15_u64,
+                    chrono::Utc::now().timestamp_millis()
+                ],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        let value = serde_json::to_value(db.usage_summary().unwrap()).unwrap();
+        for field in [
+            "cachedInputTokens",
+            "uncachedInputTokens",
+            "cacheWriteInputTokens",
+            "reasoningOutputTokens",
+            "replyOutputTokens",
+            "cacheHitRate",
+        ] {
+            assert_eq!(value[field], serde_json::Value::Null, "{field}");
+        }
+        assert_eq!(value["models"][0]["provider"], serde_json::Value::Null);
+        assert_eq!(value["models"][0]["model"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn cache_hit_rate_uses_input_total_when_cache_write_is_partially_reported() {
+        let db = ProjectionDb::memory().unwrap();
+        db.with_connection(|connection| {
+            connection.execute_batch(
+                "INSERT INTO usage(
+                   thread_id,turn_id,call_index,input_tokens,output_tokens,total_tokens,
+                   cached_input_tokens,uncached_input_tokens,cache_write_input_tokens)
+                 VALUES('thread-1','turn-1',0,100,10,110,40,40,20);
+                 INSERT INTO usage(
+                   thread_id,turn_id,call_index,input_tokens,output_tokens,total_tokens,
+                   cached_input_tokens,uncached_input_tokens,cache_write_input_tokens)
+                 VALUES('thread-2','turn-2',0,100,10,110,40,60,NULL);",
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        let summary = db.usage_summary().unwrap();
+
+        assert_eq!(summary.cache_write_input_tokens, None);
+        assert_eq!(summary.cache_hit_rate, Some(0.4));
+    }
+
+    #[test]
+    fn v9_migration_backfills_usage_dates_from_indexed_events() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
+                 INSERT INTO schema_migrations(version,applied_at) VALUES(8,datetime('now'));
+                 CREATE TABLE usage(
+                   id INTEGER PRIMARY KEY AUTOINCREMENT,
+                   thread_id TEXT NOT NULL,
+                   turn_id TEXT NOT NULL,
+                   call_index INTEGER NOT NULL,
+                   input_tokens INTEGER NOT NULL,
+                   output_tokens INTEGER NOT NULL,
+                   total_tokens INTEGER NOT NULL);
+                 CREATE UNIQUE INDEX usage_unique_call ON usage(thread_id,turn_id,call_index);
+                 CREATE TABLE indexed_events(
+                   thread_id TEXT NOT NULL,
+                   sequence INTEGER NOT NULL,
+                   event_id TEXT NOT NULL UNIQUE,
+                   turn_id TEXT,
+                   created_at_ms INTEGER NOT NULL,
+                   event_json TEXT NOT NULL,
+                   PRIMARY KEY(thread_id,sequence));",
+            )
+            .unwrap();
+        let mut event = StoredEvent::new(
+            "thread-1",
+            Some("turn-1".into()),
+            StoredEventKind::ProviderCallUsage {
+                call_index: 2,
+                usage: TokenUsage {
+                    input_tokens: 10,
+                    output_tokens: 2,
+                    total_tokens: 12,
+                },
+                details: TokenUsageDetails::default(),
+                provider: None,
+                model: None,
+            },
+        );
+        event.created_at_ms = 1_725_734_567_890;
+        connection
+            .execute(
+                "INSERT INTO usage(thread_id,turn_id,call_index,input_tokens,output_tokens,total_tokens)
+                 VALUES('thread-1','turn-1',2,10,2,12)",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO indexed_events(thread_id,sequence,event_id,turn_id,created_at_ms,event_json)
+                 VALUES(?1,0,?2,?3,?4,?5)",
+                params![
+                    event.thread_id,
+                    event.event_id,
+                    event.turn_id,
+                    event.created_at_ms,
+                    serde_json::to_string(&event).unwrap()
+                ],
+            )
+            .unwrap();
+
+        migrate(&connection).unwrap();
+
+        let created_at_ms: u64 = connection
+            .query_row("SELECT created_at_ms FROM usage", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(created_at_ms, event.created_at_ms);
     }
 }

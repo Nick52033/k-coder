@@ -564,6 +564,37 @@ pub struct TokenUsage {
     pub total_tokens: u64,
 }
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenUsageDetails {
+    pub cached_input_tokens: Option<u64>,
+    pub uncached_input_tokens: Option<u64>,
+    pub cache_write_input_tokens: Option<u64>,
+    pub reasoning_output_tokens: Option<u64>,
+}
+
+impl TokenUsageDetails {
+    pub fn is_empty(&self) -> bool {
+        self.cached_input_tokens.is_none()
+            && self.uncached_input_tokens.is_none()
+            && self.cache_write_input_tokens.is_none()
+            && self.reasoning_output_tokens.is_none()
+    }
+
+    pub fn merge_reported(&mut self, reported: Self) {
+        self.cached_input_tokens = reported.cached_input_tokens.or(self.cached_input_tokens);
+        self.uncached_input_tokens = reported
+            .uncached_input_tokens
+            .or(self.uncached_input_tokens);
+        self.cache_write_input_tokens = reported
+            .cache_write_input_tokens
+            .or(self.cache_write_input_tokens);
+        self.reasoning_output_tokens = reported
+            .reasoning_output_tokens
+            .or(self.reasoning_output_tokens);
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TurnErrorCategory {

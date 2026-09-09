@@ -21,8 +21,9 @@ use crate::protocol::{
     AgentActivityStatus, AgentEvent, AgentEventEnvelope, AgentItemStatus, AgentItemType, AgentMode,
     ApprovalAction, ApprovalMode, ApprovalRequest, ApprovalResolution, ChangeSet, ChatMessage,
     ContentBlock, ExpectedFileHash, ImageAttachment, MessageRole, PROTOCOL_VERSION, PatchPreview,
-    ReasoningEffort, TokenUsage, ToolCall, ToolResult, TurnError, TurnState, UserInputAction,
-    UserInputQuestion, UserInputRequest, UserInputRequestKind, UserInputResolution,
+    ReasoningEffort, TokenUsage, TokenUsageDetails, ToolCall, ToolResult, TurnError, TurnState,
+    UserInputAction, UserInputQuestion, UserInputRequest, UserInputRequestKind,
+    UserInputResolution,
 };
 use crate::providers::{Provider, ProviderError, ProviderEvent, ProviderMessage, ProviderRequest};
 use crate::storage::{StorageError, StoredEvent, StoredEventKind, ThreadRepository, now_ms};
@@ -1441,6 +1442,9 @@ impl AgentRuntime {
                 let mut pending_tool_calls_inner = Vec::new(); // 暂存 ToolCall，等 Completed 后再启动
                 let mut response_images_inner = Vec::new();
                 let mut iteration_usage_inner = None;
+                let mut iteration_usage_details_inner = TokenUsageDetails::default();
+                let mut iteration_provider_inner = None::<String>;
+                let mut iteration_model_inner = Some(request.model.clone());
                 let mut attempt_had_output = false;
                 let completed_inner = loop {
                     let event = tokio::select! {
@@ -1667,8 +1671,21 @@ impl AgentRuntime {
                                 ))
                                 .await?;
                         }
-                        Some(Ok(ProviderEvent::Usage { usage })) => {
+                        Some(Ok(ProviderEvent::ModelSelected { provider, model })) => {
+                            iteration_provider_inner = Some(provider);
+                            iteration_model_inner = Some(model);
+                        }
+                        Some(Ok(event @ ProviderEvent::Usage { .. }))
+                        | Some(Ok(event @ ProviderEvent::DetailedUsage { .. })) => {
+                            let (usage, details) = match event {
+                                ProviderEvent::Usage { usage } => {
+                                    (usage, TokenUsageDetails::default())
+                                }
+                                ProviderEvent::DetailedUsage { usage, details } => (usage, details),
+                                _ => unreachable!(),
+                            };
                             iteration_usage_inner = Some(usage);
+                            iteration_usage_details_inner.merge_reported(details);
                             let aggregate = add_usage(total_usage, usage);
                             if let Some(budget) =
                                 token_budget.filter(|budget| aggregate.total_tokens > *budget)
@@ -1678,6 +1695,9 @@ impl AgentRuntime {
                                     &turn_id,
                                     call_index,
                                     usage,
+                                    details,
+                                    iteration_provider_inner.as_deref(),
+                                    iteration_model_inner.as_deref(),
                                     &mut total_usage,
                                     &mut has_usage,
                                     &publisher,
@@ -1716,6 +1736,9 @@ impl AgentRuntime {
                                     &turn_id,
                                     call_index,
                                     usage,
+                                    iteration_usage_details_inner,
+                                    iteration_provider_inner.as_deref(),
+                                    iteration_model_inner.as_deref(),
                                     &mut total_usage,
                                     &mut has_usage,
                                     &publisher,
@@ -1747,6 +1770,9 @@ impl AgentRuntime {
                                     &turn_id,
                                     call_index,
                                     usage,
+                                    iteration_usage_details_inner,
+                                    iteration_provider_inner.as_deref(),
+                                    iteration_model_inner.as_deref(),
                                     &mut total_usage,
                                     &mut has_usage,
                                     &publisher,
@@ -1820,6 +1846,9 @@ impl AgentRuntime {
                                     &turn_id,
                                     call_index,
                                     usage,
+                                    iteration_usage_details_inner,
+                                    iteration_provider_inner.as_deref(),
+                                    iteration_model_inner.as_deref(),
                                     &mut total_usage,
                                     &mut has_usage,
                                     &publisher,
@@ -1838,6 +1867,9 @@ impl AgentRuntime {
                         &turn_id,
                         call_index,
                         usage,
+                        iteration_usage_details_inner,
+                        iteration_provider_inner.as_deref(),
+                        iteration_model_inner.as_deref(),
                         &mut total_usage,
                         &mut has_usage,
                         &publisher,
@@ -3303,6 +3335,9 @@ impl AgentRuntime {
         turn_id: &str,
         call_index: u32,
         usage: TokenUsage,
+        details: TokenUsageDetails,
+        provider: Option<&str>,
+        model: Option<&str>,
         total_usage: &mut TokenUsage,
         has_usage: &mut bool,
         publisher: &Arc<dyn EventPublisher>,
@@ -3313,7 +3348,13 @@ impl AgentRuntime {
             .append(StoredEvent::new(
                 thread_id,
                 Some(turn_id.to_string()),
-                StoredEventKind::ProviderCallUsage { call_index, usage },
+                StoredEventKind::ProviderCallUsage {
+                    call_index,
+                    usage,
+                    details,
+                    provider: provider.map(str::to_string),
+                    model: model.map(str::to_string),
+                },
             ))
             .await?;
         publisher.publish(AgentEventEnvelope::new(AgentEvent::UsageUpdated {
@@ -6676,9 +6717,9 @@ mod tests {
             .unwrap()
             .into_iter()
             .filter_map(|event| match event.kind {
-                StoredEventKind::ProviderCallUsage { call_index, usage } => {
-                    Some((call_index, usage.total_tokens))
-                }
+                StoredEventKind::ProviderCallUsage {
+                    call_index, usage, ..
+                } => Some((call_index, usage.total_tokens)),
                 _ => None,
             })
             .collect::<Vec<_>>();
@@ -6693,6 +6734,86 @@ mod tests {
                 .total_tokens,
             12
         );
+    }
+
+    #[tokio::test]
+    async fn provider_usage_persists_breakdown_and_selected_model() {
+        let (_directory, repository, runtime, thread_id) = runtime_fixture().await;
+        let details = crate::protocol::TokenUsageDetails {
+            cached_input_tokens: Some(40),
+            uncached_input_tokens: Some(60),
+            cache_write_input_tokens: None,
+            reasoning_output_tokens: Some(10),
+        };
+        let provider = Arc::new(FakeProvider::script(vec![vec![
+            Ok(ProviderEvent::ModelSelected {
+                provider: "openai".into(),
+                model: "gpt-test".into(),
+            }),
+            Ok(ProviderEvent::DetailedUsage {
+                usage: TokenUsage {
+                    input_tokens: 100,
+                    output_tokens: 30,
+                    total_tokens: 130,
+                },
+                details,
+            }),
+            Ok(ProviderEvent::Usage {
+                usage: TokenUsage {
+                    input_tokens: 100,
+                    output_tokens: 30,
+                    total_tokens: 130,
+                },
+            }),
+            Ok(ProviderEvent::TextDelta {
+                delta: "complete".into(),
+            }),
+            Ok(ProviderEvent::Completed),
+        ]]));
+
+        runtime
+            .run_turn(
+                provider,
+                "configured-model".into(),
+                RunTurnRequest {
+                    thread_id: thread_id.clone(),
+                    input: "track detailed usage".into(),
+                    agent_mode: None,
+                },
+                CancellationToken::new(),
+                Arc::new(RecordingPublisher::default()),
+            )
+            .await
+            .unwrap();
+
+        let usage = repository
+            .load(&thread_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .find_map(|event| match event.kind {
+                StoredEventKind::ProviderCallUsage {
+                    usage,
+                    details,
+                    provider,
+                    model,
+                    ..
+                } => Some((usage, details, provider, model)),
+                _ => None,
+            })
+            .expect("the provider call should persist usage");
+        assert_eq!(usage.0.total_tokens, 130);
+        assert_eq!(usage.1, details);
+        assert_eq!(usage.2.as_deref(), Some("openai"));
+        assert_eq!(usage.3.as_deref(), Some("gpt-test"));
+
+        let summary = repository.projection().usage_summary().unwrap();
+        assert_eq!(summary.total_tokens, 130);
+        assert_eq!(summary.cached_input_tokens, Some(40));
+        assert_eq!(summary.reasoning_output_tokens, Some(10));
+        assert_eq!(summary.models.len(), 1);
+        assert_eq!(summary.models[0].provider.as_deref(), Some("openai"));
+        assert_eq!(summary.models[0].model.as_deref(), Some("gpt-test"));
     }
 
     #[tokio::test]
