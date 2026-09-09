@@ -1412,6 +1412,17 @@ function RobotsPage({
 
               {expanded && (
                 <div className="robot-details">
+                  <div className="robot-system-prompt-group">
+                    <div className="robot-section-heading">
+                      <span>System Prompt</span>
+                      <small>内置只读</small>
+                    </div>
+                    <pre
+                      className="robot-system-prompt"
+                      aria-label={`${workflow.name} 的 System Prompt`}
+                    >{workflow.rolePrompt}</pre>
+                  </div>
+
                   <div className="robot-skill-summary" aria-label={`${workflow.name} 技能组成`}>
                     <span><strong>{workflow.localSkillCount}</strong> 本地技能</span>
                     <span><strong>{workflow.pluginSkillCount}</strong> 插件技能</span>
@@ -1814,6 +1825,9 @@ function ExtensionsPage() {
   const [query, setQuery] = useState("");
   const [category, setCategory] = useState<SkillCategory | "all">("all");
   const [scope, setScope] = useState<"all" | "builtin" | "global" | "project">("all");
+  const [collapsedGroups, setCollapsedGroups] = useState<ReadonlySet<string>>(
+    () => new Set(SKILL_CATEGORIES.slice(1).map((item) => item.id)),
+  );
 
   async function load(refresh = false) {
     setLoading(true);
@@ -1854,6 +1868,16 @@ function ExtensionsPage() {
   const groups = SKILL_CATEGORIES
     .map((item) => ({ ...item, skills: filtered.filter((skill) => skill.category === item.id) }))
     .filter((item) => item.skills.length > 0);
+  const hasActiveFilter = normalizedQuery !== "" || category !== "all" || scope !== "all";
+  const isGroupExpanded = (groupId: string) => hasActiveFilter || !collapsedGroups.has(groupId);
+  const toggleGroup = (groupId: string) => {
+    setCollapsedGroups((current) => {
+      const next = new Set(current);
+      if (next.has(groupId)) next.delete(groupId);
+      else next.add(groupId);
+      return next;
+    });
+  };
 
   return <section className="settings-page extensions-page" aria-labelledby="skills-page-title">
     <div className="settings-page-header">
@@ -1877,20 +1901,53 @@ function ExtensionsPage() {
     </div>
     {(error || overview?.error) && <div className="settings-error" role="alert">{error || overview?.error}</div>}
     {groups.length ? <div className="skill-category-list">
-      {groups.map((group) => <section className="skill-category-group" aria-labelledby={`skill-category-${group.id}`} key={group.id}>
-        <div className="skill-category-heading"><div><strong id={`skill-category-${group.id}`}>{group.label}</strong><span>{group.description}</span></div><small>{group.skills.length}</small></div>
-        <div className="extension-list">
-          {group.skills.map((skill) => <div className="extension-row" key={`${skill.scope}-${skill.path}-${skill.name}`}>
-            <div className={`skill-risk skill-risk--${skill.risk}`}>{riskText(skill.risk)}</div>
-            <div className="extension-row-main"><strong>{skill.name}</strong><span>{skill.description}</span><small>{skillScopeText(skill.scope)} · {skill.triggers.join("、")}</small></div>
-            {skill.managedByRobot ? (
-              <span className="skill-managed-state" title="机器人工作流运行所需，不能停用"><LockKeyhole size={13} />机器人必需</span>
-            ) : (
-              <label className="extension-toggle"><input type="checkbox" checked={skill.enabled} disabled={loading} onChange={(event) => void toggle("skill", skill.name, event.target.checked)} /><span>启用</span></label>
-            )}
-          </div>)}
-        </div>
-      </section>)}
+      {groups.map((group) => {
+        const expanded = isGroupExpanded(group.id);
+        const enabledCount = group.skills.filter((skill) => skill.enabled || skill.managedByRobot).length;
+        return <section className="skill-category-group" aria-labelledby={`skill-category-${group.id}`} key={group.id}>
+          <button
+            type="button"
+            className="skill-category-heading"
+            aria-expanded={expanded}
+            aria-controls={`skill-category-${group.id}-body`}
+            onClick={() => toggleGroup(group.id)}
+          >
+            {expanded ? <ChevronDown size={15} /> : <ChevronRight size={15} />}
+            <div>
+              <strong id={`skill-category-${group.id}`}>{group.label}</strong>
+              <span>{group.description}</span>
+            </div>
+            <span className="skill-category-meta">
+              <small>{enabledCount}/{group.skills.length} 已启用</small>
+              <small className="skill-category-count">{group.skills.length}</small>
+            </span>
+          </button>
+          {expanded && (
+            <div className="extension-list" id={`skill-category-${group.id}-body`}>
+              {group.skills.map((skill) => <div className="extension-row" key={`${skill.scope}-${skill.path}-${skill.name}`}>
+                <div className="extension-row-main">
+                  <div className="skill-name-line">
+                    <strong>{skill.name}</strong>
+                    <span className={`skill-scope skill-scope--${skill.scope}`}>{skillScopeText(skill.scope)}</span>
+                    <span className={`skill-risk skill-risk--${skill.risk}`}>{riskText(skill.risk)}</span>
+                  </div>
+                  <span className="skill-desc">{skill.description}</span>
+                  {skill.triggers.length > 0 && (
+                    <div className="skill-triggers">
+                      {skill.triggers.map((trigger) => <code key={trigger}>{trigger}</code>)}
+                    </div>
+                  )}
+                </div>
+                {skill.managedByRobot ? (
+                  <span className="skill-managed-state" title="机器人工作流运行所需，不能停用"><LockKeyhole size={13} />机器人必需</span>
+                ) : (
+                  <label className="extension-toggle"><input type="checkbox" checked={skill.enabled} disabled={loading} onChange={(event) => void toggle("skill", skill.name, event.target.checked)} /><span>启用</span></label>
+                )}
+              </div>)}
+            </div>
+          )}
+        </section>;
+      })}
     </div> : <ExtensionEmpty text={overview?.skills.length ? "没有符合筛选条件的 Skill" : "未发现有效的 SKILL.md"} />}
   </section>;
 }

@@ -4,7 +4,6 @@ import {
   Bot,
   CheckCircle2,
   Clock,
-  Copy,
   Loader2,
   Pause,
   Play,

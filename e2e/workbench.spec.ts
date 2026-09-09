@@ -35,10 +35,11 @@ test.beforeEach(async ({ page }) => {
         fallbackSkillId: kind === "plugin_skill" ? skillId : null,
       };
     };
-    const makeWorkflow = ({ id, name, description, localSkills, pluginSkills, nodes }: {
+    const makeWorkflow = ({ id, name, description, rolePrompt, localSkills, pluginSkills, nodes }: {
       id: string;
       name: string;
       description: string;
+      rolePrompt: string;
       localSkills: string[];
       pluginSkills: string[];
       nodes: Array<[string, string, string]>;
@@ -48,6 +49,7 @@ test.beforeEach(async ({ page }) => {
       id,
       name,
       description,
+      rolePrompt,
       localSkillCount: localSkills.length,
       pluginSkillCount: pluginSkills.length,
       uniqueSkillCount: localSkills.length + pluginSkills.length,
@@ -71,6 +73,7 @@ test.beforeEach(async ({ page }) => {
         id: "fullstack-delivery",
         name: "全栈开发机器人",
         description: "覆盖需求分析、界面与架构设计、原型 HTML、前后端开发、全面测试、构建发布和代码交付。",
+        rolePrompt: "# 全栈开发机器人 - 角色定义\n\n你是一位经验丰富的全栈开发工程师。",
         localSkills: ["brainstorming", "writing-plans", "executing-plans", "test-driven-development", "requesting-code-review", "verification-before-completion", "dispatching-parallel-agents", "taste-skill", "awesome-design-md"],
         pluginSkills: ["browser/control-in-app-browser", "superpowers/brainstorming", "superpowers/dispatching-parallel-agents", "superpowers/executing-plans", "superpowers/finishing-a-development-branch", "superpowers/receiving-code-review", "superpowers/requesting-code-review", "superpowers/subagent-driven-development", "superpowers/systematic-debugging", "superpowers/test-driven-development", "superpowers/using-git-worktrees", "superpowers/verification-before-completion", "superpowers/writing-plans", "documents/documents"],
         nodes: [
@@ -88,6 +91,7 @@ test.beforeEach(async ({ page }) => {
         id: "quality-assurance",
         name: "软件测试机器人",
         description: "覆盖测试策略、用例设计、单元测试、集成与 API、E2E/UI、性能、安全和测试报告。",
+        rolePrompt: "# 软件测试机器人 - 角色定义\n\n你是一位经验丰富的高级 QA 测试工程师。",
         localSkills: ["test-strategy-planning", "test-case-design", "api-testing", "performance-testing", "security-testing", "test-report-generation", "webapp-testing"],
         pluginSkills: ["superpowers/test-driven-development", "superpowers/systematic-debugging", "superpowers/verification-before-completion", "superpowers/writing-plans", "superpowers/executing-plans", "superpowers/dispatching-parallel-agents", "superpowers/subagent-driven-development", "browser/control-in-app-browser", "documents/documents"],
         nodes: [
@@ -104,6 +108,7 @@ test.beforeEach(async ({ page }) => {
         id: "requirements-design",
         name: "需求设计机器人",
         description: "通过需求采集、边界划定、用户故事、交互流程、PRD 审查、文档输出和钉钉发布形成可交付需求文档。",
+        rolePrompt: "# 需求设计机器人 - 角色定义\n\n你是一位资深产品经理和需求分析师。",
         localSkills: ["requirements-intake", "prd-story-modeler", "prd-delivery-review", "create-plan", "dingtalk-document"],
         pluginSkills: ["superpowers/brainstorming", "superpowers/verification-before-completion", "superpowers/writing-plans", "documents/documents"],
         nodes: [
@@ -1252,6 +1257,8 @@ test("restores persisted robot node progress and lists built-in definitions", as
   await expect(page.locator(".robot-row--active .robot-skill-summary")).toContainText("5 本地技能");
   await expect(page.locator(".robot-row--active .robot-skill-summary")).toContainText("4 插件技能");
   await expect(page.locator(".robot-row--active")).toContainText("requirements-intake");
+  await expect(page.locator(".robot-row--active .robot-system-prompt"))
+    .toContainText("需求设计机器人 - 角色定义");
   await page.screenshot({ path: testInfo.outputPath("builtin-robots-settings.png"), fullPage: true });
 });
 

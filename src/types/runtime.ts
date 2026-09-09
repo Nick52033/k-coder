@@ -670,6 +670,8 @@ export interface WorkflowDefinitionView {
   id: string;
   name: string;
   description: string;
+  /** 机器人级 System Prompt，内置定义只读，界面仅展示。 */
+  rolePrompt: string;
   localSkillCount: number;
   pluginSkillCount: number;
   uniqueSkillCount: number;

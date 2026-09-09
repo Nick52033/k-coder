@@ -5441,12 +5441,31 @@ button {
 .skill-search:focus-within { border-color: var(--color-brand); box-shadow: 0 0 0 2px color-mix(in srgb, var(--color-brand) 18%, transparent); }
 .skill-search input { min-width: 0; width: 100%; border: 0; outline: 0; color: var(--color-ink); background: transparent; font: inherit; font-size: var(--font-size-sm); }
 .skill-filters select { min-width: 0; height: 34px; padding: 0 28px 0 9px; border: 1px solid var(--color-border-input); border-radius: 6px; color: var(--color-ink); background: var(--color-surface); font: inherit; font-size: var(--font-size-sm); }
-.skill-category-list { display: grid; gap: 18px; }
-.skill-category-group { min-width: 0; }
-.skill-category-heading { display: flex; min-width: 0; padding: 0 4px 7px; align-items: end; justify-content: space-between; gap: 12px; }
-.skill-category-heading > div { display: grid; min-width: 0; gap: 2px; }
-.skill-category-heading strong { color: var(--color-ink); font-size: var(--font-size-sm); }
-.skill-category-heading span, .skill-category-heading small { color: var(--color-ink-subtle); font-size: var(--font-size-xs); }
+.skill-category-list { display: grid; max-width: 720px; gap: 10px; }
+.skill-category-group { min-width: 0; border: 1px solid var(--color-border); border-radius: var(--radius-sm); background: var(--color-surface); overflow: hidden; }
+.skill-category-heading { display: flex; width: 100%; min-width: 0; padding: 12px 14px; align-items: center; gap: 10px; border: 0; background: transparent; cursor: pointer; text-align: left; }
+.skill-category-heading:hover { background: var(--color-surface-hover); }
+.skill-category-heading > svg { flex-shrink: 0; color: var(--color-ink-muted); }
+.skill-category-heading > div { display: grid; flex: 1; min-width: 0; gap: 2px; }
+.skill-category-heading strong { color: var(--color-ink); font-size: var(--font-size-base); }
+.skill-category-heading div > span { overflow: hidden; color: var(--color-ink-subtle); font-size: var(--font-size-xs); text-overflow: ellipsis; white-space: nowrap; }
+.skill-category-meta { display: inline-flex; flex-shrink: 0; align-items: center; gap: 8px; white-space: nowrap; }
+.skill-category-meta small { color: var(--color-ink-muted); font-size: var(--font-size-xs); font-variant-numeric: tabular-nums; }
+.skill-category-count { min-width: 24px; padding: 1px 7px; border-radius: 999px; color: var(--color-ink-muted); background: var(--color-surface-raised); text-align: center; }
+.skill-category-group > .extension-list { display: grid; border-top: 1px solid var(--color-border); background: var(--color-surface-raised); }
+.skill-category-group > .extension-list .extension-row { min-height: 0; padding: 11px 14px; grid-template-columns: minmax(0, 1fr) auto; gap: 12px; border-bottom: 1px solid var(--color-border); }
+.skill-category-group > .extension-list .extension-row:last-child { border-bottom: 0; }
+.skill-name-line { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.skill-name-line strong { font-family: var(--font-family-mono); font-size: var(--font-size-sm); }
+.skill-category-group .skill-scope { padding: 1px 6px; border-radius: 4px; color: var(--color-brand); background: color-mix(in srgb, var(--color-brand) 12%, transparent); font-size: var(--font-size-xs); font-weight: 650; }
+.skill-category-group .skill-scope--global { color: var(--color-ink-muted); background: var(--color-surface-raised); }
+.skill-category-group .skill-scope--project { color: var(--color-success-text); background: var(--color-success-bg); }
+.skill-category-group .skill-risk { padding: 2px 6px; color: var(--color-ink-muted); background: var(--color-surface-hover); font-size: var(--font-size-xs); font-weight: 650; text-align: left; }
+.skill-category-group .skill-risk--delete, .skill-category-group .skill-risk--external { color: var(--color-error-text); background: var(--color-error-bg); }
+.skill-category-group .skill-risk--write { color: var(--color-warning); }
+.skill-category-group .skill-desc { color: var(--color-ink-subtle); font-size: var(--font-size-xs); line-height: 1.5; }
+.skill-triggers { display: flex; flex-wrap: wrap; margin-top: 1px; gap: 4px; }
+.skill-triggers code { padding: 1px 6px; border: 1px solid var(--color-border); border-radius: 4px; color: var(--color-ink-muted); background: var(--color-surface); font-family: var(--font-family-mono); font-size: 11px; }
 .skill-managed-state { display: inline-flex; align-items: center; gap: 5px; color: var(--color-ink-muted); font-size: var(--font-size-xs); white-space: nowrap; }
 .instruction-list > div, .audit-list > div { display: grid; min-height: 48px; padding: 8px 4px; grid-template-columns: 42px minmax(0,1fr) auto; align-items: center; gap: 9px; border-bottom: 1px solid var(--color-border); }
 .instruction-list > div > span { color: var(--color-brand); font: 650 var(--font-size-sm)/1 var(--font-family-mono, monospace); }
@@ -7399,6 +7418,22 @@ button {
 .robot-skill-summary > span { display: flex; min-width: 0; padding: 9px 10px; flex-direction: column; gap: 2px; border-right: 1px solid var(--color-border); color: var(--color-ink-subtle); font-size: var(--font-size-xs); }
 .robot-skill-summary > span:last-child { border-right: 0; }
 .robot-skill-summary strong { color: var(--color-ink); font-size: var(--font-size-base); font-variant-numeric: tabular-nums; }
+.robot-system-prompt-group { display: grid; min-width: 0; gap: 7px; }
+.robot-system-prompt {
+  margin: 0;
+  max-height: 180px;
+  padding: 10px 11px;
+  overflow: auto;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  background: var(--color-surface);
+  color: var(--color-ink-muted);
+  font-family: var(--font-family-mono);
+  font-size: var(--font-size-xs);
+  line-height: 1.6;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
 .robot-skill-group { display: grid; min-width: 0; gap: 7px; }
 .robot-section-heading { display: flex; align-items: center; justify-content: space-between; gap: 10px; color: var(--color-ink); font-size: var(--font-size-sm); font-weight: 650; }
 .robot-section-heading small { color: var(--color-ink-subtle); font-size: var(--font-size-xs); font-weight: 400; }
