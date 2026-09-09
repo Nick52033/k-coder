@@ -77,6 +77,8 @@ import type {
   AddKnowledgeSourceRequest,
   KnowledgeSource,
   KnowledgeIndexJob,
+  KnowledgeIndexProgress,
+  KnowledgeIndexMetrics,
   SetEmbeddingSettingsRequest,
   KnowledgeSearchResponse,
   KnowledgeCitation,
@@ -312,6 +314,7 @@ export function deleteKnowledgeSource(sourceId: string, confirmationToken: strin
 export function refreshKnowledgeSource(sourceId: string) { return invoke<KnowledgeIndexJob>("refresh_knowledge_source", { sourceId }); }
 export function getKnowledgeIndexJob(jobId: string) { return invoke<KnowledgeIndexJob>("get_knowledge_index_job", { jobId }); }
 export function cancelKnowledgeIndexJob(jobId: string) { return invoke<KnowledgeIndexJob>("cancel_knowledge_index_job", { jobId }); }
+export function getKnowledgeMetrics() { return invoke<KnowledgeIndexMetrics>("get_knowledge_metrics"); }
 export function getEmbeddingSettings() { return invoke<EmbeddingSettings>("get_embedding_settings"); }
 export function setEmbeddingSettings(request: SetEmbeddingSettingsRequest) { return invoke<EmbeddingSettings>("set_embedding_settings", { request }); }
 export function setEmbeddingApiKey(apiKey: string) { return invoke<Record<string, unknown>>("set_embedding_api_key", { apiKey }); }
@@ -507,6 +510,12 @@ export function subscribeToMailboxEvents(
   handler: (event: ThreadMailboxChanged) => void,
 ): Promise<UnlistenFn> {
   return listen<ThreadMailboxChanged>("thread-mailbox-changed", ({ payload }) => handler(payload));
+}
+
+export function subscribeToKnowledgeProgress(
+  handler: (event: KnowledgeIndexProgress) => void,
+): Promise<UnlistenFn> {
+  return listen<KnowledgeIndexProgress>("knowledge-index-progress", ({ payload }) => handler(payload));
 }
 
 export function subscribeToSubagentEvents(

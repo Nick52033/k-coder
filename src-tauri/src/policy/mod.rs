@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, oneshot};
 use tokio_util::sync::CancellationToken;
 
-use crate::execution::CommandRuntime;
+use crate::execution::{CommandRuntime, SandboxProfile};
 use crate::protocol::{ApprovalAction, ApprovalResolution, ToolRisk, UserInputResolution};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -93,6 +93,30 @@ impl PolicyEngine for WorkspacePolicy {
 
 pub struct ExecutionWorkspacePolicy {
     pub runtime: CommandRuntime,
+}
+
+impl ExecutionWorkspacePolicy {
+    /// ADR 0056：策略判断同时给出期望的隔离强度。
+    ///
+    /// 真正的执行侧挂点在 `CommandRuntime::start`（按实际 program/args 重新派生），
+    /// 因此模型既不能伪造也不能绕过这里的结论。
+    pub fn sandbox_profile(&self, arguments: &serde_json::Value) -> SandboxProfile {
+        let command = arguments
+            .get("command")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let cwd = arguments
+            .get("cwd")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let timeout_ms = arguments
+            .get("timeoutMs")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(120_000);
+        let assessment = self.runtime.assess_shell_command(command, cwd, timeout_ms);
+        SandboxProfile::for_risk(&assessment.risk)
+    }
 }
 
 impl PolicyEngine for ExecutionWorkspacePolicy {

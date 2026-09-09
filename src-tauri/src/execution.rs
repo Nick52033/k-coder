@@ -15,7 +15,13 @@ use tokio::sync::{Mutex, Notify};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+mod sandbox;
 mod shell;
+
+pub use sandbox::{
+    NoSandboxBackend, SandboxAudit, SandboxBackend, SandboxCapability, SandboxError, SandboxGate,
+    SandboxOutcome, SandboxProfile,
+};
 
 const DEFAULT_BUFFER_BYTES: usize = 1024 * 1024;
 const MAX_BUFFER_BYTES: usize = 8 * 1024 * 1024;
@@ -72,6 +78,9 @@ pub struct CommandSessionView {
     pub next_cursor: u64,
     pub oldest_cursor: u64,
     pub output_truncated: bool,
+    /// ADR 0056：本次执行的隔离事实，便于界面与审计展示。
+    #[serde(default)]
+    pub sandbox: SandboxAudit,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -262,6 +271,8 @@ pub enum ExecutionError {
     Closed(String),
     #[error("command runtime failed: {0}")]
     Io(String),
+    #[error("command sandbox failed: {0}")]
+    Sandbox(String),
 }
 
 #[derive(Debug, Clone)]
@@ -334,6 +345,7 @@ pub struct CommandRuntime {
     recovery_dir: Option<PathBuf>,
     default_shell: shell::DetectedShell,
     bundled_tools: Option<BundledTools>,
+    sandbox: Arc<SandboxGate>,
 }
 
 /// Host-owned reusable authorization. It is intentionally not deserializable, so a
@@ -376,6 +388,7 @@ struct Session {
     finished_at_ms: Mutex<Option<u64>>,
     stdin: Mutex<Option<ChildStdin>>,
     output: Mutex<OutputBuffer>,
+    sandbox: Mutex<SandboxAudit>,
     cancel: CancellationToken,
     changed: Notify,
 }
@@ -418,7 +431,16 @@ impl CommandRuntime {
             recovery_dir: None,
             default_shell: shell::default_user_shell(),
             bundled_tools,
+            // ADR 0056：本阶段还没有平台后端，降级继续并全量审计；
+            // `P10-002b` 引入真实后端之后应改为默认关闭失败。
+            sandbox: Arc::new(SandboxGate::new(Arc::new(sandbox::NoSandboxBackend))),
         })
+    }
+
+    /// 注入沙箱后端。目前只用于测试和后续平台后端装配。
+    pub fn with_sandbox_gate(mut self, gate: Arc<SandboxGate>) -> Self {
+        self.sandbox = gate;
+        self
     }
 
     pub fn with_recovery(
@@ -476,6 +498,7 @@ impl CommandRuntime {
                         next_cursor: view.next_cursor,
                         truncated: view.output_truncated,
                     }),
+                    sandbox: Mutex::new(view.sandbox),
                     cancel: CancellationToken::new(),
                     changed: Notify::new(),
                 }),
@@ -588,6 +611,7 @@ impl CommandRuntime {
                 next_cursor: 0,
                 truncated: false,
             }),
+            sandbox: Mutex::new(SandboxAudit::pending(self.sandbox.backend_name())),
             cancel: CancellationToken::new(),
             changed: Notify::new(),
         });
@@ -610,6 +634,14 @@ impl CommandRuntime {
             command.env("PATH", bundled_path);
         }
         configure_process_group(&mut command);
+        // ADR 0056：沙箱是 spawn 之前的最后一道边界，能力不足时按设置关闭失败或审计降级。
+        let assessment = assess_command(&request.program, &request.args);
+        let profile = SandboxProfile::for_risk(&assessment.risk);
+        let audit = self
+            .sandbox
+            .prepare(&mut command, &profile)
+            .map_err(|error| ExecutionError::Sandbox(error.to_string()))?;
+        *session.sandbox.lock().await = audit;
         let mut child = command
             .spawn()
             .map_err(|e| ExecutionError::Io(e.to_string()))?;
@@ -765,6 +797,7 @@ async fn session_view(session: &Session) -> Result<CommandSessionView, Execution
     let state = session.state.lock().await.clone();
     let finished_at_ms = *session.finished_at_ms.lock().await;
     let output = session.output.lock().await;
+    let sandbox = session.sandbox.lock().await.clone();
     Ok(CommandSessionView {
         id: session.id.clone(),
         mode: session.mode,
@@ -777,6 +810,7 @@ async fn session_view(session: &Session) -> Result<CommandSessionView, Execution
             .front()
             .map_or(output.next_cursor, |chunk| chunk.cursor),
         output_truncated: output.truncated,
+        sandbox,
     })
 }
 
@@ -1509,6 +1543,52 @@ mod tests {
         }
     }
 
+    fn echo_request(script: &str) -> StartCommandRequest {
+        #[cfg(windows)]
+        {
+            request("cmd", &["/D", "/S", "/C", script], 5_000)
+        }
+        #[cfg(not(windows))]
+        {
+            request("sh", &["-c", script], 5_000)
+        }
+    }
+
+    #[tokio::test]
+    async fn command_start_records_an_audited_degradation_without_a_platform_backend() {
+        let workspace = tempfile::tempdir().unwrap();
+        let runtime = CommandRuntime::new(workspace.path()).unwrap();
+        let session = runtime
+            .start(echo_request("echo sandbox-audit"))
+            .await
+            .unwrap();
+        assert_eq!(session.sandbox.backend, "none");
+        assert_eq!(session.sandbox.outcome, SandboxOutcome::Degraded);
+        assert!(session.sandbox.reason.is_some());
+        assert_eq!(
+            runtime.wait(&session.id).await.unwrap().state,
+            CommandState::Exited { code: 0 }
+        );
+        runtime.close(&session.id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn command_start_fails_closed_when_the_profile_cannot_be_enforced() {
+        let workspace = tempfile::tempdir().unwrap();
+        let gate = SandboxGate::new(Arc::new(NoSandboxBackend)).with_degraded_execution(false);
+        let runtime = CommandRuntime::new(workspace.path())
+            .unwrap()
+            .with_sandbox_gate(Arc::new(gate));
+        let error = runtime
+            .start(echo_request("echo blocked"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, ExecutionError::Sandbox(ref message) if message.contains("已按设置阻止执行")),
+            "unexpected error: {error}"
+        );
+    }
+
     #[cfg(windows)]
     #[tokio::test]
     async fn bundled_ripgrep_runs_when_the_requested_path_is_empty() {
@@ -1613,6 +1693,7 @@ mod tests {
                 next_cursor: 0,
                 truncated: false,
             }),
+            sandbox: Mutex::new(SandboxAudit::default()),
             cancel: CancellationToken::new(),
             changed: Notify::new(),
         });
@@ -1850,6 +1931,7 @@ mod tests {
             next_cursor: 0,
             oldest_cursor: 0,
             output_truncated: false,
+            sandbox: SandboxAudit::default(),
         };
         write_recovery_view(&directory, &view).unwrap();
 

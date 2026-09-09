@@ -60,7 +60,9 @@ impl ForkMode {
             return Ok(Self::All);
         }
         let turns = raw.parse::<usize>().map_err(|_| {
-            MultiAgentError::Invalid("forkTurns must be `none`, `all`, or a positive integer".into())
+            MultiAgentError::Invalid(
+                "forkTurns must be `none`, `all`, or a positive integer".into(),
+            )
         })?;
         if turns == 0 {
             return Err(MultiAgentError::Invalid(
@@ -520,11 +522,10 @@ impl MultiAgentCoordinator {
         trigger_turn: bool,
     ) -> Result<Option<SubagentView>, MultiAgentError> {
         let handle = {
-            let active = self
-                .inner
-                .active
-                .lock()
-                .map_err(|_| MultiAgentError::Storage("subagent active lock poisoned".into()))?;
+            let active =
+                self.inner.active.lock().map_err(|_| {
+                    MultiAgentError::Storage("subagent active lock poisoned".into())
+                })?;
             active
                 .get(id)
                 .map(|active| (Arc::clone(&active.control), Arc::clone(&active.mailbox)))
@@ -817,11 +818,10 @@ impl MultiAgentCoordinator {
         publisher: &Arc<dyn SubagentEventPublisher>,
     ) -> Result<(), MultiAgentError> {
         let record = {
-            let mut records = self
-                .inner
-                .records
-                .lock()
-                .map_err(|_| MultiAgentError::Storage("subagent record lock poisoned".into()))?;
+            let mut records =
+                self.inner.records.lock().map_err(|_| {
+                    MultiAgentError::Storage("subagent record lock poisoned".into())
+                })?;
             let record = records
                 .get_mut(id)
                 .ok_or_else(|| MultiAgentError::NotFound(id.into()))?;
@@ -1125,7 +1125,7 @@ impl ToolHandler for AgentToolHandler {
             AgentToolOperation::Create => (
                 "create_agent",
                 "Create a bounded subagent for an independent task.",
-                json!({"task":{"type":"string"},"label":{"type":"string"},"capabilities":{"type":"array","items":{"type":"string"}},"tokenBudget":{"type":"integer","minimum":1},"timeoutMs":{"type":"integer","minimum":1},"forkTurns":{"type":"string","description":"`none` (default) starts an empty thread, `all` replays the parent history, or a positive integer replays the last N parent turns."},"parentAgentId":{"type":"string","description":"Omit for a direct child of this agent; set to a subagent id to delegate one level deeper."}}),
+                json!({"task":{"type":"string"},"label":{"type":"string"},"capabilities":{"type":"array","items":{"type":"string"}},"tokenBudget":{"type":"integer","minimum":1,"description":"Omit unless you know the task is small. The default is unlimited, and once the budget is exhausted the subagent hard-fails with `token_budget_exceeded` and resume_agent refuses to relaunch it (deadlock). Prefer omitting and rely on timeoutMs + Compaction."},"timeoutMs":{"type":"integer","minimum":1},"forkTurns":{"type":"string","description":"`none` (default) starts an empty thread, `all` replays the parent history, or a positive integer replays the last N parent turns."},"parentAgentId":{"type":"string","description":"Omit for a direct child of this agent; set to a subagent id to delegate one level deeper."}}),
                 vec!["task"],
             ),
             AgentToolOperation::Wait => (
@@ -1784,5 +1784,39 @@ mod tests {
             .unwrap();
         assert_eq!(result.state, SubagentState::Failed);
         assert!(result.error.unwrap().contains("token_budget_exceeded"));
+    }
+
+    #[test]
+    fn create_agent_tool_description_warns_about_token_budget_deadlock() {
+        // Only the tool definition matters here; nothing executes, so the handler
+        // gets the cheapest valid context.
+        let data = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let repository = Arc::new(JsonlThreadRepository::new(data.path()).unwrap());
+        let provider = Arc::new(FakeProvider::text(&["unused"]));
+        let lifecycle: Arc<dyn SubagentEventPublisher> = Arc::new(NoopSubagentPublisher);
+        let manager = MultiAgentCoordinator::new(data.path()).unwrap();
+        let handler = AgentToolHandler {
+            operation: AgentToolOperation::Create,
+            manager,
+            context: context(repository, workspace.path(), provider, lifecycle),
+            parent_thread_id: "test".into(),
+            parent_cancellation: CancellationToken::new(),
+        };
+        let definition = handler.definition();
+        assert_eq!(definition.name, "create_agent");
+        let schema = serde_json::to_string(&definition.input_schema).unwrap();
+        assert!(
+            schema.contains("\"tokenBudget\""),
+            "schema missing tokenBudget: {schema}"
+        );
+        assert!(
+            schema.contains("deadlock"),
+            "create_agent tokenBudget description should warn about the deadlock risk: {schema}"
+        );
+        assert!(
+            schema.contains("exhausted") && schema.contains("resume_agent"),
+            "create_agent tokenBudget description should explain exhausted + resume_agent refusal: {schema}"
+        );
     }
 }

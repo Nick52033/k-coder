@@ -21,6 +21,8 @@ export interface UpsertKnowledgeCollectionRequest { id?: string | null; name: st
 export interface AddKnowledgeSourceRequest { collectionId: string; workspaceRelativePath: string; }
 export interface KnowledgeSource { sourceId: string; relativePath: string; sizeBytes: number; contentHashPrefix: string | null; activeRevisionId: string | null; activeEmbeddingModel: string | null; activeEmbeddingDimension: number; activeEmbeddingEncodingFormat: string; embeddingStatus: string; state: string; chunkCount: number; lastIndexedAtMs: number | null; lastErrorCode: string | null; initialJobId: string | null; }
 export interface KnowledgeIndexJob { jobId: string; sourceId: string; state: string; stage: string; embeddingMode: string; processedBytes: number; totalBytes: number; processedChunks: number; totalChunks: number; embeddingRequests: number; retryCount: number; lastHttpStatus: number | null; chunkCount: number; vectorCount: number; errorCode: string | null; createdAtMs: number; completedAtMs: number | null; }
+export interface KnowledgeIndexProgress { schemaVersion: number; jobId: string; sourceId: string; collectionId: string | null; state: string; stage: string; processedBytes: number; totalBytes: number; processedChunks: number; totalChunks: number; percent: number; embeddingRequests: number; retryCount: number; lastHttpStatus: number | null; errorCode: string | null; elapsedMs: number; timestampMs: number; }
+export interface KnowledgeIndexMetrics { jobsQueued: number; jobsCompleted: number; jobsReused: number; jobsFailed: number; jobsCancelled: number; chunksIndexed: number; vectorsIndexed: number; embeddingRequests: number; embeddingRetries: number; totalIndexDurationMs: number; averageIndexDurationMs: number; lastErrorCode: string | null; lastCompletedAtMs: number | null; }
 export interface KnowledgeSearchResult { citationId: string; title: string; path: string; locator: string; preview: string; revision: string; score: number; lexicalRank: number; semanticRank: number | null; }
 export interface KnowledgeSearchResponse { success: boolean; results: KnowledgeSearchResult[]; metadata: Record<string, unknown>; }
 export interface KnowledgeCitation { citationId: string; path: string; locator: string; text: string; revision: string; isCurrentRevision: boolean; }
@@ -184,6 +186,22 @@ export interface CommandSessionView {
   nextCursor: number;
   oldestCursor: number;
   outputTruncated: boolean;
+  sandbox: CommandSandboxAudit;
+}
+
+/** ADR 0056：命令执行的隔离事实，用于展示与审计。 */
+export interface CommandSandboxAudit {
+  schemaVersion: number;
+  backend: string;
+  capability: "full" | "unsupported" | { partial: { filesystem: boolean; network: boolean; resources: boolean } };
+  profile: {
+    filesystem: "workspace_only" | "workspace_plus_temp" | "full";
+    network: "deny" | "allow" | { allow_hosts: string[] };
+    resources: { maxProcesses: number | null; maxMemoryBytes: number | null; cpuRatePercent: number | null };
+    ui: "deny" | "allow";
+  };
+  outcome: "skipped" | "applied" | "degraded";
+  reason: string | null;
 }
 
 export interface CommandOutputChunk {

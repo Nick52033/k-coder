@@ -106,6 +106,15 @@ pub fn run() {
             )
             .map_err(|error| std::io::Error::other(error.to_string()))?;
             app.manage(state);
+            {
+                let app_state = app.state::<AppState>();
+                app_state.knowledge().attach_progress_sink(
+                    commands::TauriKnowledgeProgressSink::new(app.handle().clone()),
+                );
+                app_state
+                    .knowledge()
+                    .attach_logger(app_state.logger().clone());
+            }
             scheduled_tasks::spawn_scheduler(app.handle().clone());
 
             // 创建系统托盘
@@ -192,6 +201,7 @@ pub fn run() {
             commands::refresh_knowledge_source,
             commands::get_knowledge_index_job,
             commands::cancel_knowledge_index_job,
+            commands::get_knowledge_metrics,
             commands::get_embedding_settings,
             commands::set_embedding_settings,
             commands::set_embedding_api_key,

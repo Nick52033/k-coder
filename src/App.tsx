@@ -42,7 +42,7 @@ import {
   Target,
 } from "lucide-react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { extractLocalDocument, getRuntimeStatus, getWorkspaceState, switchWorkspace, subscribeToAgentEvents, subscribeToMailboxEvents, listSubagents, getExtensionOverview, searchWorkspaceFiles } from "./api/runtime";
+import { extractLocalDocument, getRuntimeStatus, getWorkspaceState, switchWorkspace, subscribeToAgentEvents, subscribeToMailboxEvents, subscribeToSubagentEvents, listSubagents, getExtensionOverview, searchWorkspaceFiles } from "./api/runtime";
 import { useWorkbenchStore } from "./stores/workbenchStore";
 import { reconcileConversationMessages } from "./stores/reducers/historyProjection";
 import { PatchReviewDialog } from "./components/PatchReviewDialog";
@@ -61,7 +61,36 @@ import { ImagePreviewDialog } from "./components/ImagePreviewDialog";
 import { cn } from "./lib/cn";
 import { open } from "@tauri-apps/plugin-dialog";
 import { readFile, stat } from "@tauri-apps/plugin-fs";
-import type { AttachmentContent, FileEntry, GoalView, ImageAttachment, ProjectRecord, RuntimeStatus, ThreadSummary, WorkspaceState } from "./types/runtime";
+import type { AttachmentContent, FileEntry, GoalView, ImageAttachment, ProjectRecord, RuntimeStatus, SubagentView, ThreadSummary, WorkspaceState } from "./types/runtime";
+
+/** Assigns `task1`, `task2`, ... per parent thread, oldest first. */
+function buildSubagentTaskIndex(subagents: SubagentView[]): Record<string, number> {
+  const byParent = new Map<string, SubagentView[]>();
+  for (const agent of subagents) {
+    const list = byParent.get(agent.parentThreadId);
+    if (list) list.push(agent);
+    else byParent.set(agent.parentThreadId, [agent]);
+  }
+  const index: Record<string, number> = {};
+  for (const list of byParent.values()) {
+    list
+      .slice()
+      .sort((a, b) => a.createdAtMs - b.createdAtMs || a.id.localeCompare(b.id))
+      .forEach((agent, position) => {
+        index[agent.id] = position + 1;
+      });
+  }
+  return index;
+}
+
+function upsertSubagent(list: SubagentView[], agent: SubagentView): SubagentView[] {
+  const index = list.findIndex((item) => item.id === agent.id);
+  if (index < 0) return [...list, agent];
+  const next = list.slice();
+  next[index] = agent;
+  return next;
+}
+
 import { ComposerSuggestionMenu, type ComposerSuggestion } from "./components/ComposerSuggestionMenu";
 import { ComposerAddMenu } from "./components/ComposerAddMenu";
 import { useToast } from "./components/Toast";
@@ -354,7 +383,18 @@ function App() {
   );
   const [subagentThreadIds, setSubagentThreadIds] = useState<Set<string>>(new Set());
   const [subagentByThread, setSubagentByThread] = useState<Record<string, string>>({});
+  const [subagentList, setSubagentList] = useState<SubagentView[]>([]);
+  /** Per-parent `task1`/`task2` ... numbering for the conversation timeline chips. */
+  const subagentTaskIndex = useMemo(
+    () => buildSubagentTaskIndex(subagentList),
+    [subagentList],
+  );
   const [selectedSubagentId, setSelectedSubagentId] = useState<string | null>(null);
+  function focusSubagent(agentId: string) {
+    setWorkbenchOpen(false);
+    setAgentPanelOpen(true);
+    setSelectedSubagentId(agentId);
+  }
   const [sideView, setSideView] = useState<"conversations" | "projects">("conversations");
   const [workspacePath, setWorkspacePath] = useState("");
   const [recentProjects, setRecentProjects] = useState<ProjectRecord[]>([]);
@@ -523,6 +563,7 @@ function App() {
           setSubagentByThread(
             Object.fromEntries(subagents.map((subagent) => [subagent.threadId, subagent.id])),
           );
+          setSubagentList(subagents);
         }
       } catch (error) {
         if (!disposed) setRuntimeError(String(error));
@@ -554,6 +595,33 @@ function App() {
       window.removeEventListener("keydown", handleEmergencyReset);
     };
   }, [handleAgentEvent, handleMailboxChanged, initialize, forceResetState]);
+
+  // Mirror subagent lifecycle events so the conversation timeline chips stay in sync
+  // with new subagents created mid-session (initial snapshot comes from `connect`).
+  useEffect(() => {
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    void subscribeToSubagentEvents((agent) => {
+      if (disposed) return;
+      setSubagentList((current) => upsertSubagent(current, agent));
+      setSubagentThreadIds((current) => {
+        const next = new Set(current);
+        next.add(agent.threadId);
+        return next;
+      });
+      setSubagentByThread((current) => {
+        if (current[agent.threadId] === agent.id) return current;
+        return { ...current, [agent.threadId]: agent.id };
+      });
+    }).then((stop) => {
+      if (disposed) stop();
+      else unlisten = stop;
+    });
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, []);
 
   useEffect(() => {
     const area = messageAreaRef.current;
@@ -1224,6 +1292,8 @@ function App() {
             activityStatus={turnId === activityStatus?.turnId ? activityStatus.status : null}
             renderText={renderMessageText}
             onRetry={retryable && lastTurn?.turnId === turnId ? () => void retryLastTurn() : undefined}
+            subagentTaskIndex={subagentTaskIndex}
+            onFocusSubagent={focusSubagent}
           />
         </div>
       </article>
@@ -1298,6 +1368,8 @@ function App() {
                   finalMessageId={assistantMessage?.id}
                   renderText={renderMessageText}
                   onRetry={retryable && lastTurn?.turnId === turnId ? () => void retryLastTurn() : undefined}
+                  subagentTaskIndex={subagentTaskIndex}
+                  onFocusSubagent={focusSubagent}
                 />
                 {!attemptTimeline.length && assistantMessage?.text ? (
                   <div className="message-content">{renderMessageText(assistantMessage.text)}</div>
@@ -2273,6 +2345,8 @@ function App() {
                           finalMessageId={message.id}
                           renderText={renderMessageText}
                           onRetry={retryable && lastTurn?.turnId === message.turnId ? () => void retryLastTurn() : undefined}
+                          subagentTaskIndex={subagentTaskIndex}
+                          onFocusSubagent={focusSubagent}
                         />
                       )}
                       {!messageTimeline.length && (message.text || (message.status === "streaming" && !messageActivityStatus)) ? <div className="message-content">

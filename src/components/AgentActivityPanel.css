@@ -13,7 +13,11 @@
   border-left: 1px solid var(--color-border);
 }
 
-.workbench--panel-open .subagent-drawer {
+/* Only the drawer's own open state may reveal it. Keying off .workbench--panel-open
+   would also show the drawer when the workbench opens, and because both live in
+   grid-column 3 / grid-row 2 the drawer would paint an opaque, empty panel over
+   the workbench tabs. */
+.subagent-drawer--open {
   display: flex;
 }
 

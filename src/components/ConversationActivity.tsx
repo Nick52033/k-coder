@@ -55,6 +55,8 @@ export const ConversationTurnActivity = memo(function ConversationTurnActivity({
   finalMessageId,
   renderText,
   onRetry,
+  subagentTaskIndex,
+  onFocusSubagent,
 }: {
   activities: ToolActivity[];
   timeline?: TurnTimelineItem[];
@@ -67,6 +69,9 @@ export const ConversationTurnActivity = memo(function ConversationTurnActivity({
   finalMessageId?: string;
   renderText?: (text: string) => ReactNode;
   onRetry?: () => void;
+  /** Maps a subagent id to its 1-based `taskN` label within the active thread. */
+  subagentTaskIndex?: Record<string, number>;
+  onFocusSubagent?: (agentId: string) => void;
 }) {
   const paced = usePacedTimeline(timeline, streaming, initialTextVisible);
   const visuallyStreaming = streaming || paced.settling;
@@ -148,6 +153,8 @@ export const ConversationTurnActivity = memo(function ConversationTurnActivity({
               <ToolActivityGroup
                 activities={entry.activities}
                 key={`tool-group-${entry.activities.map((activity) => activity.call.id).join("-")}`}
+                subagentTaskIndex={subagentTaskIndex}
+                onFocusSubagent={onFocusSubagent}
               />
             ) : (
               <TimelineItem
@@ -161,7 +168,11 @@ export const ConversationTurnActivity = memo(function ConversationTurnActivity({
           </div>
         ) : activities.length ? (
           <div className="turn-timeline">
-            <ToolActivityGroup activities={activities} />
+            <ToolActivityGroup
+              activities={activities}
+              subagentTaskIndex={subagentTaskIndex}
+              onFocusSubagent={onFocusSubagent}
+            />
           </div>
         ) : null}
         {terminalEvent?.kind === "turn_failed" ? (
@@ -505,7 +516,15 @@ function ReasoningGroup({
   );
 }
 
-function ToolActivityGroup({ activities }: { activities: ToolActivity[] }) {
+function ToolActivityGroup({
+  activities,
+  subagentTaskIndex,
+  onFocusSubagent,
+}: {
+  activities: ToolActivity[];
+  subagentTaskIndex?: Record<string, number>;
+  onFocusSubagent?: (agentId: string) => void;
+}) {
   const visibleActivities = hideSupersededPatchFailures(activities);
   const state = toolGroupState(visibleActivities);
   const allCommands = visibleActivities.every((activity) => activity.call.name === "run_command");
@@ -545,7 +564,14 @@ function ToolActivityGroup({ activities }: { activities: ToolActivity[] }) {
       </summary>
       <div className="turn-disclosure-panel">
         <div className="turn-tool-group-content">
-          {visibleActivities.map((activity) => <ToolActivityRow activity={activity} key={activity.call.id} />)}
+          {visibleActivities.map((activity) => (
+            <ToolActivityRow
+              activity={activity}
+              key={activity.call.id}
+              subagentTaskIndex={subagentTaskIndex}
+              onFocusSubagent={onFocusSubagent}
+            />
+          ))}
         </div>
       </div>
     </details>
@@ -594,7 +620,15 @@ function toolGroupState(activities: ToolActivity[]): ToolActivity["state"] {
 }
 
 
-function ToolActivityRow({ activity }: { activity: ToolActivity }) {
+function ToolActivityRow({
+  activity,
+  subagentTaskIndex,
+  onFocusSubagent,
+}: {
+  activity: ToolActivity;
+  subagentTaskIndex?: Record<string, number>;
+  onFocusSubagent?: (agentId: string) => void;
+}) {
   const isCommand = activity.call.name === "run_command";
   const command = isCommand ? commandText(activity) : "";
   const outputChunks = isCommand ? [] : visibleOutput(activity);
@@ -612,6 +646,8 @@ function ToolActivityRow({ activity }: { activity: ToolActivity }) {
     : failed && activity.result?.output
       ? truncate(activity.result.output, 120)
       : activityStateLabel(activity);
+  const subagentId = subagentIdOf(activity);
+  const taskNumber = subagentId ? subagentTaskIndex?.[subagentId] : undefined;
   return (
     <div className={`turn-timeline-tool turn-timeline-tool--${activity.state}${isCommand ? " turn-timeline-tool--command" : ""}`}>
       {activity.state === "completed" ? (
@@ -625,6 +661,20 @@ function ToolActivityRow({ activity }: { activity: ToolActivity }) {
       )}
       <span className={isCommand ? "turn-command-summary" : undefined}>
         <strong title={isCommand && command ? command : undefined}>{title}</strong>
+        {subagentId && taskNumber !== undefined ? (
+          <button
+            type="button"
+            className="subagent-task-chip"
+            title="在右侧面板查看该子智能体"
+            aria-label={`查看子智能体 task${taskNumber}`}
+            onClick={(event) => {
+              event.stopPropagation();
+              onFocusSubagent?.(subagentId);
+            }}
+          >
+            task{taskNumber}
+          </button>
+        ) : null}
         <small className="turn-tool-meta" title={isCommand && failed ? meta : undefined}>
           <span>{meta}</span>
           {elapsedMs !== null ? <span className="turn-tool-duration"><Clock3 size={12} aria-hidden="true" />耗时 {formatDuration(elapsedMs)}</span> : null}
@@ -939,12 +989,18 @@ function toolLabel(name: string) {
     apply_patch: "应用补丁",
     browser_click: "点击页面",
     browser_navigate: "打开网页",
+    close_agent: "关闭子智能体",
+    create_agent: "创建子智能体",
+    list_agents: "查看子智能体",
     list_directory: "查看目录",
     read_file: "读取文件",
     request_user_input: "请求输入",
+    resume_agent: "恢复子智能体",
     run_command: "执行命令",
     search_repository: "搜索代码",
+    send_agent_message: "发送给子智能体",
     update_plan: "更新计划",
+    wait_agent: "等待子智能体",
     write_file: "写入文件",
   };
   return labels[name] ?? name;
@@ -955,21 +1011,60 @@ function runningToolLabel(name: string) {
     apply_patch: "正在应用补丁",
     browser_click: "正在操作页面",
     browser_navigate: "正在打开网页",
+    close_agent: "正在关闭子智能体",
+    create_agent: "正在创建子智能体",
+    list_agents: "正在查看子智能体",
     list_directory: "正在查看目录",
     read_file: "正在读取文件",
     request_user_input: "正在准备问题",
+    resume_agent: "正在恢复子智能体",
     run_command: "正在执行命令",
     search_repository: "正在搜索代码",
+    send_agent_message: "正在发送给子智能体",
     update_plan: "正在更新计划",
+    wait_agent: "正在等待子智能体",
     write_file: "正在写入文件",
   };
   return labels[name] ?? `正在运行 ${name}`;
 }
 
+/** Delegation tools from `multi_agent`: each one targets a single subagent. */
+const DELEGATION_TOOL_NAMES = new Set([
+  "create_agent",
+  "wait_agent",
+  "send_agent_message",
+  "resume_agent",
+  "close_agent",
+]);
+
+/**
+ * Resolves the subagent a delegation tool acted on. Most tools carry `agentId` in
+ * their arguments; `create_agent` only learns the id from its structured result.
+ */
+function subagentIdOf(activity: ToolActivity): string | null {
+  if (!DELEGATION_TOOL_NAMES.has(activity.call.name)) return null;
+  const args = activity.call.arguments ?? {};
+  const argumentId = args.agentId;
+  if (typeof argumentId === "string" && argumentId.trim()) return argumentId.trim();
+  const output = activity.result?.output;
+  if (typeof output !== "string" || !output.trim()) return null;
+  try {
+    const parsed = JSON.parse(output) as { id?: unknown };
+    return typeof parsed.id === "string" && parsed.id.trim() ? parsed.id.trim() : null;
+  } catch {
+    return null;
+  }
+}
+
 function toolTarget(activity: ToolActivity) {
   const args = activity.call.arguments ?? {};
-  if (activity.state === "failed" && activity.result?.output) {
+  // Delegation failures already surface through the Chinese tool label; dumping the
+  // raw `SubagentView` JSON into the title would only add noise.
+  if (activity.state === "failed" && activity.result?.output && !DELEGATION_TOOL_NAMES.has(activity.call.name)) {
     return truncate(activity.result.output, 120);
+  }
+  if (activity.call.name === "create_agent" && typeof args.task === "string" && args.task.trim()) {
+    return truncate(`创建子智能体：${args.task.trim()}`, 120);
   }
   if (activity.call.name === "read_file" && typeof args.path === "string") {
     const metadata = activity.result?.metadata ?? {};

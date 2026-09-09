@@ -22,6 +22,7 @@ use tokio::sync::{Mutex as AsyncMutex, Notify};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use crate::logging::StructuredLogger;
 use crate::persistence::ProjectionDb;
 use crate::protocol::{ToolDefinition, ToolResult, ToolRisk};
 use crate::providers::CredentialStore;
@@ -126,6 +127,93 @@ pub struct KnowledgeIndexJob {
     pub error_code: Option<String>,
     pub created_at_ms: u64,
     pub completed_at_ms: Option<u64>,
+}
+
+/// 索引进度事件名。前端通过 `listen("knowledge-index-progress")` 订阅。
+pub const KNOWLEDGE_PROGRESS_EVENT_NAME: &str = "knowledge-index-progress";
+pub const KNOWLEDGE_PROGRESS_SCHEMA_VERSION: u32 = 1;
+/// 高速阶段（embedding 批次）合并进度事件的最小间隔。
+const PROGRESS_THROTTLE: Duration = Duration::from_millis(100);
+/// 已收口 job 的有界去重集合上限，避免长时间运行后无限增长。
+const MAX_OBSERVED_JOBS: usize = 1024;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct KnowledgeIndexProgress {
+    pub schema_version: u32,
+    pub job_id: String,
+    pub source_id: String,
+    pub collection_id: Option<String>,
+    pub state: String,
+    pub stage: String,
+    pub processed_bytes: u64,
+    pub total_bytes: u64,
+    pub processed_chunks: usize,
+    pub total_chunks: usize,
+    pub percent: u8,
+    pub embedding_requests: usize,
+    pub retry_count: usize,
+    pub last_http_status: Option<u16>,
+    pub error_code: Option<String>,
+    pub elapsed_ms: u64,
+    pub timestamp_ms: u64,
+}
+
+/// 进度事件的宿主侧出口。Rust 侧不直接依赖 Tauri，由 `commands` 提供实现。
+pub trait KnowledgeProgressSink: Send + Sync {
+    fn publish(&self, progress: KnowledgeIndexProgress);
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct KnowledgeIndexMetrics {
+    pub jobs_queued: usize,
+    pub jobs_completed: usize,
+    pub jobs_reused: usize,
+    pub jobs_failed: usize,
+    pub jobs_cancelled: usize,
+    pub chunks_indexed: usize,
+    pub vectors_indexed: usize,
+    pub embedding_requests: usize,
+    pub embedding_retries: usize,
+    pub total_index_duration_ms: u64,
+    pub average_index_duration_ms: u64,
+    pub last_error_code: Option<String>,
+    pub last_completed_at_ms: Option<u64>,
+}
+
+impl KnowledgeIndexMetrics {
+    fn refresh_average(&mut self) {
+        let finished = self
+            .jobs_completed
+            .saturating_add(self.jobs_reused)
+            .saturating_add(self.jobs_failed)
+            .saturating_add(self.jobs_cancelled);
+        self.average_index_duration_ms = if finished == 0 {
+            0
+        } else {
+            self.total_index_duration_ms / finished as u64
+        };
+    }
+
+    #[cfg(test)]
+    fn finished_jobs(&self) -> usize {
+        self.jobs_completed + self.jobs_reused + self.jobs_failed + self.jobs_cancelled
+    }
+}
+
+/// 随 `KnowledgeService` 克隆共享的观测出口，因此 worker 与后续附加的宿主出口看到同一份状态。
+#[derive(Clone, Default)]
+struct KnowledgeObservers {
+    progress: Arc<Mutex<Option<Arc<dyn KnowledgeProgressSink>>>>,
+    logger: Arc<Mutex<Option<StructuredLogger>>>,
+}
+
+/// 单个索引任务的观测上下文：进度事件需要的稳定字段只查一次。
+#[derive(Clone)]
+struct IndexJobContext {
+    collection_id: Option<String>,
+    started_at_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -235,6 +323,9 @@ pub struct KnowledgeService {
     worker_started: Arc<AtomicBool>,
     embedding_endpoint: Arc<str>,
     query_embedding_cache: Arc<Mutex<QueryEmbeddingCache>>,
+    observers: KnowledgeObservers,
+    metrics: Arc<Mutex<KnowledgeIndexMetrics>>,
+    observed_jobs: Arc<Mutex<HashSet<String>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -667,6 +758,9 @@ impl KnowledgeService {
             worker_started: Arc::new(AtomicBool::new(false)),
             embedding_endpoint,
             query_embedding_cache: Arc::new(Mutex::new(QueryEmbeddingCache::default())),
+            observers: KnowledgeObservers::default(),
+            metrics: Arc::new(Mutex::new(KnowledgeIndexMetrics::default())),
+            observed_jobs: Arc::new(Mutex::new(HashSet::new())),
         };
         service.recover_interrupted_jobs();
         service.ensure_worker();
@@ -680,6 +774,181 @@ impl KnowledgeService {
         endpoint: impl Into<Arc<str>>,
     ) -> Self {
         Self::new_with_embedding_endpoint(db, credentials, endpoint.into())
+    }
+
+    /// 附加宿主侧的进度出口。可以在 worker 启动之后调用：出口由所有克隆共享。
+    pub fn attach_progress_sink(&self, sink: Arc<dyn KnowledgeProgressSink>) {
+        if let Ok(mut guard) = self.observers.progress.lock() {
+            *guard = Some(sink);
+        }
+    }
+
+    /// 附加结构化日志。日志只记录不透明 ID、计数与耗时，不记录正文、绝对路径或凭据。
+    pub fn attach_logger(&self, logger: StructuredLogger) {
+        if let Ok(mut guard) = self.observers.logger.lock() {
+            *guard = Some(logger);
+        }
+    }
+
+    pub fn metrics_snapshot(&self) -> KnowledgeIndexMetrics {
+        self.metrics
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_default()
+    }
+
+    fn record_metrics(&self, update: impl FnOnce(&mut KnowledgeIndexMetrics)) {
+        if let Ok(mut guard) = self.metrics.lock() {
+            update(&mut guard);
+            guard.refresh_average();
+        }
+    }
+
+    fn log_event(&self, level: &str, event: &str, fields: serde_json::Value) {
+        let logger = self
+            .observers
+            .logger
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone());
+        if let Some(logger) = logger {
+            let _ = logger.log(level, event, fields);
+        }
+    }
+
+    fn progress_percent(job: &KnowledgeIndexJob) -> u8 {
+        let total = job.total_chunks.max(job.total_bytes as usize);
+        if total == 0 {
+            return 0;
+        }
+        let processed = job.processed_chunks.max(job.processed_bytes as usize);
+        if processed >= total {
+            100
+        } else {
+            ((processed.saturating_mul(100)) / total).min(100) as u8
+        }
+    }
+
+    fn publish_progress(&self, job: &KnowledgeIndexJob, context: &IndexJobContext) {
+        let sink = match self.observers.progress.lock() {
+            Ok(guard) => guard.clone(),
+            Err(_) => None,
+        };
+        let Some(sink) = sink else {
+            return;
+        };
+        let timestamp_ms = now_ms();
+        sink.publish(KnowledgeIndexProgress {
+            schema_version: KNOWLEDGE_PROGRESS_SCHEMA_VERSION,
+            job_id: job.job_id.clone(),
+            source_id: job.source_id.clone(),
+            collection_id: context.collection_id.clone(),
+            state: job.state.clone(),
+            stage: job.stage.clone(),
+            processed_bytes: job.processed_bytes,
+            total_bytes: job.total_bytes,
+            processed_chunks: job.processed_chunks,
+            total_chunks: job.total_chunks,
+            percent: Self::progress_percent(job),
+            embedding_requests: job.embedding_requests,
+            retry_count: job.retry_count,
+            last_http_status: job.last_http_status,
+            error_code: job.error_code.clone(),
+            elapsed_ms: timestamp_ms.saturating_sub(context.started_at_ms),
+            timestamp_ms,
+        });
+    }
+
+    fn job_context(&self, source_id: &str) -> IndexJobContext {
+        let collection_id = self
+            .db
+            .with_connection(|connection| {
+                connection
+                    .query_row(
+                        "SELECT collection_id FROM knowledge_sources WHERE id=?1",
+                        [source_id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()
+            })
+            .ok()
+            .flatten();
+        IndexJobContext {
+            collection_id,
+            started_at_ms: now_ms(),
+        }
+    }
+
+    /// 终态收口：只对已完成、复用、失败和取消发布最终进度、累计指标并写日志。
+    /// 取消可能同时由用户命令和 worker 收口触发，因此同一 job 只累计一次。
+    fn observe_finished_job(&self, job: &KnowledgeIndexJob, context: &IndexJobContext) {
+        let state = job.state.as_str();
+        if !matches!(state, "completed" | "reused" | "failed" | "cancelled") {
+            return;
+        }
+        let first_time = match self.observed_jobs.lock() {
+            Ok(mut seen) => {
+                if seen.len() >= MAX_OBSERVED_JOBS {
+                    seen.clear();
+                }
+                seen.insert(job.job_id.clone())
+            }
+            Err(_) => true,
+        };
+        if !first_time {
+            self.publish_progress(job, context);
+            return;
+        }
+        let duration_ms = job
+            .completed_at_ms
+            .unwrap_or_else(now_ms)
+            .saturating_sub(context.started_at_ms);
+        let error_code = job.error_code.clone();
+        let chunk_count = job.chunk_count;
+        let vector_count = job.vector_count;
+        let embedding_requests = job.embedding_requests;
+        self.record_metrics(|metrics| {
+            match state {
+                "completed" => metrics.jobs_completed += 1,
+                "reused" => metrics.jobs_reused += 1,
+                "failed" => metrics.jobs_failed += 1,
+                "cancelled" => metrics.jobs_cancelled += 1,
+                _ => {}
+            }
+            metrics.chunks_indexed = metrics.chunks_indexed.saturating_add(chunk_count);
+            metrics.vectors_indexed = metrics.vectors_indexed.saturating_add(vector_count);
+            metrics.embedding_requests = metrics
+                .embedding_requests
+                .saturating_add(embedding_requests);
+            metrics.total_index_duration_ms =
+                metrics.total_index_duration_ms.saturating_add(duration_ms);
+            metrics.last_completed_at_ms = Some(now_ms());
+            if let Some(code) = error_code.clone() {
+                metrics.last_error_code = Some(code);
+            }
+        });
+        self.publish_progress(job, context);
+        let (level, event) = match state {
+            "failed" => ("warn", "knowledge_index_job_failed"),
+            "cancelled" => ("warn", "knowledge_index_job_cancelled"),
+            _ => ("info", "knowledge_index_job_completed"),
+        };
+        self.log_event(
+            level,
+            event,
+            json!({
+                "jobId": job.job_id,
+                "sourceId": job.source_id,
+                "state": state,
+                "embeddingMode": job.embedding_mode,
+                "chunks": chunk_count,
+                "vectors": vector_count,
+                "embeddingRequests": embedding_requests,
+                "retryCount": job.retry_count,
+                "durationMs": duration_ms,
+                "errorCode": error_code,
+            }),
+        );
     }
 
     fn recover_interrupted_jobs(&self) {
@@ -791,16 +1060,26 @@ impl KnowledgeService {
         if !still_running {
             return;
         }
+        let context = self.job_context(source_id);
+        if let Ok(job) = self.get_job(job_id) {
+            self.publish_progress(&job, &context);
+        }
         match self
-            .index_source_inner(workspace, source_id, job_id, cancellation)
+            .index_source_inner(workspace, source_id, job_id, &context, cancellation)
             .await
         {
-            Ok(_) => {}
+            Ok(job) => self.observe_finished_job(&job, &context),
             Err(error) if error.code() == "KC_CANCELLED" => {
                 let _ = self.finish_cancelled_without_revision(job_id, source_id);
+                if let Ok(job) = self.get_job(job_id) {
+                    self.observe_finished_job(&job, &context);
+                }
             }
             Err(error) => {
                 let _ = self.finish_failed_job(job_id, source_id, error.code());
+                if let Ok(job) = self.get_job(job_id) {
+                    self.observe_finished_job(&job, &context);
+                }
             }
         }
     }
@@ -1317,7 +1596,11 @@ impl KnowledgeService {
             .map_err(|error| KnowledgeError::Storage(error.to_string()))?;
         self.ensure_worker();
         self.worker_notify.notify_one();
-        self.get_job(&job_id)
+        let job = self.get_job(&job_id)?;
+        let context = self.job_context(&job.source_id);
+        self.record_metrics(|metrics| metrics.jobs_queued += 1);
+        self.publish_progress(&job, &context);
+        Ok(job)
     }
 
     pub fn get_job(&self, job_id: &str) -> Result<KnowledgeIndexJob, KnowledgeError> {
@@ -1354,7 +1637,10 @@ impl KnowledgeService {
             tx.commit()?;
             Ok(())
         }).map_err(|error| KnowledgeError::Storage(error.to_string()))?;
-        self.get_job(job_id)
+        let job = self.get_job(job_id)?;
+        let context = self.job_context(&job.source_id);
+        self.observe_finished_job(&job, &context);
+        Ok(job)
     }
 
     pub fn embedding_settings(&self) -> Result<EmbeddingSettings, KnowledgeError> {
@@ -1573,6 +1859,7 @@ impl KnowledgeService {
         query: &str,
         limit: usize,
     ) -> Result<KnowledgeSearchResponse, KnowledgeError> {
+        let started = Instant::now();
         let query = query.trim();
         if query.is_empty() {
             return Err(KnowledgeError::coded(
@@ -1708,6 +1995,7 @@ impl KnowledgeService {
             .citations
             .lock()
             .map_err(|_| KnowledgeError::Storage("citation lock poisoned".into()))?;
+        let candidate_count = candidates.len();
         for (rank, ((chunk_id, title, text, path, revision, start, end), lexical_rank)) in
             candidates.into_iter().take(limit).enumerate()
         {
@@ -1750,6 +2038,20 @@ impl KnowledgeService {
             });
             let _ = chunk_id;
         }
+        let returned = results.len();
+        self.log_event(
+            "info",
+            "knowledge_search_completed",
+            json!({
+                "queryHash": hash_text(query).chars().take(12).collect::<String>(),
+                "retrievalMode": retrieval_mode,
+                "candidates": candidate_count,
+                "returned": returned,
+                "truncated": returned >= limit,
+                "fallbackCode": fallback_code,
+                "durationMs": started.elapsed().as_millis() as u64,
+            }),
+        );
         Ok(KnowledgeSearchResponse {
             success: true,
             results,
@@ -1843,6 +2145,11 @@ impl KnowledgeService {
             KnowledgeError::coded("KC_CITATION_FORBIDDEN", "citation is unknown or expired")
         })?;
         if record.thread_id != thread_id || record.turn_id != turn_id {
+            self.log_event(
+                "warn",
+                "knowledge_citation_rejected",
+                json!({ "reason": "turn_mismatch" }),
+            );
             return Err(KnowledgeError::coded(
                 "KC_CITATION_FORBIDDEN",
                 "citation is not bound to this turn",
@@ -1934,6 +2241,7 @@ impl KnowledgeService {
         root: &Path,
         source_id: &str,
         job_id: &str,
+        context: &IndexJobContext,
         cancellation: CancellationToken,
     ) -> Result<KnowledgeIndexJob, KnowledgeError> {
         let source_lock = {
@@ -2027,6 +2335,9 @@ impl KnowledgeService {
                 KnowledgeError::Storage(error.to_string())
             }
         })?;
+        if let Ok(job) = self.get_job(job_id) {
+            self.publish_progress(&job, context);
+        }
         if needs_embedding && cancellation.is_cancelled() {
             return self.finish_cancelled(
                 &job_id,
@@ -2042,6 +2353,7 @@ impl KnowledgeService {
                     &selected_revision_id,
                     source_id,
                     &job_id,
+                    context,
                     cancellation.clone(),
                 )
                 .await
@@ -2218,6 +2530,7 @@ impl KnowledgeService {
         revision_id: &str,
         source_id: &str,
         job_id: &str,
+        context: &IndexJobContext,
         cancellation: CancellationToken,
     ) -> Result<usize, KnowledgeError> {
         let key = self
@@ -2253,10 +2566,12 @@ impl KnowledgeService {
             })?;
         let mut dimension = None;
         let mut staged_vectors = Vec::with_capacity(chunks.len());
+        let mut last_progress = Instant::now();
         for batch in chunks.chunks(batch_size) {
             if cancellation.is_cancelled() {
                 return Err(KnowledgeError::coded("KC_CANCELLED", "index job cancelled"));
             }
+            let batch_started = Instant::now();
             let (response, retry_count) = send_embedding_request(
                 &client,
                 &self.embedding_endpoint,
@@ -2279,6 +2594,21 @@ impl KnowledgeService {
                     Ok(())
                 })
                 .map_err(|error| KnowledgeError::Storage(error.to_string()))?;
+            self.record_metrics(|metrics| {
+                metrics.embedding_requests = metrics.embedding_requests.saturating_add(1);
+                metrics.embedding_retries = metrics.embedding_retries.saturating_add(retry_count);
+            });
+            self.log_event(
+                if status == 200 { "info" } else { "warn" },
+                "knowledge_embedding_batch",
+                json!({
+                    "jobId": job_id,
+                    "batchSize": batch.len(),
+                    "httpStatus": status,
+                    "retries": retry_count,
+                    "durationMs": batch_started.elapsed().as_millis() as u64,
+                }),
+            );
             if status != 200 {
                 return Err(KnowledgeError::coded(
                     match status {
@@ -2328,6 +2658,12 @@ impl KnowledgeService {
                 return Err(KnowledgeError::coded("KC_CANCELLED", "index job cancelled"));
             }
             self.db.with_connection(|connection| { connection.execute("UPDATE knowledge_index_jobs SET processed_chunks=MIN(total_chunks,processed_chunks+?2),vector_count=MIN(total_chunks,vector_count+?2) WHERE id=?1", params![job_id,batch.len() as i64])?; Ok(()) }).map_err(|error| KnowledgeError::Storage(error.to_string()))?;
+            if last_progress.elapsed() >= PROGRESS_THROTTLE {
+                if let Ok(job) = self.get_job(job_id) {
+                    self.publish_progress(&job, context);
+                }
+                last_progress = Instant::now();
+            }
         }
         if cancellation.is_cancelled() {
             return Err(KnowledgeError::coded("KC_CANCELLED", "index job cancelled"));
@@ -2345,6 +2681,9 @@ impl KnowledgeService {
                 Ok(())
             })
             .map_err(|error| KnowledgeError::Storage(error.to_string()))?;
+        if let Ok(job) = self.get_job(job_id) {
+            self.publish_progress(&job, context);
+        }
         let _ = source_id;
         dimension.ok_or_else(|| {
             KnowledgeError::coded(
@@ -3065,6 +3404,15 @@ mod tests {
                 "knowledge job {job_id} did not finish"
             );
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingProgressSink(Mutex<Vec<KnowledgeIndexProgress>>);
+
+    impl KnowledgeProgressSink for RecordingProgressSink {
+        fn publish(&self, progress: KnowledgeIndexProgress) {
+            self.0.lock().unwrap().push(progress);
         }
     }
 
@@ -4165,5 +4513,197 @@ mod tests {
             )
             .unwrap();
         assert_eq!(recreated.id, collection.id);
+    }
+
+    #[tokio::test]
+    async fn index_progress_events_cover_queued_running_and_terminal_states() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("guide.md"), "第一段内容\n\n第二段内容").unwrap();
+        let db = ProjectionDb::memory().unwrap();
+        let service = KnowledgeService::new(db, Arc::new(FakeCredentialStore::default()));
+        service.set_enabled(true).unwrap();
+        let sink = Arc::new(RecordingProgressSink::default());
+        service.attach_progress_sink(sink.clone());
+        let collection = service
+            .upsert_collection(
+                root.path(),
+                UpsertCollectionRequest {
+                    id: None,
+                    name: "Docs".into(),
+                    scope: None,
+                    enabled: true,
+                },
+            )
+            .unwrap();
+        let source = service
+            .add_source(
+                root.path(),
+                AddSourceRequest {
+                    collection_id: collection.id.clone(),
+                    workspace_relative_path: "guide.md".into(),
+                },
+            )
+            .await
+            .unwrap();
+        let job_id = source.initial_job_id.clone().unwrap();
+        let finished = wait_for_job(&service, &job_id).await;
+
+        let events = sink.0.lock().unwrap().clone();
+        let states = events
+            .iter()
+            .map(|event| event.state.clone())
+            .collect::<Vec<_>>();
+        assert!(
+            states.iter().any(|state| state == "queued"),
+            "缺少 queued 进度：{states:?}"
+        );
+        assert!(
+            states.iter().any(|state| state == "running"),
+            "缺少 running 进度：{states:?}"
+        );
+        let last = events.last().expect("至少一条进度事件");
+        assert_eq!(last.job_id, job_id);
+        assert_eq!(last.collection_id.as_deref(), Some(collection.id.as_str()));
+        assert_eq!(last.state, finished.state);
+        assert_eq!(last.percent, 100);
+        assert_eq!(last.total_chunks, finished.total_chunks);
+        let mut previous = 0u8;
+        for event in &events {
+            if event.total_bytes == 0 && event.total_chunks == 0 {
+                continue;
+            }
+            assert!(event.percent >= previous, "进度回退：{event:?}");
+            previous = event.percent;
+        }
+
+        let metrics = service.metrics_snapshot();
+        assert_eq!(metrics.jobs_queued, 1);
+        assert_eq!(metrics.jobs_completed + metrics.jobs_reused, 1);
+        assert!(metrics.chunks_indexed >= finished.chunk_count.max(1));
+        assert!(metrics.last_completed_at_ms.is_some());
+        assert!(metrics.average_index_duration_ms <= metrics.total_index_duration_ms);
+    }
+
+    #[tokio::test]
+    async fn finished_job_metrics_are_not_counted_twice() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("guide.md"), "去重验收").unwrap();
+        let db = ProjectionDb::memory().unwrap();
+        let service = KnowledgeService::new(db, Arc::new(FakeCredentialStore::default()));
+        service.set_enabled(true).unwrap();
+        let collection = service
+            .upsert_collection(
+                root.path(),
+                UpsertCollectionRequest {
+                    id: None,
+                    name: "Docs".into(),
+                    scope: None,
+                    enabled: true,
+                },
+            )
+            .unwrap();
+        let source = service
+            .add_source(
+                root.path(),
+                AddSourceRequest {
+                    collection_id: collection.id,
+                    workspace_relative_path: "guide.md".into(),
+                },
+            )
+            .await
+            .unwrap();
+        let job_id = source.initial_job_id.clone().unwrap();
+        wait_for_job(&service, &job_id).await;
+        let before = service.metrics_snapshot();
+        service.cancel_job(&job_id).unwrap();
+        let after = service.metrics_snapshot();
+        assert_eq!(before.finished_jobs(), after.finished_jobs());
+        assert_eq!(before.chunks_indexed, after.chunks_indexed);
+        assert_eq!(before.embedding_requests, after.embedding_requests);
+    }
+
+    #[tokio::test]
+    async fn embedding_failure_reports_error_code_and_logs_without_content() {
+        let (endpoint, _attempts, server) = spawn_embedding_server(vec![(500, "{}".into())]).await;
+        let root = tempfile::tempdir().unwrap();
+        let logs = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("secret.md"), "不得外泄的正文").unwrap();
+        let credentials = Arc::new(FakeCredentialStore(Mutex::new(Some("test-key".into()))));
+        let service =
+            KnowledgeService::new_for_test(ProjectionDb::memory().unwrap(), credentials, endpoint);
+        service.attach_logger(StructuredLogger::new(logs.path()).unwrap());
+        let sink = Arc::new(RecordingProgressSink::default());
+        service.attach_progress_sink(sink.clone());
+        service.set_enabled(true).unwrap();
+        service
+            .set_embedding_settings(SetEmbeddingSettingsRequest {
+                semantic_enabled: true,
+                batch_size: 1,
+                timeout_ms: 5_000,
+                max_vector_scan_chunks: 100,
+            })
+            .unwrap();
+        let collection = service
+            .upsert_collection(
+                root.path(),
+                UpsertCollectionRequest {
+                    id: None,
+                    name: "Docs".into(),
+                    scope: None,
+                    enabled: true,
+                },
+            )
+            .unwrap();
+        let source = service
+            .add_source(
+                root.path(),
+                AddSourceRequest {
+                    collection_id: collection.id,
+                    workspace_relative_path: "secret.md".into(),
+                },
+            )
+            .await
+            .unwrap();
+        let job_id = source.initial_job_id.clone().unwrap();
+        let finished = wait_for_job(&service, &job_id).await;
+        assert_eq!(
+            finished.error_code.as_deref(),
+            Some("KC_EMBEDDING_RESPONSE_INVALID")
+        );
+
+        let events = sink.0.lock().unwrap().clone();
+        assert_eq!(
+            events.last().and_then(|event| event.error_code.as_deref()),
+            Some("KC_EMBEDDING_RESPONSE_INVALID")
+        );
+        let metrics = service.metrics_snapshot();
+        assert!(metrics.embedding_requests >= 1);
+        assert_eq!(
+            metrics.last_error_code.as_deref(),
+            Some("KC_EMBEDDING_RESPONSE_INVALID")
+        );
+
+        let records = StructuredLogger::new(logs.path())
+            .unwrap()
+            .read_logs(crate::logging::LogQuery {
+                limit: Some(50),
+                level: None,
+                event: None,
+                after_timestamp_ms: None,
+            })
+            .unwrap();
+        let serialized = serde_json::to_string(&records.records).unwrap();
+        assert!(
+            serialized.contains("knowledge_index_job_completed"),
+            "缺少索引终态日志：{serialized}"
+        );
+        assert!(
+            serialized.contains("knowledge_embedding_batch"),
+            "缺少 embedding 批次日志：{serialized}"
+        );
+        assert!(!serialized.contains("不得外泄的正文"));
+        assert!(!serialized.contains("secret.md"));
+        assert!(!serialized.contains("test-key"));
+        server.await.unwrap();
     }
 }

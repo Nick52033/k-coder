@@ -28,9 +28,10 @@ use crate::execution::{
 };
 use crate::extensions::{ExtensionOverview, McpConfigView, SaveUserRuleRequest, UserRulesView};
 use crate::knowledge::{
-    AddSourceRequest, EmbeddingConnectionTest, EmbeddingSettings, KnowledgeCollection,
-    KnowledgeError, KnowledgeIndexJob, KnowledgeSearchResponse, KnowledgeSettings, KnowledgeSource,
-    SetEmbeddingSettingsRequest, UpsertCollectionRequest,
+    AddSourceRequest, EmbeddingConnectionTest, EmbeddingSettings, KNOWLEDGE_PROGRESS_EVENT_NAME,
+    KnowledgeCollection, KnowledgeError, KnowledgeIndexJob, KnowledgeIndexMetrics,
+    KnowledgeIndexProgress, KnowledgeProgressSink, KnowledgeSearchResponse, KnowledgeSettings,
+    KnowledgeSource, SetEmbeddingSettingsRequest, UpsertCollectionRequest,
 };
 use crate::logging::{LogQuery, LogQueryResult};
 use crate::multi_agent::{
@@ -1060,6 +1061,28 @@ pub fn cancel_knowledge_index_job(
         .knowledge()
         .cancel_job(&job_id)
         .map_err(knowledge_command_error)
+}
+
+/// 把知识库索引进度转发给前端。事件只携带不透明 ID、计数和阶段，不含文件内容或路径。
+pub struct TauriKnowledgeProgressSink {
+    app: AppHandle,
+}
+
+impl TauriKnowledgeProgressSink {
+    pub fn new(app: AppHandle) -> Arc<Self> {
+        Arc::new(Self { app })
+    }
+}
+
+impl KnowledgeProgressSink for TauriKnowledgeProgressSink {
+    fn publish(&self, progress: KnowledgeIndexProgress) {
+        let _ = self.app.emit(KNOWLEDGE_PROGRESS_EVENT_NAME, progress);
+    }
+}
+
+#[tauri::command]
+pub fn get_knowledge_metrics(state: State<'_, AppState>) -> CommandResult<KnowledgeIndexMetrics> {
+    Ok(state.knowledge().metrics_snapshot())
 }
 
 #[tauri::command]
@@ -2682,12 +2705,7 @@ pub async fn send_subagent_message(
     );
     state
         .subagents()
-        .send_message(
-            &agent_id,
-            message,
-            context,
-            trigger_turn.unwrap_or(true),
-        )
+        .send_message(&agent_id, message, context, trigger_turn.unwrap_or(true))
         .await
         .map_err(multi_agent_command_error)
 }

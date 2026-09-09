@@ -22,6 +22,8 @@ import {
   deleteKnowledgeSource,
   refreshKnowledgeSource,
   cancelKnowledgeIndexJob,
+  getKnowledgeMetrics,
+  subscribeToKnowledgeProgress,
   getEmbeddingSettings,
   setEmbeddingSettings,
   setEmbeddingApiKey,
@@ -101,6 +103,8 @@ import type {
   EmbeddingSettings,
   KnowledgeCollection,
   KnowledgeSource,
+  KnowledgeIndexProgress,
+  KnowledgeIndexMetrics,
 } from "../types/runtime";
 import { toUserFacingPath, workspacePathKey } from "../lib/path";
 import { McpSettingsPage } from "./McpSettingsPage";
@@ -1540,6 +1544,17 @@ function knowledgeSourceStateLabel(state: string) {
   }
 }
 
+function knowledgeStageLabel(stage: string) {
+  switch (stage) {
+    case "queued": return "排队中";
+    case "parse": return "解析切片";
+    case "embedding": return "生成向量";
+    case "complete": return "已提交";
+    case "cancelled": return "已取消";
+    default: return stage;
+  }
+}
+
 function formatKnowledgeError(reason: unknown) {
   if (typeof reason === "string") return reason;
   if (reason instanceof Error) return reason.message;
@@ -1595,6 +1610,8 @@ function KnowledgePage() {
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const [pickerCollectionId, setPickerCollectionId] = useState<string | null>(null);
+  const [progress, setProgress] = useState<Record<string, KnowledgeIndexProgress>>({});
+  const [metrics, setMetrics] = useState<KnowledgeIndexMetrics | null>(null);
   const [pendingDelete, setPendingDelete] = useState<null | {
     kind: "collection" | "source";
     id: string;
@@ -1605,13 +1622,14 @@ function KnowledgePage() {
 
   async function load() {
     const version = ++loadVersionRef.current;
-    const [nextSettings, nextEmbedding, nextCollections] = await Promise.all([
-      getKnowledgeSettings(), getEmbeddingSettings(), listKnowledgeCollections(),
+    const [nextSettings, nextEmbedding, nextCollections, nextMetrics] = await Promise.all([
+      getKnowledgeSettings(), getEmbeddingSettings(), listKnowledgeCollections(), getKnowledgeMetrics(),
     ]);
     const entries = await Promise.all(nextCollections.map(async (collection) => [collection.id, await listKnowledgeSources(collection.id)] as const));
     if (version !== loadVersionRef.current) return;
     setSettings(nextSettings); setEmbedding(nextEmbedding); setCollections(nextCollections);
     setSources(Object.fromEntries(entries));
+    setMetrics(nextMetrics);
   }
   useEffect(() => { void load().catch((reason) => setError(formatKnowledgeError(reason))); }, []);
   useEffect(() => {
@@ -1624,6 +1642,18 @@ function KnowledgePage() {
     }, 750);
     return () => window.clearInterval(timer);
   }, [sources]);
+  useEffect(() => {
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    void subscribeToKnowledgeProgress((event) => {
+      if (disposed) return;
+      setProgress((current) => ({ ...current, [event.sourceId]: event }));
+    }).then((fn) => {
+      if (disposed) { fn(); return; }
+      unlisten = fn;
+    }).catch((reason) => { if (!disposed) setError(formatKnowledgeError(reason)); });
+    return () => { disposed = true; unlisten?.(); };
+  }, []);
 
   async function run(action: () => Promise<void>) {
     setBusy(true); setError("");
@@ -1764,8 +1794,10 @@ function KnowledgePage() {
             {collectionSources.length ? collectionSources.map((source) => {
               const active = source.state === "queued" || source.state === "indexing";
               const StatusIcon = source.state === "indexed" ? CheckCircle2 : source.state === "failed" ? AlertCircle : Clock3;
+              const current = progress[source.sourceId];
+              const percent = current ? Math.min(100, Math.max(0, current.percent)) : 0;
               return <div className="knowledge-source-row" key={source.sourceId}>
-                <span className="knowledge-source-file-icon" aria-hidden="true"><FileText size={15} /></span><div className="knowledge-source-copy"><strong title={source.relativePath}>{source.relativePath}</strong><small>{formatKnowledgeBytes(source.sizeBytes)}{source.contentHashPrefix ? ` · ${source.contentHashPrefix}` : ""} · {source.chunkCount} chunks</small></div>
+                <span className="knowledge-source-file-icon" aria-hidden="true"><FileText size={15} /></span><div className="knowledge-source-copy"><strong title={source.relativePath}>{source.relativePath}</strong><small>{formatKnowledgeBytes(source.sizeBytes)}{source.contentHashPrefix ? ` · ${source.contentHashPrefix}` : ""} · {source.chunkCount} chunks</small>{active && current ? <div className="knowledge-progress" role="status" aria-label={`${source.relativePath} 索引进度`}><span className="knowledge-progress-track"><span className="knowledge-progress-bar" style={{ width: `${percent}%` }} /></span><small>{knowledgeStageLabel(current.stage)} · {percent}% · {current.processedChunks}/{current.totalChunks} 切片</small></div> : null}</div>
                 <span className={`knowledge-source-status knowledge-source-status--${source.state}`} aria-live="polite"><StatusIcon size={13} aria-hidden="true" />{knowledgeSourceStateLabel(source.state)}{source.lastErrorCode ? ` · ${source.lastErrorCode}` : ""}</span>
                 <div className="knowledge-source-actions">
                   {active && source.initialJobId ? <button className="knowledge-icon-button" type="button" title="取消索引" aria-label={`取消 ${source.relativePath} 的索引`} disabled={busy} onClick={() => void run(async () => { await cancelKnowledgeIndexJob(source.initialJobId!); })}><CircleStop size={15} /></button> : null}
@@ -1784,6 +1816,21 @@ function KnowledgePage() {
       <p className="settings-help">关闭语义检索时使用本地 FTS-only；开启后只会向 SiliconFlow 发送已建立索引的文本片段。</p>
       <div className="knowledge-semantic-layout"><label className="knowledge-enable-toggle knowledge-enable-toggle--compact"><input type="checkbox" checked={embedding.semanticEnabled} disabled={busy} onChange={(event) => void run(async () => { setEmbedding(await setEmbeddingSettings({ semanticEnabled: event.target.checked, batchSize: embedding.batchSize, timeoutMs: embedding.timeoutMs, maxVectorScanChunks: embedding.maxVectorScanChunks })); })} /><span><strong>启用语义检索</strong><small>{embedding.semanticEnabled ? "混合 BM25 与向量排序" : "仅使用本地全文检索"}</small></span></label><div className="knowledge-engine-meta"><span>{embedding.provider}</span><span>{embedding.model}</span><span>{embedding.embeddingStatus}</span></div></div>
       <div className="knowledge-api-row"><label className="knowledge-api-input"><span className="sr-only">SiliconFlow API Key</span><KeyRound size={15} aria-hidden="true" /><input type="password" value={apiKey} maxLength={512} autoComplete="new-password" placeholder={embedding.embeddingConfigured ? "已配置 API Key" : "SiliconFlow API Key"} aria-label="SiliconFlow API Key" onChange={(event) => setApiKey(event.target.value)} /></label><button className="secondary-button" type="button" disabled={busy || !apiKey.trim()} onClick={() => void run(async () => { await setEmbeddingApiKey(apiKey); setApiKey(""); })}><Save size={14} />保存</button>{embedding.embeddingConfigured && <><button className="secondary-button" type="button" disabled={busy} onClick={() => void run(async () => { const result = await testEmbeddingConnection(); if (!result.connected) throw new Error(result.errorCode ?? "连接失败"); })}><PlayCircle size={14} />测试连接</button><button className="secondary-button knowledge-danger-button" type="button" disabled={busy} onClick={() => void run(async () => { await deleteEmbeddingApiKey(); })}><Trash2 size={14} />删除 Key</button></>}</div>
+    </section>
+    <section className="knowledge-settings-card" aria-labelledby="knowledge-metrics-title">
+      <div className="knowledge-card-heading"><div><span className="knowledge-section-kicker">索引指标</span><h4 id="knowledge-metrics-title">运行指标</h4></div><span className="knowledge-card-hint">仅统计本次运行</span></div>
+      <div className="knowledge-metrics-grid">
+        <div><span>已完成</span><strong>{metrics?.jobsCompleted ?? 0}</strong></div>
+        <div><span>内容未变化</span><strong>{metrics?.jobsReused ?? 0}</strong></div>
+        <div><span>失败</span><strong>{metrics?.jobsFailed ?? 0}</strong></div>
+        <div><span>取消</span><strong>{metrics?.jobsCancelled ?? 0}</strong></div>
+        <div><span>已索引切片</span><strong>{metrics?.chunksIndexed ?? 0}</strong></div>
+        <div><span>已写入向量</span><strong>{metrics?.vectorsIndexed ?? 0}</strong></div>
+        <div><span>Embedding 请求</span><strong>{metrics?.embeddingRequests ?? 0}</strong></div>
+        <div><span>网络重试</span><strong>{metrics?.embeddingRetries ?? 0}</strong></div>
+        <div><span>平均耗时</span><strong>{metrics?.averageIndexDurationMs ?? 0} ms</strong></div>
+      </div>
+      {metrics?.lastErrorCode ? <p className="settings-help">最近一次索引错误：{metrics.lastErrorCode}</p> : null}
     </section>
     {error && <div className="settings-error" role="alert">{error}</div>}
     {pendingDelete && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && setPendingDelete(null)} onKeyDown={(event) => { if (event.key !== "Escape") return; event.preventDefault(); event.stopPropagation(); setPendingDelete(null); }}>
