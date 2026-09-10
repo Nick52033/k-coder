@@ -1,0 +1,265 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>k-Coder UI 方向对比</title>
+    <style>
+      html, body { margin: 0; background: #05060a; color: #e6eaf2; font: 13px/1.5 Inter, "Segoe UI", Arial, sans-serif; }
+      .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; padding: 14px; }
+      .cell { display: flex; flex-direction: column; gap: 6px; }
+      .label { display: flex; align-items: baseline; gap: 8px; }
+      .label b { font-size: 13px; }
+      .label span { color: #8a94a6; font-size: 12px; }
+      iframe { width: 100%; height: 660px; border: 1px solid #222a34; border-radius: 8px; background: #000; }
+    </style>
+  </head>
+  <body>
+    <div class="grid">
+      <div class="cell">
+        <div class="label"><b>方向 A · 克制收敛（暗）</b><span>亮度分层替代描边，主色收敛到必须被看见的地方</span></div>
+        <iframe id="a-dark" src="/tools/ui-harness/ui-harness.html?theme=dark"></iframe>
+      </div>
+      <div class="cell">
+        <div class="label"><b>方向 B · 深度抬升（暗）</b><span>更深底色 + 卡片阴影抬升 + 更亮强调色</span></div>
+        <iframe id="b-dark" src="/tools/ui-harness/ui-harness.html?theme=dark"></iframe>
+      </div>
+      <div class="cell">
+        <div class="label"><b>方向 A · 克制收敛（亮）</b><span>灰白分层，弱边框，同一套语义 token</span></div>
+        <iframe id="a-light" src="/tools/ui-harness/ui-harness.html?theme=light"></iframe>
+      </div>
+      <div class="cell">
+        <div class="label"><b>方向 B · 深度抬升（亮）</b><span>灰底浮白卡，柔阴影，圆角更大</span></div>
+        <iframe id="b-light" src="/tools/ui-harness/ui-harness.html?theme=light"></iframe>
+      </div>
+    </div>
+
+    <script>
+      const SEL = 'html[data-skin][data-theme][data-theme-preference]';
+
+      const SHARED_RULES = `
+        SELF .sidebar-primary-nav-button.is-active,
+        SELF .sidebar-primary-nav-button[aria-current="page"],
+        SELF .sidebar-primary-nav-button[data-active="true"] {
+          background: transparent;
+          box-shadow: inset 2px 0 0 var(--color-brand);
+          color: var(--color-ink-rich);
+        }
+        SELF .message--user .message-content {
+          border-color: transparent;
+        }
+      `;
+
+      const A_DARK = `
+        SELF {
+          --color-surface: #0E1116;
+          --color-surface-subtle: #12161D;
+          --color-surface-panel: #171C24;
+          --color-surface-raised: #1D232C;
+          --color-surface-hover: #232A34;
+          --color-border: rgba(255, 255, 255, .06);
+          --color-border-subtle: rgba(255, 255, 255, .045);
+          --color-border-default: rgba(255, 255, 255, .08);
+          --color-border-strong: rgba(255, 255, 255, .14);
+          --color-border-input: rgba(255, 255, 255, .10);
+          --color-ink: #E6EAF2;
+          --color-ink-rich: #F2F5FA;
+          --color-ink-muted: #A6AFBE;
+          --color-ink-subtle: #8B95A7;
+          --color-ink-faint: #7C8698;
+          --color-text-primary: #E6EAF2;
+          --color-brand: #5B8CFF;
+          --color-brand-hover: #6E9BFF;
+          --color-brand-light: #8FB2FF;
+          --color-brand-ring: rgba(91, 140, 255, .35);
+          --color-accent: #5B8CFF;
+          --color-accent-soft: rgba(91, 140, 255, .14);
+          --color-item-active-bg: rgba(91, 140, 255, .12);
+          --color-item-active-text: #CFE0FF;
+          --color-item-active-border: rgba(91, 140, 255, .28);
+          --color-item-hover-bg: rgba(255, 255, 255, .045);
+          --color-user-msg-bg: rgba(91, 140, 255, .10);
+          --color-user-msg-border: transparent;
+          --color-success: #3DD68C; --color-success-text: #7BE8B0; --color-success-bg: rgba(61, 214, 140, .12);
+          --color-warning: #E8B33A; --color-warning-dot: #F0C45C;
+          --color-error: #F0736F; --color-error-text: #F5A09D; --color-error-bg: rgba(240, 115, 111, .12);
+          --color-error-border: rgba(240, 115, 111, .24);
+          --color-disabled-bg: #1A1F27; --color-disabled-text: #59616F;
+          background: #0E1116;
+          color-scheme: dark;
+        }
+        SELF, SELF body { background: #0E1116; }
+      `;
+
+      const B_DARK = `
+        SELF {
+          --color-surface: #07080B;
+          --color-surface-subtle: #0C0E13;
+          --color-surface-panel: #101319;
+          --color-surface-raised: #171B23;
+          --color-surface-hover: #212734;
+          --color-border: rgba(255, 255, 255, .05);
+          --color-border-subtle: rgba(255, 255, 255, .04);
+          --color-border-default: rgba(255, 255, 255, .07);
+          --color-border-strong: rgba(255, 255, 255, .16);
+          --color-border-input: rgba(255, 255, 255, .09);
+          --color-ink: #EDF1F7;
+          --color-ink-rich: #FFFFFF;
+          --color-ink-muted: #9AA5B5;
+          --color-ink-subtle: #7E8A9C;
+          --color-ink-faint: #68727F;
+          --color-text-primary: #EDF1F7;
+          --color-brand: #7AA2FF;
+          --color-brand-hover: #93B4FF;
+          --color-brand-light: #A8C2FF;
+          --color-brand-ring: rgba(122, 162, 255, .40);
+          --color-accent: #7AA2FF;
+          --color-accent-soft: rgba(122, 162, 255, .16);
+          --color-item-active-bg: rgba(122, 162, 255, .14);
+          --color-item-active-text: #D6E2FF;
+          --color-item-active-border: rgba(122, 162, 255, .34);
+          --color-item-hover-bg: rgba(255, 255, 255, .05);
+          --color-user-msg-bg: rgba(122, 162, 255, .12);
+          --color-user-msg-border: transparent;
+          --color-success: #34D399; --color-success-text: #6EE7B7; --color-success-bg: rgba(52, 211, 153, .13);
+          --color-warning: #FBBF24; --color-warning-dot: #FCD34D;
+          --color-error: #F87171; --color-error-text: #FCA5A5; --color-error-bg: rgba(248, 113, 113, .13);
+          --color-error-border: rgba(248, 113, 113, .26);
+          --color-disabled-bg: #14181F; --color-disabled-text: #545C6A;
+          background: #07080B;
+          color-scheme: dark;
+        }
+        SELF, SELF body { background: #07080B; }
+        SELF .sidebar { background: linear-gradient(180deg, #0C0E13, #080A0E); }
+        SELF .workbench,
+        SELF .composer,
+        SELF .settings-panel,
+        SELF .message-area,
+        SELF .workbench-panel {
+          border-radius: 12px;
+          box-shadow: 0 1px 2px rgba(0, 0, 0, .5), 0 14px 34px -18px rgba(0, 0, 0, .85),
+            inset 0 1px 0 rgba(255, 255, 255, .05);
+        }
+        SELF .composer { border-color: var(--color-border); }
+      `;
+
+      const A_LIGHT = `
+        SELF {
+          --color-surface: #F7F8FA;
+          --color-surface-subtle: #F1F3F6;
+          --color-surface-panel: #FFFFFF;
+          --color-surface-raised: #FFFFFF;
+          --color-surface-hover: #EEF1F5;
+          --color-border: rgba(15, 23, 42, .08);
+          --color-border-subtle: rgba(15, 23, 42, .06);
+          --color-border-default: rgba(15, 23, 42, .10);
+          --color-border-strong: rgba(15, 23, 42, .16);
+          --color-border-input: rgba(15, 23, 42, .12);
+          --color-ink: #1B2230;
+          --color-ink-rich: #0E1420;
+          --color-ink-muted: #5A6474;
+          --color-ink-subtle: #6C7789;
+          --color-ink-faint: #8A93A3;
+          --color-text-primary: #1B2230;
+          --color-brand: #2F6BFF;
+          --color-brand-hover: #2559E0;
+          --color-brand-light: #6B95FF;
+          --color-brand-ring: rgba(47, 107, 255, .28);
+          --color-accent: #2F6BFF;
+          --color-accent-soft: rgba(47, 107, 255, .10);
+          --color-item-active-bg: rgba(47, 107, 255, .09);
+          --color-item-active-text: #1D4FD8;
+          --color-item-active-border: rgba(47, 107, 255, .22);
+          --color-item-hover-bg: rgba(15, 23, 42, .04);
+          --color-user-msg-bg: rgba(47, 107, 255, .07);
+          --color-user-msg-border: transparent;
+          --color-disabled-bg: #F1F3F6; --color-disabled-text: #9AA3B2;
+          background: #F7F8FA;
+          color-scheme: light;
+        }
+        SELF, SELF body { background: #F7F8FA; }
+      `;
+
+      const B_LIGHT = `
+        SELF {
+          --color-surface: #EDF0F4;
+          --color-surface-subtle: #E7EBF0;
+          --color-surface-panel: #FFFFFF;
+          --color-surface-raised: #FFFFFF;
+          --color-surface-hover: #F4F6F9;
+          --color-border: rgba(15, 23, 42, .06);
+          --color-border-subtle: rgba(15, 23, 42, .05);
+          --color-border-default: rgba(15, 23, 42, .07);
+          --color-border-strong: rgba(15, 23, 42, .14);
+          --color-border-input: rgba(15, 23, 42, .09);
+          --color-ink: #161C28;
+          --color-ink-rich: #0A0F18;
+          --color-ink-muted: #525C6B;
+          --color-ink-subtle: #626D7D;
+          --color-ink-faint: #7C8695;
+          --color-text-primary: #161C28;
+          --color-brand: #3B76FF;
+          --color-brand-hover: #2A62E8;
+          --color-brand-light: #7AA2FF;
+          --color-brand-ring: rgba(59, 118, 255, .30);
+          --color-accent: #3B76FF;
+          --color-accent-soft: rgba(59, 118, 255, .10);
+          --color-item-active-bg: rgba(59, 118, 255, .10);
+          --color-item-active-text: #1F4FD0;
+          --color-item-active-border: rgba(59, 118, 255, .20);
+          --color-item-hover-bg: rgba(15, 23, 42, .035);
+          --color-user-msg-bg: rgba(59, 118, 255, .08);
+          --color-user-msg-border: transparent;
+          --color-disabled-bg: #E7EBF0; --color-disabled-text: #98A2B1;
+          background: #EDF0F4;
+          color-scheme: light;
+        }
+        SELF, SELF body { background: #EDF0F4; }
+        SELF .workbench,
+        SELF .composer,
+        SELF .settings-panel,
+        SELF .message-area,
+        SELF .workbench-panel {
+          border-radius: 12px;
+          box-shadow: 0 1px 2px rgba(16, 24, 40, .06), 0 14px 34px -20px rgba(16, 24, 40, .28);
+        }
+      `;
+
+      const directions = [
+        ["a-dark", A_DARK],
+        ["b-dark", B_DARK],
+        ["a-light", A_LIGHT],
+        ["b-light", B_LIGHT],
+      ];
+
+      function cssFor(block) {
+        return (block + SHARED_RULES).split("SELF").join(SEL);
+      }
+
+      for (const [id, block] of directions) {
+        const frame = document.getElementById(id);
+        const css = cssFor(block);
+        const apply = () => {
+          try {
+            const doc = frame.contentDocument;
+            if (!doc || !doc.head) return;
+            let style = doc.getElementById("kcoder-direction");
+            if (!style) {
+              style = doc.createElement("style");
+              style.id = "kcoder-direction";
+            }
+            style.textContent = css;
+            doc.head.appendChild(style);
+          } catch (err) {
+            console.error(id, err);
+          }
+        };
+        frame.addEventListener("load", () => {
+          apply();
+          setTimeout(apply, 500);
+          setTimeout(apply, 1800);
+        });
+      }
+    </script>
+  </body>
+</html>

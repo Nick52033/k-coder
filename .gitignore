@@ -30,3 +30,6 @@ scripts/deploy.config.json
 
 # ONNX Runtime debug symbols are not needed at runtime and exceed GitHub's file limit.
 *.pdb
+
+# 本地 UI 取证产物（截图、metrics、一次性调试脚本），结论沉淀在 docs/
+.tmp-ui/
