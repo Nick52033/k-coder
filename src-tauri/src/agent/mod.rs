@@ -11,7 +11,10 @@ use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::advanced::{REQUEST_USER_INPUT_TOOL_NAME, RequestUserInputTool, RuntimeMetrics};
+use crate::advanced::{
+    COMPLETE_WORKFLOW_NODE_TOOL_NAME, REQUEST_USER_INPUT_TOOL_NAME, RequestUserInputTool,
+    RuntimeMetrics,
+};
 use crate::context::{self, CompactionSummary, DEFAULT_CONTEXT_LIMIT};
 use crate::logging::StructuredLogger;
 use crate::policy::{
@@ -167,7 +170,7 @@ struct ReadRevisionCoverage {
     intervals: Vec<(usize, usize)>,
     redundant_batches: usize,
     last_redundant_batch: Option<usize>,
-    recovery_delivered: bool,
+    recovery_delivered_batch: Option<usize>,
     rehydration_available: bool,
     rehydrated_batch: Option<usize>,
 }
@@ -254,7 +257,7 @@ impl ReadObservationTracker {
                 coverage.rehydrated_batch = Some(provider_batch);
                 coverage.redundant_batches = 0;
                 coverage.last_redundant_batch = None;
-                coverage.recovery_delivered = false;
+                coverage.recovery_delivered_batch = None;
                 return Some(ReadObservationDecision::RehydratedAfterCompaction {
                     path: observation.0,
                     revision: observation.1,
@@ -268,36 +271,38 @@ impl ReadObservationTracker {
                 coverage.redundant_batches = coverage.redundant_batches.saturating_add(1);
                 coverage.last_redundant_batch = Some(provider_batch);
             }
-            return Some(if coverage.recovery_delivered {
-                ReadObservationDecision::RepeatedLoop {
-                    path: observation.0,
-                    revision: observation.1,
-                    start_line: observation.2,
-                    end_line: observation.3,
-                    overlap_percent: observation.4,
-                }
-            } else if coverage.redundant_batches >= MAX_RECOVERABLE_REDUNDANT_READ_BATCHES {
-                ReadObservationDecision::RecoveryRequired {
-                    path: observation.0,
-                    revision: observation.1,
-                    start_line: observation.2,
-                    end_line: observation.3,
-                    overlap_percent: observation.4,
-                }
-            } else {
-                ReadObservationDecision::AlreadyCovered {
-                    path: observation.0,
-                    revision: observation.1,
-                    start_line: observation.2,
-                    end_line: observation.3,
-                    overlap_percent: observation.4,
-                }
-            });
+            return Some(
+                if coverage.recovery_delivered_batch == Some(provider_batch) {
+                    ReadObservationDecision::RepeatedLoop {
+                        path: observation.0,
+                        revision: observation.1,
+                        start_line: observation.2,
+                        end_line: observation.3,
+                        overlap_percent: observation.4,
+                    }
+                } else if coverage.redundant_batches >= MAX_RECOVERABLE_REDUNDANT_READ_BATCHES {
+                    ReadObservationDecision::RecoveryRequired {
+                        path: observation.0,
+                        revision: observation.1,
+                        start_line: observation.2,
+                        end_line: observation.3,
+                        overlap_percent: observation.4,
+                    }
+                } else {
+                    ReadObservationDecision::AlreadyCovered {
+                        path: observation.0,
+                        revision: observation.1,
+                        start_line: observation.2,
+                        end_line: observation.3,
+                        overlap_percent: observation.4,
+                    }
+                },
+            );
         }
 
         coverage.redundant_batches = 0;
         coverage.last_redundant_batch = None;
-        coverage.recovery_delivered = false;
+        coverage.recovery_delivered_batch = None;
         coverage.intervals.push((start_line, end_line));
         coverage
             .intervals
@@ -314,10 +319,14 @@ impl ReadObservationTracker {
         }
     }
 
-    fn mark_recovery_delivered(&mut self, key: &ReadRevisionKey) {
+    fn mark_recovery_delivered(&mut self, key: &ReadRevisionKey, provider_batch: usize) {
         if let Some(coverage) = self.coverage.get_mut(key) {
-            coverage.recovery_delivered = true;
+            coverage.recovery_delivered_batch = Some(provider_batch);
         }
+    }
+
+    fn begin_workflow_node(&mut self) {
+        self.coverage.clear();
     }
 }
 
@@ -332,6 +341,18 @@ struct ReadObservationOutcome {
     result: ToolResult,
     recovery_instruction: Option<PendingReadRecoveryInstruction>,
     stop_reason: Option<String>,
+}
+
+fn begin_read_observation_scope_after_workflow_transition(
+    call: &ToolCall,
+    result: &ToolResult,
+    read_observations: &mut ReadObservationTracker,
+    pending_recovery_instructions: &mut Vec<PendingReadRecoveryInstruction>,
+) {
+    if call.name == COMPLETE_WORKFLOW_NODE_TOOL_NAME && result.success {
+        read_observations.begin_workflow_node();
+        pending_recovery_instructions.clear();
+    }
 }
 
 fn merge_line_intervals(intervals: &[(usize, usize)]) -> Vec<(usize, usize)> {
@@ -1326,7 +1347,7 @@ impl AgentRuntime {
                 tools: tool_definitions.clone(),
             };
             for key in &delivered_read_recovery_keys {
-                read_observations.mark_recovery_delivered(key);
+                read_observations.mark_recovery_delivered(key, iteration);
             }
             publisher.publish(AgentEventEnvelope::new(AgentEvent::ActivityStatusChanged {
                 thread_id: thread_id.clone(),
@@ -1358,6 +1379,9 @@ impl AgentRuntime {
 
             // 外层循环：支持整个请求的重试
             'retry_loop: loop {
+                publisher.publish(AgentEventEnvelope::new(AgentEvent::ActivityStatusChanged {
+                    thread_id: thread_id.clone(), turn_id: turn_id.clone(), status: AgentActivityStatus::Thinking,
+                }));
                 let call_index = provider_call_index;
                 provider_call_index = provider_call_index.saturating_add(1);
                 let provider_started = std::time::Instant::now();
@@ -1385,7 +1409,7 @@ impl AgentRuntime {
                             self.transient_retry_delays
                                 .get(transient_retry_count)
                                 .copied()
-                                .map(|delay| (delay, true))
+                                .map(|delay| (error.rate_limit_delay().unwrap_or(delay), true))
                         } else if is_incomplete_tool_call_error(&error)
                             && protocol_retry_count < MAX_PROTOCOL_RETRIES
                         {
@@ -1395,6 +1419,12 @@ impl AgentRuntime {
                         };
 
                         if let Some((delay, transient)) = retry_delay {
+                            if error.rate_limit_delay().is_some() {
+                                publisher.publish(AgentEventEnvelope::new(AgentEvent::ProviderRetryWaiting {
+                                    thread_id: thread_id.clone(), turn_id: turn_id.clone(),
+                                    retry_at_ms: crate::providers::retry_at_ms(delay),
+                                }));
+                            }
                             if !wait_for_provider_retry(delay, &provider_cancellation).await {
                                 if !cancellation.is_cancelled()
                                     && provider_cancellation.is_cancelled()
@@ -1430,7 +1460,7 @@ impl AgentRuntime {
                             error.to_string()
                         };
                         return self
-                            .finish_failed(&thread_id, &turn_id, message, &publisher)
+                            .finish_failed_with_error(&thread_id, &turn_id, error.turn_error(message), &publisher)
                             .await;
                     }
                 };
@@ -1463,6 +1493,16 @@ impl AgentRuntime {
                     };
 
                     match event {
+                        Some(Ok(ProviderEvent::RetryWaiting { retry_at_ms })) => {
+                            publisher.publish(AgentEventEnvelope::new(AgentEvent::ProviderRetryWaiting {
+                                thread_id: thread_id.clone(), turn_id: turn_id.clone(), retry_at_ms,
+                            }));
+                        }
+                        Some(Ok(ProviderEvent::RequestReady)) => {
+                            publisher.publish(AgentEventEnvelope::new(AgentEvent::ActivityStatusChanged {
+                                thread_id: thread_id.clone(), turn_id: turn_id.clone(), status: AgentActivityStatus::Thinking,
+                            }));
+                        }
                         Some(Ok(ProviderEvent::TextDelta { delta })) => {
                             attempt_had_output = true;
                             if response_inner.len().saturating_add(delta.len()) > MAX_RESPONSE_BYTES
@@ -1786,7 +1826,7 @@ impl AgentRuntime {
                                 self.transient_retry_delays
                                     .get(transient_retry_count)
                                     .copied()
-                                    .map(|delay| (delay, true))
+                                    .map(|delay| (error.rate_limit_delay().unwrap_or(delay), true))
                             } else if is_retryable_protocol_stream_error(&error)
                                 && !attempt_had_output
                                 && protocol_retry_count < MAX_PROTOCOL_RETRIES
@@ -1796,6 +1836,12 @@ impl AgentRuntime {
                                 None
                             };
                             if let Some((delay, transient)) = retry_delay {
+                            if error.rate_limit_delay().is_some() {
+                                publisher.publish(AgentEventEnvelope::new(AgentEvent::ProviderRetryWaiting {
+                                    thread_id: thread_id.clone(), turn_id: turn_id.clone(),
+                                    retry_at_ms: crate::providers::retry_at_ms(delay),
+                                }));
+                            }
                                 if !wait_for_provider_retry(delay, &provider_cancellation).await {
                                     if !cancellation.is_cancelled()
                                         && provider_cancellation.is_cancelled()
@@ -1831,7 +1877,7 @@ impl AgentRuntime {
                                 error.to_string()
                             };
                             return self
-                                .finish_failed(&thread_id, &turn_id, message, &publisher)
+                                .finish_failed_with_error(&thread_id, &turn_id, error.turn_error(message), &publisher)
                                 .await;
                         }
                         None => {
@@ -2102,6 +2148,7 @@ impl AgentRuntime {
                     progress: None,
                 };
 
+                let tool_started_at = tokio::time::Instant::now();
                 let (mut result, mut item_status) = match self
                     .execute_tool_with_progress(context, &call, cancellation.clone(), &publisher)
                     .await
@@ -2134,6 +2181,13 @@ impl AgentRuntime {
                     }
                 };
 
+                if is_pending_subagent_wait(&call, &result, tool_started_at.elapsed()) {
+                    // A bounded blocking wait is legitimate while children do work.
+                    // Snapshot polling, finished results and failures retain loop guards.
+                    identical_call_streak = 0;
+                    no_progress_count = 0;
+                }
+
                 if call.name == "read_file"
                     && let Some(decision) = read_observations.observe(&result, iteration)
                 {
@@ -2161,6 +2215,13 @@ impl AgentRuntime {
                     item_status = AgentItemStatus::Failed;
                     stop_reason = Some(reason);
                 }
+
+                begin_read_observation_scope_after_workflow_transition(
+                    &call,
+                    &result,
+                    &mut read_observations,
+                    &mut pending_read_recovery_instructions,
+                );
 
                 if let Some(metrics) = &self.metrics {
                     metrics.tool(result.success);
@@ -3092,6 +3153,18 @@ impl AgentRuntime {
         message: String,
         publisher: &Arc<dyn EventPublisher>,
     ) -> Result<TurnOutcome, AgentRuntimeError> {
+        self.finish_failed_with_error(thread_id, turn_id, TurnError::classify(message), publisher)
+            .await
+    }
+
+    async fn finish_failed_with_error(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        error: TurnError,
+        publisher: &Arc<dyn EventPublisher>,
+    ) -> Result<TurnOutcome, AgentRuntimeError> {
+        let message = error.message.clone();
         if let Some(logger) = &self.logger {
             let _ = logger.log(
                 "error",
@@ -3124,7 +3197,7 @@ impl AgentRuntime {
                 turn_id,
                 StoredEventKind::TurnFailed {
                     message: message.clone(),
-                    error: Some(TurnError::classify(message.clone())),
+                    error: Some(error),
                 },
             )
             .await?;
@@ -3541,6 +3614,29 @@ fn canonical_json(value: &Value) -> String {
                 .join(",")
         ),
         _ => serde_json::to_string(value).unwrap_or_default(),
+    }
+}
+
+fn is_pending_subagent_wait(call: &ToolCall, result: &ToolResult, elapsed: Duration) -> bool {
+    if call.name != "wait_agent" || !result.success || elapsed < Duration::from_secs(1) {
+        return false;
+    }
+    let Ok(value) = serde_json::from_str::<Value>(&result.output) else {
+        return false;
+    };
+    let active = |agent: &Value| {
+        matches!(
+            agent["state"].as_str(),
+            Some("queued" | "running" | "blocked")
+        )
+    };
+    if call.arguments.get("agentIds").is_some() {
+        value["timedOut"] == true
+            && value["agents"]
+                .as_array()
+                .is_some_and(|agents| !agents.is_empty() && agents.iter().all(active))
+    } else {
+        active(&value)
     }
 }
 
@@ -4117,6 +4213,71 @@ mod tests {
     }
 
     #[test]
+    fn only_blocking_pending_subagent_waits_relax_loop_guards() {
+        let mut call = ToolCall {
+            id: "wait".into(),
+            name: "wait_agent".into(),
+            arguments: json!({"agentIds": ["a"]}),
+            metadata: json!({}),
+        };
+        let mut result = ToolResult {
+            success: true,
+            output: json!({"timedOut": true, "agents": [{"id": "a", "state": "running"}]})
+                .to_string(),
+            metadata: json!({}),
+        };
+        assert!(is_pending_subagent_wait(
+            &call,
+            &result,
+            Duration::from_secs(30)
+        ));
+        assert!(!is_pending_subagent_wait(
+            &call,
+            &result,
+            Duration::from_millis(999)
+        ));
+        result.success = false;
+        assert!(!is_pending_subagent_wait(
+            &call,
+            &result,
+            Duration::from_secs(30)
+        ));
+        result.success = true;
+        for output in [
+            json!({"timedOut": true, "agents": []}),
+            json!({"timedOut": false, "agents": [{"state": "completed"}]}),
+            json!({"timedOut": true, "agents": [{"state": "failed"}]}),
+        ] {
+            result.output = output.to_string();
+            assert!(!is_pending_subagent_wait(
+                &call,
+                &result,
+                Duration::from_secs(30)
+            ));
+        }
+        call.arguments = json!({"agentId": "a"});
+        result.output = json!({"state": "blocked"}).to_string();
+        assert!(is_pending_subagent_wait(
+            &call,
+            &result,
+            Duration::from_secs(30)
+        ));
+        result.output = "invalid JSON".into();
+        assert!(!is_pending_subagent_wait(
+            &call,
+            &result,
+            Duration::from_secs(30)
+        ));
+        result.output = json!({"state": "running"}).to_string();
+        call.name = "run_command".into();
+        assert!(!is_pending_subagent_wait(
+            &call,
+            &result,
+            Duration::from_secs(30)
+        ));
+    }
+
+    #[test]
     fn oversized_tool_results_keep_head_tail_and_metadata() {
         let original = format!("HEAD\n{}\nTAIL", "x".repeat(MAX_TOOL_OUTPUT_BYTES));
         let result = bound_tool_result(ToolResult {
@@ -4198,7 +4359,7 @@ mod tests {
                 ..
             })
         ));
-        tracker.mark_recovery_delivered(&ReadRevisionKey::new("src/file.rs", "revision-a"));
+        tracker.mark_recovery_delivered(&ReadRevisionKey::new("src/file.rs", "revision-a"), 3);
         assert!(matches!(
             tracker.observe(
                 &versioned_read_result("src/file.rs", "revision-a", 5, 396),
@@ -4216,6 +4377,89 @@ mod tests {
             ),
             Some(ReadObservationDecision::NewCoverage)
         );
+    }
+
+    #[test]
+    fn read_recovery_delivery_only_hard_stops_the_corrected_provider_batch() {
+        let mut tracker = ReadObservationTracker::default();
+        let result = versioned_read_result("src/file.rs", "revision-a", 1, 40);
+        assert_eq!(
+            tracker.observe(&result, 0),
+            Some(ReadObservationDecision::NewCoverage)
+        );
+        assert!(matches!(
+            tracker.observe(&result, 1),
+            Some(ReadObservationDecision::AlreadyCovered { .. })
+        ));
+        assert!(matches!(
+            tracker.observe(&result, 2),
+            Some(ReadObservationDecision::RecoveryRequired { .. })
+        ));
+
+        let key = ReadRevisionKey::new("src/file.rs", "revision-a");
+        tracker.mark_recovery_delivered(&key, 3);
+        assert!(matches!(
+            tracker.observe(&result, 4),
+            Some(ReadObservationDecision::RecoveryRequired { .. })
+        ));
+
+        tracker.mark_recovery_delivered(&key, 5);
+        assert!(matches!(
+            tracker.observe(&result, 5),
+            Some(ReadObservationDecision::RepeatedLoop { .. })
+        ));
+    }
+
+    #[test]
+    fn successful_workflow_node_transition_starts_a_new_read_observation_scope() {
+        let mut tracker = ReadObservationTracker::default();
+        let read_result = versioned_read_result("src/file.rs", "revision-a", 1, 40);
+        assert_eq!(
+            tracker.observe(&read_result, 0),
+            Some(ReadObservationDecision::NewCoverage)
+        );
+        let mut pending = vec![PendingReadRecoveryInstruction {
+            key: ReadRevisionKey::new("src/file.rs", "revision-a"),
+            text: "stale correction".into(),
+        }];
+        let transition = ToolCall {
+            id: "complete-node".into(),
+            name: COMPLETE_WORKFLOW_NODE_TOOL_NAME.into(),
+            arguments: json!({}),
+            metadata: json!({}),
+        };
+
+        begin_read_observation_scope_after_workflow_transition(
+            &transition,
+            &ToolResult {
+                success: true,
+                output: "next node".into(),
+                metadata: json!({}),
+            },
+            &mut tracker,
+            &mut pending,
+        );
+
+        assert!(pending.is_empty());
+        assert_eq!(
+            tracker.observe(&read_result, 1),
+            Some(ReadObservationDecision::NewCoverage)
+        );
+
+        begin_read_observation_scope_after_workflow_transition(
+            &transition,
+            &ToolResult {
+                success: false,
+                output: "node rejected".into(),
+                metadata: json!({}),
+            },
+            &mut tracker,
+            &mut pending,
+        );
+        assert!(matches!(
+            tracker.observe(&read_result, 2),
+            Some(ReadObservationDecision::AlreadyCovered { .. })
+        ));
     }
 
     #[test]
@@ -4341,6 +4585,97 @@ mod tests {
         assert_eq!(results["read-3"].metadata["contentSuppressed"], true);
         assert_eq!(results["read-3"].metadata["recoveryRequired"], true);
         assert_eq!(results["read-3"].metadata["turnContinues"], true);
+    }
+
+    #[tokio::test]
+    async fn stale_read_recovery_does_not_fail_after_an_intervening_provider_batch() {
+        let (directory, repository, runtime, thread_id) = runtime_fixture().await;
+        std::fs::write(directory.path().join("loop.txt"), "line 1\nline 2\nline 3").unwrap();
+        let read_call = |id: &str| ProviderEvent::ToolCall {
+            call: ToolCall {
+                id: id.into(),
+                name: "read_file".into(),
+                arguments: json!({
+                    "path": "loop.txt",
+                    "startLine": 1,
+                    "lineCount": 3
+                }),
+                metadata: json!({}),
+            },
+        };
+        let provider = Arc::new(FakeProvider::script(vec![
+            vec![Ok(read_call("read-1")), Ok(ProviderEvent::Completed)],
+            vec![Ok(read_call("read-2")), Ok(ProviderEvent::Completed)],
+            vec![Ok(read_call("read-3")), Ok(ProviderEvent::Completed)],
+            vec![
+                Ok(ProviderEvent::ToolCall {
+                    call: ToolCall {
+                        id: "list-after-correction".into(),
+                        name: "list_directory".into(),
+                        arguments: json!({ "path": "." }),
+                        metadata: json!({}),
+                    },
+                }),
+                Ok(ProviderEvent::Completed),
+            ],
+            vec![Ok(read_call("read-4")), Ok(ProviderEvent::Completed)],
+            vec![
+                Ok(ProviderEvent::TextDelta {
+                    delta: "completed after the fresh correction".into(),
+                }),
+                Ok(ProviderEvent::Completed),
+            ],
+        ]));
+
+        let outcome = runtime
+            .run_turn(
+                provider.clone(),
+                "fake".into(),
+                RunTurnRequest {
+                    thread_id: thread_id.clone(),
+                    input: "inspect without inheriting stale recovery state".into(),
+                    agent_mode: None,
+                },
+                CancellationToken::new(),
+                Arc::new(RecordingPublisher::default()),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.state, TurnState::Completed);
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 6);
+        for request_index in [3, 5] {
+            assert!(
+                requests[request_index]
+                    .messages
+                    .iter()
+                    .any(|message| matches!(
+                        message,
+                        ProviderMessage::Text {
+                            role: MessageRole::System,
+                            text,
+                        } if text.contains("[Host-enforced read recovery]")
+                    ))
+            );
+        }
+        let results = repository
+            .load(&thread_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter_map(|event| match event.kind {
+                StoredEventKind::ToolResult {
+                    call_id, result, ..
+                } => Some((call_id, result)),
+                _ => None,
+            })
+            .collect::<HashMap<_, _>>();
+        assert!(results["read-4"].success);
+        assert_eq!(
+            results["read-4"].metadata["observationStatus"],
+            "read_observation_recovery_required"
+        );
     }
 
     #[tokio::test]
@@ -6371,6 +6706,105 @@ mod tests {
             results["read-after-second-compaction"].metadata["observationStatus"],
             "read_observation_recovery_required"
         );
+    }
+
+    #[tokio::test]
+    async fn rate_limit_retry_is_visible_and_cancellation_prevents_replay() {
+        let (_directory, _repository, runtime, thread_id) = runtime_fixture().await;
+        let provider = Arc::new(PreStreamProvider::new(vec![Err(
+            ProviderError::RateLimited {
+                message: "free tier".into(),
+                retry_after: None,
+            },
+        )]));
+        let publisher = Arc::new(RecordingPublisher::default());
+        let token = CancellationToken::new();
+        let task = tokio::spawn({
+            let provider = provider.clone();
+            let publisher = publisher.clone();
+            let token = token.clone();
+            async move {
+                runtime
+                    .run_turn(
+                        provider,
+                        "fixture".into(),
+                        RunTurnRequest {
+                            thread_id,
+                            input: "read documents".into(),
+                            agent_mode: None,
+                        },
+                        token,
+                        publisher,
+                    )
+                    .await
+                    .unwrap()
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if publisher
+                    .events
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|event| matches!(event.event, AgentEvent::ProviderRetryWaiting { .. }))
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+        token.cancel();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), task)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            TurnState::Cancelled
+        );
+        assert_eq!(provider.requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn exhausted_rate_limits_are_typed_and_partial_output_is_never_replayed() {
+        for partial in [false, true] {
+            let (_directory, repository, runtime, thread_id) = runtime_fixture().await;
+            let mut events = vec![];
+            if partial {
+                events.push(Ok(ProviderEvent::TextDelta {
+                    delta: "already visible".into(),
+                }));
+            }
+            events.push(Err(ProviderError::RateLimited {
+                message: "Free-tier request limit reached".into(),
+                retry_after: Some(Duration::from_millis(1)),
+            }));
+            let provider = Arc::new(FakeProvider::new(events));
+            let outcome = runtime
+                .run_turn(
+                    provider.clone(),
+                    "fixture".into(),
+                    RunTurnRequest {
+                        thread_id: thread_id.clone(),
+                        input: "test quota".into(),
+                        agent_mode: None,
+                    },
+                    CancellationToken::new(),
+                    Arc::new(RecordingPublisher::default()),
+                )
+                .await
+                .unwrap();
+            assert_eq!(outcome.state, TurnState::Failed);
+            assert_eq!(provider.requests().len(), if partial { 1 } else { 4 });
+            let history = repository.read_thread_history(&thread_id).await.unwrap();
+            assert_eq!(
+                history.last_turn.unwrap().error.unwrap().code,
+                "rate_limited"
+            );
+        }
     }
 
     #[tokio::test]

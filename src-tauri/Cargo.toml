@@ -72,3 +72,4 @@ keyring = { version = "3.6.3", default-features = false, features = ["linux-nati
 
 [dev-dependencies]
 tempfile = "3"
+tokio = { version = "1", features = ["test-util"] }

@@ -28,6 +28,7 @@ import type {
 } from "../types/runtime";
 import { changeLineStats } from "../lib/diff";
 import { PlanProgress } from "./PlanProgress";
+import { RetryWaitingLabel } from "./RetryWaitingLabel";
 
 const ReadOnlyCodeEditor = lazy(() => import("./CodeEditor").then((module) => ({ default: module.CodeEditor })));
 const ChangeCodeDiffEditor = lazy(() => import("./CodeEditor").then((module) => ({ default: module.CodeDiffEditor })));
@@ -52,6 +53,7 @@ export const ConversationTurnActivity = memo(function ConversationTurnActivity({
   streaming = false,
   initialTextVisible = false,
   activityStatus = null,
+  retryAtMs,
   finalMessageId,
   renderText,
   onRetry,
@@ -66,6 +68,7 @@ export const ConversationTurnActivity = memo(function ConversationTurnActivity({
   streaming?: boolean;
   initialTextVisible?: boolean;
   activityStatus?: AgentActivityStatus | null;
+  retryAtMs?: number;
   finalMessageId?: string;
   renderText?: (text: string) => ReactNode;
   onRetry?: () => void;
@@ -132,6 +135,7 @@ export const ConversationTurnActivity = memo(function ConversationTurnActivity({
   const statusLabel = paced.pendingTextIds.size
     ? "生成回复中"
     : activityStatus ? {
+      rate_limited: "限流等待",
       thinking: "思考中",
       responding: "生成回复中",
       running_tool: "处理工具结果中",
@@ -210,7 +214,7 @@ export const ConversationTurnActivity = memo(function ConversationTurnActivity({
         >
           <summary>
             <SummaryIcon size={15} aria-hidden="true" className={visuallyStreaming ? "turn-tool-running" : undefined} />
-            <span className="turn-disclosure-title">{visuallyStreaming ? statusLabel : summaryTitle}</span>
+            <span className="turn-disclosure-title">{visuallyStreaming && activityStatus === "rate_limited" ? <RetryWaitingLabel retryAtMs={retryAtMs} /> : visuallyStreaming ? statusLabel : summaryTitle}</span>
             {visuallyStreaming ? (
               <span className="turn-live-status-dots" aria-hidden="true"><i /><i /><i /></span>
             ) : (
@@ -646,8 +650,7 @@ function ToolActivityRow({
     : failed && activity.result?.output
       ? truncate(activity.result.output, 120)
       : activityStateLabel(activity);
-  const subagentId = subagentIdOf(activity);
-  const taskNumber = subagentId ? subagentTaskIndex?.[subagentId] : undefined;
+  const subagentIds = subagentIdsOf(activity);
   return (
     <div className={`turn-timeline-tool turn-timeline-tool--${activity.state}${isCommand ? " turn-timeline-tool--command" : ""}`}>
       {activity.state === "completed" ? (
@@ -660,9 +663,13 @@ function ToolActivityRow({
         <LoaderCircle className="turn-tool-running" size={15} aria-hidden="true" />
       )}
       <span className={isCommand ? "turn-command-summary" : undefined}>
+        <span className="turn-tool-heading">
         <strong title={isCommand && command ? command : undefined}>{title}</strong>
-        {subagentId && taskNumber !== undefined ? (
+        {subagentIds.map((subagentId) => {
+          const taskNumber = subagentTaskIndex?.[subagentId];
+          return taskNumber !== undefined ? (
           <button
+            key={subagentId}
             type="button"
             className="subagent-task-chip"
             title="在右侧面板查看该子智能体"
@@ -674,10 +681,12 @@ function ToolActivityRow({
           >
             task{taskNumber}
           </button>
-        ) : null}
+          ) : null;
+        })}
+        </span>
         <small className="turn-tool-meta" title={isCommand && failed ? meta : undefined}>
           <span>{meta}</span>
-          {elapsedMs !== null ? <span className="turn-tool-duration"><Clock3 size={12} aria-hidden="true" />耗时 {formatDuration(elapsedMs)}</span> : null}
+          {elapsedMs !== null ? <span className="turn-tool-duration" title={activity.call.name === "wait_agent" ? "本次等待调用的耗时；子任务耗时可在右侧详情查看" : undefined}><Clock3 size={12} aria-hidden="true" />{activity.call.name === "wait_agent" ? "等待耗时" : "耗时"} {formatDuration(elapsedMs)}</span> : null}
         </small>
       </span>
       {fileDetails ? <FileActivityDetails details={fileDetails} /> : null}
@@ -1028,7 +1037,7 @@ function runningToolLabel(name: string) {
   return labels[name] ?? `正在运行 ${name}`;
 }
 
-/** Delegation tools from `multi_agent`: each one targets a single subagent. */
+/** Delegation tools from `multi_agent`; waits may target multiple subagents. */
 const DELEGATION_TOOL_NAMES = new Set([
   "create_agent",
   "wait_agent",
@@ -1041,23 +1050,29 @@ const DELEGATION_TOOL_NAMES = new Set([
  * Resolves the subagent a delegation tool acted on. Most tools carry `agentId` in
  * their arguments; `create_agent` only learns the id from its structured result.
  */
-function subagentIdOf(activity: ToolActivity): string | null {
-  if (!DELEGATION_TOOL_NAMES.has(activity.call.name)) return null;
+function subagentIdsOf(activity: ToolActivity): string[] {
+  if (!DELEGATION_TOOL_NAMES.has(activity.call.name)) return [];
   const args = activity.call.arguments ?? {};
+  if (activity.call.name === "wait_agent" && Array.isArray(args.agentIds)) {
+    return [...new Set(args.agentIds.filter((id): id is string => typeof id === "string" && !!id.trim()).map((id) => id.trim()))];
+  }
   const argumentId = args.agentId;
-  if (typeof argumentId === "string" && argumentId.trim()) return argumentId.trim();
+  if (typeof argumentId === "string" && argumentId.trim()) return [argumentId.trim()];
   const output = activity.result?.output;
-  if (typeof output !== "string" || !output.trim()) return null;
+  if (typeof output !== "string" || !output.trim()) return [];
   try {
     const parsed = JSON.parse(output) as { id?: unknown };
-    return typeof parsed.id === "string" && parsed.id.trim() ? parsed.id.trim() : null;
+    return typeof parsed.id === "string" && parsed.id.trim() ? [parsed.id.trim()] : [];
   } catch {
-    return null;
+    return [];
   }
 }
 
 function toolTarget(activity: ToolActivity) {
   const args = activity.call.arguments ?? {};
+  if (activity.call.name === "wait_agent" && Array.isArray(args.agentIds)) {
+    return "等待任一子智能体结束";
+  }
   // Delegation failures already surface through the Chinese tool label; dumping the
   // raw `SubagentView` JSON into the title would only add noise.
   if (activity.state === "failed" && activity.result?.output && !DELEGATION_TOOL_NAMES.has(activity.call.name)) {
@@ -1112,6 +1127,17 @@ function activityStateLabel(activity: ToolActivity) {
   if (activity.state === "running") return "执行中";
   if (activity.state === "failed") return "执行失败";
   if (activity.state === "cancelled") return "已取消";
+  if (activity.call.name === "wait_agent" && activity.result?.success) {
+    try {
+      const result = JSON.parse(activity.result.output);
+      if (result.timedOut === true || ["queued", "running", "blocked"].includes(result.state)) {
+        return "本次等待结束，子任务仍在运行";
+      }
+      return "已获取结果";
+    } catch {
+      return "本次等待结束";
+    }
+  }
   return "已完成";
 }
 

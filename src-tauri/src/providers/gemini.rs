@@ -182,8 +182,9 @@ impl Provider for GoogleGeminiProvider {
         };
         if !response.status().is_success() {
             let status = response.status().as_u16();
+            let retry_after = super::common::retry_after(&response);
             let message = read_error_message(response, &cancellation, &self.api_key).await?;
-            return Err(ProviderError::Http { status, message });
+            return Err(ProviderError::from_http(status, message, retry_after));
         }
 
         let secret = self.api_key.clone();

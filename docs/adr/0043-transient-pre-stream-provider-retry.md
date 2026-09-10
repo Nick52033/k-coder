@@ -13,12 +13,20 @@ DeepSeek V4 的当前工具 Turn 已能正确回传 `reasoning_content`、`tool_
 ## 决策
 
 1. 瞬时错误自动重试由 `AgentRuntime` 在 Provider 调用边界协调。`stream()` 尚未返回 `ProviderStream` 时产生的 `ProviderError::Request`，以及 HTTP `408/429/502/503/504` 可以进入该策略。OpenAI Chat Completions 与 Responses 还会保留 SSE 错误的 code/type；`server_error`、过载和暂时不可用语义映射为类型化 `ProviderError::Unavailable`，而不是协议无效。
-2. 每次逻辑模型请求最多自动重试 3 次，生产退避固定为 1 秒、2 秒、4 秒。退避使用当前 Turn 的 `CancellationToken`；停止、替换 Turn 或父级取消必须立即结束等待，不能再发起下一次请求。
+2. 每次逻辑模型请求最多自动重试 3 次，非限流故障的生产退避为 1 秒、2 秒、4 秒。429 使用类型化 `RateLimited`，优先读取 `Retry-After` 秒数或 HTTP 日期，无有效提示时等待 60 秒；提示限制在 1 秒到 24 小时内。退避使用当前 Turn 的 `CancellationToken`；停止、替换 Turn 或父级取消必须立即结束等待，不能再发起下一次请求。
 3. `ProviderStream` 返回后，只有明确类型化的临时不可用错误且当前尝试尚未产生正文、摘要、工具调用、图片或 Provider 上下文时，才能复用相同瞬时重试预算。此前 Provider 调用已经完成的工具轮不影响当前尝试的零输出判断；当前尝试一旦产生任何可见或持久化输出就禁止重放。普通 HTTP/网络流中断、无效响应和不完整工具 JSON 不因此升级为临时故障；不完整工具 JSON 继续使用独立的零输出协议重试策略。
 4. 每次真实重放都增加 `provider_call_index`，进入普通 Turn 的软请求计数，并单独记录 Provider 成败指标和 `retry_count`。失败尝试若已返回 Usage，继续按既有契约进入累计 Token、显式预算和持久化用量；纯流前错误没有可伪造的 Usage。
 5. 配置了备用模型或备用端点时，`FallbackProvider` 仍先在一次 Provider 调用内尝试允许的目标；只有整条配置路由以瞬时流前错误失败后，`AgentRuntime` 才按相同请求重试。不得自动启用 `fallback = false` 的模型，也不得虚构未配置的端点或 Provider。
 6. 自动重试复用同一个 Provider 实例和完全相同的 `ProviderRequest`。这保留当前 Turn 中 DeepSeek 的有界私有 passback 状态，且不把该状态写入公共事件、JSONL、SQLite、指标或界面。
 7. 重试耗尽后保留最后一个 Provider 错误的状态码与脱敏消息，并在用户可见错误中追加实际自动重试次数。持续不可用仍明确失败，不能把有界重试描述为可保证恢复。
+
+## 2026-09-10：共享限流恢复（P10-161）
+
+- AppState 持有按供应商配置 ID 隔离的内存调度器；主任务、子任务及重新构建的 Provider 共用。不同配置不互相阻塞；同一凭据被另存为不同配置或其他进程使用时，不能共享该限流状态。
+- 调度器包裹完整 FallbackProvider，先保留已配置路由内的既有故障切换顺序；整条路由返回 429 后共享冷却，不启用未配置备用项。冷却结束后逐个放行逻辑请求，首次 429 后间隔 4 秒，每次再次限流加倍，最多 60 秒；这是保守自适应节奏，不把截图中的 15 RPM 当作所有供应商的额度。冷却和间隔仅在当前应用进程内保留。
+- 运行时仍负责有界重试，调度器只处理请求准入，不实现第二套 Turn 循环。等待不重复正文、工具或 Provider 私有状态；失败带用量时仍保留统计。停止和引导都能取消冷却，取消的等待者不占用未来时隙；模型恢复子任务继承父级取消令牌。
+- 公共事件 schema v7 新增 `provider_retry_waiting`，仅包含线程、Turn 与预计请求时间。它是瞬时展示信息，不进入模型上下文；主对话与子任务详情显示倒计时，实际发请求或收到终态时清除。子任务快照可附带可选 `retryAtMs`，旧快照兼容。
+- 最终失败从 ProviderError 类型生成 `rate_limited` 错误码；兼容历史字符串中的 `HTTP 429:`，不再依赖供应商错误正文是否包含 `rate limit`。
 
 ## 影响
 

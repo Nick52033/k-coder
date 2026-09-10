@@ -448,6 +448,7 @@ impl Provider for OpenAiChatCompletionsProvider {
             .await?;
         if !response.status().is_success() {
             let status = response.status().as_u16();
+            let retry_after = super::common::retry_after(&response);
             let message = read_error_message(response, &cancellation, &self.api_key).await?;
             let can_retry_with_degraded_history =
                 deepseek.as_ref().is_some_and(|(_, thinking_enabled)| {
@@ -467,15 +468,17 @@ impl Provider for OpenAiChatCompletionsProvider {
                     .await?;
                 if !response.status().is_success() {
                     let retry_status = response.status().as_u16();
+                    let retry_after = super::common::retry_after(&response);
                     let retry_message =
                         read_error_message(response, &cancellation, &self.api_key).await?;
-                    return Err(ProviderError::Http {
-                        status: retry_status,
-                        message: retry_message,
-                    });
+                    return Err(ProviderError::from_http(
+                        retry_status,
+                        retry_message,
+                        retry_after,
+                    ));
                 }
             } else {
-                return Err(ProviderError::Http { status, message });
+                return Err(ProviderError::from_http(status, message, retry_after));
             }
         }
 

@@ -20,21 +20,22 @@ import {
   closeSubagent,
   createSubagent,
   errorMessage,
-  listSubagents,
   readThread,
   resumeSubagent,
   sendSubagentMessage,
   subscribeToAgentEvents,
-  subscribeToSubagentEvents,
 } from "../api/runtime";
 import { cn } from "../lib/cn";
 import type { AgentEvent, ChatMessage, SubagentState, SubagentView } from "../types/runtime";
 import { MarkdownContent } from "./MarkdownContent";
 import "./AgentActivityPanel.css";
+import { RetryWaitingLabel } from "./RetryWaitingLabel";
 
 interface AgentActivityPanelProps {
   open: boolean;
   parentThreadId: string | null;
+  agents: SubagentView[];
+  onAgentUpdated: (agent: SubagentView) => void;
   /** Controlled selection so the conversation view can focus a subagent from anywhere. */
   selectedId: string | null;
   onSelectId: (id: string | null) => void;
@@ -53,11 +54,12 @@ interface DetailLine {
 export function AgentActivityPanel({
   open,
   parentThreadId,
+  agents,
+  onAgentUpdated,
   selectedId,
   onSelectId,
   onClose,
 }: AgentActivityPanelProps) {
-  const [agents, setAgents] = useState<SubagentView[]>([]);
   const [task, setTask] = useState("");
   const [tokenBudget, setTokenBudget] = useState("");
   const [forkTurns, setForkTurns] = useState("none");
@@ -66,34 +68,6 @@ export function AgentActivityPanel({
   const [creating, setCreating] = useState(false);
   const [showCreateForm, setShowCreateForm] = useState(false);
   const [error, setError] = useState("");
-
-  useEffect(() => {
-    let disposed = false;
-    let unlisten: (() => void) | undefined;
-    void subscribeToSubagentEvents((agent) => {
-      if (disposed) return;
-      setAgents((current) => sortAgents(upsert(current, agent)));
-    }).then((stop) => {
-      if (disposed) stop();
-      else unlisten = stop;
-    });
-    return () => {
-      disposed = true;
-      unlisten?.();
-    };
-  }, []);
-
-  useEffect(() => {
-    if (!open) return;
-    // Load every subagent, not just the ones owned by the active thread, so the
-    // conversation can focus a subagent created from another session.
-    void listSubagents()
-      .then((items) => {
-        setAgents(sortAgents(items));
-        setError("");
-      })
-      .catch((reason) => setError(errorMessage(reason)));
-  }, [open]);
 
   useEffect(() => {
     function handleKeyDown(event: globalThis.KeyboardEvent) {
@@ -105,11 +79,17 @@ export function AgentActivityPanel({
       window.addEventListener("keydown", handleKeyDown);
       return () => window.removeEventListener("keydown", handleKeyDown);
     }
-  }, [open, onClose, selectedId]);
+  }, [open, onClose, onSelectId, selectedId]);
+
+  const threadAgents = useMemo(
+    () => agents.filter((agent) => agent.parentThreadId === parentThreadId)
+      .sort((a, b) => b.updatedAtMs - a.updatedAtMs),
+    [agents, parentThreadId],
+  );
 
   const runningCount = useMemo(
-    () => agents.filter((agent) => activeStates.has(agent.state)).length,
-    [agents],
+    () => threadAgents.filter((agent) => activeStates.has(agent.state)).length,
+    [threadAgents],
   );
   const selected = useMemo(
     () => agents.find((agent) => agent.id === selectedId) ?? null,
@@ -140,7 +120,7 @@ export function AgentActivityPanel({
         timeoutMs: 600_000,
         forkTurns: forkTurns.trim() || "none",
       });
-      setAgents((current) => sortAgents(upsert(current, created)));
+      onAgentUpdated(created);
       onSelectId(created.id);
       setTask("");
       setTokenBudget("");
@@ -159,7 +139,7 @@ export function AgentActivityPanel({
   async function stop(agent: SubagentView) {
     try {
       const updated = await closeSubagent(agent.id);
-      setAgents((current) => sortAgents(upsert(current, updated)));
+      onAgentUpdated(updated);
     } catch (reason) {
       setError(errorMessage(reason));
     }
@@ -168,7 +148,7 @@ export function AgentActivityPanel({
   async function resume(agent: SubagentView) {
     try {
       const updated = await resumeSubagent(agent.id);
-      setAgents((current) => sortAgents(upsert(current, updated)));
+      onAgentUpdated(updated);
       setError("");
     } catch (reason) {
       setError(errorMessage(reason));
@@ -183,6 +163,7 @@ export function AgentActivityPanel({
     >
       {!open ? null : selected ? (
         <SubagentDetail
+          key={selected.id}
           agent={selected}
           onBack={() => onSelectId(null)}
           onStop={() => void stop(selected)}
@@ -306,14 +287,16 @@ export function AgentActivityPanel({
           {error && <div className="agent-error" role="alert">{String(error)}</div>}
 
           <div className="subagent-list">
-            {agents.length === 0 && (
+            {selectedId ? (
+              <div className="agent-empty" role="status">正在加载所选子任务…</div>
+            ) : threadAgents.length === 0 && (
               <div className="agent-empty">
                 <Bot size={28} />
-                <strong>暂无子任务</strong>
-                <p>创建子任务来并行处理工作</p>
+                <strong>当前会话暂无子任务</strong>
+                <p>在对话中点击 task 查看对应子智能体，或创建子任务来并行处理工作</p>
               </div>
             )}
-            {agents.map((agent) => (
+            {!selectedId && threadAgents.map((agent) => (
               <SubagentRow
                 key={agent.id}
                 agent={agent}
@@ -339,7 +322,9 @@ interface SubagentRowProps {
 }
 
 function SubagentRow({ agent, selected, onSelect, onStop, onResume }: SubagentRowProps) {
-  const statusInfo = getStatusInfo(agent.state);
+  const statusInfo = activeStates.has(agent.state) && agent.retryAtMs
+    ? { label: "限流等待", Icon: Clock, color: "var(--color-ink)", spinning: false }
+    : getStatusInfo(agent.state);
   const elapsed = formatElapsed(agent.createdAtMs, agent.updatedAtMs);
 
   return (
@@ -351,7 +336,7 @@ function SubagentRow({ agent, selected, onSelect, onStop, onResume }: SubagentRo
         <span className="subagent-row-body">
           <span className="subagent-row-label">{String(agent.label)}</span>
           <span className="subagent-row-meta">
-            {statusInfo.label} · 已处理 {elapsed} · {formatTokenUsage(agent.tokensUsed, agent.tokenBudget)}
+            {statusInfo.label} · 子任务耗时 {elapsed} · {formatTokenUsage(agent.tokensUsed, agent.tokenBudget)}
           </span>
           <span className="subagent-row-summary">{summarize(agent)}</span>
         </span>
@@ -397,7 +382,9 @@ function SubagentDetail({ agent, onBack, onStop, onResume, onError }: SubagentDe
   const [triggerTurn, setTriggerTurn] = useState(true);
   const [sending, setSending] = useState(false);
   const scrollRef = useRef<HTMLDivElement | null>(null);
-  const statusInfo = getStatusInfo(agent.state);
+  const statusInfo = activeStates.has(agent.state) && agent.retryAtMs
+    ? { label: "限流等待", Icon: Clock, color: "var(--color-ink)", spinning: false }
+    : getStatusInfo(agent.state);
 
   useEffect(() => {
     let disposed = false;
@@ -480,6 +467,10 @@ function SubagentDetail({ agent, onBack, onStop, onResume, onError }: SubagentDe
 
       <dl className="subagent-detail-meta">
         <div>
+          <dt>子任务耗时</dt>
+          <dd title="从创建到最近一次状态更新的时间，包含等待及恢复间隔">{formatElapsed(agent.createdAtMs, agent.updatedAtMs)}</dd>
+        </div>
+        <div>
           <dt>路径</dt>
           <dd className="subagent-path">{agent.agentPath ?? "-"}</dd>
         </div>
@@ -529,6 +520,7 @@ function SubagentDetail({ agent, onBack, onStop, onResume, onError }: SubagentDe
             <p>{agent.summary}</p>
           </div>
         )}
+        {activeStates.has(agent.state) && agent.retryAtMs && <div className="agent-retry-wait" role="status"><RetryWaitingLabel retryAtMs={agent.retryAtMs} /></div>}
         {agent.error && <div className="agent-error">{agent.error}</div>}
       </div>
 
@@ -628,17 +620,6 @@ function formatTokenUsage(tokensUsed: number, tokenBudget: number | null) {
   return tokenBudget === null
     ? `${tokensUsed.toLocaleString()} tokens`
     : `${tokensUsed.toLocaleString()} / ${tokenBudget.toLocaleString()} tokens`;
-}
-
-function upsert(agents: SubagentView[], incoming: SubagentView) {
-  const existing = agents.some((agent) => agent.id === incoming.id);
-  return existing
-    ? agents.map((agent) => (agent.id === incoming.id ? incoming : agent))
-    : [incoming, ...agents];
-}
-
-function sortAgents(agents: SubagentView[]) {
-  return [...agents].sort((a, b) => b.updatedAtMs - a.updatedAtMs);
 }
 
 function getStatusInfo(state: SubagentState) {

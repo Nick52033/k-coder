@@ -5,7 +5,7 @@ use crate::storage::{
 };
 
 pub const PROTOCOL_VERSION: u32 = 1;
-pub const AGENT_EVENT_SCHEMA_VERSION: u32 = 6;
+pub const AGENT_EVENT_SCHEMA_VERSION: u32 = 7;
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -644,7 +644,10 @@ impl TurnError {
                 false,
                 TurnErrorCategory::Authentication,
             )
-        } else if normalized.contains("rate limit") || normalized.contains("status 429") {
+        } else if normalized.contains("rate limit")
+            || normalized.contains("status 429")
+            || normalized.contains("http 429:")
+        {
             ("rate_limited", true, TurnErrorCategory::Provider)
         } else if normalized.contains("approval") || normalized.contains("permission") {
             ("policy_denied", false, TurnErrorCategory::Policy)
@@ -683,6 +686,7 @@ pub enum TurnState {
 #[serde(rename_all = "snake_case")]
 pub enum AgentActivityStatus {
     Thinking,
+    RateLimited,
     Responding,
     RunningTool,
     AwaitingApproval,
@@ -776,11 +780,13 @@ impl AgentEvent {
     /// 根据事件类型推断默认的 turn phase。
     fn default_phase(&self) -> TurnPhase {
         match self {
-            Self::TurnStarted { .. } => TurnPhase::Exploring,
+            Self::TurnStarted { .. } | Self::ProviderRetryWaiting { .. } => TurnPhase::Exploring,
             Self::TurnSteered { .. } => TurnPhase::Exploring,
             Self::TurnRejected { .. } => TurnPhase::Failed,
             Self::ActivityStatusChanged { status, .. } => match status {
-                AgentActivityStatus::Thinking => TurnPhase::Exploring,
+                AgentActivityStatus::Thinking | AgentActivityStatus::RateLimited => {
+                    TurnPhase::Exploring
+                }
                 AgentActivityStatus::Responding | AgentActivityStatus::Finalizing => {
                     TurnPhase::Planning
                 }
@@ -826,6 +832,11 @@ impl AgentEvent {
     rename_all_fields = "camelCase"
 )]
 pub enum AgentEvent {
+    ProviderRetryWaiting {
+        thread_id: String,
+        turn_id: String,
+        retry_at_ms: u64,
+    },
     TurnStarted {
         thread_id: String,
         turn_id: String,
@@ -1098,6 +1109,29 @@ pub struct UserInputResolution {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn rate_limit_event_and_legacy_failure_are_compatible() {
+        let event = super::AgentEventEnvelope::new(super::AgentEvent::ProviderRetryWaiting {
+            thread_id: "thread".into(),
+            turn_id: "turn".into(),
+            retry_at_ms: 123,
+        });
+        let value = serde_json::to_value(&event).unwrap();
+        assert_eq!(value["type"], "provider_retry_waiting");
+        assert_eq!(value["retryAtMs"], 123);
+        assert_eq!(
+            serde_json::from_value::<super::AgentEventEnvelope>(value).unwrap(),
+            event
+        );
+        assert_eq!(
+            super::TurnError::classify(
+                "provider returned HTTP 429: Free-tier request limit reached".into()
+            )
+            .code,
+            "rate_limited"
+        );
+    }
+
     use super::*;
 
     #[test]
@@ -1297,7 +1331,7 @@ mod tests {
 
         let value = serde_json::to_value(event).expect("usage event should serialize");
 
-        assert_eq!(value["schemaVersion"], 6);
+        assert_eq!(value["schemaVersion"], AGENT_EVENT_SCHEMA_VERSION);
         assert_eq!(value["type"], "usage_updated");
         assert_eq!(value["usage"]["totalTokens"], 100_000);
         assert_eq!(value["contextUsage"]["totalTokens"], 15_360);
@@ -1317,7 +1351,7 @@ mod tests {
         });
         let value = serde_json::to_value(event).unwrap();
 
-        assert_eq!(value["schemaVersion"], 6);
+        assert_eq!(value["schemaVersion"], AGENT_EVENT_SCHEMA_VERSION);
         assert_eq!(value["type"], "tool_queued");
         assert_eq!(value["phase"], "executing");
         assert_eq!(value["call"]["id"], "call-queued");

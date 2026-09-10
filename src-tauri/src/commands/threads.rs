@@ -30,8 +30,7 @@ pub async fn create_thread(
 #[tauri::command]
 pub async fn list_threads(state: State<'_, AppState>) -> CommandResult<Vec<ThreadSummary>> {
     state
-        .repository()
-        .list_threads()
+        .list_conversation_threads("")
         .await
         .map_err(|error| CommandError::new("storage", error))
 }
@@ -42,8 +41,7 @@ pub async fn search_threads(
     query: String,
 ) -> CommandResult<Vec<ThreadSummary>> {
     state
-        .repository()
-        .search_threads(&query)
+        .list_conversation_threads(&query)
         .await
         .map_err(|error| CommandError::new("storage", error))
 }

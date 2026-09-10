@@ -154,6 +154,8 @@ pub struct SubagentView {
     pub updated_at_ms: u64,
     pub summary: Option<String>,
     pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_at_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -192,7 +194,6 @@ pub struct SubagentExecutionContext {
 
 struct ActiveSubagent {
     cancellation: CancellationToken,
-    notify: Arc<Notify>,
     /// Steer channel for the running turn. Used for `trigger_turn` delivery while active.
     control: Arc<TurnControl>,
     /// Queue-only delivery: drained into the next turn's input instead of interrupting.
@@ -324,6 +325,61 @@ struct CoordinatorInner {
     /// Queue-only messages, kept across turns so a follow-up survives until it is delivered.
     mailboxes: Mutex<HashMap<String, Arc<Mutex<VecDeque<String>>>>>,
     permits: Arc<Semaphore>,
+    completed: Notify,
+}
+
+/// Batch waits return snapshots in request order; every terminal state wakes the parent.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WaitAgentsResult {
+    pub schema_version: u32,
+    pub agents: Vec<WaitAgentSnapshot>,
+    pub finished_agent_ids: Vec<String>,
+    pub timed_out: bool,
+}
+
+/// Keep batch output valid JSON under the runtime's 128 KiB tool-output bound,
+/// even when all four summaries contain JSON-escaped control characters.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WaitAgentSnapshot {
+    pub id: String,
+    pub state: SubagentState,
+    pub summary: Option<String>,
+    pub error: Option<String>,
+    pub truncated: bool,
+    pub tokens_used: u64,
+    pub updated_at_ms: u64,
+}
+
+impl From<SubagentView> for WaitAgentSnapshot {
+    fn from(agent: SubagentView) -> Self {
+        fn bounded(value: Option<String>, limit: usize, truncated: &mut bool) -> Option<String> {
+            value.map(|mut text| {
+                if text.len() > limit {
+                    let mut end = limit;
+                    while !text.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    text.truncate(end);
+                    *truncated = true;
+                }
+                text
+            })
+        }
+        let mut truncated = false;
+        let summary = bounded(agent.summary, 4096, &mut truncated);
+        let error = bounded(agent.error, 512, &mut truncated);
+        Self {
+            id: agent.id,
+            state: agent.state,
+            summary,
+            error,
+            truncated,
+            tokens_used: agent.tokens_used,
+            updated_at_ms: agent.updated_at_ms,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -342,6 +398,7 @@ impl MultiAgentCoordinator {
         for id in interrupted {
             if let Some(record) = records.get_mut(&id) {
                 record.state = SubagentState::Failed;
+                record.retry_at_ms = None;
                 record.error = Some("subagent was interrupted by an application restart".into());
                 record.updated_at_ms = now_ms();
                 store.append(record)?;
@@ -354,6 +411,7 @@ impl MultiAgentCoordinator {
                 active: Mutex::new(HashMap::new()),
                 mailboxes: Mutex::new(HashMap::new()),
                 permits: Arc::new(Semaphore::new(MAX_ACTIVE_SUBAGENTS)),
+                completed: Notify::new(),
             }),
         })
     }
@@ -465,6 +523,7 @@ impl MultiAgentCoordinator {
             updated_at_ms: timestamp,
             summary: None,
             error: None,
+            retry_at_ms: None,
         };
         self.store_record(record.clone(), &context.lifecycle_events)?;
         self.launch(
@@ -557,6 +616,17 @@ impl MultiAgentCoordinator {
         message: Option<String>,
         context: SubagentExecutionContext,
     ) -> Result<SubagentView, MultiAgentError> {
+        self.resume_with_cancellation(id, message, context, CancellationToken::new())
+            .await
+    }
+
+    async fn resume_with_cancellation(
+        &self,
+        id: &str,
+        message: Option<String>,
+        context: SubagentExecutionContext,
+        parent_cancellation: CancellationToken,
+    ) -> Result<SubagentView, MultiAgentError> {
         self.ensure_inactive(id)?;
         let permit = self.acquire_permit()?;
         let record = self.get(id)?;
@@ -579,7 +649,7 @@ impl MultiAgentCoordinator {
             input,
             retry,
             context,
-            CancellationToken::new(),
+            parent_cancellation,
             permit,
         )
         .await?;
@@ -614,7 +684,6 @@ impl MultiAgentCoordinator {
         };
         let allowed_tools = available_tools.restricted_to(&record.capabilities)?;
         let cancellation = parent_cancellation.child_token();
-        let notify = Arc::new(Notify::new());
         let control = TurnControl::new();
         let mailbox = self.mailbox_for(&id)?;
         let input = merge_queued_input(input, &mailbox)?;
@@ -626,7 +695,6 @@ impl MultiAgentCoordinator {
                 id.clone(),
                 ActiveSubagent {
                     cancellation: cancellation.clone(),
-                    notify: notify.clone(),
                     control: Arc::clone(&control),
                     mailbox: Arc::clone(&mailbox),
                     _permit: permit,
@@ -740,7 +808,7 @@ impl MultiAgentCoordinator {
             if let Ok(mut active) = manager.inner.active.lock() {
                 active.remove(&id);
             }
-            notify.notify_waiters();
+            manager.inner.completed.notify_waiters();
         });
         Ok(())
     }
@@ -751,25 +819,59 @@ impl MultiAgentCoordinator {
         timeout_ms: u64,
         cancellation: CancellationToken,
     ) -> Result<SubagentView, MultiAgentError> {
+        self.wait_any(&[id.to_string()], timeout_ms, cancellation)
+            .await?;
+        self.get(id)
+    }
+
+    pub async fn wait_any(
+        &self,
+        ids: &[String],
+        timeout_ms: u64,
+        cancellation: CancellationToken,
+    ) -> Result<WaitAgentsResult, MultiAgentError> {
+        if ids.is_empty()
+            || ids.len() > MAX_ACTIVE_SUBAGENTS
+            || ids.iter().collect::<HashSet<_>>().len() != ids.len()
+        {
+            return Err(MultiAgentError::Invalid(format!(
+                "agentIds must contain 1 to {MAX_ACTIVE_SUBAGENTS} unique ids"
+            )));
+        }
+        let deadline = tokio::time::Instant::now()
+            + Duration::from_millis(timeout_ms.min(MAX_SUBAGENT_RUNTIME_MS));
         loop {
-            let record = self.get(id)?;
-            if !record.state.is_active() {
-                return Ok(record);
+            // Register before reading state so a completion between the read and await
+            // cannot be lost. Other agents waking us must not reset the deadline.
+            let notified = self.inner.completed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if cancellation.is_cancelled() {
+                return Err(MultiAgentError::Cancelled);
             }
-            let notify = self
-                .inner
-                .active
-                .lock()
-                .map_err(|_| MultiAgentError::Storage("subagent active lock poisoned".into()))?
-                .get(id)
-                .map(|active| active.notify.clone())
-                .ok_or_else(|| {
-                    MultiAgentError::Runtime("active subagent has no runtime handle".into())
-                })?;
+            let agents = ids
+                .iter()
+                .map(|id| self.get(id))
+                .collect::<Result<Vec<_>, _>>()?;
+            let finished_agent_ids: Vec<_> = agents
+                .iter()
+                .filter(|agent| !agent.state.is_active())
+                .map(|agent| agent.id.clone())
+                .collect();
+            let timed_out =
+                finished_agent_ids.is_empty() && tokio::time::Instant::now() >= deadline;
+            if !finished_agent_ids.is_empty() || timed_out {
+                return Ok(WaitAgentsResult {
+                    schema_version: 1,
+                    agents: agents.into_iter().map(Into::into).collect(),
+                    finished_agent_ids,
+                    timed_out,
+                });
+            }
             tokio::select! {
-                _ = notify.notified() => {},
+                _ = &mut notified => {},
                 _ = cancellation.cancelled() => return Err(MultiAgentError::Cancelled),
-                _ = tokio::time::sleep(Duration::from_millis(timeout_ms.min(MAX_SUBAGENT_RUNTIME_MS))) => return Ok(self.get(id)?),
+                _ = tokio::time::sleep_until(deadline) => {},
             }
         }
     }
@@ -891,6 +993,9 @@ impl MultiAgentCoordinator {
                 .ok_or_else(|| MultiAgentError::NotFound(id.into()))?;
             let previous_state = record.state;
             record.state = state;
+            if !state.is_active() || !previous_state.is_active() {
+                record.retry_at_ms = None;
+            }
             record.updated_at_ms = now_ms();
             if summary.is_some()
                 || !state.is_active()
@@ -1026,6 +1131,34 @@ struct ChildEventPublisher {
 
 impl EventPublisher for ChildEventPublisher {
     fn publish(&self, event: AgentEventEnvelope) {
+        let retry_update = match &event.event {
+            AgentEvent::ProviderRetryWaiting { retry_at_ms, .. } => Some(Some(*retry_at_ms)),
+            AgentEvent::ActivityStatusChanged { .. }
+            | AgentEvent::TurnCompleted { .. }
+            | AgentEvent::TurnFailed { .. }
+            | AgentEvent::TurnCancelled { .. } => Some(None),
+            _ => None,
+        };
+        if let Some(retry_at_ms) = retry_update {
+            let snapshot = self
+                .manager
+                .inner
+                .records
+                .lock()
+                .ok()
+                .and_then(|mut records| {
+                    let record = records.get_mut(&self.agent_id)?;
+                    if record.retry_at_ms == retry_at_ms {
+                        return None;
+                    }
+                    record.retry_at_ms = retry_at_ms;
+                    record.updated_at_ms = now_ms();
+                    Some(record.clone())
+                });
+            if let Some(snapshot) = snapshot {
+                self.lifecycle.publish(snapshot);
+            }
+        }
         let state = match &event.event {
             AgentEvent::ApprovalRequested { .. } => Some(SubagentState::Blocked),
             AgentEvent::ApprovalResolved { .. } | AgentEvent::ToolStarted { .. } => {
@@ -1124,15 +1257,15 @@ impl ToolHandler for AgentToolHandler {
         let (name, description, properties, required) = match self.operation {
             AgentToolOperation::Create => (
                 "create_agent",
-                "Create a bounded subagent for an independent task.",
+                "Create a bounded subagent for an independent task and return immediately while it runs in the background. Start independent delegated tasks first, then do your own non-overlapping work before waiting. Do not duplicate delegated work just to stay busy.",
                 json!({"task":{"type":"string"},"label":{"type":"string"},"capabilities":{"type":"array","items":{"type":"string"}},"tokenBudget":{"type":"integer","minimum":1,"description":"Omit unless you know the task is small. The default is unlimited, and once the budget is exhausted the subagent hard-fails with `token_budget_exceeded` and resume_agent refuses to relaunch it (deadlock). Prefer omitting and rely on timeoutMs + Compaction."},"timeoutMs":{"type":"integer","minimum":1},"forkTurns":{"type":"string","description":"`none` (default) starts an empty thread, `all` replays the parent history, or a positive integer replays the last N parent turns."},"parentAgentId":{"type":"string","description":"Omit for a direct child of this agent; set to a subagent id to delegate one level deeper."}}),
                 vec!["task"],
             ),
             AgentToolOperation::Wait => (
                 "wait_agent",
-                "Wait for a subagent and return its structured status and summary.",
-                json!({"agentId":{"type":"string"},"timeoutMs":{"type":"integer","minimum":1}}),
-                vec!["agentId"],
+                "Wait only when no independent work remains. Pass either agentId (legacy single status result) or agentIds (1-4 unique ids): batch waits return as soon as ANY target completes, fails, or is cancelled, with schemaVersion, agents, finishedAgentIds and timedOut. Each agent has id, state, summary, error, truncated, tokensUsed and updatedAtMs; if truncated, use agentId to retrieve its full snapshot. Process finished results promptly and wait again only on remaining active ids. A wait timeout does not cancel subagents. timeoutMs defaults to 30000; 0 reads a snapshot. Avoid repeated short polling.",
+                json!({"agentId":{"type":"string","minLength":1},"agentIds":{"type":"array","minItems":1,"maxItems":4,"uniqueItems":true,"items":{"type":"string","minLength":1}},"timeoutMs":{"type":"integer","minimum":0}}),
+                vec![],
             ),
             AgentToolOperation::Send => (
                 "send_agent_message",
@@ -1207,6 +1340,34 @@ impl ToolHandler for AgentToolHandler {
                     .await
             }
             AgentToolOperation::Wait => {
+                if arguments.get("agentIds").is_some() {
+                    if arguments.get("agentId").is_some() {
+                        return Err(ToolError::InvalidArguments(
+                            "pass either agentId or agentIds, not both".into(),
+                        ));
+                    }
+                    let items = arguments["agentIds"].as_array().ok_or_else(|| {
+                        ToolError::InvalidArguments("agentIds must be an array".into())
+                    })?;
+                    let mut ids = Vec::new();
+                    // Authorize the entire batch before waiting or returning any snapshot.
+                    for item in items {
+                        ids.push(self.owned_agent_id(&json!({"agentId": item}))?);
+                    }
+                    let result = self
+                        .manager
+                        .wait_any(
+                            &ids,
+                            arguments
+                                .get("timeoutMs")
+                                .and_then(Value::as_u64)
+                                .unwrap_or(30_000),
+                            cancellation,
+                        )
+                        .await
+                        .map_err(|error| ToolError::Execution(error.to_string()))?;
+                    return tool_json(&result);
+                }
                 let agent_id = self.owned_agent_id(&arguments)?;
                 self.manager
                     .wait(
@@ -1236,10 +1397,11 @@ impl ToolHandler for AgentToolHandler {
             AgentToolOperation::Resume => {
                 let agent_id = self.owned_agent_id(&arguments)?;
                 self.manager
-                    .resume(
+                    .resume_with_cancellation(
                         &agent_id,
                         optional_string_arg(&arguments, "message"),
                         self.context.clone(),
+                        self.parent_cancellation.child_token(),
                     )
                     .await
             }
@@ -1455,6 +1617,328 @@ mod tests {
         assert_eq!(first.unwrap().state, SubagentState::Completed);
         assert_eq!(second.unwrap().summary.as_deref(), Some("parallel result"));
         assert_eq!(provider.arrivals.load(Ordering::SeqCst), 2);
+    }
+
+    fn seed_wait_agent(
+        manager: &MultiAgentCoordinator,
+        id: &str,
+        parent: &str,
+        state: SubagentState,
+    ) {
+        let view: SubagentView = serde_json::from_value(json!({
+            "schemaVersion": 1, "id": id, "parentThreadId": parent,
+            "threadId": format!("thread-{id}"), "label": id, "task": "wait fixture",
+            "state": state, "depth": 1, "workspaceRoot": ".", "capabilities": [],
+            "tokensUsed": 0, "timeoutMs": 600000, "createdAtMs": 1, "updatedAtMs": 1
+        }))
+        .unwrap();
+        manager
+            .inner
+            .records
+            .lock()
+            .unwrap()
+            .insert(id.into(), view);
+    }
+
+    #[tokio::test]
+    async fn batch_wait_returns_fast_second_child_while_first_keeps_running() {
+        let data = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let repository = Arc::new(JsonlThreadRepository::new(data.path()).unwrap());
+        let manager = MultiAgentCoordinator::new(data.path()).unwrap();
+        let parent = CancellationToken::new();
+        let ctx = context(
+            repository,
+            workspace.path(),
+            Arc::new(ConcurrentGateProvider::new(2)),
+            Arc::new(NoopSubagentPublisher),
+        );
+        // The first child's provider cannot finish: it has no second barrier participant.
+        let slow = manager
+            .create(
+                request("parent", "slow"),
+                None,
+                ctx.clone(),
+                parent.child_token(),
+            )
+            .await
+            .unwrap();
+        let fast = manager
+            .create(
+                request("parent", "fast"),
+                None,
+                SubagentExecutionContext {
+                    provider: Arc::new(FakeProvider::text(&["fast result"])),
+                    ..ctx
+                },
+                parent.child_token(),
+            )
+            .await
+            .unwrap();
+        let result = manager
+            .wait_any(
+                &[slow.id.clone(), fast.id.clone()],
+                5000,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(!result.timed_out);
+        assert_eq!(result.finished_agent_ids, vec![fast.id.clone()]);
+        assert!(result.agents[0].state.is_active());
+        assert_eq!(result.agents[1].summary.as_deref(), Some("fast result"));
+        let legacy = manager
+            .wait(&fast.id, 0, CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(legacy.parent_thread_id, "parent");
+        parent.cancel();
+        assert_eq!(
+            manager
+                .wait(&slow.id, 5000, CancellationToken::new())
+                .await
+                .unwrap()
+                .state,
+            SubagentState::Cancelled
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn batch_wait_uses_fixed_deadline_and_cancellation_does_not_close_children() {
+        let data = tempfile::tempdir().unwrap();
+        let manager = MultiAgentCoordinator::new(data.path()).unwrap();
+        seed_wait_agent(&manager, "a", "parent", SubagentState::Running);
+        let ids = vec!["a".to_string()];
+        let waiting = manager.wait_any(&ids, 1000, CancellationToken::new());
+        tokio::pin!(waiting);
+        assert!(futures_util::poll!(&mut waiting).is_pending());
+        for _ in 0..3 {
+            tokio::time::advance(Duration::from_millis(300)).await;
+            manager.inner.completed.notify_waiters();
+            assert!(futures_util::poll!(&mut waiting).is_pending());
+        }
+        tokio::time::advance(Duration::from_millis(100)).await;
+        let result = waiting.await.unwrap();
+        assert!(result.timed_out);
+        assert!(result.finished_agent_ids.is_empty());
+        assert_eq!(manager.get("a").unwrap().state, SubagentState::Running);
+
+        let cancellation = CancellationToken::new();
+        let waiting = manager.wait_any(&ids, 30000, cancellation.clone());
+        tokio::pin!(waiting);
+        assert!(futures_util::poll!(&mut waiting).is_pending());
+        cancellation.cancel();
+        assert!(matches!(waiting.await, Err(MultiAgentError::Cancelled)));
+        assert_eq!(manager.get("a").unwrap().state, SubagentState::Running);
+    }
+
+    #[tokio::test]
+    async fn batch_wait_wakes_all_waiters_for_every_terminal_state_and_bounds_json() {
+        let data = tempfile::tempdir().unwrap();
+        let manager = MultiAgentCoordinator::new(data.path()).unwrap();
+        for state in [
+            SubagentState::Completed,
+            SubagentState::Failed,
+            SubagentState::Cancelled,
+            SubagentState::TimedOut,
+        ] {
+            seed_wait_agent(&manager, "a", "parent", SubagentState::Blocked);
+            let ids = vec!["a".to_string()];
+            let first = manager.wait_any(&ids, 30000, CancellationToken::new());
+            let second = manager.wait_any(&ids, 30000, CancellationToken::new());
+            tokio::pin!(first, second);
+            assert!(futures_util::poll!(&mut first).is_pending());
+            assert!(futures_util::poll!(&mut second).is_pending());
+            manager
+                .inner
+                .records
+                .lock()
+                .unwrap()
+                .get_mut("a")
+                .unwrap()
+                .state = state;
+            manager.inner.completed.notify_waiters();
+            assert_eq!(first.await.unwrap().agents[0].state, state);
+            assert_eq!(second.await.unwrap().agents[0].state, state);
+            assert!(
+                !manager
+                    .wait_any(&ids, 0, CancellationToken::new())
+                    .await
+                    .unwrap()
+                    .timed_out
+            );
+        }
+        let ids: Vec<String> = (0..4).map(|n| n.to_string()).collect();
+        for id in &ids {
+            seed_wait_agent(&manager, id, "parent", SubagentState::Completed);
+            let mut records = manager.inner.records.lock().unwrap();
+            let record = records.get_mut(id).unwrap();
+            record.summary = Some("\0".repeat(32768));
+            record.error = Some("错".repeat(3000));
+            record.task = "large task".repeat(10000);
+        }
+        let result = manager
+            .wait_any(&ids, 0, CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(result.agents.iter().all(|agent| agent.truncated));
+        let encoded = serde_json::to_string(&result).unwrap();
+        assert!(encoded.len() < 128 * 1024);
+        assert_eq!(
+            serde_json::from_str::<Value>(&encoded).unwrap()["schemaVersion"],
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_wait_validates_all_targets_and_preserves_parent_boundary() {
+        let data = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let manager = MultiAgentCoordinator::new(data.path()).unwrap();
+        seed_wait_agent(&manager, "owned", "parent", SubagentState::Completed);
+        seed_wait_agent(&manager, "foreign", "other", SubagentState::Completed);
+        let handler = AgentToolHandler {
+            operation: AgentToolOperation::Wait,
+            manager: manager.clone(),
+            context: context(
+                Arc::new(JsonlThreadRepository::new(data.path()).unwrap()),
+                workspace.path(),
+                Arc::new(FakeProvider::text(&["unused"])),
+                Arc::new(NoopSubagentPublisher),
+            ),
+            parent_thread_id: "parent".into(),
+            parent_cancellation: CancellationToken::new(),
+        };
+        let ctx = ToolContext {
+            thread_id: "parent".into(),
+            turn_id: "turn".into(),
+            call_id: "wait".into(),
+            workspace_root: workspace.path().into(),
+            approval: None,
+            progress: None,
+        };
+        for args in [
+            json!({}),
+            json!({"agentIds": []}),
+            json!({"agentIds": ["owned", "owned"]}),
+            json!({"agentIds": ["owned", "missing"]}),
+            json!({"agentIds": ["owned", 7]}),
+            json!({"agentIds": ["owned"], "agentId": "owned"}),
+            json!({"agentIds": "owned"}),
+            json!({"agentIds": ["1", "2", "3", "4", "5"]}),
+        ] {
+            assert!(
+                handler
+                    .execute(&ctx, args, CancellationToken::new())
+                    .await
+                    .is_err()
+            );
+        }
+        assert!(matches!(
+            handler
+                .execute(
+                    &ctx,
+                    json!({"agentIds": ["owned", "foreign"]}),
+                    CancellationToken::new()
+                )
+                .await,
+            Err(ToolError::Denied(_))
+        ));
+        assert!(matches!(
+            handler
+                .execute(
+                    &ctx,
+                    json!({"agentId": "foreign"}),
+                    CancellationToken::new()
+                )
+                .await,
+            Err(ToolError::Denied(_))
+        ));
+        let result = handler
+            .execute(
+                &ctx,
+                json!({"agentIds": ["owned"], "timeoutMs": 0}),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&result.output).unwrap()["finishedAgentIds"],
+            json!(["owned"])
+        );
+        let schema = handler.definition().input_schema;
+        let validator = jsonschema::validator_for(&schema).unwrap();
+        assert!(validator.is_valid(&json!({"agentId": "owned"})));
+        assert!(validator.is_valid(&json!({"agentIds": ["owned"], "timeoutMs": 0})));
+        assert!(!validator.is_valid(&json!({"agentIds": []})));
+        assert!(!validator.is_valid(&json!({"agentIds": ["owned", "owned"]})));
+        assert!(!validator.is_valid(&json!({"agentIds": ["owned"], "timeoutMs": -1})));
+    }
+
+    #[tokio::test]
+    async fn resumed_child_cooldown_is_visible_and_parent_cancellation_stops_it() {
+        let data = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let repository = Arc::new(JsonlThreadRepository::new(data.path()).unwrap());
+        let manager = MultiAgentCoordinator::new(data.path()).unwrap();
+        let ctx = context(
+            repository,
+            workspace.path(),
+            Arc::new(FakeProvider::text(&["done"])),
+            Arc::new(NoopSubagentPublisher),
+        );
+        let agent = manager
+            .create(
+                request("parent", "task"),
+                None,
+                ctx.clone(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        manager
+            .wait(&agent.id, 2000, CancellationToken::new())
+            .await
+            .unwrap();
+        // Completion notification follows removal of the active handle.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while manager.has_active() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let ctx = SubagentExecutionContext {
+            provider: Arc::new(FakeProvider::new(vec![Err(ProviderError::RateLimited {
+                message: "quota".into(),
+                retry_after: None,
+            })])),
+            ..ctx
+        };
+        let parent = CancellationToken::new();
+        manager
+            .resume_with_cancellation(
+                &agent.id,
+                Some("continue".into()),
+                ctx,
+                parent.child_token(),
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while manager.get(&agent.id).unwrap().retry_at_ms.is_none() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+        parent.cancel();
+        let stopped = manager
+            .wait(&agent.id, 2000, CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(stopped.state, SubagentState::Cancelled);
+        assert_eq!(stopped.retry_at_ms, None);
     }
 
     #[tokio::test]

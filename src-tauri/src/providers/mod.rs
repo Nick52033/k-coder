@@ -5,6 +5,7 @@ mod credentials;
 mod fallback;
 mod gemini;
 mod openai;
+mod rate_limit;
 mod responses;
 mod sse;
 
@@ -32,6 +33,8 @@ pub use credentials::{CredentialError, CredentialStore, OsCredentialStore};
 pub use fallback::{FallbackProvider, FallbackTarget};
 pub use gemini::GoogleGeminiProvider;
 pub use openai::{DeepSeekChatCompletionsProvider, OpenAiChatCompletionsProvider};
+pub use rate_limit::RateLimitRegistry;
+pub(crate) use rate_limit::retry_at_ms;
 pub use responses::OpenAiResponsesProvider;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -92,6 +95,10 @@ pub(crate) fn split_image_data_url(data_url: &str) -> Option<(&str, &str)> {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ProviderEvent {
+    RetryWaiting {
+        retry_at_ms: u64,
+    },
+    RequestReady,
     TextDelta {
         delta: String,
     },
@@ -136,6 +143,11 @@ pub enum ProviderError {
     Request(String),
     #[error("provider returned HTTP {status}: {message}")]
     Http { status: u16, message: String },
+    #[error("provider returned HTTP 429: {message}")]
+    RateLimited {
+        message: String,
+        retry_after: Option<std::time::Duration>,
+    },
     #[error("provider is temporarily unavailable: {0}")]
     Unavailable(String),
     #[error("provider response was invalid: {0}")]
@@ -145,11 +157,51 @@ pub enum ProviderError {
 }
 
 impl ProviderError {
+    pub(crate) fn turn_error(&self, message: String) -> crate::protocol::TurnError {
+        if self.rate_limit_delay().is_some() {
+            crate::protocol::TurnError {
+                code: "rate_limited".into(),
+                message,
+                retryable: true,
+                category: crate::protocol::TurnErrorCategory::Provider,
+                details: None,
+            }
+        } else {
+            crate::protocol::TurnError::classify(message)
+        }
+    }
+
+    pub(crate) fn from_http(
+        status: u16,
+        message: String,
+        retry_after: Option<std::time::Duration>,
+    ) -> Self {
+        if status == 429 {
+            Self::RateLimited {
+                message,
+                retry_after,
+            }
+        } else {
+            Self::Http { status, message }
+        }
+    }
+
+    pub(crate) fn rate_limit_delay(&self) -> Option<std::time::Duration> {
+        match self {
+            Self::RateLimited { retry_after, .. } => {
+                Some(retry_after.unwrap_or(std::time::Duration::from_secs(60)))
+            }
+            Self::Http { status: 429, .. } => Some(std::time::Duration::from_secs(60)),
+            _ => None,
+        }
+    }
+
     pub(crate) fn is_transient(&self) -> bool {
         match self {
             Self::Request(_) => true,
             Self::Http { status, .. } => matches!(*status, 408 | 429 | 502 | 503 | 504),
             Self::Unavailable(_) => true,
+            Self::RateLimited { .. } => true,
             Self::Cancelled | Self::InvalidResponse(_) | Self::Interrupted => false,
         }
     }

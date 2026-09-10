@@ -144,6 +144,7 @@ impl Provider for OpenAiResponsesProvider {
         };
         if !response.status().is_success() {
             let status = response.status().as_u16();
+            let retry_after = super::common::retry_after(&response);
             let message = read_error_message(response, &cancellation, &self.api_key).await?;
             if should_retry_without_reasoning_summary(status, &message) {
                 if let Some(payload) = payload.as_object_mut() {
@@ -160,12 +161,13 @@ impl Provider for OpenAiResponsesProvider {
                 };
                 if !response.status().is_success() {
                     let status = response.status().as_u16();
+                    let retry_after = super::common::retry_after(&response);
                     let message =
                         read_error_message(response, &cancellation, &self.api_key).await?;
-                    return Err(ProviderError::Http { status, message });
+                    return Err(ProviderError::from_http(status, message, retry_after));
                 }
             } else {
-                return Err(ProviderError::Http { status, message });
+                return Err(ProviderError::from_http(status, message, retry_after));
             }
         }
 

@@ -78,7 +78,9 @@ impl Provider for FallbackProvider {
 
 fn retryable(error: &ProviderError) -> bool {
     match error {
-        ProviderError::Request(_) | ProviderError::Unavailable(_) => true,
+        ProviderError::Request(_)
+        | ProviderError::Unavailable(_)
+        | ProviderError::RateLimited { .. } => true,
         ProviderError::Http { status, .. } => {
             matches!(*status, 408 | 429) || (500..=599).contains(status)
         }

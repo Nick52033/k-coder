@@ -111,7 +111,7 @@ interface WorkbenchState {
   contextUsage: TokenUsage | null;
   turnTimeline: TurnTimelineItem[];
   turnUserMessageIds: Record<string, string>;
-  activityStatus: { turnId: string; status: AgentActivityStatus } | null;
+  activityStatus: { turnId: string; status: AgentActivityStatus; retryAtMs?: number } | null;
   pendingApproval: ApprovalRequest | null;
   pendingApprovals: ApprovalRequest[];
   pendingUserInput: UserInputRequest | null;

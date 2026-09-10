@@ -138,6 +138,7 @@ export interface CreateSubagentRequest {
   parentAgentId?: string;
 }
 export interface SubagentView {
+  retryAtMs?: number;
   schemaVersion: number;
   id: string;
   parentAgentId: string | null;
@@ -523,7 +524,7 @@ export interface ToolActivity {
   durationMs?: number;
 }
 
-export type AgentActivityStatus = "thinking" | "responding" | "running_tool" | "awaiting_approval" | "finalizing";
+export type AgentActivityStatus = "rate_limited" | "thinking" | "responding" | "running_tool" | "awaiting_approval" | "finalizing";
 export type ToolOutputStream = "stdout" | "stderr";
 export interface ToolOutputDelta { stream: ToolOutputStream; cursor: number; text: string; }
 
@@ -850,6 +851,7 @@ export type AgentEvent =
   | (EventBase & { type: "turn_rejected"; message: string })
   | (EventBase & { type: "item_started"; itemId: string; itemType: AgentItemType })
   | (EventBase & { type: "item_completed"; itemId: string; itemType: AgentItemType; status: AgentItemStatus })
+  | (EventBase & { type: "provider_retry_waiting"; retryAtMs: number })
   | (EventBase & { type: "activity_status_changed"; status: AgentActivityStatus })
   | (EventBase & { type: "text_delta"; itemId: string; delta: string })
   | (EventBase & { type: "reasoning_summary_delta"; itemId: string; delta: string })

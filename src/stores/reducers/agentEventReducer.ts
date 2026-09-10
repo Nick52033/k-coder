@@ -27,7 +27,7 @@ export interface ConversationProjectionState {
   activeTurnThreadId: string | null;
   activeTurns: Record<string, string>;
   cancellingTurns: Record<string, string>;
-  activityStatus: { turnId: string; status: AgentActivityStatus } | null;
+  activityStatus: { turnId: string; status: AgentActivityStatus; retryAtMs?: number } | null;
   pendingApproval: ApprovalRequest | null;
   pendingApprovals: ApprovalRequest[];
   pendingUserInput: UserInputRequest | null;
@@ -236,6 +236,8 @@ export function reduceAgentEvent(
         },
       };
     }
+    case "provider_retry_waiting":
+      return { state: { activityStatus: { turnId: event.turnId, status: "rate_limited", retryAtMs: event.retryAtMs } } };
     case "activity_status_changed":
       return {
         state: { activityStatus: { turnId: event.turnId, status: event.status } },

@@ -532,6 +532,12 @@ fn build_system_prompt(
         ));
     }
 
+    if tool_names.iter().any(|name| name == "create_agent")
+        && tool_names.iter().any(|name| name == "wait_agent")
+    {
+        sections.push("<delegation_scheduling>\n需要委派时，先启动相互独立的子任务，再推进自己不依赖其结果的工作；不要重复子任务的工作来填补等待时间。仅当没有可独立推进的工作或下一步依赖结果时调用 wait_agent。多个子任务待收集时，优先用 agentIds 一次等待任意一个结束，及时检查 finishedAgentIds 对应的结果，并只对剩余活动任务继续等待。等待超时不会停止子任务；避免短间隔反复轮询，无事可做时正常等待即可。\n</delegation_scheduling>".into());
+    }
+
     // 5. memory — 相关记忆
     if !memory_context.trim().is_empty() {
         sections.push(format!("<memory>\n{}\n</memory>", memory_context.trim()));
@@ -3408,6 +3414,11 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(disclosed_names, provider_names);
+        assert!(prompt.contains("<delegation_scheduling>"));
+        assert!(prompt.contains("finishedAgentIds"));
+        assert!(
+            !build_system_prompt(None, "", "", "", "", &[]).contains("<delegation_scheduling>")
+        );
     }
 
     #[tokio::test]

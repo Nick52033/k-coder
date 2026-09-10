@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::RwLock;
@@ -40,6 +40,7 @@ use crate::providers::{
 use crate::scheduled_tasks::ScheduledTaskStore;
 use crate::storage::{
     JsonlThreadRepository, StorageError, StoredEvent, StoredEventKind, ThreadRepository,
+    ThreadSummary,
 };
 use crate::tools::ToolRegistry;
 
@@ -47,6 +48,7 @@ pub struct AppState {
     started_at: Instant,
     repository: Arc<JsonlThreadRepository>,
     provider_config: ProviderConfigStore,
+    rate_limits: crate::providers::RateLimitRegistry,
     credentials: Arc<dyn CredentialStore>,
     data_root: PathBuf,
     workspace_root: RwLock<PathBuf>,
@@ -232,6 +234,7 @@ impl AppState {
             started_at: Instant::now(),
             repository,
             provider_config: ProviderConfigStore::new(&data_root),
+            rate_limits: crate::providers::RateLimitRegistry::default(),
             credentials,
             data_root: data_root.clone(),
             workspace_root: RwLock::new(workspace_root),
@@ -265,6 +268,23 @@ impl AppState {
 
     pub fn repository(&self) -> Arc<JsonlThreadRepository> {
         self.repository.clone()
+    }
+
+    /// User-facing navigation excludes delegation threads; their history remains
+    /// available by ID to the parent conversation's activity panel.
+    pub async fn list_conversation_threads(
+        &self,
+        query: &str,
+    ) -> Result<Vec<ThreadSummary>, StorageError> {
+        let mut threads = self.repository.search_threads(query).await?;
+        let child_ids: HashSet<_> = self
+            .subagents
+            .list(None)
+            .into_iter()
+            .map(|agent| agent.thread_id)
+            .collect();
+        threads.retain(|thread| !child_ids.contains(&thread.id));
+        Ok(threads)
     }
 
     pub fn runtime_repository(&self) -> Arc<dyn ThreadRepository> {
@@ -946,7 +966,11 @@ impl AppState {
             targets,
             self.advanced.metrics.clone(),
         )?) as Arc<dyn Provider>;
-        Ok((provider, model, context_limit))
+        Ok((
+            self.rate_limits.wrap(&config.id, provider),
+            model,
+            context_limit,
+        ))
     }
 
     fn provider_for_config(
@@ -1609,6 +1633,96 @@ mod tests {
     #[derive(Default)]
     struct FakeCredentials {
         api_keys: StdMutex<HashMap<String, String>>,
+    }
+
+    #[tokio::test]
+    async fn conversation_navigation_excludes_persisted_subagents_but_keeps_their_history() {
+        let data = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let credentials = Arc::new(FakeCredentials::default());
+        let state = AppState::with_workspace_and_credentials(
+            data.path(),
+            workspace.path(),
+            credentials.clone(),
+        )
+        .unwrap();
+        let repository = state.repository();
+        let parent = repository
+            .create_thread_in_workspace(workspace.path())
+            .await
+            .unwrap();
+        let standalone = repository.create_standalone_thread().await.unwrap();
+        // A matching title must not hide an ordinary user conversation.
+        repository
+            .rename_thread(&parent.id, "shared navigation title".into())
+            .await
+            .unwrap();
+        repository
+            .rename_thread(&standalone.id, "shared navigation title".into())
+            .await
+            .unwrap();
+        let mut child_ids = Vec::new();
+        let mut snapshots = String::new();
+        for status in [
+            "queued",
+            "running",
+            "blocked",
+            "completed",
+            "failed",
+            "cancelled",
+            "timed_out",
+        ] {
+            let child = repository
+                .create_thread_in_workspace(workspace.path())
+                .await
+                .unwrap();
+            repository
+                .rename_thread(&child.id, "shared navigation title".into())
+                .await
+                .unwrap();
+            snapshots.push_str(&serde_json::json!({
+                "schemaVersion": 1,
+                "snapshot": {
+                    "schemaVersion": 1, "id": Uuid::new_v4().to_string(),
+                    "parentAgentId": null, "parentThreadId": parent.id,
+                    "threadId": child.id, "label": "shared navigation title", "task": "inspect",
+                    "state": status, "depth": 1, "workspaceRoot": workspace.path().to_str().unwrap(),
+                    "capabilities": [], "tokenBudget": null, "tokensUsed": 0,
+                    "timeoutMs": 60000, "createdAtMs": 1, "updatedAtMs": 1,
+                    "summary": null, "error": null
+                }
+            }).to_string());
+            snapshots.push('\n');
+            child_ids.push(child.id);
+        }
+        drop(repository);
+        drop(state);
+        std::fs::write(data.path().join("subagents.jsonl"), snapshots).unwrap();
+        let restored =
+            AppState::with_workspace_and_credentials(data.path(), workspace.path(), credentials)
+                .unwrap();
+        for query in ["", "   ", "shared navigation title"] {
+            let threads = restored.list_conversation_threads(query).await.unwrap();
+            assert_eq!(threads.len(), 2, "query: {query:?}");
+            assert!(threads.iter().any(|thread| thread.id == parent.id));
+            assert!(threads.iter().any(|thread| thread.id == standalone.id));
+            assert!(threads.iter().all(|thread| !child_ids.contains(&thread.id)));
+        }
+        assert!(
+            restored
+                .list_conversation_threads("no match")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(restored.subagents().list(Some(&parent.id)).len(), 7);
+        assert_eq!(restored.repository().list_threads().await.unwrap().len(), 9);
+        for child_id in child_ids {
+            assert_eq!(
+                restored.read_thread(&child_id).await.unwrap().summary.id,
+                child_id
+            );
+        }
     }
 
     #[test]

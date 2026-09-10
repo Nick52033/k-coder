@@ -578,6 +578,10 @@ test.beforeEach(async ({ page }) => {
             if (restored) workflowRun = JSON.parse(restored);
             return workflowRun?.threadId === args?.threadId ? workflowRun : null;
           }
+          if (command === "get_plan") {
+            const configured = localStorage.getItem("kcoder_e2e_plan");
+            if (configured) return JSON.parse(configured);
+          }
           if (command === "cancel_workflow_run") {
             const request = args?.request as { threadId?: string; runId?: string } | undefined;
             if (!workflowRun || workflowRun.threadId !== request?.threadId || workflowRun.id !== request?.runId) {
@@ -785,6 +789,10 @@ test.beforeEach(async ({ page }) => {
             if (configured) return JSON.parse(configured);
             const forcedThreadWorkspacePath = localStorage.getItem("kcoder_e2e_thread_workspace_path");
             if (forcedThreadWorkspacePath) return [{ ...thread, workspacePath: forcedThreadWorkspacePath }];
+          }
+          if (command === "list_subagents") {
+            const configured = localStorage.getItem("kcoder_e2e_subagents");
+            if (configured) return JSON.parse(configured);
           }
           if (
             (command === "get_plan" || command === "get_goal")
@@ -1701,9 +1709,9 @@ test("supports the primary workbench inspection flow", async ({ page }, testInfo
   const planPopover = page.getByRole("dialog", { name: "执行计划详情" });
   await expect(planPopover).toBeVisible();
   await expect(planPopover.locator(".plan-progress-step--completed").getByText("检查工作区", { exact: true })).toBeVisible();
-  await expect(planPopover.locator(".plan-progress-step--completed").getByText("已完成", { exact: true })).toBeVisible();
+  await expect(planPopover.locator(".plan-progress-step--completed .plan-progress-step-status")).toContainText("已完成");
   await expect(planPopover.locator(".plan-progress-step--in_progress").getByText("验证实现", { exact: true })).toBeVisible();
-  await expect(planPopover.locator(".plan-progress-step--in_progress").getByText("进行中", { exact: true })).toBeVisible();
+  await expect(planPopover.locator(".plan-progress-step--in_progress .plan-progress-step-status")).toContainText("进行中");
   await page.screenshot({ path: testInfo.outputPath("plan-progress-hover.png"), fullPage: true });
   await planProgressTrigger.click();
   await page.mouse.move(0, 0);
@@ -4641,18 +4649,110 @@ test("replays live events received while a thread snapshot is loading", async ({
 test("shows and starts subagent activity without a default token budget", async ({ page }) => {
   await page.goto("/");
   await page.getByRole("button", { name: "子智能体", exact: true }).click();
-  await page.getByRole("button", { name: /检查后端/ }).click();
+  await expect(page.getByText(/420 tokens/)).toBeVisible();
+  await page.getByRole("complementary", { name: "子智能体", exact: true }).getByRole("button", { name: /检查后端/ }).click();
   await expect(page.getByText("后端检查完成", { exact: true })).toBeVisible();
-  await expect(page.getByText("420 / 无上限 tokens", { exact: true })).toBeVisible();
-  await page.getByRole("button", { name: "创建新任务" }).click();
+  await page.getByRole("button", { name: "返回列表" }).click();
+  await page.getByRole("button", { name: "新建子任务" }).click();
   await page.getByLabel("子任务描述").fill("检查测试");
   await page.getByRole("button", { name: "启动" }).click();
-  await expect(page.getByRole("button", { name: /检查测试/ })).toBeVisible();
+  await expect(page.locator(".subagent-detail-title")).toContainText("检查测试");
   await expect.poll(() => page.evaluate(() => (window as unknown as { __invoked: string[] }).__invoked.includes("create_subagent"))).toBe(true);
   await expect.poll(() => page.evaluate(() => {
     const args = (window as unknown as { __invocationArgs: Record<string, { request?: Record<string, unknown> }> }).__invocationArgs.create_subagent;
     return args?.request && Object.prototype.hasOwnProperty.call(args.request, "tokenBudget");
   })).toBe(false);
+});
+
+test("focuses only the clicked subagent and scopes the list to its conversation", async ({ page }, testInfo) => {
+  await page.addInitScript(() => {
+    const threads = ["thread-1", "thread-2", "thread-empty"].map((id, index) => ({
+      schemaVersion: 1, id, title: ["Phase 6 workbench", "Parallel conversation", "Empty conversation"][index],
+      createdAtMs: index + 1, updatedAtMs: index + 1, archived: false,
+      inProject: true, workspacePath: "D:\\code\\k-coder",
+    }));
+    const agents = ["agent-1", "agent-2", "agent-old"].map((id, index) => ({
+      schemaVersion: 1, id, parentAgentId: null, parentThreadId: index === 2 ? "thread-2" : "thread-1",
+      threadId: `thread-${id}`, label: ["检查后端", "检查文档", "历史任务"][index], task: `任务 ${id}`,
+      state: "running", depth: 1, workspaceRoot: "D:\\code\\k-coder", capabilities: ["read_file"],
+      tokenBudget: null, tokensUsed: 420, timeoutMs: 600000, createdAtMs: index + 2,
+      updatedAtMs: index + 2, summary: null, error: null, turnCount: 1,
+    }));
+    localStorage.setItem("kcoder_e2e_threads", JSON.stringify(threads));
+    localStorage.setItem("kcoder_e2e_subagents", JSON.stringify(agents));
+    localStorage.setItem("kcoder_e2e_thread_detail_by_id", JSON.stringify(Object.fromEntries([
+      ...threads.map((summary) => [summary.id, {
+        schemaVersion: 1, summary, messages: [], messageTurnIds: {}, turnUserMessageIds: {}, lastTurn: null,
+        toolActivities: [], turnTimeline: [], lastUsage: null, contextUsage: null,
+        approvals: [], userInputs: [], changes: [], todos: [],
+      }]),
+      ...agents.map((agent) => [agent.threadId, {
+        schemaVersion: 1, summary: { ...threads[0], id: agent.threadId, title: agent.label },
+        messages: [{ id: `message-${agent.id}`, role: "assistant", content: [{ type: "text", text: `${agent.label}独立历史` }] }],
+      }]),
+    ])));
+  });
+  await page.goto("/");
+  await expect(page.getByRole("heading", { name: "Phase 6 workbench", exact: true })).toBeVisible();
+  await page.evaluate(() => {
+    const emit = (window as unknown as { __emitAgentEvent: (event: unknown) => void }).__emitAgentEvent;
+    const base = { schemaVersion: 6, threadId: "thread-1", turnId: "turn-focus", phase: "executing" };
+    emit({ ...base, type: "turn_started" });
+    for (const agentId of ["agent-1", "agent-2"]) {
+      emit({ ...base, type: "tool_queued", call: { id: `wait-${agentId}`, name: "wait_agent", arguments: { agentId }, metadata: {} } });
+    }
+  });
+  const drawer = page.getByRole("complementary", { name: "子智能体", exact: true });
+  await page.getByRole("button", { name: "查看子智能体 task1", exact: true }).click();
+  await expect(drawer.locator(".subagent-detail-title")).toContainText("检查后端");
+  await expect(drawer.getByText("检查后端独立历史", { exact: true })).toBeVisible();
+  await expect(drawer.locator(".subagent-row")).toHaveCount(0);
+  await page.evaluate(() => {
+    (window as unknown as { __emitTauriEvent: (name: string, event: unknown) => void }).__emitTauriEvent("agent-event", {
+      schemaVersion: 6, threadId: "thread-agent-1", turnId: "child-turn-1", phase: "answering",
+      type: "text_delta", itemId: "child-item-1", delta: "仅 task1 的实时输出",
+    });
+  });
+  await expect(drawer.getByText("仅 task1 的实时输出", { exact: true })).toBeVisible();
+  await drawer.getByPlaceholder("向该子智能体发送消息…").fill("仅发给 task1 的草稿");
+  // On narrow windows the panel occupies the conversation area; close it before selecting another chip.
+  if (testInfo.project.name === "narrow") await page.getByRole("button", { name: "子智能体", exact: true }).click();
+  await page.getByRole("button", { name: "查看子智能体 task2", exact: true }).click();
+  await expect(drawer.locator(".subagent-detail-title")).toContainText("检查文档");
+  await expect(drawer.getByText("检查文档独立历史", { exact: true })).toBeVisible();
+  await expect(drawer.getByText("检查后端独立历史", { exact: true })).toHaveCount(0);
+  await expect(drawer.getByText("仅 task1 的实时输出", { exact: true })).toHaveCount(0);
+  await expect(drawer.getByPlaceholder("向该子智能体发送消息…")).toHaveValue("");
+  await page.screenshot({ path: testInfo.outputPath(`focused-task-${testInfo.project.name}.png`), fullPage: true });
+  await drawer.getByRole("button", { name: "返回列表" }).click();
+  await expect(drawer.locator(".subagent-row")).toHaveCount(2);
+  await expect(drawer.locator(".agent-count-badge")).toHaveText("2 运行中");
+  await expect(drawer.getByText("历史任务", { exact: true })).toHaveCount(0);
+  await page.evaluate(() => {
+    const agents = JSON.parse(localStorage.getItem("kcoder_e2e_subagents")!) as Array<Record<string, unknown>>;
+    const emit = (window as unknown as { __emitTauriEvent: (name: string, event: unknown) => void }).__emitTauriEvent;
+    emit("subagent-event", { ...agents[0], state: "completed", updatedAtMs: 10 });
+    emit("subagent-event", { ...agents[2], label: "其他会话实时任务", updatedAtMs: 11 });
+  });
+  await expect(drawer.locator(".agent-count-badge")).toHaveText("1 运行中");
+  await expect(drawer.locator(".subagent-row")).toHaveCount(2);
+  await expect(drawer.getByText("其他会话实时任务", { exact: true })).toHaveCount(0);
+
+  // The sidebar is intentionally hidden at the narrow breakpoint; validate conversation switching at desktop width.
+  await page.setViewportSize({ width: 1500, height: 900 });
+  await page.getByRole("tab", { name: "项目", exact: true }).click();
+  await page.getByRole("button", { name: "展开项目", exact: true }).click();
+  await drawer.getByRole("button", { name: /检查后端/ }).click();
+  await page.getByRole("button", { name: "Parallel conversation", exact: true }).click();
+  await expect(drawer.locator(".subagent-detail")).toHaveCount(0);
+  await expect(drawer.locator(".subagent-row")).toHaveCount(1);
+  await expect(drawer.getByText("其他会话实时任务", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Empty conversation", exact: true }).click();
+  await expect(drawer.getByText("当前会话暂无子任务", { exact: true })).toBeVisible();
+  await expect(drawer.locator(".agent-count-badge")).toHaveCount(0);
+  await page.locator(".thread-item-main").filter({ hasText: "Phase 6 workbench" }).click();
+  await expect(drawer.locator(".subagent-detail")).toHaveCount(0);
+  await expect(drawer.locator(".subagent-row")).toHaveCount(2);
 });
 
 test("shows every queued subagent wait before serial execution reaches it", async ({ page }, testInfo) => {
@@ -4748,6 +4848,69 @@ test("shows every queued subagent wait before serial execution reaches it", asyn
     liveMessage.locator(".turn-timeline-tool--cancelled").getByRole("button", { name: "查看子智能体 task2" }),
   ).toBeVisible();
   await expect(liveMessage.locator(".turn-timeline-tool--failed")).toHaveCount(0);
+});
+
+test("batch subagent wait shows all targets and distinguishes timeout from task completion", async ({ page }, testInfo) => {
+  await page.addInitScript(() => {
+    localStorage.setItem("kcoder_e2e_subagents", JSON.stringify([1, 2, 3, 4].map(n => ({
+      schemaVersion: 1, id: `batch-${n}`, parentAgentId: null, parentThreadId: "thread-1",
+      threadId: `child-batch-${n}`, label: `批量任务${n}`, task: "检查文档", state: "running", depth: 1,
+      workspaceRoot: "D:\\code\\k-coder", capabilities: ["read_file"], tokenBudget: null,
+      tokensUsed: 0, timeoutMs: 600000, createdAtMs: n, updatedAtMs: 30000, summary: null, error: null,
+    }))));
+  });
+  await page.goto("/");
+  await expect(page.getByRole("heading", { name: "Phase 6 workbench", exact: true })).toBeVisible();
+  await page.evaluate(() => {
+    const emit = (window as unknown as { __emitAgentEvent: (event: unknown) => void }).__emitAgentEvent;
+    const base = { schemaVersion: 7, threadId: "thread-1", turnId: "turn-batch-wait", phase: "executing" };
+    const call = { id: "batch-wait", name: "wait_agent", arguments: { agentIds: ["batch-1", "batch-2", "batch-3", "batch-4"] }, metadata: {} };
+    emit({ ...base, type: "turn_started" });
+    emit({ ...base, type: "tool_queued", call });
+    emit({ ...base, type: "tool_started", call });
+  });
+  const row = page.locator('.turn-timeline-tool').filter({ hasText: "等待任一子智能体结束" }).first();
+  await expect(row).toHaveCount(1);
+  await expect(row.locator('.subagent-task-chip')).toHaveCount(4);
+  await expect(row).toContainText("等待耗时");
+  for (let n = 1; n <= 4; n++) {
+    await expect(row.getByRole('button', { name: `查看子智能体 task${n}`, exact: true })).toBeVisible();
+  }
+  await page.evaluate(() => {
+    const emit = (window as unknown as { __emitAgentEvent: (event: unknown) => void }).__emitAgentEvent;
+    const base = { schemaVersion: 7, threadId: "thread-1", turnId: "turn-batch-wait", phase: "executing" };
+    emit({ ...base, type: "tool_completed", callId: "batch-wait", name: "wait_agent", result: {
+      success: true, output: JSON.stringify({ schemaVersion: 1, agents: [], finishedAgentIds: [], timedOut: true }), metadata: {},
+    }});
+    emit({ ...base, type: "item_completed", itemId: "batch-wait", itemType: "tool", status: "completed" });
+  });
+  await expect(row).toContainText("本次等待结束，子任务仍在运行");
+  const group = page.locator('.turn-tool-group').filter({ has: row });
+  await expect(group).not.toHaveAttribute('open', '');
+  await group.locator(':scope > summary').click();
+  await page.evaluate(() => {
+    const bridge = window as unknown as { __emitTauriEvent: (name: string, event: unknown) => void };
+    const emit = (event: unknown) => bridge.__emitTauriEvent("agent-event", event);
+    const base = { schemaVersion: 7, threadId: "thread-1", turnId: "turn-batch-wait", phase: "executing" };
+    const call = { id: "batch-next", name: "wait_agent", arguments: { agentIds: ["batch-1", "batch-2"] }, metadata: {} };
+    emit({ ...base, type: "tool_started", call });
+    emit({ ...base, type: "tool_completed", callId: call.id, name: call.name, result: {
+      success: true, output: JSON.stringify({ schemaVersion: 1, agents: [{ id: 'batch-2', state: 'completed' }], finishedAgentIds: ['batch-2'], timedOut: false }), metadata: {},
+    }});
+    emit({ ...base, type: "item_completed", itemId: call.id, itemType: "tool", status: "completed" });
+  });
+  await expect(page.locator('.turn-timeline-tool').filter({ hasText: '已获取结果' })).toHaveCount(1);
+  // Open the child detail only after emitting parent events: the mock bridge
+  // keeps one callback per event name, unlike the real Tauri event bus.
+  const finalGroup = page.locator('.turn-tool-group').filter({ has: page.locator('.subagent-task-chip[aria-label="查看子智能体 task3"]') });
+  await expect(finalGroup).not.toHaveAttribute('open', '');
+  await finalGroup.locator(':scope > summary').click();
+  await row.getByRole('button', { name: '查看子智能体 task3', exact: true }).click();
+  const drawer = page.getByRole('complementary', { name: '子智能体', exact: true });
+  await expect(drawer.locator('.subagent-detail-title')).toContainText('批量任务3');
+  await expect(drawer.locator('.subagent-detail-meta')).toContainText('子任务耗时');
+  await expect(drawer.locator('.subagent-detail-meta')).toContainText('30s');
+  await page.screenshot({ path: testInfo.outputPath(`batch-subagent-wait-${testInfo.project.name}.png`), fullPage: true });
 });
 
 test("shows unbounded goal token consumption and controls", async ({ page }, testInfo) => {
@@ -6142,4 +6305,133 @@ test("opens the embedded browser panel and keeps the page across tab switches", 
   await page.getByRole("tab", { name: "浏览器" }).click();
   await expect(page.locator(".browser-host iframe")).toBeVisible();
   await expect(page.locator(".browser-host iframe")).toHaveAttribute("src", "https://example.com/docs");
+});
+
+
+test("rate limit waiting and all child states are visible with only one wait call", async ({ page }, testInfo) => {
+  await page.goto("/");
+  await expect(page.getByRole("heading", { name: "Phase 6 workbench", exact: true })).toBeVisible();
+  await page.evaluate(() => {
+    const bridge = window as unknown as { __emitAgentEvent: (event: unknown) => void; __emitTauriEvent: (name: string, event: unknown) => void };
+    const child = { schemaVersion: 1, parentAgentId: null, parentThreadId: "thread-1", state: "running", depth: 1,
+      workspaceRoot: "D:\\code\\k-coder", capabilities: ["read_file"], tokenBudget: null, tokensUsed: 0,
+      timeoutMs: 600000, summary: null, error: null, turnCount: 1, task: "检查文档" };
+    bridge.__emitTauriEvent("subagent-event", { ...child, id: "agent-1", threadId: "child-1", label: "项目文档", createdAtMs: 1, updatedAtMs: 10 });
+    bridge.__emitTauriEvent("subagent-event", { ...child, id: "agent-2", threadId: "child-2", label: "架构文档", createdAtMs: 2, updatedAtMs: 10, retryAtMs: Date.now() + 60000 });
+    const base = { schemaVersion: 7, threadId: "thread-1", turnId: "quota-turn", phase: "executing" };
+    bridge.__emitAgentEvent({ ...base, type: "turn_started" });
+    const call = { id: "wait-only-task2", name: "wait_agent", arguments: { agentId: "agent-2" }, metadata: {} };
+    bridge.__emitAgentEvent({ ...base, type: "tool_queued", call });
+    bridge.__emitAgentEvent({ ...base, type: "tool_started", call });
+  });
+  const summary = page.getByRole("region", { name: "本会话子智能体状态" });
+  await expect(summary.locator("li")).toHaveCount(2);
+  await expect(summary).toContainText("项目文档运行中");
+  await expect(summary).toContainText("架构文档限流等待");
+  await expect(page.locator(".message--assistant").last().locator(".turn-timeline-tool")).toHaveCount(1);
+  const chip = page.getByRole("button", { name: "查看子智能体 task2", exact: true });
+  await expect(chip).toBeVisible();
+  const box = await chip.boundingBox();
+  expect(box!.width).toBeLessThan(90);
+  await page.evaluate(() => {
+    const bridge = window as unknown as { __emitAgentEvent: (event: unknown) => void };
+    bridge.__emitAgentEvent({ schemaVersion: 7, threadId: "thread-1", turnId: "quota-turn", phase: "exploring", type: "provider_retry_waiting", retryAtMs: Date.now() + 60000 });
+  });
+  await expect(page.locator(".turn-execution--live > summary > .turn-disclosure-title").last()).toContainText("限流等待");
+  await page.evaluate(() => {
+    (window as unknown as { __emitAgentEvent: (event: unknown) => void }).__emitAgentEvent({ schemaVersion: 7, threadId: "thread-1", turnId: "quota-turn", phase: "exploring", type: "activity_status_changed", status: "thinking" });
+  });
+  await expect(page.locator(".turn-execution--live > summary > .turn-disclosure-title").last()).not.toContainText("限流等待");
+  await chip.click();
+  const drawer = page.getByRole("complementary", { name: "子智能体", exact: true });
+  await expect(drawer.locator(".agent-retry-wait")).toContainText("限流等待");
+  await page.screenshot({ path: testInfo.outputPath("child-rate-limit.png"), fullPage: true });
+
+  await page.evaluate(() => {
+    const bridge = window as unknown as { __emitAgentEvent: (event: unknown) => void; __emitTauriEvent: (name: string, event: unknown) => void };
+    bridge.__emitAgentEvent({ schemaVersion: 7, threadId: "thread-1", turnId: "quota-turn", phase: "exploring", type: "activity_status_changed", status: "thinking" });
+    bridge.__emitTauriEvent("subagent-event", { schemaVersion: 1, id: "agent-2", parentAgentId: null, parentThreadId: "thread-1", threadId: "child-2", label: "架构文档", task: "检查文档", state: "failed", depth: 1, workspaceRoot: "D:\\code\\k-coder", capabilities: ["read_file"], tokenBudget: null, tokensUsed: 0, timeoutMs: 600000, createdAtMs: 2, updatedAtMs: 20, summary: null, error: "provider returned HTTP 429", turnCount: 1 });
+  });
+  await expect(page.locator(".turn-execution--live > summary > .turn-disclosure-title").last()).not.toContainText("限流等待");
+  await expect(summary).toContainText("架构文档失败");
+  await expect(drawer.locator(".agent-retry-wait")).toHaveCount(0);
+});
+
+
+test("shows direct subagent creation in a conversation without messages", async ({ page }) => {
+  await page.addInitScript(() => {
+    localStorage.setItem("kcoder_e2e_subagents", "[]");
+    localStorage.setItem("kcoder_e2e_thread_detail_by_id", JSON.stringify({ "thread-1": {
+      schemaVersion: 1,
+      summary: { schemaVersion: 1, id: "thread-1", title: "Phase 6 workbench", createdAtMs: 1, updatedAtMs: 1, archived: false, inProject: true, workspacePath: "D:\\code\\k-coder" },
+      messages: [], messageTurnIds: {}, turnUserMessageIds: {}, lastTurn: null,
+      toolActivities: [], turnTimeline: [], lastUsage: null, contextUsage: null, approvals: [], userInputs: [], changes: [], todos: [],
+    } }));
+  });
+  await page.goto("/");
+  await expect(page.getByRole("heading", { name: "Phase 6 workbench", exact: true })).toBeVisible();
+  await page.evaluate(() => {
+    (window as unknown as { __emitTauriEvent: (name: string, payload: unknown) => void }).__emitTauriEvent("subagent-event", {
+      schemaVersion: 1, id: "direct-child", parentAgentId: null, parentThreadId: "thread-1", threadId: "child-thread",
+      label: "直接创建的任务", task: "检查文档", state: "running", depth: 1, workspaceRoot: "D:\\code\\k-coder", capabilities: [],
+      tokenBudget: null, tokensUsed: 0, timeoutMs: 600000, createdAtMs: 2, updatedAtMs: 2, summary: null, error: null, turnCount: 0,
+    });
+  });
+  const summary = page.getByRole("region", { name: "本会话子智能体状态" });
+  await expect(summary).toBeVisible();
+  await expect(summary).toContainText("直接创建的任务运行中");
+});
+
+test("robot progress follows authoritative nodes across failure retry and reload", async ({ page }) => {
+  await page.addInitScript(() => {
+    if (localStorage.getItem("kcoder_e2e_workflow_run")) return;
+    const nodes = ["requirements-analysis", "interface-architecture-design", "html-prototype", "backend-development", "frontend-development", "comprehensive-testing", "build-release", "code-review-delivery"];
+    localStorage.setItem("kcoder_e2e_plan", JSON.stringify({ schemaVersion: 1, threadId: "thread-1", revision: 1, updatedAtMs: 1, steps: nodes.map((id, index) => ({ id, step: `旧计划 ${index + 1}`, status: index === 0 ? "in_progress" : "pending" })) }));
+    localStorage.setItem("kcoder_e2e_workflow_run", JSON.stringify({ schemaVersion: 1, definitionVersion: 2, id: "progress-run", threadId: "thread-1", workflowId: "fullstack-delivery", objective: "进度回归", state: "active", currentNodeId: nodes[1], currentNodeIndex: 1, nodeCount: 8, completedNodes: [{ nodeId: nodes[0], summary: "需求已确认", evidence: ["docs"], completedAtMs: 2 }], createdAtMs: 1, updatedAtMs: 2, revision: 2 }));
+  });
+  await page.goto("/");
+  const progress = page.locator(".plan-progress-trigger");
+  const control = page.getByLabel("机器人工作流 全栈开发机器人");
+  await expect(progress).toHaveCount(1);
+  await expect(progress).toContainText("第 2/8 步");
+  await expect(control).toContainText("2 / 8");
+  await page.evaluate(() => {
+    const emit = (window as unknown as { __emitAgentEvent: (event: unknown) => void }).__emitAgentEvent;
+    const base = { schemaVersion: 1, threadId: "thread-1", turnId: "retry-progress", phase: "executing" };
+    emit({ ...base, type: "turn_started" });
+    emit({ ...base, type: "tool_started", call: { id: "advance", name: "complete_workflow_node", arguments: {}, metadata: {} } });
+    const run = JSON.parse(localStorage.getItem("kcoder_e2e_workflow_run")!);
+    run.completedNodes.push({ nodeId: run.currentNodeId, summary: "设计已完成", evidence: ["docs/design"], completedAtMs: 3 });
+    Object.assign(run, { currentNodeId: "html-prototype", currentNodeIndex: 2, revision: 3, updatedAtMs: 3 });
+    localStorage.setItem("kcoder_e2e_workflow_run", JSON.stringify(run));
+    emit({ ...base, type: "tool_completed", callId: "advance", name: "complete_workflow_node", result: { success: true, output: "done", metadata: {} } });
+  });
+  await expect(progress).toHaveCount(1);
+  await expect(progress).toContainText("第 3/8 步");
+  await expect(control).toContainText("3 / 8");
+  await progress.click();
+  const details = page.getByRole("dialog", { name: "执行计划详情" });
+  await expect(details.locator(".plan-progress-step--completed")).toHaveCount(2);
+  await expect(details.locator(".plan-progress-step--in_progress")).toContainText("原型 HTML");
+  await expect(details).not.toContainText("旧计划");
+  await page.keyboard.press("Escape");
+  await page.evaluate(() => (window as unknown as { __emitAgentEvent: (event: unknown) => void }).__emitAgentEvent({ schemaVersion: 1, threadId: "thread-1", turnId: "retry-progress", phase: "responding", type: "turn_failed", message: "provider request failed" }));
+  await expect(progress).toContainText("第 3/8 步");
+  await page.reload();
+  await expect(progress).toContainText("第 3/8 步");
+  await expect(control).toContainText("3 / 8");
+});
+
+test("ordinary conversation keeps its independent plan progress", async ({ page }) => {
+  await page.goto("/");
+  const progress = page.locator(".plan-progress-trigger");
+  await expect(progress).toHaveCount(1);
+  await expect(progress).toContainText("第 2/2 步");
+  await expect(progress).toContainText("1 个文件已更新");
+  await progress.click();
+  const details = page.getByRole("dialog", { name: "执行计划详情" });
+  await expect(details.locator(".plan-progress-step--completed")).toContainText("检查工作区");
+  await expect(details.locator(".plan-progress-step--in_progress")).toContainText("验证实现");
+  await page.reload();
+  await expect(progress).toContainText("第 2/2 步");
 });

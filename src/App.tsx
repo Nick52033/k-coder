@@ -10,7 +10,6 @@ import {
   ChevronRight,
   Check,
   CircleAlert,
-  Bot,
   Copy,
   FileDiff,
   Folder,
@@ -44,6 +43,7 @@ import {
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { extractLocalDocument, getRuntimeStatus, getWorkspaceState, switchWorkspace, subscribeToAgentEvents, subscribeToMailboxEvents, subscribeToSubagentEvents, listSubagents, getExtensionOverview, searchWorkspaceFiles } from "./api/runtime";
 import { useWorkbenchStore } from "./stores/workbenchStore";
+import { workflowProgressPlan } from "./lib/workflowProgress";
 import {
   buildSteeredTurnSegments,
   reconcileConversationMessages,
@@ -59,6 +59,7 @@ import { ContextProgress } from "./components/ContextProgress";
 import { ApprovalModeSelector } from "./components/ApprovalModeSelector";
 import { ReasoningSelector } from "./components/ReasoningSelector";
 import { TodoList } from "./components/TodoList";
+import { SubagentSummary } from "./SubagentSummary";
 import { ConversationTurnActivity, isVisibleConversationTimelineItem } from "./components/ConversationActivity";
 import { MarkdownContent } from "./components/MarkdownContent";
 import { ImagePreviewDialog } from "./components/ImagePreviewDialog";
@@ -385,15 +386,13 @@ function App() {
   const [systemPrefersDark, setSystemPrefersDark] = useState(() =>
     typeof window !== "undefined" && window.matchMedia?.("(prefers-color-scheme: dark)").matches === true,
   );
-  const [subagentThreadIds, setSubagentThreadIds] = useState<Set<string>>(new Set());
-  const [subagentByThread, setSubagentByThread] = useState<Record<string, string>>({});
   const [subagentList, setSubagentList] = useState<SubagentView[]>([]);
   /** Per-parent `task1`/`task2` ... numbering for the conversation timeline chips. */
   const subagentTaskIndex = useMemo(
     () => buildSubagentTaskIndex(subagentList),
     [subagentList],
   );
-  const [selectedSubagentId, setSelectedSubagentId] = useState<string | null>(null);
+  const [subagentSelection, setSubagentSelection] = useState<{ id: string; threadId: string | null } | null>(null);
   function focusSubagent(agentId: string) {
     setWorkbenchOpen(false);
     setAgentPanelOpen(true);
@@ -458,7 +457,7 @@ function App() {
     activeProviderId,
     approvalMode,
     reasoningEffort,
-    plan,
+    plan: savedPlan,
     goal,
     workflows,
     workflowRun,
@@ -497,6 +496,19 @@ function App() {
     clearQueue,
     forceResetState,
   } = useWorkbenchStore();
+  const plan = useMemo(
+    () => workflowRun
+      ? workflowProgressPlan(activeThreadId, workflowRun, workflows)
+      : savedPlan,
+    [activeThreadId, workflowRun, workflows, savedPlan],
+  );
+  const selectedSubagentId = subagentSelection?.threadId === activeThreadId ? subagentSelection.id : null;
+  function setSelectedSubagentId(id: string | null) {
+    setSubagentSelection(id ? { id, threadId: activeThreadId } : null);
+  }
+  useEffect(() => {
+    setSubagentSelection(null);
+  }, [activeThreadId]);
   const displayMessages = useMemo(
     () => reconcileConversationMessages(messages, turnTimeline),
     [messages, turnTimeline],
@@ -563,12 +575,6 @@ function App() {
           setWorkspacePath(workspace.current.path);
           setRecentProjects(workspaceProjects(workspace));
 
-          // Fetch all subagents to mark their threads
-          const threadIds = new Set(subagents.map(subagent => subagent.threadId));
-          setSubagentThreadIds(threadIds);
-          setSubagentByThread(
-            Object.fromEntries(subagents.map((subagent) => [subagent.threadId, subagent.id])),
-          );
           setSubagentList(subagents);
         }
       } catch (error) {
@@ -610,15 +616,6 @@ function App() {
     void subscribeToSubagentEvents((agent) => {
       if (disposed) return;
       setSubagentList((current) => upsertSubagent(current, agent));
-      setSubagentThreadIds((current) => {
-        const next = new Set(current);
-        next.add(agent.threadId);
-        return next;
-      });
-      setSubagentByThread((current) => {
-        if (current[agent.threadId] === agent.id) return current;
-        return { ...current, [agent.threadId]: agent.id };
-      });
     }).then((stop) => {
       if (disposed) stop();
       else unlisten = stop;
@@ -1237,12 +1234,16 @@ function App() {
       }
     }
     const groupedRetryTurnIds = new Set([...retryTurnGroupsByUserMessage.values()].flat());
-    const latestPlanActivity = [...toolActivities].reverse().find((activity) => activity.call.name === "update_plan");
+    const latestPlanActivity = [...toolActivities].reverse().find((activity) =>
+      workflowRun
+        ? activity.call.name === "complete_workflow_node" && activity.result?.success
+        : activity.call.name === "update_plan");
     const latestAssistantTurnId = [...displayMessages].reverse().find(
       (message) => message.role === "assistant" && message.turnId,
     )?.turnId;
     const planTurnId = plan?.steps.length
-      ? latestPlanActivity?.turnId ?? (currentThreadBusy ? currentThreadTurnId : latestAssistantTurnId)
+      ? (workflowRun && currentThreadBusy ? currentThreadTurnId : null)
+        ?? latestPlanActivity?.turnId ?? (currentThreadBusy ? currentThreadTurnId : latestAssistantTurnId)
       : null;
     const orphanTurnIds = [...new Set([...activitiesByTurn.keys(), ...timelineByTurn.keys()])]
       .filter((turnId) => !representedTurnIds.has(turnId) && !groupedRetryTurnIds.has(turnId))
@@ -1284,7 +1285,7 @@ function App() {
       planIsAttachedToOrphan,
       planIsAttachedToRetryGroup,
     };
-  }, [displayMessages, turnTimeline, turnUserMessageIds, toolActivities, activitiesByTurn, timelineByTurn, steeredTurnProjection, plan?.steps.length, currentThreadBusy, currentThreadTurnId, activityStatus?.turnId]);
+  }, [displayMessages, turnTimeline, turnUserMessageIds, toolActivities, activitiesByTurn, timelineByTurn, steeredTurnProjection, plan?.steps.length, workflowRun, currentThreadBusy, currentThreadTurnId, activityStatus?.turnId]);
 
   const assistantMessagesByTurn = derivedTurnData.assistantMessagesByTurn;
   const retryTurnGroupsByUserMessage = derivedTurnData.retryTurnGroupsByUserMessage;
@@ -1301,6 +1302,7 @@ function App() {
   const steeredTurnSegmentsByTurnId = steeredTurnProjection.segmentsByTurnId;
   const steeredTurnIds = steeredTurnProjection.turnIds;
   const hasConversationContent = displayMessages.length > 0
+    || subagentList.some((agent) => agent.parentThreadId === activeThreadId)
     || orphanTurnIds.length > 0
     || Boolean(plan?.steps.length)
     || Boolean(pendingApproval)
@@ -1322,6 +1324,7 @@ function App() {
             activityStatus={turnId === activityStatus?.turnId ? activityStatus.status : null}
             renderText={renderMessageText}
             onRetry={retryable && lastTurn?.turnId === turnId ? () => void retryLastTurn() : undefined}
+            retryAtMs={activityStatus?.retryAtMs}
             subagentTaskIndex={subagentTaskIndex}
             onFocusSubagent={focusSubagent}
           />
@@ -1455,6 +1458,7 @@ function App() {
             onRetry={segment.isLast && retryable && lastTurn?.turnId === segment.turnId
               ? () => void retryLastTurn()
               : undefined}
+            retryAtMs={activityStatus?.retryAtMs}
             subagentTaskIndex={subagentTaskIndex}
             onFocusSubagent={focusSubagent}
           />
@@ -1520,6 +1524,7 @@ function App() {
                   onRetry={attemptIsTerminalSegment && retryable && lastTurn?.turnId === turnId
                     ? () => void retryLastTurn()
                     : undefined}
+                  retryAtMs={activityStatus?.retryAtMs}
                   subagentTaskIndex={subagentTaskIndex}
                   onFocusSubagent={focusSubagent}
                 />
@@ -2183,29 +2188,14 @@ function App() {
           {sideView === "conversations" ? (
             <nav className="thread-list" aria-label="会话列表">
               {conversationListThreads.map((thread) => {
-                const isSubagentThread = subagentThreadIds.has(thread.id);
+                const isThreadRunning = Boolean(activeTurns[thread.id]);
                 return (
                   <div className={cn("thread-item", thread.id === activeThreadId && "thread-item--active")} key={thread.id}>
                     <button className="thread-item-main" type="button" onClick={() => void selectSessionThread(thread)}>
                       <MessageSquare size={15} />
                       <span>{thread.title}</span>
-                      {isSubagentThread && (
-                        <button
-                          type="button"
-                          className="subagent-badge"
-                          title="在右侧面板查看该子智能体"
-                          aria-label={`查看子智能体 ${thread.title}`}
-                          onClick={(event) => {
-                            event.stopPropagation();
-                            const agentId = subagentByThread[thread.id];
-                            if (!agentId) return;
-                            setWorkbenchOpen(false);
-                            setAgentPanelOpen(true);
-                            setSelectedSubagentId(agentId);
-                          }}
-                        >
-                          <Bot size={12} />
-                        </button>
+                      {isThreadRunning && (
+                        <Loader2 className="spin thread-item-spinner" size={12} aria-label="正在生成" />
                       )}
                     </button>
                     <span className="thread-actions">
@@ -2327,29 +2317,14 @@ function App() {
                         <div className="project-group-children">
                           {project.threads.length ? (
                             project.threads.map((thread) => {
-                              const isSubagentThread = subagentThreadIds.has(thread.id);
+                              const isThreadRunning = Boolean(activeTurns[thread.id]);
                               return (
                                 <div className={cn("thread-item thread-item--child", thread.id === activeThreadId && "thread-item--active")} key={thread.id}>
                                   <button className="thread-item-main" type="button" onClick={() => void selectSessionThread(thread)}>
                                     <MessageSquare size={14} />
                                     <span>{thread.title}</span>
-                                    {isSubagentThread && (
-                                      <button
-                                        type="button"
-                                        className="subagent-badge"
-                                        title="在右侧面板查看该子智能体"
-                                        aria-label={`查看子智能体 ${thread.title}`}
-                                        onClick={(event) => {
-                                          event.stopPropagation();
-                                          const agentId = subagentByThread[thread.id];
-                                          if (!agentId) return;
-                                          setWorkbenchOpen(false);
-                                          setAgentPanelOpen(true);
-                                          setSelectedSubagentId(agentId);
-                                        }}
-                                      >
-                                        <Bot size={12} />
-                                      </button>
+                                    {isThreadRunning && (
+                                      <Loader2 className="spin thread-item-spinner" size={12} aria-label="正在生成" />
                                     )}
                                   </button>
                                   <span className="thread-actions">
@@ -2495,6 +2470,7 @@ function App() {
                           finalMessageId={message.id}
                           renderText={renderMessageText}
                           onRetry={retryable && lastTurn?.turnId === message.turnId ? () => void retryLastTurn() : undefined}
+                          retryAtMs={activityStatus?.retryAtMs}
                           subagentTaskIndex={subagentTaskIndex}
                           onFocusSubagent={focusSubagent}
                         />
@@ -2537,6 +2513,9 @@ function App() {
                   </div>
                 </article>
               ) : null}
+
+              <SubagentSummary agents={subagentList.filter((agent) => agent.parentThreadId === activeThreadId)}
+                taskIndex={subagentTaskIndex} onFocus={focusSubagent} />
 
               {/* 内嵌授权请求 */}
               {pendingApproval && (
@@ -2995,8 +2974,11 @@ function App() {
 
       <WorkbenchPanel key={workspaceRevision} open={workbenchOpen} onAttach={(attachment) => appendAttachments([attachment])} />
       <AgentActivityPanel
+        key={activeThreadId}
         open={agentPanelOpen}
         parentThreadId={activeThreadId}
+        agents={subagentList}
+        onAgentUpdated={(agent) => setSubagentList((current) => upsertSubagent(current, agent))}
         selectedId={selectedSubagentId}
         onSelectId={setSelectedSubagentId}
         onClose={() => setAgentPanelOpen(false)}

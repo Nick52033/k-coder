@@ -1,0 +1,8 @@
+{
+  "productName": "k-Coder Read Convergence Validation",
+  "identifier": "com.kcoder.validation.readconvergence",
+  "build": {
+    "beforeDevCommand": "pnpm vite --host 127.0.0.1 --port 1456 --strictPort",
+    "devUrl": "http://127.0.0.1:1456"
+  }
+}
