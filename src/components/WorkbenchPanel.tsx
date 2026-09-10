@@ -3,7 +3,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import {
   ArrowDownToLine, Braces, ChevronDown, ChevronRight, CircleCheck,
   CodeXml, Database, Eye, File, FileCode2, FileCog, FileText, Folder, FolderOpen,
-  GitBranch, Hash, Image, LocateFixed, Paperclip, Plus, RefreshCw, Search,
+  GitBranch, Globe, Hash, Image, LocateFixed, Paperclip, Plus, RefreshCw, Search,
   RotateCcw, Save, Terminal, Upload, X,
 } from "lucide-react";
 import "./WorkbenchPanel.css";
@@ -21,10 +21,11 @@ import type {
   SearchResult,
 } from "../types/runtime";
 
-type Tab = "files" | "git" | "terminal";
+type Tab = "files" | "git" | "terminal" | "browser";
 
 const CodeEditor = lazy(() => import("./CodeEditor").then((module) => ({ default: module.CodeEditor })));
 const TerminalPanel = lazy(() => import("./TerminalPanel").then((module) => ({ default: module.TerminalPanel })));
+const BrowserPanel = lazy(() => import("./BrowserPanel").then((module) => ({ default: module.BrowserPanel })));
 
 export function WorkspacePicker({ onChanged, compact = false }: { onChanged: () => void; compact?: boolean }) {
   const [state, setState] = useState<WorkspaceState | null>(null);
@@ -84,9 +85,14 @@ export function WorkspacePicker({ onChanged, compact = false }: { onChanged: () 
 export function WorkbenchPanel({ onAttach, open = false }: { onAttach: (attachment: AttachmentContent) => void; open?: boolean }) {
   const [tab, setTab] = useState<Tab>("files");
   const [terminalMounted, setTerminalMounted] = useState(false);
+  const [browserMounted, setBrowserMounted] = useState(false);
   const openTerminal = () => {
     setTerminalMounted(true);
     setTab("terminal");
+  };
+  const openBrowser = () => {
+    setBrowserMounted(true);
+    setTab("browser");
   };
   return (
     <aside className={`workbench-panel ${open ? "workbench-panel--open" : ""}`}>
@@ -94,6 +100,7 @@ export function WorkbenchPanel({ onAttach, open = false }: { onAttach: (attachme
         <TabButton active={tab === "files"} icon={<FileCode2 size={15} />} label="文件" onClick={() => setTab("files")} />
         <TabButton active={tab === "git"} icon={<GitBranch size={15} />} label="Git" onClick={() => setTab("git")} />
         <TabButton active={tab === "terminal"} icon={<Terminal size={15} />} label="终端" onClick={openTerminal} />
+        <TabButton active={tab === "browser"} icon={<Globe size={15} />} label="浏览器" onClick={openBrowser} />
       </div>
       {tab === "files" && <FilesView onAttach={onAttach} />}
       {tab === "git" && <GitView />}
@@ -101,6 +108,13 @@ export function WorkbenchPanel({ onAttach, open = false }: { onAttach: (attachme
         <div className="terminal-tab-host" hidden={tab !== "terminal"}>
           <Suspense fallback={<div className="panel-empty">正在载入终端...</div>}>
             <TerminalPanel visible={open && tab === "terminal"} />
+          </Suspense>
+        </div>
+      )}
+      {browserMounted && (
+        <div className="terminal-tab-host" hidden={tab !== "browser"}>
+          <Suspense fallback={<div className="panel-empty">正在载入浏览器...</div>}>
+            <BrowserPanel visible={open && tab === "browser"} />
           </Suspense>
         </div>
       )}

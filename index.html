@@ -4,14 +4,149 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>k-Coder</title>
+    <script>
+      // 首帧之前确定主题：窗口底色、启动屏与真实界面使用同一套配色，避免启动阶段闪白/闪黑。
+      (function () {
+        var DARK_THEMES = ["dark", "crt-green", "ember", "synthwave", "terminal"];
+        var THEMES = ["light", "dark", "arctic", "crt-green", "ember", "miami", "synthwave", "terminal", "vapor", "system"];
+        var stored = "light";
+        try {
+          stored = localStorage.getItem("kcoder_theme") || "light";
+        } catch (_) {
+          stored = "light";
+        }
+        if (THEMES.indexOf(stored) < 0) stored = "light";
+        var resolved = stored;
+        if (stored === "system") {
+          resolved = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+        }
+        var root = document.documentElement;
+        root.setAttribute("data-skin", "codebuddy");
+        root.setAttribute("data-theme", resolved);
+        root.setAttribute("data-theme-preference", stored);
+        root.setAttribute("data-boot-tone", DARK_THEMES.indexOf(resolved) >= 0 ? "dark" : "light");
+      })();
+    </script>
+    <style>
+      html,
+      body {
+        height: 100%;
+        margin: 0;
+        background: #f6f8f6;
+      }
+      html[data-boot-tone="dark"],
+      html[data-boot-tone="dark"] body {
+        background: #14191f;
+      }
+      #app-splash {
+        position: fixed;
+        inset: 0;
+        z-index: 9999;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 18px;
+        background: #f6f8f6;
+        color: #57615b;
+        font-family: Inter, "Segoe UI", "Microsoft YaHei", Arial, sans-serif;
+        transition: opacity 0.24s ease;
+      }
+      html[data-boot-tone="dark"] #app-splash {
+        background: #14191f;
+        color: #94a0b3;
+      }
+      #app-splash.is-hiding {
+        opacity: 0;
+        pointer-events: none;
+      }
+      #app-splash .boot-mark {
+        display: grid;
+        place-items: center;
+        width: 52px;
+        height: 52px;
+        color: #176b4d;
+      }
+      html[data-boot-tone="dark"] #app-splash .boot-mark {
+        color: #4f8aff;
+      }
+      #app-splash .boot-title {
+        font-size: 15px;
+        font-weight: 600;
+        letter-spacing: 0.02em;
+      }
+      #app-splash .boot-hint {
+        font-size: 12px;
+        opacity: 0.72;
+      }
+      #app-splash .boot-bar {
+        position: relative;
+        width: 168px;
+        height: 3px;
+        overflow: hidden;
+        background: rgba(23, 107, 77, 0.14);
+        border-radius: 999px;
+      }
+      html[data-boot-tone="dark"] #app-splash .boot-bar {
+        background: rgba(79, 138, 255, 0.18);
+      }
+      #app-splash .boot-bar::after {
+        content: "";
+        position: absolute;
+        inset: 0 auto 0 0;
+        width: 42%;
+        border-radius: 999px;
+        background: #176b4d;
+        animation: boot-slide 1.05s ease-in-out infinite;
+      }
+      html[data-boot-tone="dark"] #app-splash .boot-bar::after {
+        background: #4f8aff;
+      }
+      @keyframes boot-slide {
+        0% { transform: translateX(-100%); }
+        100% { transform: translateX(340%); }
+      }
+      @media (prefers-reduced-motion: reduce) {
+        #app-splash .boot-bar::after {
+          animation-duration: 2.4s;
+        }
+      }
+    </style>
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;650;700&display=swap" rel="stylesheet" />
-    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
-    <link href="https://fonts.googleapis.com/css2?family=Syne:wght@600;700;800&display=swap" rel="stylesheet" />
+    <!-- 字体异步加载：离线或网络受限时不再阻塞首帧渲染（系统字体兜底已在 --font-family 中）。 -->
+    <link
+      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;650;700&display=swap"
+      rel="stylesheet"
+      media="print"
+      onload="this.media='all'"
+    />
+    <link
+      href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&display=swap"
+      rel="stylesheet"
+      media="print"
+      onload="this.media='all'"
+    />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Syne:wght@600;700;800&display=swap"
+      rel="stylesheet"
+      media="print"
+      onload="this.media='all'"
+    />
   </head>
 
   <body>
+    <div id="app-splash" role="status" aria-live="polite">
+      <span class="boot-mark" aria-hidden="true">
+        <svg viewBox="0 0 512 512" width="52" height="52" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <rect width="512" height="512" rx="104" fill="currentColor" />
+          <path d="M154 112h72v119l104-119h88L298 247l128 153h-91L250 294l-24 27v79h-72V112Z" fill="#ffffff" />
+        </svg>
+      </span>
+      <span class="boot-title">k-Coder</span>
+      <span class="boot-bar" aria-hidden="true"></span>
+      <span class="boot-hint">正在启动工作区…</span>
+    </div>
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>
   </body>

@@ -1887,11 +1887,40 @@ fn turn_item_display_order(
     detail: &ThreadDetail,
     items: &[ProjectedItem],
     item: &ThreadItem,
-) -> (u8, u64, u32) {
+) -> (u8, u64, u64, u32) {
+    let order = projected_item_order(items, item);
     if matches!(&item.payload, ThreadItemPayload::UserMessage { .. }) {
-        let order = projected_item_order(items, item);
-        return (0, order.event_index, order.item_index);
+        let initial_user_message_id = item
+            .turn_id
+            .as_deref()
+            .and_then(|turn_id| detail.turn_user_message_ids.get(turn_id));
+        if initial_user_message_id.is_none_or(|message_id| message_id == &item.id) {
+            return (0, order.event_index, 0, order.item_index);
+        }
+
+        let next_item_position = items
+            .iter()
+            .filter(|candidate| candidate.order > order && candidate.item.turn_id == item.turn_id)
+            .filter_map(|candidate| turn_timeline_display_position(detail, &candidate.item))
+            .min();
+        let position = next_item_position
+            .map(|position| position.saturating_sub(1))
+            .unwrap_or_else(|| {
+                (detail.turn_timeline.len() as u64)
+                    .saturating_mul(4)
+                    .saturating_add(3)
+            });
+        return (1, position, order.event_index, order.item_index);
     }
+
+    if let Some(position) = turn_timeline_display_position(detail, item) {
+        return (1, position, order.event_index, order.item_index);
+    }
+
+    (2, order.event_index, 0, order.item_index)
+}
+
+fn turn_timeline_display_position(detail: &ThreadDetail, item: &ThreadItem) -> Option<u64> {
     if let ThreadItemPayload::Approval { approval } = &item.payload
         && let Some(index) = detail.turn_timeline.iter().position(|candidate| {
             matches!(candidate, TurnTimelineItem::Tool { activity }
@@ -1899,10 +1928,9 @@ fn turn_item_display_order(
                     && activity.call.id == approval.request.tool_call_id)
         })
     {
-        return (1, (index as u64).saturating_mul(2).saturating_sub(1), 0);
+        return Some((index as u64).saturating_mul(4).saturating_add(1));
     }
-    if let Some(index) = item
-        .timeline_items
+    item.timeline_items
         .iter()
         .filter_map(|timeline_item| {
             detail.turn_timeline.iter().position(|candidate| {
@@ -1911,11 +1939,7 @@ fn turn_item_display_order(
             })
         })
         .min()
-    {
-        return (1, (index as u64).saturating_mul(2), 0);
-    }
-    let order = projected_item_order(items, item);
-    (2, order.event_index, order.item_index)
+        .map(|index| (index as u64).saturating_mul(4).saturating_add(2))
 }
 
 fn projected_item_order(items: &[ProjectedItem], item: &ThreadItem) -> HistoryOrder {
@@ -3448,6 +3472,64 @@ mod tests {
         let json = serde_json::to_value(history).unwrap();
         assert_eq!(json["turns"]["data"][0]["itemsView"], "full");
         assert_eq!(json["turns"]["data"][0]["items"][2]["type"], "approval");
+    }
+
+    #[tokio::test]
+    async fn projects_steered_user_message_between_the_surrounding_turn_items() {
+        let directory = tempfile::tempdir().unwrap();
+        let repository = JsonlThreadRepository::new(directory.path()).unwrap();
+        let thread = repository.create_thread().await.unwrap();
+        let turn_id = "turn-steered-history";
+        let base = now_ms() + 100;
+        let initial = message(MessageRole::User, "start the task");
+        let initial_id = initial.id.clone();
+        let before = message(MessageRole::Assistant, "answer before steer");
+        let before_id = before.id.clone();
+        let steer = message(MessageRole::User, "change direction");
+        let steer_id = steer.id.clone();
+        let after = message(MessageRole::Assistant, "answer after steer");
+        let after_id = after.id.clone();
+
+        for (offset, kind) in [
+            StoredEventKind::UserMessage { message: initial },
+            StoredEventKind::TurnStarted,
+            StoredEventKind::AssistantMessage { message: before },
+            StoredEventKind::UserMessage { message: steer },
+            StoredEventKind::AssistantMessage { message: after },
+            StoredEventKind::TurnCompleted { usage: None },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            append_at(
+                &repository,
+                &thread.id,
+                Some(turn_id),
+                base + offset as u64 * 10,
+                kind,
+            )
+            .await;
+        }
+
+        let history = repository.read_thread_history(&thread.id).await.unwrap();
+        let turn = &history.turns.data[0];
+        assert!(
+            matches!(
+                &turn.items[..],
+                [
+                    ThreadItem { payload: ThreadItemPayload::UserMessage { message: first }, .. },
+                    ThreadItem { payload: ThreadItemPayload::AgentMessage { message: pre_steer, .. }, .. },
+                    ThreadItem { payload: ThreadItemPayload::UserMessage { message: steered }, .. },
+                    ThreadItem { payload: ThreadItemPayload::AgentMessage { message: post_steer, .. }, .. },
+                    ThreadItem { payload: ThreadItemPayload::Event, .. },
+                ] if first.id == initial_id
+                    && pre_steer.id == before_id
+                    && steered.id == steer_id
+                    && post_steer.id == after_id
+            ),
+            "{:#?}",
+            turn.items
+        );
     }
 
     #[tokio::test]

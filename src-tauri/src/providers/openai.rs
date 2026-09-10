@@ -7,6 +7,7 @@ use reqwest::Client;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
 use super::common::{classify_event_error, read_error_message, redact_error, redact_event};
 use super::sse::SseDecoder;
@@ -388,7 +389,7 @@ impl ToolCallAccumulator {
         std::mem::take(&mut self.calls)
             .into_values()
             .map(|pending| {
-                if pending.id.is_empty() || pending.name.is_empty() {
+                if pending.name.is_empty() {
                     return Err(ProviderError::InvalidResponse(
                         format!(
                             "Chat Completions returned an incomplete tool call (id: '{}', name: '{}', arguments: '{}')",
@@ -403,7 +404,16 @@ impl ToolCallAccumulator {
                     ))
                 })?;
                 Ok(ToolCall {
-                    id: pending.id,
+                    // Some OpenAI-compatible gateways emit a complete function call but
+                    // omit the protocol id (or send an empty string). The id is only used
+                    // to pair the host's tool result with this assistant message, so a
+                    // host-owned UUID preserves that pairing without trusting malformed
+                    // provider metadata. Name and arguments remain strictly validated.
+                    id: if pending.id.trim().is_empty() {
+                        Uuid::new_v4().to_string()
+                    } else {
+                        pending.id
+                    },
                     name: pending.name,
                     arguments,
                     metadata: json!({}),
@@ -1198,6 +1208,27 @@ mod tests {
     }
 
     #[test]
+    fn assigns_a_host_id_when_chat_completions_omits_tool_call_id() {
+        let mut accumulator = ToolCallAccumulator::default();
+        accumulator.push(OpenAiToolCallDelta {
+            index: 0,
+            id: None,
+            function: Some(OpenAiFunctionDelta {
+                name: Some("list_directory".to_string()),
+                arguments: Some(r#"{"path":""}"#.to_string()),
+            }),
+        });
+
+        let calls = accumulator
+            .take()
+            .expect("a missing upstream id should not discard an otherwise complete call");
+        assert_eq!(calls.len(), 1);
+        assert!(!calls[0].id.is_empty());
+        assert_eq!(calls[0].name, "list_directory");
+        assert_eq!(calls[0].arguments, json!({ "path": "" }));
+    }
+
+    #[test]
     fn length_finish_reason_is_not_a_successful_completion() {
         let parsed = parse_sse_data(
             r#"{"choices":[{"delta":{"content":"partial"},"finish_reason":"length"}],"usage":{"prompt_tokens":4,"completion_tokens":3}}"#,
@@ -1725,6 +1756,52 @@ mod tests {
         assert!(
             matches!(error, ProviderError::InvalidResponse(message) if message.contains("more than"))
         );
+    }
+
+    #[tokio::test]
+    async fn streams_a_host_id_for_a_tool_call_with_an_empty_upstream_id() {
+        let response = concat!(
+            r#"data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"","function":{"name":"list_directory","arguments":"{\"path\":\"\"}"}}]},"finish_reason":"tool_calls"}]}"#,
+            "\n\n",
+            "data: [DONE]\n\n"
+        );
+        let (base_url, mut received, server) = spawn_sse_server(vec![response]).await;
+        let mut config = provider_config("deepseek-v4-pro-0813");
+        config.base_url = base_url;
+        let provider = DeepSeekChatCompletionsProvider::new(config, "secret".to_string())
+            .expect("DeepSeek provider should build");
+
+        let mut stream = provider
+            .stream(
+                provider_request(
+                    ReasoningEffort::High,
+                    vec![ProviderMessage::Text {
+                        role: MessageRole::User,
+                        text: "inspect the workspace".to_string(),
+                    }],
+                ),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("the simulated response should connect");
+        let mut returned_call = None;
+        while let Some(event) = stream.next().await {
+            match event.expect("the simulated response should be valid") {
+                ProviderEvent::ToolCall { call } => returned_call = Some(call),
+                ProviderEvent::Completed => {}
+                event => panic!("unexpected provider event: {event:?}"),
+            }
+        }
+
+        let call = returned_call.expect("the response should yield a tool call");
+        assert!(Uuid::parse_str(&call.id).is_ok());
+        assert_eq!(call.name, "list_directory");
+        assert_eq!(call.arguments, json!({ "path": "" }));
+        received
+            .recv()
+            .await
+            .expect("the request payload should arrive");
+        server.await.expect("test server should stop cleanly");
     }
 
     #[tokio::test]

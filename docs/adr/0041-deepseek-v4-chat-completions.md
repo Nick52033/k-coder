@@ -12,7 +12,7 @@
 
 ## 决策
 
-1. 增加 `deep_seek_chat_completions` 传输，继续复用 Chat Completions HTTP、SSE、取消、错误脱敏和工具增量基础设施，但由 Provider 适配器独立生成 DeepSeek 载荷。
+1. 增加 `deep_seek_chat_completions` 传输，继续复用 Chat Completions HTTP、SSE、取消、错误脱敏和工具增量基础设施，但由 Provider 适配器独立生成 DeepSeek 载荷。对兼容端点返回函数名和可解析 JSON 参数、但省略或发送空 `tool_call.id` 的响应，适配器只为内部工具结果配对生成宿主 UUID；函数名仍必须存在，参数仍严格解析并交给既有工具 Schema 校验，不能用该兼容处理改写路径或扩大工作区权限。
 2. 为兼容已经保存为 `open_ai_chat_completions` 的配置，只要模型 ID 的独立供应商段以 `deepseek` 开头并带 `-`、`_` 或 `.` 分隔符，就自动使用 DeepSeek 方言，覆盖 `deepseek-chat`、`deepseek-reasoner`、V3/V4/R1 以及常见网关前缀。显式 DeepSeek 传输不限制模型 ID；相近但不匹配的名称继续使用普通 OpenAI 方言。
 3. `Off` 映射为 `thinking.type=disabled` 并省略 `reasoning_effort`；`Minimal/Low` 映射为 `low`，`Medium/High` 映射为 `high`，`XHigh` 映射为 `max`。配置的 `maxOutputTokens` 映射为 `max_tokens`。
 4. DeepSeek `reasoning_content` 不产生任何公共或持久化事件。适配器在单个 Provider 实例内使用有界内存按工具调用 ID 暂存，最多接受 2 MiB 的单次推理、4 MiB 的 Turn 缓存和 512 个调用；完成同一 Turn 的下一次请求时原样回传。官方流的第一帧可以携带空字符串占位，但完整思考工具响应必须取得非空私有推理才能执行原生 passback；响应结束后缓存仍为空表示兼容端点没有提供必要协议事实，不能发送 `reasoning_content: ""` 冒充原始 CoT。关闭思考不需要私有推理，仍可发送原生工具消息并省略该字段。
@@ -31,5 +31,5 @@
 
 - 请求测试覆盖 `thinking` 开关、`low/high/max` 映射、`max_tokens` 和普通 OpenAI `xhigh` 不回退。
 - SSE 测试证明 `reasoning_content` 只进入私有缓冲，不产生 `ProviderEvent`。
-- 工具历史测试覆盖当前 Turn 非空原样 passback、思考模式空缓存的同 Provider 安全降级、关闭思考时的原生工具配对、重启历史文本降级、失败工具 Turn 重试边界、`request_user_input` 原始参数隔离、失败结果的 assistant 角色、旧内部标记与结构化事实逐字匹配后的定向清理、无关 assistant 说明及 user 同名正文保留、空工具结果和缓存上限；环回 HTTP/SSE 测试分别验证同一 Provider 的原始 `reasoning_content`/`tool_calls`/`role=tool` passback、同 Provider 缺失 reasoning 时的无原生工具降级，以及重建 Provider 后请求以不含工具正文的固定 user 续跑意图收尾。
+- 工具历史测试覆盖当前 Turn 非空原样 passback、思考模式空缓存的同 Provider 安全降级、关闭思考时的原生工具配对、重启历史文本降级、失败工具 Turn 重试边界、`request_user_input` 原始参数隔离、失败结果的 assistant 角色、旧内部标记与结构化事实逐字匹配后的定向清理、无关 assistant 说明及 user 同名正文保留、空工具结果和缓存上限；环回 HTTP/SSE 测试分别验证同一 Provider 的原始 `reasoning_content`/`tool_calls`/`role=tool` passback、同 Provider 缺失 reasoning 时的无原生工具降级、缺失工具调用 ID 时的宿主 UUID 兼容，以及重建 Provider 后请求以不含工具正文的固定 user 续跑意图收尾。
 - 配置与应用状态测试覆盖传输枚举、DeepSeek 家族识别、相近名称拒绝和文本输入能力收缩。

@@ -45,7 +45,7 @@ pub struct SandboxProfile {
 
 pub enum SandboxCapability {
     Full,
-    Partial { filesystem: bool, network: bool, resources: bool },
+    Partial { filesystem: bool, network: bool, resources: bool, ui: bool },
     Unsupported,
 }
 
@@ -115,6 +115,8 @@ Unix 后端在 Windows 版本验收后实现：macOS 用 `include_str!` 内嵌 S
 - 唯一内置后端 `NoSandboxBackend` 明确报告 `Unsupported`。因此**本阶段降级默认开启**：需要隔离但无法兑现时继续执行命令，并写入 `SandboxAudit { outcome: Degraded, reason }`。关闭降级（`with_degraded_execution(false)`）时按 ADR 的要求真正拒绝执行。
 - `P10-002b` 引入真实 Windows 后端之后，必须把 `SandboxGate::allow_degraded` 的默认值改为 `false`，让能力不足真正关闭失败。
 - 审计事实通过 `CommandSessionView.sandbox` 暴露给界面与日志；后端内部错误只进入日志，回传给模型的是固定中文文案。
+- **能力协商必须覆盖 profile 的全部四个维度**：`for_risk` 派生的 profile 恒为 `ui: Deny`，因此 `SandboxCapability::Partial` 增加 `ui` 字段，`SandboxCapability::supports` 对文件系统、网络、资源和 UI 逐一校验。缺少任一维声明的后端一律视为能力不足（旧审计记录缺 `ui` 时按不具备处理），否则后端会声称兑现自己做不到的隔离，fail-closed 在该维度形同虚设。
+- 策略侧的 `ExecutionWorkspacePolicy::sandbox_profile` 与执行侧 `CommandRuntime::start` 使用同一个 `SandboxProfile::for_risk`，回归测试断言两者结论一致，界面与审计不会展示与实际隔离不符的事实。
 
 ## 兼容与非目标
 

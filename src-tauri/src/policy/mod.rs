@@ -405,6 +405,28 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn execution_policy_derives_the_same_sandbox_profile_as_the_runtime() {
+        let workspace = tempfile::tempdir().unwrap();
+        let runtime = CommandRuntime::new(workspace.path()).unwrap();
+        let policy = ExecutionWorkspacePolicy {
+            runtime: runtime.clone(),
+        };
+        // 策略侧与执行侧必须得到同一结论，否则界面/审计会展示与实际隔离不一致的事实。
+        let command = "cargo test";
+        let arguments = serde_json::json!({ "command": command });
+        let assessment = runtime.assess_shell_command(command, String::new(), 120_000);
+        assert_eq!(
+            policy.sandbox_profile(&arguments),
+            SandboxProfile::for_risk(&assessment.risk)
+        );
+        // 只读命令同样要求工作区写保护与 UI 限制。
+        let readonly =
+            policy.sandbox_profile(&serde_json::json!({ "command": "Get-Content Cargo.toml" }));
+        assert!(readonly.requires_isolation());
+        assert_eq!(readonly.ui, crate::execution::UiPolicy::Deny);
+    }
+
     #[tokio::test]
     async fn duplicate_registration_does_not_close_the_original_request() {
         let manager = ApprovalManager::new(Duration::from_secs(1));

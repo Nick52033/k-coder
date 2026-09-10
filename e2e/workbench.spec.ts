@@ -3179,14 +3179,32 @@ test("follows streamed growth only while the conversation remains near the lates
 test("primary send queues behind the active turn and the queued send steers it", async ({ page }, testInfo) => {
   await page.goto("/");
   await page.evaluate(() => {
-    (window as unknown as { __emitAgentEvent: (event: unknown) => void }).__emitAgentEvent({
+    const emit = (window as unknown as { __emitAgentEvent: (event: unknown) => void }).__emitAgentEvent;
+    emit({
       schemaVersion: 1,
       threadId: "thread-1",
       turnId: "turn-primary-active",
       type: "turn_started",
       phase: "exploring",
+      userMessage: {
+        schemaVersion: 1,
+        id: "primary-active-user",
+        role: "user",
+        content: [{ type: "text", text: "请检查当前发送逻辑" }],
+        createdAtMs: Date.now(),
+      },
+    });
+    emit({
+      schemaVersion: 4,
+      threadId: "thread-1",
+      turnId: "turn-primary-active",
+      type: "text_delta",
+      phase: "responding",
+      itemId: "assistant-before-steer",
+      delta: "这是引导前的助手回复。",
     });
   });
+  await expect(page.getByText("这是引导前的助手回复。", { exact: true })).toBeVisible();
 
   const composer = page.getByRole("textbox", { name: "消息" });
   await expect(composer).toBeEnabled();
@@ -3243,7 +3261,8 @@ test("primary send queues behind the active turn and the queued send steers it",
   await expect(page.locator(".message-queue")).toHaveCount(0);
 
   await page.evaluate(() => {
-    (window as unknown as { __emitAgentEvent: (event: unknown) => void }).__emitAgentEvent({
+    const emit = (window as unknown as { __emitAgentEvent: (event: unknown) => void }).__emitAgentEvent;
+    emit({
       schemaVersion: 4,
       threadId: "thread-1",
       turnId: "turn-primary-active",
@@ -3257,8 +3276,32 @@ test("primary send queues behind the active turn and the queued send steers it",
         createdAtMs: Date.now(),
       },
     });
+    emit({
+      schemaVersion: 4,
+      threadId: "thread-1",
+      turnId: "turn-primary-active",
+      type: "text_delta",
+      phase: "responding",
+      itemId: "assistant-after-steer",
+      delta: "这是根据引导产生的新回复。",
+    });
   });
   await expect(page.locator(".message--user").getByText("改为先修复发送逻辑，再继续验证", { exact: true })).toBeVisible();
+  await expect(page.getByText("这是引导前的助手回复。", { exact: true })).toBeVisible();
+  await expect(page.getByText("这是根据引导产生的新回复。", { exact: true })).toBeVisible();
+  await expect(page.locator('article.message--assistant[data-turn-id="turn-primary-active"]')).toHaveCount(2);
+  const preSteerAssistant = page
+    .locator('article.message--assistant[data-turn-id="turn-primary-active"]')
+    .filter({ hasText: "这是引导前的助手回复。" });
+  await expect(preSteerAssistant.locator(".turn-final-response")).toContainText("这是引导前的助手回复。");
+  const visibleOrder = await page.locator(".message-list").innerText();
+  expect(visibleOrder.indexOf("这是引导前的助手回复。")).toBeLessThan(
+    visibleOrder.indexOf("改为先修复发送逻辑，再继续验证"),
+  );
+  expect(visibleOrder.indexOf("改为先修复发送逻辑，再继续验证")).toBeLessThan(
+    visibleOrder.indexOf("这是根据引导产生的新回复。"),
+  );
+  await page.screenshot({ path: testInfo.outputPath("primary-send-steered-current-turn.png"), fullPage: true });
   await expect(page.locator(".mode-label")).toHaveText("正在生成");
 
   await page.getByRole("button", { name: "停止生成" }).click();
@@ -4612,6 +4655,101 @@ test("shows and starts subagent activity without a default token budget", async 
   })).toBe(false);
 });
 
+test("shows every queued subagent wait before serial execution reaches it", async ({ page }, testInfo) => {
+  await page.goto("/");
+  await expect.poll(() => page.evaluate(() => {
+    try {
+      (window as unknown as { __emitTauriEvent: (event: string, payload: unknown) => void }).__emitTauriEvent(
+        "subagent-event",
+        {
+          schemaVersion: 1,
+          id: "agent-2",
+          parentAgentId: null,
+          parentThreadId: "thread-1",
+          threadId: "thread-agent-2",
+          label: "检查文档",
+          task: "分析文档结构",
+          state: "running",
+          depth: 1,
+          workspaceRoot: "D:\\code\\k-coder",
+          capabilities: ["list_directory", "read_file"],
+          tokenBudget: null,
+          tokensUsed: 0,
+          timeoutMs: 600000,
+          createdAtMs: 4,
+          updatedAtMs: 4,
+          summary: null,
+          error: null,
+        },
+      );
+      return true;
+    } catch {
+      return false;
+    }
+  })).toBe(true);
+
+  await page.evaluate(() => {
+    const emit = (window as unknown as { __emitAgentEvent: (event: unknown) => void }).__emitAgentEvent;
+    const base = { schemaVersion: 6, threadId: "thread-1", turnId: "turn-subagent-waits" };
+    const calls = [
+      { id: "call-wait-1", name: "wait_agent", arguments: { agentId: "agent-1" }, metadata: {} },
+      { id: "call-wait-2", name: "wait_agent", arguments: { agentId: "agent-2" }, metadata: {} },
+    ];
+    emit({ ...base, type: "turn_started", phase: "exploring" });
+    for (const call of calls) {
+      emit({ ...base, type: "item_started", phase: "executing", itemId: call.id, itemType: "tool" });
+      emit({ ...base, type: "tool_queued", phase: "executing", call });
+    }
+    emit({ ...base, type: "tool_started", phase: "executing", call: calls[0] });
+  });
+
+  const liveMessage = page.locator(".message--assistant").last();
+  await expect(liveMessage.locator(".turn-timeline-tool")).toHaveCount(2);
+  await expect(
+    liveMessage.locator(".turn-timeline-tool--running").getByRole("button", { name: "查看子智能体 task1" }),
+  ).toBeVisible();
+  await expect(
+    liveMessage.locator(".turn-timeline-tool--pending").getByRole("button", { name: "查看子智能体 task2" }),
+  ).toBeVisible();
+  await expect(
+    liveMessage.locator(".turn-timeline-tool--running .turn-tool-meta > span:not(.turn-tool-duration)"),
+  ).toHaveText("执行中");
+  await expect(
+    liveMessage.locator(".turn-timeline-tool--pending .turn-tool-meta > span:not(.turn-tool-duration)"),
+  ).toHaveText("等待执行");
+  await page.screenshot({ path: testInfo.outputPath(`queued-subagent-waits-${testInfo.project.name}.png`), fullPage: true });
+
+  await page.evaluate(() => {
+    const emit = (window as unknown as { __emitAgentEvent: (event: unknown) => void }).__emitAgentEvent;
+    const base = { schemaVersion: 6, threadId: "thread-1", turnId: "turn-subagent-waits", phase: "executing" };
+    for (const callId of ["call-wait-1", "call-wait-2"]) {
+      emit({
+        ...base,
+        type: "tool_completed",
+        callId,
+        name: "wait_agent",
+        result: { success: false, output: "tool execution was cancelled", metadata: {} },
+      });
+      emit({
+        ...base,
+        type: "item_completed",
+        itemId: callId,
+        itemType: "tool",
+        status: "cancelled",
+      });
+    }
+  });
+
+  await expect(liveMessage.locator(".turn-timeline-tool")).toHaveCount(2);
+  await expect(
+    liveMessage.locator(".turn-timeline-tool--cancelled").getByRole("button", { name: "查看子智能体 task1" }),
+  ).toBeVisible();
+  await expect(
+    liveMessage.locator(".turn-timeline-tool--cancelled").getByRole("button", { name: "查看子智能体 task2" }),
+  ).toBeVisible();
+  await expect(liveMessage.locator(".turn-timeline-tool--failed")).toHaveCount(0);
+});
+
 test("shows unbounded goal token consumption and controls", async ({ page }, testInfo) => {
   await page.goto("/");
   const goal = page.locator(".goal-slim");
@@ -5299,6 +5437,525 @@ test("renders a recovered assistant item only once when its turn comes from the 
   await expect(page.locator(".message--assistant .turn-execution")).toHaveCount(1);
 });
 
+test("restores a steered turn around the user guidance boundary", async ({ page }, testInfo) => {
+  await page.addInitScript(() => {
+    const turnId = "turn-restored-steer";
+    const messageItem = (
+      id: string,
+      role: "user" | "assistant",
+      text: string,
+      createdAtMs: number,
+      image?: { name: string; dataUrl: string },
+    ) => ({
+      schemaVersion: 1,
+      id,
+      turnId,
+      status: "completed",
+      startedAtMs: createdAtMs,
+      completedAtMs: createdAtMs,
+      timelineItems: role === "assistant" ? [{ type: "text", id, turnId, text }] : [],
+      type: role === "user" ? "user_message" : "agent_message",
+      message: {
+        schemaVersion: 1,
+        id,
+        role,
+        content: [
+          { type: "text", text },
+          ...(image ? [{ type: "image", name: image.name, dataUrl: image.dataUrl }] : []),
+        ],
+        createdAtMs,
+      },
+      ...(role === "assistant" ? { phase: "final_answer" } : {}),
+    });
+    localStorage.setItem("kcoder_e2e_thread_history", JSON.stringify({
+      schemaVersion: 1,
+      summary: {
+        schemaVersion: 1,
+        id: "thread-1",
+        title: "Steered conversation",
+        createdAtMs: 1,
+        updatedAtMs: 6,
+        archived: false,
+        workspacePath: "D:\\code\\k-coder",
+      },
+      lastTurn: { turnId, state: "completed", error: null },
+      todos: [],
+      lastUsage: null,
+      turns: {
+        data: [{
+          schemaVersion: 1,
+          id: turnId,
+          userMessageId: "steer-initial-user",
+          state: "completed",
+          error: null,
+          startedAtMs: 2,
+          completedAtMs: 6,
+          durationMs: 4,
+          itemsView: "full",
+          items: [
+            messageItem("steer-initial-user", "user", "开始检查实现。", 2),
+            messageItem(
+              "assistant-before-restored-steer",
+              "assistant",
+              "这是刷新前的阶段回复。",
+              3,
+              {
+                name: "pre-steer-result.png",
+                dataUrl: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+              },
+            ),
+            messageItem("restored-steer-user", "user", "改为先检查子智能体实现。", 4),
+            messageItem(
+              "assistant-after-restored-steer",
+              "assistant",
+              "这是根据新引导继续的回复。",
+              5,
+              {
+                name: "steered-result.png",
+                dataUrl: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+              },
+            ),
+            {
+              schemaVersion: 1,
+              id: `turn-completed-${turnId}`,
+              turnId,
+              status: "completed",
+              startedAtMs: 6,
+              completedAtMs: 6,
+              timelineItems: [{
+                type: "event",
+                itemId: `turn-completed-${turnId}`,
+                turnId,
+                kind: "turn_completed",
+                title: "Turn 已完成",
+                detail: null,
+                durationMs: 4,
+              }],
+              type: "event",
+            },
+          ],
+        }],
+        nextCursor: null,
+        backwardsCursor: null,
+      },
+      unscopedItems: [],
+    }));
+  });
+  await page.goto("/");
+
+  await expect(page.getByText("这是刷新前的阶段回复。", { exact: true })).toHaveCount(1);
+  await expect(page.locator(".message--user").getByText("改为先检查子智能体实现。", { exact: true })).toHaveCount(1);
+  await expect(page.getByText("这是根据新引导继续的回复。", { exact: true })).toBeVisible();
+  await expect(page.locator('article.message--assistant[data-turn-id="turn-restored-steer"]')).toHaveCount(2);
+  const restoredPreSteerAssistant = page
+    .locator('article.message--assistant[data-turn-id="turn-restored-steer"]')
+    .filter({ hasText: "这是刷新前的阶段回复。" });
+  await expect(restoredPreSteerAssistant.locator(".turn-final-response")).toContainText("这是刷新前的阶段回复。");
+  await expect(restoredPreSteerAssistant.getByRole("button", { name: "查看图片 pre-steer-result.png" })).toBeVisible();
+  await expect(restoredPreSteerAssistant.getByRole("button", { name: "查看图片 steered-result.png" })).toHaveCount(0);
+  const restoredPostSteerAssistant = page
+    .locator('article.message--assistant[data-turn-id="turn-restored-steer"]')
+    .filter({ hasText: "这是根据新引导继续的回复。" });
+  await expect(restoredPostSteerAssistant.getByRole("button", { name: "查看图片 pre-steer-result.png" })).toHaveCount(0);
+  const restoredAttachment = restoredPostSteerAssistant.getByRole("button", { name: "查看图片 steered-result.png" });
+  await expect(restoredAttachment).toBeVisible();
+  await expect.poll(() => restoredAttachment.locator("img").evaluate((image) => (
+    (image as HTMLImageElement).complete && (image as HTMLImageElement).naturalWidth > 0
+  ))).toBe(true);
+  const restoredOrder = await page.locator(".message-list").textContent() ?? "";
+  expect(restoredOrder.indexOf("这是刷新前的阶段回复。")).toBeLessThan(
+    restoredOrder.indexOf("改为先检查子智能体实现。"),
+  );
+  expect(restoredOrder.indexOf("改为先检查子智能体实现。")).toBeLessThan(
+    restoredOrder.indexOf("这是根据新引导继续的回复。"),
+  );
+  await page.screenshot({ path: testInfo.outputPath("restored-steered-turn.png"), fullPage: true });
+});
+
+test("does not repeat a pre-steer answer when the steered tail has no text", async ({ page }) => {
+  await page.addInitScript(() => {
+    const turnId = "turn-steer-empty-tail";
+    const messageItem = (
+      id: string,
+      role: "user" | "assistant",
+      text: string,
+      createdAtMs: number,
+    ) => ({
+      schemaVersion: 1,
+      id,
+      turnId,
+      status: "completed",
+      startedAtMs: createdAtMs,
+      completedAtMs: createdAtMs,
+      timelineItems: role === "assistant" ? [{ type: "text", id, turnId, text }] : [],
+      type: role === "user" ? "user_message" : "agent_message",
+      message: {
+        schemaVersion: 1,
+        id,
+        role,
+        content: [{ type: "text", text }],
+        createdAtMs,
+      },
+      ...(role === "assistant" ? { phase: "final_answer" } : {}),
+    });
+    localStorage.setItem("kcoder_e2e_thread_history", JSON.stringify({
+      schemaVersion: 1,
+      summary: {
+        schemaVersion: 1,
+        id: "thread-1",
+        title: "Steered empty tail",
+        createdAtMs: 1,
+        updatedAtMs: 5,
+        archived: false,
+      },
+      lastTurn: { turnId, state: "cancelled", error: null },
+      todos: [],
+      lastUsage: null,
+      turns: {
+        data: [{
+          schemaVersion: 1,
+          id: turnId,
+          userMessageId: "empty-tail-initial-user",
+          state: "cancelled",
+          error: null,
+          startedAtMs: 2,
+          completedAtMs: 5,
+          durationMs: 3,
+          itemsView: "full",
+          items: [
+            messageItem("empty-tail-initial-user", "user", "先给出初步结论。", 2),
+            messageItem("empty-tail-assistant", "assistant", "这是引导前唯一的回复。", 3),
+            messageItem("empty-tail-steer-user", "user", "先停一下，不要继续回答。", 4),
+            {
+              schemaVersion: 1,
+              id: `turn-cancelled-${turnId}`,
+              turnId,
+              status: "cancelled",
+              startedAtMs: 5,
+              completedAtMs: 5,
+              timelineItems: [{
+                type: "event",
+                itemId: `turn-cancelled-${turnId}`,
+                turnId,
+                kind: "turn_cancelled",
+                title: "Turn 已停止",
+                detail: null,
+                durationMs: 3,
+              }],
+              type: "event",
+            },
+          ],
+        }],
+        nextCursor: null,
+        backwardsCursor: null,
+      },
+      unscopedItems: [],
+    }));
+  });
+  await page.goto("/");
+
+  await expect(page.getByText("这是引导前唯一的回复。", { exact: true })).toHaveCount(1);
+  const listText = await page.locator(".message-list").textContent() ?? "";
+  expect(listText.indexOf("这是引导前唯一的回复。")).toBeLessThan(
+    listText.indexOf("先停一下，不要继续回答。"),
+  );
+});
+
+test("does not duplicate tool-only steered turns as orphan activity", async ({ page }) => {
+  await page.addInitScript(() => {
+    const turnId = "turn-steer-tools-only";
+    const userItem = (id: string, text: string, createdAtMs: number) => ({
+      schemaVersion: 1,
+      id,
+      turnId,
+      status: "completed",
+      startedAtMs: createdAtMs,
+      completedAtMs: createdAtMs,
+      timelineItems: [],
+      type: "user_message",
+      message: {
+        schemaVersion: 1,
+        id,
+        role: "user",
+        content: [{ type: "text", text }],
+        createdAtMs,
+      },
+    });
+    const toolItem = (id: string, path: string, createdAtMs: number) => {
+      const activity = {
+        turnId,
+        call: { id, name: "read_file", arguments: { path }, metadata: {} },
+        state: "completed",
+        result: { success: true, output: path, metadata: {} },
+        startedAtMs: createdAtMs,
+        completedAtMs: createdAtMs + 1,
+        durationMs: 1,
+      };
+      return {
+        schemaVersion: 1,
+        id,
+        turnId,
+        status: "completed",
+        startedAtMs: createdAtMs,
+        completedAtMs: createdAtMs + 1,
+        timelineItems: [{ type: "tool", activity }],
+        type: "tool",
+        activity,
+      };
+    };
+    localStorage.setItem("kcoder_e2e_thread_history", JSON.stringify({
+      schemaVersion: 1,
+      summary: {
+        schemaVersion: 1,
+        id: "thread-1",
+        title: "Steered tools only",
+        createdAtMs: 1,
+        updatedAtMs: 7,
+        archived: false,
+      },
+      lastTurn: { turnId, state: "completed", error: null },
+      todos: [],
+      lastUsage: null,
+      turns: {
+        data: [{
+          schemaVersion: 1,
+          id: turnId,
+          userMessageId: "tools-initial-user",
+          state: "completed",
+          error: null,
+          startedAtMs: 2,
+          completedAtMs: 7,
+          durationMs: 5,
+          itemsView: "full",
+          items: [
+            userItem("tools-initial-user", "检查两个文件。", 2),
+            toolItem("tool-before-steer", "src/before.ts", 3),
+            userItem("tools-steer-user", "改为先检查后一个文件。", 5),
+            toolItem("tool-after-steer", "src/after.ts", 6),
+          ],
+        }],
+        nextCursor: null,
+        backwardsCursor: null,
+      },
+      unscopedItems: [],
+    }));
+  });
+  await page.goto("/");
+
+  await expect(page.locator('article.message--assistant[data-turn-id="turn-steer-tools-only"]')).toHaveCount(2);
+  await expect(page.locator(".turn-timeline-tool")).toHaveCount(2);
+  const listText = await page.locator(".message-list").textContent() ?? "";
+  expect(listText.indexOf("src/before.ts")).toBeLessThan(listText.indexOf("改为先检查后一个文件。"));
+  expect(listText.indexOf("改为先检查后一个文件。")).toBeLessThan(listText.indexOf("src/after.ts"));
+});
+
+test("keeps the pre-steer segment when the original retry owner is on an older page", async ({ page }) => {
+  await page.addInitScript(() => {
+    const turnId = "turn-steer-newer-page";
+    const messageItem = (
+      id: string,
+      role: "user" | "assistant",
+      text: string,
+      createdAtMs: number,
+    ) => ({
+      schemaVersion: 1,
+      id,
+      turnId,
+      status: "completed",
+      startedAtMs: createdAtMs,
+      completedAtMs: createdAtMs,
+      timelineItems: role === "assistant" ? [{ type: "text", id, turnId, text }] : [],
+      type: role === "user" ? "user_message" : "agent_message",
+      message: {
+        schemaVersion: 1,
+        id,
+        role,
+        content: [{ type: "text", text }],
+        createdAtMs,
+      },
+      ...(role === "assistant" ? { phase: "final_answer" } : {}),
+    });
+    localStorage.setItem("kcoder_e2e_thread_history", JSON.stringify({
+      schemaVersion: 1,
+      summary: {
+        schemaVersion: 1,
+        id: "thread-1",
+        title: "Paginated steered retry",
+        createdAtMs: 1,
+        updatedAtMs: 105,
+        archived: false,
+      },
+      lastTurn: { turnId, state: "completed", error: null },
+      todos: [],
+      lastUsage: null,
+      turns: {
+        data: [{
+          schemaVersion: 1,
+          id: turnId,
+          userMessageId: "retry-owner-on-older-page",
+          state: "completed",
+          error: null,
+          startedAtMs: 101,
+          completedAtMs: 105,
+          durationMs: 4,
+          itemsView: "full",
+          items: [
+            messageItem("newer-page-pre-steer", "assistant", "分页中引导前的回复。", 102),
+            messageItem("newer-page-steer-user", "user", "分页中改用另一种方法。", 103),
+            messageItem("newer-page-post-steer", "assistant", "分页中引导后的回复。", 104),
+          ],
+        }],
+        nextCursor: "older-page-cursor",
+        backwardsCursor: null,
+      },
+      unscopedItems: [],
+    }));
+  });
+  await page.goto("/");
+
+  await expect(page.getByText("分页中引导前的回复。", { exact: true })).toHaveCount(1);
+  await expect(page.getByText("分页中引导后的回复。", { exact: true })).toHaveCount(1);
+  const listText = await page.locator(".message-list").textContent() ?? "";
+  expect(listText.indexOf("分页中引导前的回复。")).toBeLessThan(listText.indexOf("分页中改用另一种方法。"));
+  expect(listText.indexOf("分页中改用另一种方法。")).toBeLessThan(listText.indexOf("分页中引导后的回复。"));
+});
+
+test("keeps retry attempts on the correct side of steer boundaries", async ({ page }) => {
+  await page.addInitScript(() => {
+    const messageItem = (
+      turnId: string,
+      id: string,
+      role: "user" | "assistant",
+      text: string,
+      createdAtMs: number,
+    ) => ({
+      schemaVersion: 1,
+      id,
+      turnId,
+      status: "completed",
+      startedAtMs: createdAtMs,
+      completedAtMs: createdAtMs,
+      timelineItems: role === "assistant" ? [{ type: "text", id, turnId, text }] : [],
+      type: role === "user" ? "user_message" : "agent_message",
+      message: {
+        schemaVersion: 1,
+        id,
+        role,
+        content: [{ type: "text", text }],
+        createdAtMs,
+      },
+      ...(role === "assistant" ? { phase: "final_answer" } : {}),
+    });
+    const terminalItem = (turnId: string, kind: "turn_failed" | "turn_completed", createdAtMs: number) => ({
+      schemaVersion: 1,
+      id: `${kind}-${turnId}`,
+      turnId,
+      status: kind === "turn_failed" ? "failed" : "completed",
+      startedAtMs: createdAtMs,
+      completedAtMs: createdAtMs,
+      timelineItems: [{
+        type: "event",
+        itemId: `${kind}-${turnId}`,
+        turnId,
+        kind,
+        title: kind === "turn_failed" ? "Turn 已失败" : "Turn 已完成",
+        detail: kind === "turn_failed" ? "provider failed" : null,
+        durationMs: 1,
+      }],
+      type: "event",
+    });
+    const initialMessageId = "steered-retry-initial-user";
+    const firstTurnId = "turn-steered-retry-first";
+    const secondTurnId = "turn-steered-retry-second";
+    const thirdTurnId = "turn-steered-retry-third";
+    localStorage.setItem("kcoder_e2e_thread_history", JSON.stringify({
+      schemaVersion: 1,
+      summary: {
+        schemaVersion: 1,
+        id: "thread-1",
+        title: "Steered retry grouping",
+        createdAtMs: 1,
+        updatedAtMs: 10,
+        archived: false,
+      },
+      lastTurn: { turnId: thirdTurnId, state: "completed", error: null },
+      todos: [],
+      lastUsage: null,
+      turns: {
+        data: [
+          {
+            schemaVersion: 1,
+            id: thirdTurnId,
+            userMessageId: initialMessageId,
+            state: "completed",
+            error: null,
+            startedAtMs: 8,
+            completedAtMs: 10,
+            durationMs: 2,
+            itemsView: "full",
+            items: [
+              messageItem(thirdTurnId, "steered-retry-third-answer", "assistant", "第三次尝试在引导结束后开始。", 9),
+              terminalItem(thirdTurnId, "turn_completed", 10),
+            ],
+          },
+          {
+            schemaVersion: 1,
+            id: secondTurnId,
+            userMessageId: initialMessageId,
+            state: "completed",
+            error: null,
+            startedAtMs: 4,
+            completedAtMs: 7,
+            durationMs: 3,
+            itemsView: "full",
+            items: [
+              messageItem(secondTurnId, "steered-retry-before", "assistant", "第二次尝试在引导前的回复。", 4),
+              messageItem(secondTurnId, "steered-retry-user", "user", "第二次尝试请改用另一种方法。", 5),
+              messageItem(secondTurnId, "steered-retry-after", "assistant", "第二次尝试在引导后的回复。", 7),
+              terminalItem(secondTurnId, "turn_completed", 7),
+            ],
+          },
+          {
+            schemaVersion: 1,
+            id: firstTurnId,
+            userMessageId: initialMessageId,
+            state: "failed",
+            error: "provider failed",
+            startedAtMs: 1,
+            completedAtMs: 3,
+            durationMs: 2,
+            itemsView: "full",
+            items: [
+              messageItem(firstTurnId, initialMessageId, "user", "请修复这个问题。", 1),
+              messageItem(firstTurnId, "steered-retry-first-answer", "assistant", "第一次尝试的回复。", 2),
+              terminalItem(firstTurnId, "turn_failed", 3),
+            ],
+          },
+        ],
+        nextCursor: null,
+        backwardsCursor: null,
+      },
+      unscopedItems: [],
+    }));
+  });
+  await page.goto("/");
+
+  const retryGroups = page.locator(".message--retry-group");
+  await expect(retryGroups).toHaveCount(2);
+  await expect(page.locator(".message-retry-attempt")).toHaveCount(3);
+  const listText = await page.locator(".message-list").textContent() ?? "";
+  expect(listText.indexOf("第一次尝试的回复。")).toBeLessThan(listText.indexOf("第二次尝试在引导前的回复。"));
+  expect(listText.indexOf("第二次尝试在引导前的回复。")).toBeLessThan(
+    listText.indexOf("第二次尝试请改用另一种方法。"),
+  );
+  expect(listText.indexOf("第二次尝试请改用另一种方法。")).toBeLessThan(
+    listText.indexOf("第二次尝试在引导后的回复。"),
+  );
+  expect(listText.indexOf("第二次尝试在引导后的回复。")).toBeLessThan(
+    listText.indexOf("第三次尝试在引导结束后开始。"),
+  );
+});
+
 test("coalesces multiple assistant projections for the same turn", async ({ page }) => {
   await page.addInitScript(() => {
     const turnId = "turn-overlap";
@@ -5454,4 +6111,35 @@ test("shows the terminal exit state and restarts the session", async ({ page }) 
   const started = await page.evaluate(() => (window as unknown as { __ptyStartRequests: unknown[] }).__ptyStartRequests.length);
   await page.getByRole("button", { name: "重启终端" }).click();
   await expect.poll(() => page.evaluate(() => (window as unknown as { __ptyStartRequests: unknown[] }).__ptyStartRequests.length)).toBe(started + 1);
+});
+
+test("opens the embedded browser panel and keeps the page across tab switches", async ({ page }) => {
+  await page.goto("/");
+  await page.getByRole("button", { name: "工作台", exact: true }).click();
+  await page.getByRole("tab", { name: "浏览器" }).click();
+
+  await expect(page.locator(".browser-empty")).toBeVisible();
+
+  const address = page.getByRole("textbox", { name: "网址" });
+  await address.fill("localhost:1420");
+  await address.press("Enter");
+  await expect(page.locator(".browser-host iframe")).toHaveAttribute("src", "http://localhost:1420");
+  await expect(address).toHaveValue("http://localhost:1420");
+
+  await address.fill("example.com/docs");
+  await address.press("Enter");
+  await expect(page.locator(".browser-host iframe")).toHaveAttribute("src", "https://example.com/docs");
+
+  await page.getByRole("button", { name: "后退" }).click();
+  await expect(page.locator(".browser-host iframe")).toHaveAttribute("src", "http://localhost:1420");
+  await expect(address).toHaveValue("http://localhost:1420");
+
+  await page.getByRole("button", { name: "前进" }).click();
+  await expect(page.locator(".browser-host iframe")).toHaveAttribute("src", "https://example.com/docs");
+
+  await page.getByRole("tab", { name: "文件", exact: true }).click();
+  await expect(page.locator(".browser-host")).toBeHidden();
+  await page.getByRole("tab", { name: "浏览器" }).click();
+  await expect(page.locator(".browser-host iframe")).toBeVisible();
+  await expect(page.locator(".browser-host iframe")).toHaveAttribute("src", "https://example.com/docs");
 });

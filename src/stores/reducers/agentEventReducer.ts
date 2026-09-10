@@ -15,6 +15,7 @@ import type {
   TurnTimelineItem,
   UserInputRequest,
 } from "../../types/runtime";
+import { mergeConversationAttachments } from "./historyProjection";
 
 const MAX_REASONING_SUMMARY_CHARS = 64 * 1024;
 
@@ -40,7 +41,12 @@ export interface ConversationProjectionState {
 }
 
 export interface ReducerHelpers {
-  toConversationMessage: (message: ChatMessage, turnId?: string) => ConversationMessage;
+  toConversationMessage: (
+    message: ChatMessage,
+    turnId?: string,
+    turnTimelineOffset?: number,
+    turnSegmentIndex?: number,
+  ) => ConversationMessage;
   appendTimelineEvent: (
     timeline: TurnTimelineItem[],
     itemId: string,
@@ -160,14 +166,27 @@ export function reduceAgentEvent(
         },
       };
     }
-    case "turn_steered":
+    case "turn_steered": {
+      const turnTimelineOffset = state.turnTimeline.reduce((count, item) => {
+        const turnId = item.type === "tool" ? item.activity.turnId : item.turnId;
+        return count + Number(turnId === event.turnId);
+      }, 0);
+      const steeredMessage = toConversationMessage(
+        event.message,
+        event.turnId,
+        turnTimelineOffset,
+      );
       return {
         state: {
           messages: state.messages.some((message) => message.id === event.message.id)
-            ? state.messages
-            : [...state.messages, toConversationMessage(event.message, event.turnId)],
+            ? state.messages.map((message) => message.id === event.message.id
+              && message.turnTimelineOffset === undefined
+                ? { ...message, turnId: event.turnId, turnTimelineOffset }
+                : message)
+            : [...state.messages, steeredMessage],
         },
       };
+    }
     case "turn_rejected":
       return {
         state: { error: event.message },
@@ -193,8 +212,30 @@ export function reduceAgentEvent(
           : null;
       }
       return null;
-    case "item_completed":
-      return null;
+    case "item_completed": {
+      if (event.itemType !== "tool") return null;
+      const completedAtMs = Date.now();
+      return {
+        state: {
+          turnTimeline: state.turnTimeline.map((item) => item.type === "tool"
+            && item.activity.turnId === event.turnId
+            && item.activity.call.id === event.itemId
+            ? {
+                ...item,
+                activity: {
+                  ...item.activity,
+                  state: event.status,
+                  completedAtMs: item.activity.completedAtMs ?? completedAtMs,
+                  durationMs: item.activity.durationMs
+                    ?? (item.activity.startedAtMs
+                      ? Math.max(0, completedAtMs - item.activity.startedAtMs)
+                      : undefined),
+                },
+              }
+            : item),
+        },
+      };
+    }
     case "activity_status_changed":
       return {
         state: { activityStatus: { turnId: event.turnId, status: event.status } },
@@ -293,6 +334,30 @@ export function reduceAgentEvent(
           ),
         },
       };
+    case "tool_queued": {
+      const activity: ToolActivity = {
+        turnId: event.turnId,
+        call: event.call,
+        state: "pending",
+        result: null,
+      };
+      const hasExisting = state.turnTimeline.some((item) => item.type === "tool"
+        && item.activity.turnId === event.turnId
+        && item.activity.call.id === event.call.id);
+      return {
+        state: {
+          lastTurn: { turnId: event.turnId, state: "running_tool", error: null },
+          activityStatus: { turnId: event.turnId, status: "running_tool" },
+          turnTimeline: hasExisting
+            ? state.turnTimeline.map((item) => item.type === "tool"
+              && item.activity.turnId === event.turnId
+              && item.activity.call.id === event.call.id
+              ? { ...item, activity: { ...item.activity, call: event.call } }
+              : item)
+            : [...state.turnTimeline, { type: "tool", activity }],
+        },
+      };
+    }
     case "tool_started": {
       const startedAtMs = Date.now();
       const activity: ToolActivity = {
@@ -515,7 +580,18 @@ export function reduceAgentEvent(
       };
     case "turn_completed": {
       const completedAtMs = event.completedAtMs ?? Date.now();
-      const finalText = toConversationMessage(event.message, event.turnId).text;
+      const turnSegmentIndex = state.messages.filter((message) => (
+        message.role === "user"
+        && message.turnId === event.turnId
+        && message.turnTimelineOffset !== undefined
+      )).length;
+      const completedMessage = toConversationMessage(
+        event.message,
+        event.turnId,
+        undefined,
+        turnSegmentIndex,
+      );
+      const finalText = completedMessage.text;
       const completedTextItemIndex = state.turnTimeline.findIndex((item) =>
         item.type === "text" && item.turnId === event.turnId && item.id === event.message.id,
       );
@@ -566,9 +642,12 @@ export function reduceAgentEvent(
             message.turnId === event.turnId && message.role === "assistant",
           )
             ? state.messages.map((message) => message.turnId === event.turnId && message.role === "assistant"
-                ? toConversationMessage(event.message, event.turnId)
+                ? {
+                    ...completedMessage,
+                    attachments: mergeConversationAttachments(message.attachments, completedMessage.attachments),
+                  }
                 : message)
-            : [...state.messages, toConversationMessage(event.message, event.turnId)],
+            : [...state.messages, completedMessage],
         },
       };
     }

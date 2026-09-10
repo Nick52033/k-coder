@@ -45,6 +45,10 @@ export interface AttachmentContent {
   ocrError?: string;
 }
 export interface ImageAttachment { name: string; dataUrl: string; ocrText?: string; }
+export interface ConversationImageAttachment extends ImageAttachment {
+  /** Zero-based display segment within a steered turn. */
+  turnSegmentIndex?: number;
+}
 export interface GitFileStatus { path: string; indexStatus: string; worktreeStatus: string; }
 export interface GitStatusView { isRepository: boolean; branch: string | null; upstream: string | null; ahead: number; behind: number; files: GitFileStatus[]; }
 export interface GitBranchView { current: string | null; branches: string[]; }
@@ -193,7 +197,7 @@ export interface CommandSessionView {
 export interface CommandSandboxAudit {
   schemaVersion: number;
   backend: string;
-  capability: "full" | "unsupported" | { partial: { filesystem: boolean; network: boolean; resources: boolean } };
+  capability: "full" | "unsupported" | { partial: { filesystem: boolean; network: boolean; resources: boolean; ui?: boolean } };
   profile: {
     filesystem: "workspace_only" | "workspace_plus_temp" | "full";
     network: "deny" | "allow" | { allow_hosts: string[] };
@@ -864,6 +868,7 @@ export type AgentEvent =
       recentToolResultCount: number;
       recentUserMessageCount?: number;
     })
+  | (EventBase & { type: "tool_queued"; call: ToolCall })
   | (EventBase & { type: "tool_started"; call: ToolCall })
   | (EventBase & {
       type: "tool_output_delta";
@@ -908,9 +913,11 @@ export interface ConversationMessage {
   id: string;
   role: MessageRole;
   text: string;
-  attachments?: ImageAttachment[];
+  attachments?: ConversationImageAttachment[];
   createdAtMs: number;
   turnId?: string;
+  /** Number of this turn's timeline items rendered before a steered user message. */
+  turnTimelineOffset?: number;
   status?: "streaming" | "failed" | "cancelled";
 }
 

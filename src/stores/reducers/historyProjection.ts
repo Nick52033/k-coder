@@ -18,7 +18,12 @@ export interface ProjectedThreadHistory {
   changes: ChangeSet[];
 }
 
-export function toConversationMessage(message: ChatMessage, turnId?: string): ConversationMessage {
+export function toConversationMessage(
+  message: ChatMessage,
+  turnId?: string,
+  turnTimelineOffset?: number,
+  turnSegmentIndex?: number,
+): ConversationMessage {
   return {
     id: message.id,
     role: message.role,
@@ -28,9 +33,10 @@ export function toConversationMessage(message: ChatMessage, turnId?: string): Co
       .join(""),
     attachments: message.content
       .filter((block) => block.type === "image")
-      .map((block) => ({ name: block.name, dataUrl: block.dataUrl })),
+      .map((block) => ({ name: block.name, dataUrl: block.dataUrl, turnSegmentIndex })),
     createdAtMs: message.createdAtMs,
     turnId,
+    turnTimelineOffset,
   };
 }
 
@@ -66,14 +72,111 @@ export function reconcileConversationMessages(
   return reconciled;
 }
 
+export interface SteeredTurnSegment {
+  turnId: string;
+  ownerMessageId: string;
+  index: number;
+  timeline: TurnTimelineItem[];
+  isLast: boolean;
+}
+
+export function buildSteeredTurnSegments(
+  messages: ConversationMessage[],
+  timeline: TurnTimelineItem[],
+  turnUserMessageIds: Record<string, string>,
+) {
+  const messageIds = new Set(messages.map((message) => message.id));
+  const timelineByTurn = new Map<string, TurnTimelineItem[]>();
+  for (const item of timeline) {
+    const turnId = item.type === "tool" ? item.activity.turnId : item.turnId;
+    const turnItems = timelineByTurn.get(turnId) ?? [];
+    turnItems.push(item);
+    timelineByTurn.set(turnId, turnItems);
+  }
+
+  const boundariesByTurn = new Map<string, Array<{
+    messageId: string;
+    offset: number;
+    messageIndex: number;
+  }>>();
+  messages.forEach((message, messageIndex) => {
+    if (message.role !== "user" || !message.turnId) return;
+    if (typeof message.turnTimelineOffset !== "number" || !Number.isFinite(message.turnTimelineOffset)) return;
+    const initialMessageId = turnUserMessageIds[message.turnId];
+    if (!initialMessageId || initialMessageId === message.id) return;
+    const boundaries = boundariesByTurn.get(message.turnId) ?? [];
+    boundaries.push({
+      messageId: message.id,
+      offset: Math.max(0, Math.trunc(message.turnTimelineOffset)),
+      messageIndex,
+    });
+    boundariesByTurn.set(message.turnId, boundaries);
+  });
+
+  const segmentsByMessageId = new Map<string, SteeredTurnSegment[]>();
+  const leadingSegmentsByMessageId = new Map<string, SteeredTurnSegment[]>();
+  const segmentsByTurnId = new Map<string, SteeredTurnSegment[]>();
+  const turnIds = new Set<string>();
+  for (const [turnId, boundaries] of boundariesByTurn) {
+    const turnTimeline = timelineByTurn.get(turnId) ?? [];
+    boundaries.sort((left, right) => left.offset - right.offset || left.messageIndex - right.messageIndex);
+    const owners = [turnUserMessageIds[turnId], ...boundaries.map((boundary) => boundary.messageId)];
+    const offsets = [0, ...boundaries.map((boundary) => Math.min(boundary.offset, turnTimeline.length))];
+    for (let index = 0; index < owners.length; index += 1) {
+      const start = Math.max(offsets[index], index > 0 ? offsets[index - 1] : 0);
+      const requestedEnd = index + 1 < offsets.length ? offsets[index + 1] : turnTimeline.length;
+      const end = Math.max(start, requestedEnd);
+      const ownerMessageId = owners[index];
+      const segment = {
+        turnId,
+        ownerMessageId,
+        index,
+        timeline: turnTimeline.slice(start, end),
+        isLast: index === owners.length - 1,
+      };
+      const ownerSegments = segmentsByMessageId.get(ownerMessageId) ?? [];
+      ownerSegments.push(segment);
+      segmentsByMessageId.set(ownerMessageId, ownerSegments);
+      const turnSegments = segmentsByTurnId.get(turnId) ?? [];
+      turnSegments.push(segment);
+      segmentsByTurnId.set(turnId, turnSegments);
+    }
+    if (!messageIds.has(owners[0]) && boundaries.length > 0) {
+      const firstBoundaryMessageId = boundaries[0].messageId;
+      const leadingSegments = leadingSegmentsByMessageId.get(firstBoundaryMessageId) ?? [];
+      leadingSegments.push(segmentsByTurnId.get(turnId)![0]);
+      leadingSegmentsByMessageId.set(firstBoundaryMessageId, leadingSegments);
+    }
+    turnIds.add(turnId);
+  }
+
+  return { segmentsByMessageId, leadingSegmentsByMessageId, segmentsByTurnId, turnIds };
+}
+
 function preferredConversationMessage(
   current: ConversationMessage,
   candidate: ConversationMessage,
 ) {
   const currentRank = conversationMessageRank(current);
   const candidateRank = conversationMessageRank(candidate);
-  if (candidateRank !== currentRank) return candidateRank > currentRank ? candidate : current;
-  return candidate.createdAtMs >= current.createdAtMs ? candidate : current;
+  const preferred = candidateRank !== currentRank
+    ? candidateRank > currentRank ? candidate : current
+    : candidate.createdAtMs >= current.createdAtMs ? candidate : current;
+  const attachments = mergeConversationAttachments(current.attachments, candidate.attachments);
+  return attachments.length ? { ...preferred, attachments } : preferred;
+}
+
+export function mergeConversationAttachments(
+  ...groups: Array<ConversationMessage["attachments"]>
+) {
+  const attachments = new Map<string, NonNullable<ConversationMessage["attachments"]>[number]>();
+  for (const group of groups) {
+    for (const attachment of group ?? []) {
+      const key = `${attachment.name}\u0000${attachment.dataUrl}\u0000${attachment.turnSegmentIndex ?? ""}`;
+      if (!attachments.has(key)) attachments.set(key, attachment);
+    }
+  }
+  return [...attachments.values()];
 }
 
 function conversationMessageRank(message: ConversationMessage) {
@@ -125,13 +228,30 @@ export function projectHistoryTurns(
   const userInputIds = new Set<string>();
   const changeIds = new Set<string>();
 
-  const projectItem = (item: ThreadItem, turnId?: string) => {
+  const turnTimelineCounts = new Map<string, number>();
+  const turnSegmentIndexes = new Map<string, number>();
+
+  const projectItem = (
+    item: ThreadItem,
+    turnId?: string,
+    turnTimelineOffset?: number,
+    turnSegmentIndex?: number,
+  ) => {
     if (item.type === "user_message" && !messageIds.has(item.message.id)) {
       messageIds.add(item.message.id);
-      projected.messages.push(toConversationMessage(item.message));
+      projected.messages.push(toConversationMessage(
+        item.message,
+        turnId ?? item.turnId ?? undefined,
+        turnTimelineOffset,
+      ));
     } else if (item.type === "agent_message" && item.phase === "final_answer" && !messageIds.has(item.message.id)) {
       messageIds.add(item.message.id);
-      projected.messages.push(toConversationMessage(item.message, turnId ?? item.turnId ?? undefined));
+      projected.messages.push(toConversationMessage(
+        item.message,
+        turnId ?? item.turnId ?? undefined,
+        undefined,
+        turnSegmentIndex,
+      ));
     } else if (item.type === "approval" && !approvalIds.has(item.approval.request.id)) {
       approvalIds.add(item.approval.request.id);
       projected.approvals.push(item.approval);
@@ -148,13 +268,25 @@ export function projectHistoryTurns(
       if (timelineIds.has(key)) continue;
       timelineIds.add(key);
       projected.turnTimeline.push(timelineItem);
+      const timelineTurnId = timelineItem.type === "tool"
+        ? timelineItem.activity.turnId
+        : timelineItem.turnId;
+      turnTimelineCounts.set(timelineTurnId, (turnTimelineCounts.get(timelineTurnId) ?? 0) + 1);
     }
   };
 
   for (const turn of turns) {
     if (turn.userMessageId) projected.turnUserMessageIds[turn.id] = turn.userMessageId;
     for (const item of turn.items) {
-      projectItem(item, turn.id);
+      const isSteeredUserMessage = item.type === "user_message"
+        && turn.userMessageId !== null
+        && item.message.id !== turn.userMessageId;
+      const turnTimelineOffset = isSteeredUserMessage
+        ? turnTimelineCounts.get(turn.id) ?? 0
+        : undefined;
+      const turnSegmentIndex = turnSegmentIndexes.get(turn.id) ?? 0;
+      projectItem(item, turn.id, turnTimelineOffset, turnSegmentIndex);
+      if (isSteeredUserMessage) turnSegmentIndexes.set(turn.id, turnSegmentIndex + 1);
     }
   }
   for (const item of unscopedItems) projectItem(item);

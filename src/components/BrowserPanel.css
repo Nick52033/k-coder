@@ -1,0 +1,99 @@
+.browser-view {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  flex-direction: column;
+}
+
+.browser-toolbar {
+  gap: 4px;
+  align-items: center;
+}
+
+.browser-address {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  height: 26px;
+  align-items: center;
+  gap: 6px;
+  padding: 0 8px;
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+  color: var(--color-ink-muted);
+  background: var(--color-surface-raised);
+}
+
+.browser-address:focus-within {
+  border-color: var(--color-brand);
+}
+
+.browser-address input {
+  flex: 1;
+  min-width: 0;
+  border: 0;
+  outline: none;
+  color: var(--color-ink);
+  background: transparent;
+  font-size: 12px;
+}
+
+.browser-host {
+  flex: 1;
+  min-height: 0;
+}
+
+.browser-host iframe {
+  width: 100%;
+  height: 100%;
+  border: 0;
+  background: #ffffff;
+}
+
+.browser-empty {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 24px 20px;
+  color: var(--color-ink-subtle);
+  text-align: center;
+}
+
+.browser-empty strong {
+  color: var(--color-ink);
+  font-size: var(--font-size-base, 13px);
+}
+
+.browser-empty p {
+  margin: 4px 0 0;
+  font-size: var(--font-size-sm, 12px);
+}
+
+.browser-empty code {
+  padding: 1px 5px;
+  border: 1px solid var(--color-border);
+  border-radius: 4px;
+  background: var(--color-surface-hover);
+}
+
+.browser-empty small {
+  max-width: 320px;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.browser-spinner {
+  animation: browser-spin 800ms linear infinite;
+}
+
+@keyframes browser-spin {
+  to { transform: rotate(360deg); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .browser-spinner { animation: none; }
+}

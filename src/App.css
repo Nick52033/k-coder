@@ -5216,7 +5216,7 @@ button {
 .workbench--panel-open .workbench-panel > * {
   min-width: 0;
 }
-.workbench-tabs { display: grid; grid-template-columns: repeat(3,1fr); border-bottom: 1px solid var(--color-border); }
+.workbench-tabs { display: grid; grid-template-columns: repeat(4,1fr); border-bottom: 1px solid var(--color-border); }
 .workbench-tabs button { display: flex; min-width: 0; align-items: center; justify-content: center; gap: 5px; border: 0; border-bottom: 2px solid transparent; color: var(--color-ink-subtle); background: transparent; cursor: pointer; font-size: var(--font-size-sm); }
 .workbench-tabs button.active { border-bottom-color: var(--color-brand); color: var(--color-brand); font-weight: 600; }
 .files-view, .git-view { display: flex; min-height: 0; flex-direction: column; overflow: hidden; }

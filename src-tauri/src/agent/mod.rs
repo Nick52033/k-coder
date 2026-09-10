@@ -2028,6 +2028,11 @@ impl AgentRuntime {
                     &publisher,
                 )
                 .await?;
+                publisher.publish(AgentEventEnvelope::new(AgentEvent::ToolQueued {
+                    thread_id: thread_id.clone(),
+                    turn_id: turn_id.clone(),
+                    call: call.clone(),
+                }));
             }
 
             let mut stop_reason: Option<String> = None;
@@ -5515,6 +5520,7 @@ mod tests {
             .unwrap()
             .iter()
             .filter_map(|event| match &event.event {
+                AgentEvent::ToolQueued { call, .. } => Some(format!("queued:{}", call.id)),
                 AgentEvent::ToolStarted { call, .. } => Some(format!("started:{}", call.id)),
                 AgentEvent::ToolCompleted { call_id, .. } => Some(format!("completed:{call_id}")),
                 _ => None,
@@ -5523,6 +5529,8 @@ mod tests {
         assert_eq!(
             lifecycle,
             [
+                "queued:slow",
+                "queued:fast",
                 "started:slow",
                 "completed:slow",
                 "started:fast",

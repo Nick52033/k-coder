@@ -111,31 +111,41 @@ pub enum SandboxCapability {
         filesystem: bool,
         network: bool,
         resources: bool,
+        /// `UiPolicy::Deny` 要求后端能限制弹窗、剪贴板、桌面切换和退出 Windows。
+        /// 该字段可缺省，旧审计记录缺少它时按“不具备”处理。
+        #[serde(default)]
+        ui: bool,
     },
     Unsupported,
 }
 
 impl SandboxCapability {
     /// 平台后端能否兑现这个 profile。能力不足必须由调用方决定拒绝还是降级。
+    ///
+    /// profile 的四个维度都必须有对应的能力声明；漏掉任何一维都会让后端声称
+    /// 兑现自己根本做不到的隔离，从而使 fail-closed 失效。
     pub fn supports(&self, profile: &SandboxProfile) -> bool {
         if !profile.requires_isolation() {
             return true;
         }
-        let (filesystem, network, resources) = match self {
+        let (filesystem, network, resources, ui) = match self {
             Self::Full => return true,
             Self::Partial {
                 filesystem,
                 network,
                 resources,
-            } => (*filesystem, *network, *resources),
+                ui,
+            } => (*filesystem, *network, *resources, *ui),
             Self::Unsupported => return false,
         };
         let needs_filesystem = profile.filesystem != FileSystemPolicy::Full;
         let needs_network = !matches!(profile.network, NetworkPolicy::Allow);
         let needs_resources = profile.resources != ResourceLimits::default();
+        let needs_ui = profile.ui != UiPolicy::Allow;
         (!needs_filesystem || filesystem)
             && (!needs_network || network)
             && (!needs_resources || resources)
+            && (!needs_ui || ui)
     }
 }
 
@@ -147,9 +157,10 @@ impl std::fmt::Display for SandboxCapability {
                 filesystem,
                 network,
                 resources,
+                ui,
             } => write!(
                 formatter,
-                "partial(filesystem={filesystem},network={network},resources={resources})"
+                "partial(filesystem={filesystem},network={network},resources={resources},ui={ui})"
             ),
             Self::Unsupported => formatter.write_str("unsupported"),
         }
@@ -460,6 +471,7 @@ mod tests {
                 filesystem: true,
                 network: false,
                 resources: false,
+                ui: false,
             },
             applied: StdMutex::new(0),
         };
@@ -483,6 +495,64 @@ mod tests {
                 .unwrap_err(),
             SandboxError::Unavailable(_)
         ));
+    }
+
+    #[test]
+    fn partial_backend_without_ui_limits_cannot_serve_risk_profiles() {
+        // `for_risk` 派生的 profile 恒为 `ui: Deny`，后端必须显式声明该能力。
+        let backend = StubBackend {
+            name: "no-ui",
+            capability: SandboxCapability::Partial {
+                filesystem: true,
+                network: true,
+                resources: true,
+                ui: false,
+            },
+            applied: StdMutex::new(0),
+        };
+        let gate = SandboxGate::new(Arc::new(backend)).with_degraded_execution(false);
+        let error = gate
+            .prepare(
+                &mut command(),
+                &SandboxProfile::for_risk(&CommandRisk::ReadOnly),
+            )
+            .unwrap_err();
+        match error {
+            SandboxError::Unavailable(unavailable) => {
+                assert_eq!(unavailable.backend, "no-ui");
+                assert_eq!(
+                    unavailable.capability,
+                    SandboxCapability::Partial {
+                        filesystem: true,
+                        network: true,
+                        resources: true,
+                        ui: false,
+                    }
+                );
+            }
+            other => panic!("unexpected error: {other}"),
+        }
+        // 声明 UI 能力之后，同一 profile 可以真正应用。
+        let backend = StubBackend {
+            name: "with-ui",
+            capability: SandboxCapability::Partial {
+                filesystem: true,
+                network: true,
+                resources: true,
+                ui: true,
+            },
+            applied: StdMutex::new(0),
+        };
+        let gate = SandboxGate::new(Arc::new(backend)).with_degraded_execution(false);
+        assert_eq!(
+            gate.prepare(
+                &mut command(),
+                &SandboxProfile::for_risk(&CommandRisk::ReadOnly)
+            )
+            .unwrap()
+            .outcome,
+            SandboxOutcome::Applied
+        );
     }
 
     #[test]

@@ -35,8 +35,8 @@ use crate::knowledge::{
 };
 use crate::logging::{LogQuery, LogQueryResult};
 use crate::multi_agent::{
-    CreateSubagentRequest, MultiAgentError, SubagentEventPublisher, SubagentExecutionContext,
-    SubagentView, delegation_tools,
+    CreateSubagentRequest, MultiAgentCoordinator, MultiAgentError, SubagentEventPublisher,
+    SubagentExecutionContext, SubagentView, delegation_tools,
 };
 use crate::ocr::{self, OcrResult};
 use crate::persistence::ProjectRecord;
@@ -407,13 +407,27 @@ impl SubagentEventPublisher for TauriSubagentEventPublisher {
     }
 }
 
+struct SubagentPublishers {
+    agent_events: Arc<dyn EventPublisher>,
+    lifecycle_events: Arc<dyn SubagentEventPublisher>,
+}
+
+impl SubagentPublishers {
+    fn tauri(app: &AppHandle) -> Self {
+        Self {
+            agent_events: Arc::new(TauriEventPublisher { app: app.clone() }),
+            lifecycle_events: Arc::new(TauriSubagentEventPublisher { app: app.clone() }),
+        }
+    }
+}
+
 fn subagent_context(
-    app: &AppHandle,
     state: &AppState,
     provider: Arc<dyn crate::providers::Provider>,
     model: String,
     context_limit: usize,
     tools: crate::tools::ToolRegistry,
+    publishers: SubagentPublishers,
 ) -> SubagentExecutionContext {
     SubagentExecutionContext {
         repository: state.repository(),
@@ -425,9 +439,39 @@ fn subagent_context(
         approvals: state.approvals(),
         approval_mode: state.approval_mode(),
         reasoning_effort: state.reasoning_effort(),
-        agent_events: Arc::new(TauriEventPublisher { app: app.clone() }),
-        lifecycle_events: Arc::new(TauriSubagentEventPublisher { app: app.clone() }),
+        agent_events: publishers.agent_events,
+        lifecycle_events: publishers.lifecycle_events,
         logger: Some(state.logger()),
+    }
+}
+
+struct PreparedTurnTools {
+    registry: crate::tools::ToolRegistry,
+    names: Vec<String>,
+}
+
+impl PreparedTurnTools {
+    fn new(registry: crate::tools::ToolRegistry) -> Self {
+        let names = registry.definition_names();
+        Self { registry, names }
+    }
+
+    fn with_delegation(
+        base_tools: crate::tools::ToolRegistry,
+        manager: MultiAgentCoordinator,
+        context: SubagentExecutionContext,
+        parent_thread_id: String,
+        parent_cancellation: CancellationToken,
+    ) -> Result<Self, crate::tools::ToolError> {
+        let (handlers, risks) =
+            delegation_tools(manager, context, parent_thread_id, parent_cancellation);
+        base_tools
+            .with_additional_handlers(handlers, risks)
+            .map(Self::new)
+    }
+
+    fn into_parts(self) -> (crate::tools::ToolRegistry, Vec<String>) {
+        (self.registry, self.names)
     }
 }
 
@@ -1911,6 +1955,7 @@ async fn drain_thread_mailbox(app: AppHandle, thread_id: String) {
                     Some(handle.turn_id),
                     Some(operation_guard),
                     publisher.clone(),
+                    SubagentPublishers::tauri(&app),
                 )
                 .await
             }
@@ -2245,7 +2290,6 @@ async fn execute_turn(
             .map_err(|error| CommandError::new("workspace_tools", error))?
     };
 
-    let tool_names = base_tools.definition_names();
     let goal_budget = advanced
         .goals
         .turn_budget(&thread_id)
@@ -2289,14 +2333,6 @@ async fn execute_turn(
             .start_or_resume(&thread_id, workflow_id, objective)
             .map_err(|error| CommandError::new("workflow", error))?;
     }
-    let runtime_instruction_provider = live_runtime_instruction_provider(
-        state,
-        thread_id.clone(),
-        request.input.clone(),
-        project_workspace.clone(),
-        mode_instructions,
-        tool_names,
-    );
     let turn_id = assigned_turn_id.unwrap_or_else(|| Uuid::new_v4().to_string());
     let begin_result = match operation_guard.as_ref() {
         Some(operation_guard) => {
@@ -2325,22 +2361,22 @@ async fn execute_turn(
             cancellation.cancel();
         })
     });
-    let tools = if has_project {
+    let prepared_tools = if has_project {
         let child_context = subagent_context(
-            &app,
             &state,
             provider.clone(),
             model.clone(),
             context_limit,
             base_tools.clone(),
+            SubagentPublishers::tauri(&app),
         );
-        let (agent_handlers, agent_risks) = delegation_tools(
+        match PreparedTurnTools::with_delegation(
+            base_tools,
             state.subagents(),
             child_context,
             thread_id.clone(),
             cancellation.child_token(),
-        );
-        match base_tools.with_additional_handlers(agent_handlers, agent_risks) {
+        ) {
             Ok(tools) => tools,
             Err(error) => {
                 if let Some(timeout) = goal_timeout {
@@ -2351,8 +2387,17 @@ async fn execute_turn(
             }
         }
     } else {
-        base_tools
+        PreparedTurnTools::new(base_tools)
     };
+    let (tools, tool_names) = prepared_tools.into_parts();
+    let runtime_instruction_provider = live_runtime_instruction_provider(
+        state,
+        thread_id.clone(),
+        request.input.clone(),
+        project_workspace.clone(),
+        mode_instructions,
+        tool_names,
+    );
     let mut runtime = AgentRuntime::with_tools_and_approvals(
         state.runtime_repository(),
         tools,
@@ -2418,7 +2463,15 @@ pub async fn retry_turn(
     thread_id: String,
 ) -> CommandResult<TurnOutcome> {
     let publisher: Arc<dyn EventPublisher> = Arc::new(TauriEventPublisher { app: app.clone() });
-    execute_retry(state.inner(), thread_id, None, None, publisher).await
+    execute_retry(
+        state.inner(),
+        thread_id,
+        None,
+        None,
+        publisher,
+        SubagentPublishers::tauri(&app),
+    )
+    .await
 }
 
 async fn execute_retry(
@@ -2427,6 +2480,7 @@ async fn execute_retry(
     assigned_turn_id: Option<String>,
     operation_guard: Option<ThreadOperationGuard>,
     publisher: Arc<dyn EventPublisher>,
+    subagent_publishers: SubagentPublishers,
 ) -> CommandResult<TurnOutcome> {
     let project_workspace = state
         .resolve_thread_workspace(&thread_id)
@@ -2493,15 +2547,6 @@ async fn execute_retry(
         tools_without_project(mode_tools)
             .map_err(|error| CommandError::new("workspace_tools", error))?
     };
-    let tool_names = base_tools.definition_names();
-    let runtime_instruction_provider = live_runtime_instruction_provider(
-        state,
-        thread_id.clone(),
-        retry_input,
-        project_workspace.clone(),
-        mode_instructions,
-        tool_names,
-    );
     let goal_budget = advanced
         .goals
         .turn_budget(&thread_id)
@@ -2566,9 +2611,46 @@ async fn execute_retry(
             cancellation.cancel();
         })
     });
+    let prepared_tools = if has_project {
+        let child_context = subagent_context(
+            &state,
+            provider.clone(),
+            model.clone(),
+            context_limit,
+            base_tools.clone(),
+            subagent_publishers,
+        );
+        match PreparedTurnTools::with_delegation(
+            base_tools,
+            state.subagents(),
+            child_context,
+            thread_id.clone(),
+            cancellation.child_token(),
+        ) {
+            Ok(tools) => tools,
+            Err(error) => {
+                if let Some(timeout) = goal_timeout {
+                    timeout.abort();
+                }
+                state.finish_turn(&thread_id).await;
+                return Err(CommandError::new("multi_agent", error));
+            }
+        }
+    } else {
+        PreparedTurnTools::new(base_tools)
+    };
+    let (tools, tool_names) = prepared_tools.into_parts();
+    let runtime_instruction_provider = live_runtime_instruction_provider(
+        state,
+        thread_id.clone(),
+        retry_input,
+        project_workspace.clone(),
+        mode_instructions,
+        tool_names,
+    );
     let mut runtime = AgentRuntime::with_tools_and_approvals(
         state.runtime_repository(),
-        base_tools,
+        tools,
         workspace_root,
         state.approvals(),
     )
@@ -2649,12 +2731,12 @@ pub async fn create_subagent(
         .build_provider()
         .map_err(|error| CommandError::new("provider_config", error))?;
     let context = subagent_context(
-        &app,
-        &state,
+        state.inner(),
         provider,
         model,
         context_limit,
         state.tool_registry(),
+        SubagentPublishers::tauri(&app),
     );
     state
         .subagents()
@@ -2696,12 +2778,12 @@ pub async fn send_subagent_message(
         .build_provider()
         .map_err(|error| CommandError::new("provider_config", error))?;
     let context = subagent_context(
-        &app,
-        &state,
+        state.inner(),
         provider,
         model,
         context_limit,
         state.tool_registry(),
+        SubagentPublishers::tauri(&app),
     );
     state
         .subagents()
@@ -2721,12 +2803,12 @@ pub async fn resume_subagent(
         .build_provider()
         .map_err(|error| CommandError::new("provider_config", error))?;
     let context = subagent_context(
-        &app,
-        &state,
+        state.inner(),
         provider,
         model,
         context_limit,
         state.tool_registry(),
+        SubagentPublishers::tauri(&app),
     );
     state
         .subagents()
@@ -3039,22 +3121,41 @@ async fn enrich_image_attachments(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::path::Path;
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     use base64::Engine;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::sync::mpsc;
+    use tokio_util::sync::CancellationToken;
+    use uuid::Uuid;
 
     use super::{
-        CRAFT_MODE_INSTRUCTIONS, CommandError, TurnStartPublisher, build_system_prompt,
+        CRAFT_MODE_INSTRUCTIONS, CommandError, PROJECT_FREE_TOOL_NAMES, PreparedTurnTools,
+        SubagentPublishers, TurnStartPublisher, build_system_prompt, execute_retry,
         extract_local_document, ordinary_turn_soft_limits, plugin_command_error,
         preflight_requested_or_active_workflow, require_project_thread_for_subagent,
         require_project_thread_for_workflow, require_queued_workflow_steerable, retry_mode,
         tools_for_mode, tools_without_project, validate_workflow_turn_context,
     };
-    use crate::agent::EventPublisher;
+    use crate::agent::mailbox::{MailboxTurn, MailboxTurnKind};
+    use crate::agent::{AgentRuntime, EventPublisher, RunTurnRequest};
     use crate::app_state::AppState;
-    use crate::protocol::{AgentEvent, AgentEventEnvelope, AgentMode, PROTOCOL_VERSION};
-    use crate::storage::{StoredEvent, StoredEventKind, ThreadSummary};
+    use crate::multi_agent::{
+        MultiAgentCoordinator, NoopSubagentPublisher, SubagentExecutionContext,
+    };
+    use crate::policy::ApprovalManager;
+    use crate::protocol::{
+        AgentEvent, AgentEventEnvelope, AgentMode, ApprovalMode, PROTOCOL_VERSION, ReasoningEffort,
+    };
+    use crate::providers::{
+        CredentialError, CredentialStore, ProviderError, ProviderKind, ProviderModelConfig,
+        ProviderTransport, SaveProviderConfigRequest, testing::FakeProvider,
+    };
+    use crate::storage::{JsonlThreadRepository, StoredEvent, StoredEventKind, ThreadSummary};
     use crate::{patch::PatchService, tools::ToolRegistry};
 
     #[derive(Default)]
@@ -3074,6 +3175,376 @@ mod tests {
         fn publish(&self, event: AgentEventEnvelope) {
             self.events.lock().unwrap().push(event);
         }
+    }
+
+    fn test_subagent_publishers() -> SubagentPublishers {
+        SubagentPublishers {
+            agent_events: Arc::new(RecordingPublisher::default()),
+            lifecycle_events: Arc::new(NoopSubagentPublisher),
+        }
+    }
+
+    #[derive(Default)]
+    struct TestCredentials {
+        api_keys: Mutex<HashMap<String, String>>,
+    }
+
+    impl CredentialStore for TestCredentials {
+        fn get_api_key(&self, provider_id: &str) -> Result<Option<String>, CredentialError> {
+            Ok(self.api_keys.lock().unwrap().get(provider_id).cloned())
+        }
+
+        fn set_api_key(&self, provider_id: &str, api_key: &str) -> Result<(), CredentialError> {
+            self.api_keys
+                .lock()
+                .unwrap()
+                .insert(provider_id.to_string(), api_key.to_string());
+            Ok(())
+        }
+
+        fn delete_api_key(&self, provider_id: &str) -> Result<(), CredentialError> {
+            self.api_keys.lock().unwrap().remove(provider_id);
+            Ok(())
+        }
+    }
+
+    async fn read_test_http_json(stream: &mut TcpStream) -> serde_json::Value {
+        let mut request = Vec::new();
+        let header_end = loop {
+            let mut chunk = [0_u8; 4096];
+            let read = stream.read(&mut chunk).await.unwrap();
+            assert!(read > 0, "request ended before its headers");
+            request.extend_from_slice(&chunk[..read]);
+            if let Some(index) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                break index + 4;
+            }
+        };
+        let headers = std::str::from_utf8(&request[..header_end]).unwrap();
+        let content_length = headers
+            .lines()
+            .filter_map(|line| line.split_once(':'))
+            .find_map(|(name, value)| {
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().unwrap())
+            })
+            .unwrap();
+        while request.len() < header_end + content_length {
+            let mut chunk = [0_u8; 4096];
+            let read = stream.read(&mut chunk).await.unwrap();
+            assert!(read > 0, "request ended before its body");
+            request.extend_from_slice(&chunk[..read]);
+        }
+        serde_json::from_slice(&request[header_end..header_end + content_length]).unwrap()
+    }
+
+    async fn spawn_retry_provider_server(
+        request_count: usize,
+    ) -> (
+        String,
+        mpsc::Receiver<serde_json::Value>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (sender, receiver) = mpsc::channel(request_count);
+        let body = concat!(
+            r#"data: {"choices":[{"delta":{"content":"retry complete"},"finish_reason":"stop"}]}"#,
+            "\n\n",
+            "data: [DONE]\n\n"
+        );
+        let server = tokio::spawn(async move {
+            for _ in 0..request_count {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                sender
+                    .send(read_test_http_json(&mut stream).await)
+                    .await
+                    .unwrap();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        (format!("http://{address}/v1"), receiver, server)
+    }
+
+    fn provider_tool_names(payload: &serde_json::Value) -> Vec<String> {
+        payload["tools"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|tool| tool["function"]["name"].as_str().map(str::to_string))
+            .collect()
+    }
+
+    fn disclosed_tool_names(payload: &serde_json::Value) -> Vec<String> {
+        let prompt = payload["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|message| message["role"] == "system")
+            .filter_map(|message| message["content"].as_str())
+            .find(|content| content.contains("<available_tools>"))
+            .unwrap();
+        prompt
+            .split("<available_tools>\n")
+            .nth(1)
+            .and_then(|section| section.split("\n</available_tools>").next())
+            .unwrap()
+            .lines()
+            .map(|line| line.strip_prefix("- ").unwrap().to_string())
+            .collect()
+    }
+
+    async fn seed_failed_turn(state: &AppState, thread_id: &str, workspace: &Path) {
+        let runtime = AgentRuntime::with_tools(
+            state.repository(),
+            ToolRegistry::read_only(),
+            workspace.to_path_buf(),
+        );
+        let _ = runtime
+            .run_turn(
+                Arc::new(FakeProvider::new(vec![Err(
+                    ProviderError::InvalidResponse("intentional retry fixture failure".into()),
+                )])),
+                "fixture".into(),
+                RunTurnRequest {
+                    thread_id: thread_id.to_string(),
+                    input: "Use a subagent for this inspection.".into(),
+                    agent_mode: Some("craft".into()),
+                },
+                CancellationToken::new(),
+                Arc::new(RecordingPublisher::default()),
+            )
+            .await;
+        assert_eq!(
+            state
+                .repository()
+                .read_thread(thread_id)
+                .await
+                .unwrap()
+                .last_turn
+                .unwrap()
+                .state,
+            crate::protocol::TurnState::Failed
+        );
+    }
+
+    fn prepared_project_turn_tools() -> (tempfile::TempDir, PreparedTurnTools) {
+        let data = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let repository = Arc::new(JsonlThreadRepository::new(data.path()).unwrap());
+        let base_tools = ToolRegistry::read_only();
+        let context = SubagentExecutionContext {
+            repository,
+            provider: Arc::new(FakeProvider::text(&["unused"])),
+            model: "fixture".into(),
+            context_limit: crate::context::DEFAULT_CONTEXT_LIMIT,
+            tools: base_tools.clone(),
+            workspace_root: workspace.path().to_path_buf(),
+            approvals: Arc::new(ApprovalManager::new(Duration::from_secs(1))),
+            approval_mode: ApprovalMode::Ask,
+            reasoning_effort: ReasoningEffort::default(),
+            agent_events: Arc::new(RecordingPublisher::default()),
+            lifecycle_events: Arc::new(NoopSubagentPublisher),
+            logger: None,
+        };
+        let tools = PreparedTurnTools::with_delegation(
+            base_tools,
+            MultiAgentCoordinator::new(data.path()).unwrap(),
+            context,
+            "parent-thread".into(),
+            CancellationToken::new(),
+        )
+        .unwrap();
+        drop(workspace);
+        (data, tools)
+    }
+
+    #[test]
+    fn project_turn_tools_expose_every_delegation_operation() {
+        let (_data, tools) = prepared_project_turn_tools();
+
+        for expected in [
+            "close_agent",
+            "create_agent",
+            "list_agents",
+            "resume_agent",
+            "send_agent_message",
+            "wait_agent",
+        ] {
+            assert!(
+                tools.names.iter().any(|name| name == expected),
+                "project turn should expose {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn system_prompt_discloses_the_final_provider_tool_set() {
+        let (_data, tools) = prepared_project_turn_tools();
+        let provider_names = tools
+            .registry
+            .provider_definitions()
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect::<Vec<_>>();
+        let prompt = build_system_prompt(
+            Some(Path::new(r"D:\code\k-coder")),
+            "",
+            "",
+            "",
+            "",
+            &tools.names,
+        );
+        let disclosed_names = prompt
+            .split("<available_tools>\n")
+            .nth(1)
+            .and_then(|section| section.split("\n</available_tools>").next())
+            .unwrap()
+            .lines()
+            .map(|line| line.strip_prefix("- ").unwrap().to_string())
+            .collect::<Vec<_>>();
+
+        assert_eq!(disclosed_names, provider_names);
+    }
+
+    #[tokio::test]
+    async fn direct_mailbox_and_standalone_retries_use_the_final_scoped_tool_registry() {
+        let data = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let (base_url, mut requests, server) = spawn_retry_provider_server(3).await;
+        let state =
+            AppState::with_credentials(data.path(), Arc::new(TestCredentials::default())).unwrap();
+        state
+            .save_provider_config(SaveProviderConfigRequest {
+                id: "retry-contract".into(),
+                kind: ProviderKind::OpenAiCompatible,
+                transport: ProviderTransport::OpenAiChatCompletions,
+                name: "Retry contract fixture".into(),
+                base_url,
+                model: "fixture".into(),
+                models: vec![ProviderModelConfig {
+                    id: "fixture".into(),
+                    display_name: "Fixture".into(),
+                    context_window: 128_000,
+                    max_output_tokens: Some(256),
+                    supports_vision: false,
+                    fallback: false,
+                }],
+                endpoints: Vec::new(),
+                api_key: Some("fixture-key".into()),
+                activate: true,
+            })
+            .unwrap();
+        state.switch_workspace(workspace.path()).await.unwrap();
+
+        let direct_project = state
+            .repository()
+            .create_thread_in_workspace(workspace.path())
+            .await
+            .unwrap();
+        let standalone = state.repository().create_standalone_thread().await.unwrap();
+        let mailbox_project = state
+            .repository()
+            .create_thread_in_workspace(workspace.path())
+            .await
+            .unwrap();
+        for thread in [&direct_project, &standalone, &mailbox_project] {
+            seed_failed_turn(&state, &thread.id, workspace.path()).await;
+        }
+
+        let direct = execute_retry(
+            &state,
+            direct_project.id.clone(),
+            None,
+            None,
+            Arc::new(RecordingPublisher::default()),
+            test_subagent_publishers(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(direct.state, crate::protocol::TurnState::Completed);
+
+        let standalone_outcome = execute_retry(
+            &state,
+            standalone.id.clone(),
+            None,
+            None,
+            Arc::new(RecordingPublisher::default()),
+            test_subagent_publishers(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            standalone_outcome.state,
+            crate::protocol::TurnState::Completed
+        );
+
+        let mailbox_turn_id = Uuid::new_v4().to_string();
+        assert!(
+            state
+                .enqueue_thread_turn(MailboxTurn {
+                    handle: crate::protocol::TurnHandle {
+                        schema_version: PROTOCOL_VERSION,
+                        thread_id: mailbox_project.id.clone(),
+                        turn_id: mailbox_turn_id.clone(),
+                        state: crate::protocol::TurnState::Queued,
+                    },
+                    kind: MailboxTurnKind::Retry,
+                    started: None,
+                })
+                .await
+        );
+        let (queued_retry, operation_guard) = state
+            .next_thread_turn(&mailbox_project.id)
+            .await
+            .expect("mailbox retry should be dequeued with its operation guard");
+        assert!(matches!(queued_retry.kind, MailboxTurnKind::Retry));
+        let mailbox = execute_retry(
+            &state,
+            queued_retry.handle.thread_id,
+            Some(queued_retry.handle.turn_id),
+            Some(operation_guard),
+            Arc::new(RecordingPublisher::default()),
+            test_subagent_publishers(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(mailbox.turn_id, mailbox_turn_id);
+        assert_eq!(mailbox.state, crate::protocol::TurnState::Completed);
+
+        let direct_request = requests.recv().await.unwrap();
+        let standalone_request = requests.recv().await.unwrap();
+        let mailbox_request = requests.recv().await.unwrap();
+        server.await.unwrap();
+
+        let delegation_tools = [
+            "close_agent",
+            "create_agent",
+            "list_agents",
+            "resume_agent",
+            "send_agent_message",
+            "wait_agent",
+        ];
+        for request in [&direct_request, &mailbox_request] {
+            let provider_names = provider_tool_names(request);
+            assert_eq!(disclosed_tool_names(request), provider_names);
+            for expected in delegation_tools {
+                assert!(
+                    provider_names.iter().any(|name| name == expected),
+                    "project retry should expose {expected}"
+                );
+            }
+        }
+
+        let standalone_names = provider_tool_names(&standalone_request);
+        assert_eq!(disclosed_tool_names(&standalone_request), standalone_names);
+        assert!(standalone_names.iter().all(|name| {
+            PROJECT_FREE_TOOL_NAMES.contains(&name.as_str())
+                && !delegation_tools.contains(&name.as_str())
+        }));
     }
 
     #[test]

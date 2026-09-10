@@ -19,8 +19,9 @@ mod sandbox;
 mod shell;
 
 pub use sandbox::{
-    NoSandboxBackend, SandboxAudit, SandboxBackend, SandboxCapability, SandboxError, SandboxGate,
-    SandboxOutcome, SandboxProfile,
+    FileSystemPolicy, NetworkPolicy, NoSandboxBackend, ResourceLimits, SandboxApplyError,
+    SandboxAudit, SandboxBackend, SandboxCapability, SandboxError, SandboxGate, SandboxOutcome,
+    SandboxProfile, UiPolicy,
 };
 
 const DEFAULT_BUFFER_BYTES: usize = 1024 * 1024;

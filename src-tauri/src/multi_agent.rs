@@ -1302,11 +1302,14 @@ fn tool_json(value: &impl Serialize) -> Result<ToolResult, ToolError> {
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex as StdMutex;
-    use std::time::Instant;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use crate::patch::{PatchError, PatchService};
     use crate::protocol::ExpectedFileHash;
-    use crate::providers::{ProviderEvent, testing::FakeProvider};
+    use crate::providers::{
+        ProviderError, ProviderEvent, ProviderRequest, ProviderStream, testing::FakeProvider,
+    };
+    use tokio::sync::Barrier;
 
     use super::*;
 
@@ -1323,6 +1326,44 @@ mod tests {
     impl SubagentEventPublisher for RecordingLifecycle {
         fn publish(&self, view: SubagentView) {
             self.states.lock().unwrap().push((view.id, view.state));
+        }
+    }
+
+    #[derive(Clone)]
+    struct ConcurrentGateProvider {
+        arrivals: Arc<AtomicUsize>,
+        barrier: Arc<Barrier>,
+    }
+
+    impl ConcurrentGateProvider {
+        fn new(parties: usize) -> Self {
+            Self {
+                arrivals: Arc::new(AtomicUsize::new(0)),
+                barrier: Arc::new(Barrier::new(parties)),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Provider for ConcurrentGateProvider {
+        async fn stream(
+            &self,
+            _request: ProviderRequest,
+            cancellation: CancellationToken,
+        ) -> Result<ProviderStream, ProviderError> {
+            self.arrivals.fetch_add(1, Ordering::SeqCst);
+            let barrier = self.barrier.clone();
+            Ok(Box::pin(async_stream::stream! {
+                tokio::select! {
+                    _ = cancellation.cancelled() => {
+                        yield Err(ProviderError::Cancelled);
+                        return;
+                    }
+                    _ = barrier.wait() => {}
+                }
+                yield Ok(ProviderEvent::TextDelta { delta: "parallel result".into() });
+                yield Ok(ProviderEvent::Completed);
+            }))
         }
     }
 
@@ -1376,15 +1417,12 @@ mod tests {
         let data = tempfile::tempdir().unwrap();
         let workspace = tempfile::tempdir().unwrap();
         let repository = Arc::new(JsonlThreadRepository::new(data.path()).unwrap());
-        // Each scripted turn sleeps once per event, so a serial run costs ~4 delays and a
-        // concurrent run ~2. The budget sits between them to keep the assertion meaningful.
-        let provider = Arc::new(
-            FakeProvider::text(&["parallel result"]).with_delay(Duration::from_millis(200)),
-        );
+        // Neither stream can complete until both have reached the Provider. A serial runtime
+        // therefore fails the existing bounded waits without relying on host timing.
+        let provider = Arc::new(ConcurrentGateProvider::new(2));
         let lifecycle = Arc::new(RecordingLifecycle::default());
         let manager = MultiAgentCoordinator::new(data.path()).unwrap();
         let parent = CancellationToken::new();
-        let started = Instant::now();
 
         let first = manager
             .create(
@@ -1404,7 +1442,7 @@ mod tests {
             .create(
                 request("parent", "inspect frontend"),
                 None,
-                context(repository, workspace.path(), provider, lifecycle),
+                context(repository, workspace.path(), provider.clone(), lifecycle),
                 parent.child_token(),
             )
             .await
@@ -1416,9 +1454,7 @@ mod tests {
 
         assert_eq!(first.unwrap().state, SubagentState::Completed);
         assert_eq!(second.unwrap().summary.as_deref(), Some("parallel result"));
-        // Serial execution would take at least two provider delays; keep the budget wide
-        // enough that a loaded CI machine does not turn this into a flake.
-        assert!(started.elapsed() < Duration::from_millis(600));
+        assert_eq!(provider.arrivals.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]

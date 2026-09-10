@@ -1828,6 +1828,15 @@ mod tests {
         let result = registry
             .dispatch(
                 &context(directory.path()),
+                "list_directory",
+                json!({ "path": "" }),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(matches!(result, Err(ToolError::InvalidArguments(_))));
+        let result = registry
+            .dispatch(
+                &context(directory.path()),
                 "shell",
                 json!({}),
                 CancellationToken::new(),

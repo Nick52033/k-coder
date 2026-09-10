@@ -167,6 +167,19 @@ pub fn run() {
                 }
             });
 
+            // 兜底：前端始终没有上报就绪时（例如 dev server 未启动、脚本执行失败），
+            // 也要把窗口显示出来，避免应用看起来"没有启动"。
+            let boot_handle = app.handle().clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_secs(8));
+                let window_handle = boot_handle.clone();
+                let _ = boot_handle.run_on_main_thread(move || {
+                    if let Some(window) = window_handle.get_webview_window("main") {
+                        let _ = window.show();
+                    }
+                });
+            });
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

@@ -44,7 +44,11 @@ import {
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { extractLocalDocument, getRuntimeStatus, getWorkspaceState, switchWorkspace, subscribeToAgentEvents, subscribeToMailboxEvents, subscribeToSubagentEvents, listSubagents, getExtensionOverview, searchWorkspaceFiles } from "./api/runtime";
 import { useWorkbenchStore } from "./stores/workbenchStore";
-import { reconcileConversationMessages } from "./stores/reducers/historyProjection";
+import {
+  buildSteeredTurnSegments,
+  reconcileConversationMessages,
+  type SteeredTurnSegment,
+} from "./stores/reducers/historyProjection";
 import { PatchReviewDialog } from "./components/PatchReviewDialog";
 import { SettingsDialog, type SettingsSection } from "./components/SettingsDialog";
 import { LogViewerDialog } from "./components/LogViewerDialog";
@@ -61,7 +65,7 @@ import { ImagePreviewDialog } from "./components/ImagePreviewDialog";
 import { cn } from "./lib/cn";
 import { open } from "@tauri-apps/plugin-dialog";
 import { readFile, stat } from "@tauri-apps/plugin-fs";
-import type { AttachmentContent, FileEntry, GoalView, ImageAttachment, ProjectRecord, RuntimeStatus, SubagentView, ThreadSummary, WorkspaceState } from "./types/runtime";
+import type { AttachmentContent, ConversationMessage, FileEntry, GoalView, ImageAttachment, ProjectRecord, RuntimeStatus, SubagentView, ThreadSummary, WorkspaceState } from "./types/runtime";
 
 /** Assigns `task1`, `task2`, ... per parent thread, oldest first. */
 function buildSubagentTaskIndex(subagents: SubagentView[]): Record<string, number> {
@@ -548,16 +552,18 @@ function App() {
           unlistenAgent = stopAgentEvents;
           unlistenMailbox = stopMailboxEvents;
         }
-        await initialize();
-        const workspace = await getWorkspaceState();
+        // 订阅就绪后并发拉取首屏数据：会话、工作区、子智能体互不依赖，
+        // 串行等待会把"有内容可看"的时间拉长。
+        const [, workspace, subagents] = await Promise.all([
+          initialize(),
+          getWorkspaceState(),
+          listSubagents(),
+        ]);
         if (!disposed) {
           setWorkspacePath(workspace.current.path);
           setRecentProjects(workspaceProjects(workspace));
-        }
 
-        // Fetch all subagents to mark their threads
-        const subagents = await listSubagents();
-        if (!disposed) {
+          // Fetch all subagents to mark their threads
           const threadIds = new Set(subagents.map(subagent => subagent.threadId));
           setSubagentThreadIds(threadIds);
           setSubagentByThread(
@@ -1175,10 +1181,16 @@ function App() {
     }
     return map;
   }, [turnTimeline]);
+  const steeredTurnProjection = useMemo(
+    () => buildSteeredTurnSegments(displayMessages, turnTimeline, turnUserMessageIds),
+    [displayMessages, turnTimeline, turnUserMessageIds],
+  );
   const derivedTurnData = useMemo(() => {
+    const displayMessageIds = new Set(displayMessages.map((message) => message.id));
     const representedTurnIds = new Set(
       displayMessages.flatMap((message) => message.role === "assistant" && message.turnId ? [message.turnId] : []),
     );
+    for (const turnId of steeredTurnProjection.turnIds) representedTurnIds.add(turnId);
     const assistantMessagesByTurn = new Map(
       displayMessages.flatMap((message) => message.role === "assistant" && message.turnId
         ? [[message.turnId, message] as const]
@@ -1199,16 +1211,30 @@ function App() {
         orderedTurnIds.push(message.turnId);
       }
     }
-    const retryTurnGroupsByUserMessage = new Map<string, string[]>();
+    const retryTurnsByInitialUserMessage = new Map<string, string[]>();
     for (const turnId of orderedTurnIds) {
       const userMessageId = turnUserMessageIds[turnId];
       if (!userMessageId) continue;
-      const turnIds = retryTurnGroupsByUserMessage.get(userMessageId) ?? [];
+      const turnIds = retryTurnsByInitialUserMessage.get(userMessageId) ?? [];
       turnIds.push(turnId);
-      retryTurnGroupsByUserMessage.set(userMessageId, turnIds);
+      retryTurnsByInitialUserMessage.set(userMessageId, turnIds);
     }
-    for (const [userMessageId, turnIds] of retryTurnGroupsByUserMessage) {
-      if (turnIds.length < 2) retryTurnGroupsByUserMessage.delete(userMessageId);
+    const retryTurnGroupsByUserMessage = new Map<string, string[]>();
+    for (const [initialUserMessageId, turnIds] of retryTurnsByInitialUserMessage) {
+      if (turnIds.length < 2) continue;
+      let ownerMessageId = initialUserMessageId;
+      for (const turnId of turnIds) {
+        if (displayMessageIds.has(ownerMessageId)) {
+          const ownerTurnIds = retryTurnGroupsByUserMessage.get(ownerMessageId) ?? [];
+          ownerTurnIds.push(turnId);
+          retryTurnGroupsByUserMessage.set(ownerMessageId, ownerTurnIds);
+        }
+        const steeredSegments = steeredTurnProjection.segmentsByTurnId.get(turnId) ?? [];
+        const finalSteeredSegment = steeredSegments[steeredSegments.length - 1];
+        if (finalSteeredSegment && finalSteeredSegment.index > 0) {
+          ownerMessageId = finalSteeredSegment.ownerMessageId;
+        }
+      }
     }
     const groupedRetryTurnIds = new Set([...retryTurnGroupsByUserMessage.values()].flat());
     const latestPlanActivity = [...toolActivities].reverse().find((activity) => activity.call.name === "update_plan");
@@ -1258,7 +1284,7 @@ function App() {
       planIsAttachedToOrphan,
       planIsAttachedToRetryGroup,
     };
-  }, [displayMessages, turnTimeline, turnUserMessageIds, toolActivities, activitiesByTurn, timelineByTurn, plan?.steps.length, currentThreadBusy, currentThreadTurnId, activityStatus?.turnId]);
+  }, [displayMessages, turnTimeline, turnUserMessageIds, toolActivities, activitiesByTurn, timelineByTurn, steeredTurnProjection, plan?.steps.length, currentThreadBusy, currentThreadTurnId, activityStatus?.turnId]);
 
   const assistantMessagesByTurn = derivedTurnData.assistantMessagesByTurn;
   const retryTurnGroupsByUserMessage = derivedTurnData.retryTurnGroupsByUserMessage;
@@ -1270,6 +1296,10 @@ function App() {
   const planIsAttached = derivedTurnData.planIsAttached;
   const planIsAttachedToOrphan = derivedTurnData.planIsAttachedToOrphan;
   const planIsAttachedToRetryGroup = derivedTurnData.planIsAttachedToRetryGroup;
+  const steeredTurnSegmentsByMessageId = steeredTurnProjection.segmentsByMessageId;
+  const leadingSteeredTurnSegmentsByMessageId = steeredTurnProjection.leadingSegmentsByMessageId;
+  const steeredTurnSegmentsByTurnId = steeredTurnProjection.segmentsByTurnId;
+  const steeredTurnIds = steeredTurnProjection.turnIds;
   const hasConversationContent = displayMessages.length > 0
     || orphanTurnIds.length > 0
     || Boolean(plan?.steps.length)
@@ -1339,21 +1369,141 @@ function App() {
     );
   }
 
+  function renderMessageAttachments(
+    message?: ConversationMessage,
+    attachments = message?.attachments,
+  ) {
+    if (!message || !attachments?.length) return null;
+    return (
+      <div className="message-attachments" aria-label={message.role === "user" ? "图片附件" : "生成的图片"}>
+        {attachments.map((attachment, index) => (
+          <button
+            className="message-image-attachment"
+            type="button"
+            key={`${message.id}-${index}-${attachment.name}`}
+            aria-label={`查看图片 ${attachment.name}`}
+            title={`查看 ${attachment.name}`}
+            onClick={() => setPreviewImage(attachment)}
+          >
+            <img src={attachment.dataUrl} alt="" />
+            <span>{attachment.name}</span>
+          </button>
+        ))}
+      </div>
+    );
+  }
+
+  function renderSteeredTurnSegment(segment: SteeredTurnSegment) {
+    const assistantMessage = assistantMessagesByTurn.get(segment.turnId);
+    const turnSegments = steeredTurnSegmentsByTurnId.get(segment.turnId) ?? [];
+    const segmentAttachments = assistantMessage?.attachments?.filter((attachment) => (
+      attachment.turnSegmentIndex === undefined
+        ? segment.isLast
+        : attachment.turnSegmentIndex === segment.index
+    ));
+    const segmentActivities = segment.timeline.flatMap((item) => item.type === "tool" ? [item.activity] : []);
+    const segmentStreaming = segment.isLast && (
+      assistantMessage?.status === "streaming" || segment.turnId === currentThreadTurnId
+    );
+    const segmentActivityStatus = segment.isLast && segment.turnId === activityStatus?.turnId
+      ? activityStatus.status
+      : null;
+    const segmentPlan = segment.isLast && segment.turnId === planTurnId ? plan : null;
+    const segmentChanges = segment.isLast
+      ? changes.filter((change) => change.turnId === segment.turnId && !change.undone)
+      : [];
+    const segmentHasTerminalEvent = segment.timeline.some(
+      (item) => item.type === "event" && ["turn_completed", "turn_failed", "turn_cancelled"].includes(item.kind),
+    );
+    const segmentHasVisibleTimeline = segment.timeline.some(isVisibleConversationTimelineItem);
+    const lastVisibleTimelineItem = [...segment.timeline]
+      .reverse()
+      .find(isVisibleConversationTimelineItem);
+    const segmentFinalMessageId = segment.isLast
+      ? assistantMessage?.id
+      : lastVisibleTimelineItem?.type === "text"
+        ? lastVisibleTimelineItem.id
+        : undefined;
+    const hasProjectedFinalText = turnSegments.some((turnSegment) => turnSegment.timeline.some(
+      (item) => item.type === "text" && item.id === assistantMessage?.id,
+    ));
+    const hasFallbackText = segment.isLast && Boolean(assistantMessage?.text) && !hasProjectedFinalText;
+    const hasAttachments = Boolean(segmentAttachments?.length);
+    if (!segmentHasVisibleTimeline && !hasFallbackText && !hasAttachments && !segmentActivityStatus && !segmentPlan?.steps.length) {
+      return null;
+    }
+
+    return (
+      <article
+        className={cn("message", "message--assistant", segmentStreaming && "message--streaming")}
+        data-turn-id={segment.turnId}
+        key={`steered-turn-${segment.turnId}-${segment.index}-${segment.ownerMessageId}`}
+      >
+        <div className="message-body">
+          <div className="message-role">k-Coder</div>
+          <ConversationTurnActivity
+            activities={segmentActivities}
+            timeline={segment.timeline}
+            changes={changes}
+            plan={segmentPlan}
+            turnId={segment.turnId}
+            streaming={segmentStreaming}
+            initialTextVisible={segment.turnId === restoredCurrentTurnId}
+            activityStatus={segmentActivityStatus}
+            finalMessageId={segmentFinalMessageId}
+            renderText={renderMessageText}
+            onRetry={segment.isLast && retryable && lastTurn?.turnId === segment.turnId
+              ? () => void retryLastTurn()
+              : undefined}
+            subagentTaskIndex={subagentTaskIndex}
+            onFocusSubagent={focusSubagent}
+          />
+          {hasFallbackText ? (
+            <div className="message-content">{renderMessageText(assistantMessage!.text)}</div>
+          ) : null}
+          {renderMessageAttachments(assistantMessage, segmentAttachments)}
+          {segment.isLast ? renderMessageChanges(assistantMessage?.id ?? segment.ownerMessageId, segmentChanges) : null}
+          {segment.isLast && !segmentHasTerminalEvent && assistantMessage?.status === "failed" ? (
+            <div className="message-status message-status--error">生成失败</div>
+          ) : null}
+          {segment.isLast && !segmentHasTerminalEvent && assistantMessage?.status === "cancelled" ? (
+            <div className="message-status">已停止</div>
+          ) : null}
+        </div>
+      </article>
+    );
+  }
+
   function renderRetryTurnGroup(userMessageId: string, turnIds: string[]) {
-    const groupChanges = changes.filter((change) => turnIds.includes(change.turnId) && !change.undone);
+    const groupChanges = changes.filter((change) => (
+      turnIds.includes(change.turnId) && !steeredTurnIds.has(change.turnId) && !change.undone
+    ));
     return (
       <article className="message message--assistant message--retry-group" key={`retry-group-${userMessageId}`}>
         <div className="message-body">
           <div className="message-role">k-Coder</div>
           {turnIds.map((turnId) => {
             const assistantMessage = assistantMessagesByTurn.get(turnId);
-            const attemptTimeline = timelineByTurn.get(turnId) ?? [];
-            const attemptActivities = activitiesByTurn.get(turnId) ?? [];
-            const attemptPlan = turnId === planTurnId ? plan : null;
-            const attemptActivityStatus = turnId === activityStatus?.turnId ? activityStatus.status : null;
+            const steeredAttemptSegment = steeredTurnSegmentsByTurnId.get(turnId)?.[0];
+            const attemptTimeline = steeredAttemptSegment?.timeline ?? timelineByTurn.get(turnId) ?? [];
+            const attemptActivities = attemptTimeline.flatMap((item) => item.type === "tool" ? [item.activity] : []);
+            const attemptIsTerminalSegment = !steeredAttemptSegment || steeredAttemptSegment.isLast;
+            const attemptPlan = attemptIsTerminalSegment && turnId === planTurnId ? plan : null;
+            const attemptActivityStatus = attemptIsTerminalSegment && turnId === activityStatus?.turnId
+              ? activityStatus.status
+              : null;
             const attemptHasTerminalEvent = attemptTimeline.some(
               (item) => item.type === "event" && ["turn_completed", "turn_failed", "turn_cancelled"].includes(item.kind),
             );
+            const lastVisibleAttemptItem = [...attemptTimeline].reverse().find(isVisibleConversationTimelineItem);
+            const attemptFinalMessageId = steeredAttemptSegment
+              ? lastVisibleAttemptItem?.type === "text" ? lastVisibleAttemptItem.id : undefined
+              : assistantMessage?.id;
+            const attemptAttachments = steeredAttemptSegment
+              ? assistantMessage?.attachments?.filter((attachment) => (
+                attachment.turnSegmentIndex === steeredAttemptSegment.index
+              ))
+              : assistantMessage?.attachments;
             return (
               <section className="message-retry-attempt" data-turn-id={turnId} key={turnId}>
                 <ConversationTurnActivity
@@ -1362,20 +1512,23 @@ function App() {
                   changes={changes}
                   plan={attemptPlan}
                   turnId={turnId}
-                  streaming={turnId === currentThreadTurnId}
+                  streaming={attemptIsTerminalSegment && turnId === currentThreadTurnId}
                   initialTextVisible={turnId === restoredCurrentTurnId}
                   activityStatus={attemptActivityStatus}
-                  finalMessageId={assistantMessage?.id}
+                  finalMessageId={attemptFinalMessageId}
                   renderText={renderMessageText}
-                  onRetry={retryable && lastTurn?.turnId === turnId ? () => void retryLastTurn() : undefined}
+                  onRetry={attemptIsTerminalSegment && retryable && lastTurn?.turnId === turnId
+                    ? () => void retryLastTurn()
+                    : undefined}
                   subagentTaskIndex={subagentTaskIndex}
                   onFocusSubagent={focusSubagent}
                 />
-                {!attemptTimeline.length && assistantMessage?.text ? (
+                {!steeredAttemptSegment && !attemptTimeline.length && assistantMessage?.text ? (
                   <div className="message-content">{renderMessageText(assistantMessage.text)}</div>
                 ) : null}
-                {!attemptHasTerminalEvent && assistantMessage?.status === "failed" ? <div className="message-status message-status--error">生成失败</div> : null}
-                {!attemptHasTerminalEvent && assistantMessage?.status === "cancelled" ? <div className="message-status">已停止</div> : null}
+                {renderMessageAttachments(assistantMessage, attemptAttachments)}
+                {attemptIsTerminalSegment && !attemptHasTerminalEvent && assistantMessage?.status === "failed" ? <div className="message-status message-status--error">生成失败</div> : null}
+                {attemptIsTerminalSegment && !attemptHasTerminalEvent && assistantMessage?.status === "cancelled" ? <div className="message-status">已停止</div> : null}
               </section>
             );
           })}
@@ -2280,9 +2433,21 @@ function App() {
               )}
 
               {displayMessages.map((message) => {
-                if (message.role === "assistant" && message.turnId && groupedRetryTurnIds.has(message.turnId)) {
+                if (message.role === "assistant" && message.turnId && (
+                  groupedRetryTurnIds.has(message.turnId) || steeredTurnIds.has(message.turnId)
+                )) {
                   return null;
                 }
+                const steeredSegments = message.role === "user"
+                  ? (steeredTurnSegmentsByMessageId.get(message.id) ?? []).filter(
+                    (segment) => segment.index > 0 || !groupedRetryTurnIds.has(segment.turnId),
+                  )
+                  : [];
+                const leadingSteeredSegments = message.role === "user"
+                  ? (leadingSteeredTurnSegmentsByMessageId.get(message.id) ?? []).filter(
+                    (segment) => !groupedRetryTurnIds.has(segment.turnId),
+                  )
+                  : [];
                 // 查找该消息对应回合的文件变更
                 const messageChanges = message.role === "assistant" && message.turnId
                   ? changes.filter(change => change.turnId === message.turnId && !change.undone)
@@ -2307,6 +2472,7 @@ function App() {
 
                 return (
                   <Fragment key={message.role === "assistant" && message.turnId ? `assistant-turn-${message.turnId}` : message.id}>
+                  {leadingSteeredSegments.map(renderSteeredTurnSegment)}
                   <article className={cn("message", `message--${message.role}`, message.status === "streaming" && "message--streaming")}>
                     <div className="message-body">
                       <div className="message-role">
@@ -2315,23 +2481,7 @@ function App() {
                           <CopyMessageButton text={message.text} />
                         ) : null}
                       </div>
-                      {message.attachments?.length ? (
-                        <div className="message-attachments" aria-label={message.role === "user" ? "图片附件" : "生成的图片"}>
-                          {message.attachments.map((attachment, index) => (
-                            <button
-                              className="message-image-attachment"
-                              type="button"
-                              key={`${message.id}-${index}-${attachment.name}`}
-                              aria-label={`查看图片 ${attachment.name}`}
-                              title={`查看 ${attachment.name}`}
-                              onClick={() => setPreviewImage(attachment)}
-                            >
-                              <img src={attachment.dataUrl} alt="" />
-                              <span>{attachment.name}</span>
-                            </button>
-                          ))}
-                        </div>
-                      ) : null}
+                      {renderMessageAttachments(message)}
                       {message.role === "assistant" && (
                         <ConversationTurnActivity
                           activities={messageActivities}
@@ -2367,6 +2517,7 @@ function App() {
                       {!messageHasTerminalEvent && message.status === "cancelled" && <div className="message-status">已停止</div>}
                     </div>
                   </article>
+                  {steeredSegments.map(renderSteeredTurnSegment)}
                   {message.role === "user"
                     ? retryTurnGroupsByUserMessage.has(message.id)
                       ? renderRetryTurnGroup(message.id, retryTurnGroupsByUserMessage.get(message.id)!)

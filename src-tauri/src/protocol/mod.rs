@@ -5,7 +5,7 @@ use crate::storage::{
 };
 
 pub const PROTOCOL_VERSION: u32 = 1;
-pub const AGENT_EVENT_SCHEMA_VERSION: u32 = 5;
+pub const AGENT_EVENT_SCHEMA_VERSION: u32 = 6;
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -801,7 +801,7 @@ impl AgentEvent {
             Self::ReasoningSummaryDelta { .. } | Self::ReasoningSummaryCompleted { .. } => {
                 TurnPhase::Planning
             }
-            Self::ToolStarted { .. } => TurnPhase::Executing,
+            Self::ToolQueued { .. } | Self::ToolStarted { .. } => TurnPhase::Executing,
             Self::ToolOutputDelta { .. } => TurnPhase::Executing,
             Self::ToolCompleted { .. } => TurnPhase::Executing,
             Self::ApprovalRequested { .. } => TurnPhase::AwaitingInput,
@@ -893,6 +893,11 @@ pub enum AgentEvent {
         recent_tool_result_count: usize,
         #[serde(default)]
         recent_user_message_count: usize,
+    },
+    ToolQueued {
+        thread_id: String,
+        turn_id: String,
+        call: ToolCall,
     },
     ToolStarted {
         thread_id: String,
@@ -1292,10 +1297,32 @@ mod tests {
 
         let value = serde_json::to_value(event).expect("usage event should serialize");
 
-        assert_eq!(value["schemaVersion"], 5);
+        assert_eq!(value["schemaVersion"], 6);
         assert_eq!(value["type"], "usage_updated");
         assert_eq!(value["usage"]["totalTokens"], 100_000);
         assert_eq!(value["contextUsage"]["totalTokens"], 15_360);
+    }
+
+    #[test]
+    fn queued_tool_event_exposes_the_complete_call() {
+        let event = AgentEventEnvelope::new(AgentEvent::ToolQueued {
+            thread_id: "thread-1".into(),
+            turn_id: "turn-1".into(),
+            call: ToolCall {
+                id: "call-queued".into(),
+                name: "wait_agent".into(),
+                arguments: serde_json::json!({ "agentId": "agent-2" }),
+                metadata: serde_json::json!({}),
+            },
+        });
+        let value = serde_json::to_value(event).unwrap();
+
+        assert_eq!(value["schemaVersion"], 6);
+        assert_eq!(value["type"], "tool_queued");
+        assert_eq!(value["phase"], "executing");
+        assert_eq!(value["call"]["id"], "call-queued");
+        assert_eq!(value["call"]["name"], "wait_agent");
+        assert_eq!(value["call"]["arguments"]["agentId"], "agent-2");
     }
 
     #[test]
