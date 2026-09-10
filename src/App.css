@@ -1,13 +1,13 @@
 :root {
   /* Typography (skin-invariant) */
-  --font-family: Inter, "Segoe UI", Arial, sans-serif;
+  --font-family: Inter, "Segoe UI", "Microsoft YaHei UI", "PingFang SC", Arial, sans-serif;
   --font-family-heading: var(--font-family);
   --font-family-mono: "JetBrains Mono", "Cascadia Code", "SFMono-Regular", Consolas, monospace;
-  --font-size-xs: 0.625rem;
-  --font-size-sm: 0.6875rem;
-  --font-size-base: 0.75rem;
-  --font-size-md: 0.8125rem;
-  --font-size-lg: 0.875rem;
+  --font-size-xs: 0.75rem;
+  --font-size-sm: 0.8125rem;
+  --font-size-base: 0.875rem;
+  --font-size-md: 0.875rem;
+  --font-size-lg: 0.9375rem;
   --font-weight-medium: 500;
   --font-weight-semibold: 600;
   --font-weight-bold: 650;
@@ -194,22 +194,22 @@
    🎨 Skin: CodeBuddy — 冷调蓝灰 (Cursor 风格)
    ════════════════════════════════════════════ */
 [data-skin="codebuddy"][data-theme="dark"] {
-  --color-brand: #4F8AFF;
-  --color-brand-hover: #3B7AEE;
-  --color-brand-light: #7FAEFF;
-  --color-brand-ring: rgba(79, 138, 255, 0.28);
-  --color-ink: #E3E8F0;
-  --color-ink-rich: #F1F5FA;
-  --color-ink-muted: #94A0B3;
-  --color-ink-subtle: #707A8C;
-  --color-ink-faint: #4E5868;
-  --color-surface: #1B2030;
-  --color-surface-raised: #232A3D;
-  --color-surface-panel: #161A26;
-  --color-surface-hover: #2A324A;
-  --color-border: #2A3146;
-  --color-border-strong: #3A4258;
-  --color-border-input: #353D52;
+  --color-brand: #91adff;
+  --color-brand-hover: #adc1ff;
+  --color-brand-light: #a8bfff;
+  --color-brand-ring: rgba(145, 173, 255, 0.22);
+  --color-ink: #e8ebf2;
+  --color-ink-rich: #f1f3f8;
+  --color-ink-muted: #bac2cf;
+  --color-ink-subtle: #a8b2c2;
+  --color-ink-faint: #a4adbd;
+  --color-surface: #171a21;
+  --color-surface-raised: #20242d;
+  --color-surface-panel: #12151b;
+  --color-surface-hover: #2b303b;
+  --color-border: #303641;
+  --color-border-strong: #485161;
+  --color-border-input: #737f92;
   --color-error: #F87171;
   --color-error-text: #FCA5A5;
   --color-error-bg: rgba(248, 113, 113, 0.12);
@@ -218,35 +218,35 @@
   --color-success-text: #6EE7B7;
   --color-warning: #FBBF24;
   --color-warning-dot: #FCD34D;
-  --color-user-msg-bg: rgba(79, 138, 255, 0.10);
-  --color-user-msg-border: rgba(79, 138, 255, 0.22);
-  --color-item-active-bg: #2A324A;
-  --color-item-active-text: #7FAEFF;
-  --color-item-active-border: #3A4258;
-  --color-disabled-bg: #232A3D;
-  --color-disabled-text: #4E5868;
-  background: #161A26;
+  --color-user-msg-bg: #232833;
+  --color-user-msg-border: transparent;
+  --color-item-active-bg: #28334d;
+  --color-item-active-text: #b4c7ff;
+  --color-item-active-border: #566b99;
+  --color-disabled-bg: #2b303b;
+  --color-disabled-text: #778191;
+  background: #12151b;
   color-scheme: dark;
 }
 
 /* ── CodeBuddy Light ── */
 [data-skin="codebuddy"][data-theme="light"] {
-  --color-brand: #2f6fe4;
-  --color-brand-hover: #2459b8;
-  --color-brand-light: #3f6fbd;
-  --color-brand-ring: rgba(47, 111, 228, 0.2);
-  --color-ink: #172033;
-  --color-ink-rich: #101827;
-  --color-ink-muted: #526078;
-  --color-ink-subtle: #68758a;
-  --color-ink-faint: #9aa6b7;
-  --color-surface: #f8fafc;
+  --color-brand: #365cce;
+  --color-brand-hover: #294aac;
+  --color-brand-light: #4264c5;
+  --color-brand-ring: rgba(54, 92, 206, 0.16);
+  --color-ink: #222938;
+  --color-ink-rich: #192130;
+  --color-ink-muted: #536073;
+  --color-ink-subtle: #606c7e;
+  --color-ink-faint: #667080;
+  --color-surface: #ffffff;
   --color-surface-raised: #ffffff;
-  --color-surface-panel: #f1f5f9;
-  --color-surface-hover: #e7edf6;
-  --color-border: #d7dee9;
-  --color-border-strong: #bdc8d8;
-  --color-border-input: #cbd5e1;
+  --color-surface-panel: #f3f5f8;
+  --color-surface-hover: #e9edf3;
+  --color-border: #dfe4ec;
+  --color-border-strong: #c5ccd8;
+  --color-border-input: #858fa0;
   --color-error: #c24145;
   --color-error-text: #9f1d27;
   --color-error-bg: #fff7f7;
@@ -255,15 +255,15 @@
   --color-success-text: #13734f;
   --color-warning: #ad6800;
   --color-warning-dot: #c4830c;
-  --color-user-msg-bg: #eef4ff;
-  --color-user-msg-border: #d6e2fb;
-  --color-item-active-bg: #e4edff;
-  --color-item-active-text: #204b99;
-  --color-item-active-border: #c4d6f3;
+  --color-user-msg-bg: #f2f4f8;
+  --color-user-msg-border: transparent;
+  --color-item-active-bg: #e9eefc;
+  --color-item-active-text: #3655ab;
+  --color-item-active-border: #aebde7;
   --color-disabled-bg: #e7ebf1;
   --color-disabled-text: #98a3b4;
   color: var(--color-ink);
-  background: #f2f5fa;
+  background: #f3f5f8;
   color-scheme: light;
 }
 
@@ -573,7 +573,7 @@ button {
 .workbench {
   position: relative;
   display: grid;
-  grid-template-columns: 232px minmax(0, 1fr);
+  grid-template-columns: var(--sidebar-width, 232px) minmax(0, 1fr);
   grid-template-rows: 48px minmax(0, 1fr);
   width: 100%;
   height: 100vh;
@@ -581,12 +581,45 @@ button {
   min-height: 0;
   overflow: hidden;
   background: var(--color-surface);
-  transition: grid-template-columns var(--transition-modal, 200ms ease);
 }
 
 /* 打开工作台：对话区让出第三列，工作台成为右侧面板（不再是覆盖浮层） */
 .workbench--panel-open {
-  grid-template-columns: 232px minmax(420px, 1fr) clamp(360px, 28vw, 440px);
+  grid-template-columns: var(--sidebar-width, 232px) minmax(420px, 1fr) var(--panel-width, clamp(360px, 28vw, 440px));
+}
+
+.panel-resize-handle {
+  position: absolute;
+  z-index: 11;
+  top: 48px;
+  bottom: 0;
+  width: 8px;
+  cursor: col-resize;
+  touch-action: none;
+  user-select: none;
+  outline: none;
+}
+
+.panel-resize-handle--sidebar { left: calc(var(--sidebar-width) - 4px); }
+.panel-resize-handle--panel { right: calc(var(--panel-width) - 4px); }
+.panel-resize-handle::after {
+  content: "";
+  position: absolute;
+  inset: 0 3px;
+  background: transparent;
+}
+.panel-resize-handle:hover::after,
+.panel-resize-handle:focus-visible::after,
+.workbench--resizing .panel-resize-handle:focus::after { background: var(--color-brand); }
+
+/* Capture dragging above embedded pages and prevent text selection. */
+.workbench--resizing { cursor: col-resize; user-select: none; }
+.workbench--resizing::after {
+  content: "";
+  position: absolute;
+  z-index: 10;
+  inset: 48px 0 0;
+  cursor: col-resize;
 }
 
 .icon-button--active {
@@ -1269,6 +1302,7 @@ button {
 
 .sidebar {
   display: flex;
+  min-width: 0;
   min-height: 0;
   padding: 10px 8px 8px;
   flex-direction: column;
@@ -2549,6 +2583,32 @@ button {
   border-radius: 4px;
   color: var(--color-ink-muted);
   background: var(--color-surface-raised);
+  font-size: 0.9em;
+}
+
+.markdown-image {
+  display: block;
+  max-width: min(100%, 480px);
+  max-height: 280px;
+  margin: 0.6em 0;
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+  object-fit: contain;
+  cursor: zoom-in;
+}
+
+.markdown-image--expanded {
+  max-width: 100%;
+  max-height: none;
+  cursor: zoom-out;
+}
+
+.markdown-image-loading {
+  display: inline-flex;
+  padding: 0.12em 0.4em;
+  border: 1px dashed var(--color-border);
+  border-radius: 4px;
+  color: var(--color-ink-muted);
   font-size: 0.9em;
 }
 
@@ -5214,7 +5274,7 @@ button {
 }
 .activity-panel--overlay { display: none !important; }
 
-/* 工作台：默认作为右侧浮层叠加在对话区上，不挤压对话区 */
+/* 工作台：桌面端作为独立的可调整右列。 */
 .workbench-panel {
   grid-column: 3;
   grid-row: 2;
@@ -7655,11 +7715,11 @@ button {
 
 @media (max-width: 1180px) {
   .workbench {
-    grid-template-columns: 210px minmax(0, 1fr);
+    grid-template-columns: var(--sidebar-width, 210px) minmax(0, 1fr);
   }
 
   .workbench--panel-open {
-    grid-template-columns: minmax(0, 1fr) clamp(320px, 34vw, 400px);
+    grid-template-columns: minmax(0, 1fr) var(--panel-width, clamp(320px, 34vw, 400px));
   }
 
   .workbench--panel-open .sidebar {
@@ -8626,3 +8686,15 @@ button {
 .user-input-option--selected {
   background: var(--color-surface-hover);
 }
+.markdown-image-button {
+  display: inline-block;
+  max-width: 100%;
+  padding: 0;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  cursor: zoom-in;
+  vertical-align: top;
+}
+.markdown-image-button .markdown-image { display: block; max-width: 100%; max-height: 320px; object-fit: contain; }
+.markdown-image-button:focus-visible { outline: 2px solid var(--accent, #528bff); outline-offset: 3px; }

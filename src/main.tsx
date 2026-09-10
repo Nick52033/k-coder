@@ -3,6 +3,7 @@ import ReactDOM from "react-dom/client";
 import App from "./App";
 import { ToastProvider } from "./components/Toast";
 import { finishBoot, installBootFallback } from "./lib/boot";
+import "./styles/workspace.css";
 
 installBootFallback();
 

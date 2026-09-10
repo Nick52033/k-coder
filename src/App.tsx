@@ -1,5 +1,7 @@
 import { Fragment, FormEvent, KeyboardEvent, useEffect, useId, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
+import { PanelResizeHandle } from "./components/PanelResizeHandle";
+import { usePanelWidths } from "./hooks/usePanelWidths";
 import {
   Activity,
   ArrowUp,
@@ -379,6 +381,7 @@ function App() {
   const [threadQuery, setThreadQuery] = useState("");
   const [workbenchOpen, setWorkbenchOpen] = useState(false);
   const [agentPanelOpen, setAgentPanelOpen] = useState(false);
+  const panelWidths = usePanelWidths(workbenchOpen || agentPanelOpen);
   const [workspaceRevision, setWorkspaceRevision] = useState(0);
   const [themeMode, setThemeModeState] = useState<ThemeId>(() =>
     parseThemePreference(readStored<string>(THEME_STORAGE_KEY, "light")),
@@ -2025,7 +2028,7 @@ function App() {
   }
 
   return (
-    <main className={cn("workbench", (workbenchOpen || agentPanelOpen) && "workbench--panel-open")}>
+    <main style={panelWidths.style} className={cn("workbench", (workbenchOpen || agentPanelOpen) && "workbench--panel-open", panelWidths.resizing && "workbench--resizing")}>
       <header className="titlebar" data-tauri-drag-region>
         <div className="brand" data-tauri-drag-region>
           <span className="brand-mark" aria-hidden="true">
@@ -2972,6 +2975,8 @@ function App() {
         )}
       </section>
 
+      {panelWidths.sidebarVisible && <PanelResizeHandle side="sidebar" width={panelWidths.sidebar} min={200} max={panelWidths.sidebarMax} onChange={panelWidths.setSidebar} onResizing={panelWidths.setResizing} />}
+      {panelWidths.panelVisible && <PanelResizeHandle side="panel" width={panelWidths.panel} min={320} max={panelWidths.panelMax} onChange={panelWidths.setPanel} onResizing={panelWidths.setResizing} />}
       <WorkbenchPanel key={workspaceRevision} open={workbenchOpen} onAttach={(attachment) => appendAttachments([attachment])} />
       <AgentActivityPanel
         key={activeThreadId}

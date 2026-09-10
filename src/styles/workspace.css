@@ -1,0 +1,151 @@
+/* Professional workspace: shared geometry, existing semantic theme palette.
+   Keep layout tracks, panel resizing and disclosure state owned by App.css. */
+:root {
+  --workspace-radius: 12px;
+  --workspace-gap: 8px;
+  --workspace-gutter: clamp(18px, 3%, 40px);
+  --workspace-shadow: 0 3px 16px color-mix(in srgb, var(--color-ink) 5%, transparent);
+}
+
+.sidebar {
+  padding: 14px 10px 10px;
+}
+
+.sidebar-primary-nav-button {
+  min-height: 38px;
+  font-weight: var(--font-weight-medium);
+}
+
+.sidebar-primary-nav-button.is-active {
+  border-color: transparent;
+  box-shadow: inset 2px 0 var(--color-brand);
+}
+
+.thread-section {
+  padding: 8px 2px 0;
+  border-top: 0;
+}
+
+.thread-section-heading { padding: 0 2px; gap: 4px; }
+.sidebar-segmented {
+  height: 34px;
+  padding: 3px;
+  gap: 2px;
+  border: 0;
+  border-radius: 8px;
+  background: var(--color-surface-hover);
+}
+.sidebar-segmented button { border-radius: 5px; }
+.sidebar-segmented button + button { border-left: 0; }
+.sidebar-segmented button.is-active {
+  color: var(--color-ink);
+  background: var(--color-surface);
+  box-shadow: 0 1px 3px color-mix(in srgb, var(--color-ink) 8%, transparent);
+}
+
+.thread-search { min-height: 34px; margin-top: 12px; border-radius: 8px; }
+.thread-search input { font-size: var(--font-size-sm); }
+.thread-item-main { min-height: 36px; padding: 8px 54px 8px 10px; font-size: var(--font-size-sm); }
+.thread-item--active { border-radius: 7px; }
+.project-group-header { height: auto; min-height: 34px; }
+.project-group-count { background: transparent; }
+.sidebar-footer { padding-top: 10px; }
+.sidebar-settings-button { font-size: var(--font-size-sm); }
+
+.conversation-header { padding-inline: var(--workspace-gutter); }
+.conversation-header h1 { font-size: 16px; font-weight: var(--font-weight-semibold); }
+.message-area--populated { padding-top: 28px; }
+.message { margin-bottom: 26px; }
+.message-content { line-height: 1.75; }
+.message--user .message-content { padding: 12px 16px; border-radius: var(--workspace-radius); }
+.turn-progress-text { line-height: 1.75; }
+
+/* Completed metadata remains expandable; errors and active states keep their
+   existing semantic colors and visible actions. */
+.message-changes { margin-top: 12px; border-color: transparent; background: transparent; }
+.message-changes .changes-toggle { padding-inline: 0; }
+.goal-slim {
+  width: min(1040px, calc(100% - 36px));
+  border-color: transparent;
+  background: transparent;
+}
+.goal-slim:hover { background: var(--color-surface-panel); }
+.plan-progress:not(.plan-progress--failed):not(.plan-progress--live) .plan-progress-trigger {
+  border-color: var(--color-border);
+  background: var(--color-surface-panel);
+}
+.plan-progress:not(.plan-progress--failed) .plan-progress-trigger:hover,
+.plan-progress:not(.plan-progress--failed) .plan-progress-trigger[aria-expanded="true"] { border-color: var(--color-brand); }
+
+.composer {
+  width: min(1040px, calc(100% - 2 * var(--workspace-gutter)));
+  max-width: calc(100% - 2 * var(--workspace-gutter));
+  margin: 0 auto 22px;
+  border-radius: var(--workspace-radius);
+  background: var(--color-surface-raised);
+  box-shadow: var(--workspace-shadow);
+}
+.composer:focus-within {
+  border-color: var(--color-brand);
+  box-shadow: 0 0 0 2px var(--color-brand-ring), var(--workspace-shadow);
+}
+.composer-quick-actions {
+  min-height: 36px;
+  padding: 6px 10px 0;
+  border-bottom: 0;
+  border-radius: var(--workspace-radius) var(--workspace-radius) 0 0;
+  background: transparent;
+  gap: 4px;
+}
+.composer-quick-action:hover { border-color: transparent; color: var(--color-ink); }
+.composer textarea { padding: 10px 16px 14px; font-size: 15px; line-height: 1.65; }
+/* The composer owns focus feedback; nested textarea glow caused a second box
+   and a one-pixel jump in enhanced-animations.css. */
+[data-theme] .composer textarea:focus { transform: none; box-shadow: none; }
+.composer-controls { padding: 6px 10px 10px; gap: var(--workspace-gap); }
+.composer-options { gap: 4px; flex-wrap: wrap; }
+.composer-options .model-selector { min-width: 0; }
+.composer .send-button { color: var(--color-surface); background: var(--color-brand); border-color: transparent; }
+.composer .send-button:hover:not(:disabled) { background: var(--color-brand-hover); }
+.composer .send-button:disabled { background: var(--color-disabled-bg); color: var(--color-disabled-text); }
+.composer-quick-action:focus-visible,
+.project-selector-trigger:focus-visible { outline-color: var(--color-brand); }
+
+.workbench-tabs { background: var(--color-surface-panel); }
+.workbench-tabs button { font-weight: var(--font-weight-medium); }
+.workbench-tabs button.active { background: var(--color-surface); }
+.panel-toolbar { padding-inline: 12px; }
+.file-tree { padding: 8px; }
+.settings-nav-item { font-size: var(--font-size-sm); }
+.settings-nav-item--active { border-color: transparent; }
+
+/* Bright accents in dark mode need a dark foreground on solid fills. Keep
+   this scoped to brand fills; destructive actions own their error palette. */
+[data-theme="dark"] .agent-count-badge,
+[data-theme="dark"] .agent-button--primary,
+[data-theme="dark"] .panel-empty-action button,
+[data-theme="dark"] .scheduled-primary-button,
+[data-theme="dark"] .claude-approval-choice.is-highlight:not(.claude-approval-choice--reject) .claude-approval-index {
+  color: var(--color-surface);
+}
+
+/* Keep frequent navigation and typing stationary. Feedback uses color; modal
+   transitions and running indicators still honor the existing reduced motion. */
+.sidebar .sidebar-settings-button:active,
+.settings-nav-item:hover:not(.settings-nav-item--active),
+.settings-nav-item:active,
+.settings-nav-item:hover svg,
+.icon-button:hover:not(:disabled),
+.icon-button:active:not(:disabled),
+.composer .send-button:hover:not(:disabled),
+.composer .send-button:active:not(:disabled) { transform: none; }
+
+@media (max-width: 720px) {
+  .composer { margin-bottom: 12px; }
+  .composer-quick-actions { padding-inline: 6px; gap: 2px; }
+  .composer-controls { padding-inline: 6px; }
+}
+
+@media (prefers-contrast: high) {
+  .composer { border-width: 2px; }
+}
