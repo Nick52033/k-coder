@@ -29,9 +29,10 @@ const path = require('node:path');
   };
   const toolPayload = (input, id) => {
     const output = toolOutput(input, id);
-    const payloadStart = output.indexOf('{');
-    assert.notEqual(payloadStart, -1, `missing JSON tool payload ${id} at stage ${stage}`);
-    return JSON.parse(output.slice(payloadStart));
+    const payload = output.startsWith('[read_file observation] ')
+      ? output.slice(output.indexOf('\n') + 1)
+      : output;
+    return JSON.parse(payload);
   };
   const observationType = (input, id) => toolPayload(input, id).type;
   const hasRecovery = input => input.messages.some(message =>
