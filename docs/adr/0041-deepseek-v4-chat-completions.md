@@ -33,3 +33,7 @@
 - SSE 测试证明 `reasoning_content` 只进入私有缓冲，不产生 `ProviderEvent`。
 - 工具历史测试覆盖当前 Turn 非空原样 passback、思考模式空缓存的同 Provider 安全降级、关闭思考时的原生工具配对、重启历史文本降级、失败工具 Turn 重试边界、`request_user_input` 原始参数隔离、失败结果的 assistant 角色、旧内部标记与结构化事实逐字匹配后的定向清理、无关 assistant 说明及 user 同名正文保留、空工具结果和缓存上限；环回 HTTP/SSE 测试分别验证同一 Provider 的原始 `reasoning_content`/`tool_calls`/`role=tool` passback、同 Provider 缺失 reasoning 时的无原生工具降级、缺失工具调用 ID 时的宿主 UUID 兼容，以及重建 Provider 后请求以不含工具正文的固定 user 续跑意图收尾。
 - 配置与应用状态测试覆盖传输枚举、DeepSeek 家族识别、相近名称拒绝和文本输入能力收缩。
+
+## 2026-09-10 图片能力声明补充
+
+按 ADR 0058，普通 `open_ai_chat_completions` 配置中显式 `supportsVision=true` 的模型保留通用多模态协议，覆盖模型名 DeepSeek 启发式，避免网关别名导致原图被转换为 OCR 文本。显式选择 `deep_seek_chat_completions` 仍按纯文本协议处理；未声明图片能力的模型继续遵循原名称匹配规则。

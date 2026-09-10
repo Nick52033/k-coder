@@ -1685,7 +1685,7 @@ test("renders the composer add menu in dark mode", async ({ page }, testInfo) =>
 
 test("supports the primary workbench inspection flow", async ({ page }, testInfo) => {
   await page.goto("/");
-  await expect(page.getByRole("textbox", { name: "消息" })).toHaveCSS("font-size", "13px");
+  await expect(page.getByRole("textbox", { name: "消息" })).toHaveCSS("font-size", "15px");
   await expect.poll(() => page.evaluate(() => (window as unknown as { __invocationArgs: Record<string, unknown> }).__invocationArgs.get_plan)).toEqual({ threadId: "thread-1" });
   await expect.poll(() => page.evaluate(() => (window as unknown as { __invocationArgs: Record<string, unknown> }).__invocationArgs.get_goal)).toEqual({ threadId: "thread-1" });
   await expect(page.getByRole("heading", { name: "Phase 6 workbench" })).toBeVisible();
@@ -1828,8 +1828,10 @@ test("supports the primary workbench inspection flow", async ({ page }, testInfo
   await expect(page.getByLabel("上下文长度 1")).toHaveValue("128000");
   await expect(page.getByLabel(/设为默认模型：GPT-4.1/)).toBeChecked();
   await page.getByRole("button", { name: /Skills/ }).click();
+  // Skills are grouped and collapsed by category; inspect the review group.
+  await page.getByRole("region", { name: "质量与评审", exact: true }).getByRole("button").click();
   await expect(page.getByText("Built-in workspace review")).toBeVisible();
-  await expect(page.getByText("内置 · workspace review")).toBeVisible();
+  await expect(page.getByText("workspace review", { exact: true })).toBeVisible();
   await expect(page.getByText("Review code safely")).toBeVisible();
   await page.getByRole("button", { name: "MCP", exact: true }).click();
   await expect(page.getByRole("heading", { name: "MCP 配置", exact: true })).toBeVisible();
@@ -2171,7 +2173,7 @@ test("renders the MCP settings tool in dark mode", async ({ page }, testInfo) =>
   await expect.poll(() => dialog.locator(".mcp-json-workspace").evaluate((element) => ({
     background: getComputedStyle(element).backgroundColor,
     surface: getComputedStyle(document.documentElement).getPropertyValue("--color-surface").trim(),
-  }))).toEqual({ background: "rgb(27, 32, 48)", surface: "#1B2030" });
+  }))).toEqual({ background: "rgb(23, 26, 33)", surface: "#171a21" });
   await page.screenshot({ path: testInfo.outputPath("mcp-settings-dark.png") });
 });
 
@@ -2282,8 +2284,86 @@ test("renders local plugin settings in dark mode", async ({ page }, testInfo) =>
   await expect.poll(() => settings.locator(".plugin-row-icon").first().evaluate((element) => ({
     background: getComputedStyle(element).backgroundColor,
     panel: getComputedStyle(document.documentElement).getPropertyValue("--color-surface-panel").trim(),
-  }))).toEqual({ background: "rgb(22, 26, 38)", panel: "#161A26" });
+  }))).toEqual({ background: "rgb(18, 21, 27)", panel: "#12151b" });
   await page.screenshot({ path: testInfo.outputPath("plugin-settings-dark.png") });
+});
+
+test("professional workspace stays readable and stable in both appearances", async ({ page }, testInfo) => {
+  for (const theme of ["light", "dark"]) {
+    await page.addInitScript((value) => localStorage.setItem("kcoder_theme", value), theme);
+    await page.goto("/");
+    await expect(page.getByRole("heading", { name: "Phase 6 workbench" })).toBeVisible();
+    const reading = await page.evaluate(() => {
+      const css = getComputedStyle(document.documentElement);
+      const luminance = (value: string) => {
+        const channels = value.trim().replace("#", "").match(/.{2}/g)!.map((part) => parseInt(part, 16) / 255);
+        const linear = channels.map((c) => c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4);
+        return linear[0] * 0.2126 + linear[1] * 0.7152 + linear[2] * 0.0722;
+      };
+      const contrast = (foreground: string, background: string) => {
+        const a = luminance(css.getPropertyValue(foreground));
+        const b = luminance(css.getPropertyValue(background));
+        return (Math.max(a, b) + 0.05) / (Math.min(a, b) + 0.05);
+      };
+      return {
+        navigation: parseFloat(getComputedStyle(document.querySelector(".sidebar-primary-nav-button")!).fontSize),
+        message: parseFloat(getComputedStyle(document.querySelector(".message-content")!).fontSize),
+        primary: contrast("--color-ink", "--color-surface"),
+        secondary: contrast("--color-ink-subtle", "--color-surface-panel"),
+        metadata: contrast("--color-ink-faint", "--color-surface-raised"),
+      };
+    });
+    expect(reading.navigation).toBeGreaterThanOrEqual(13);
+    expect(reading.message).toBeGreaterThanOrEqual(15);
+    expect(reading.primary).toBeGreaterThanOrEqual(4.5);
+    expect(reading.secondary).toBeGreaterThanOrEqual(4.5);
+    expect(reading.metadata).toBeGreaterThanOrEqual(4.5);
+    const input = page.getByRole("textbox", { name: "消息", exact: true });
+    await input.fill("A 方向布局验证：保持输入草稿");
+    await expect.poll(() => input.evaluate((element) => getComputedStyle(element).transform)).toBe("none");
+    for (const width of [1280, 1024, 853, 375]) {
+      await page.setViewportSize({ width, height: 820 });
+      await expect(page.getByRole("button", { name: "发送消息", exact: true })).toBeVisible();
+      await expect(input).toHaveValue("A 方向布局验证：保持输入草稿");
+      const overflow = await page.locator(".composer").evaluate((element) => ({
+        composer: element.scrollWidth - element.clientWidth,
+        page: document.documentElement.scrollWidth - innerWidth,
+      }));
+      expect(overflow.composer).toBeLessThanOrEqual(1);
+      expect(overflow.page).toBeLessThanOrEqual(1);
+    }
+    await page.setViewportSize({ width: 1280, height: 820 });
+    await page.screenshot({ path: testInfo.outputPath(`professional-${theme}.png`) });
+  }
+});
+
+test("professional workspace primary actions keep readable text on hover", async ({ page }) => {
+  // The scheduled-task navigation belongs to the desktop sidebar.
+  await page.setViewportSize({ width: 1280, height: 820 });
+  for (const theme of ["dark", "light"]) {
+    await page.addInitScript((value) => localStorage.setItem("kcoder_theme", value), theme);
+    await page.goto("/");
+    await page.evaluate(() => {
+      const internals = (window as unknown as { __TAURI_INTERNALS__: { invoke: (command: string, args?: unknown) => Promise<unknown> } }).__TAURI_INTERNALS__;
+      const invoke = internals.invoke;
+      internals.invoke = (command, args) => command === "list_scheduled_tasks" ? Promise.resolve([]) : invoke(command, args);
+    });
+    await page.getByRole("button", { name: "定时任务", exact: true }).click();
+    const button = page.locator(".scheduled-header-actions .scheduled-primary-button");
+    await expect(button).toBeVisible();
+    const contrast = () => button.evaluate((element) => {
+      const css = getComputedStyle(element);
+      const luminance = (rgb: string) => {
+        const c = rgb.match(/[\d.]+/g)!.slice(0, 3).map(Number).map((x) => x / 255).map((x) => x <= 0.04045 ? x / 12.92 : ((x + 0.055) / 1.055) ** 2.4);
+        return c[0] * 0.2126 + c[1] * 0.7152 + c[2] * 0.0722;
+      };
+      const a = luminance(css.color), b = luminance(css.backgroundColor);
+      return (Math.max(a, b) + 0.05) / (Math.min(a, b) + 0.05);
+    });
+    await expect.poll(contrast).toBeGreaterThanOrEqual(4.5);
+    await button.hover();
+    await expect.poll(contrast).toBeGreaterThanOrEqual(4.5);
+  }
 });
 
 test("supports a light CodeBuddy appearance", async ({ page }) => {
@@ -2303,16 +2383,16 @@ test("supports a light CodeBuddy appearance", async ({ page }) => {
       background: styles.backgroundColor,
       colorScheme: styles.colorScheme,
     };
-  })).toEqual({ surface: "#f8fafc", background: "rgb(242, 245, 250)", colorScheme: "light" });
+  })).toEqual({ surface: "#ffffff", background: "rgb(243, 245, 248)", colorScheme: "light" });
   await expect(page.getByRole("button", { name: "切换到深色模式" })).toBeVisible();
 
   await page.getByRole("button", { name: "切换到深色模式" }).click();
   await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
-  await expect.poll(() => page.evaluate(() => getComputedStyle(document.documentElement).getPropertyValue("--color-surface").trim())).toBe("#1B2030");
+  await expect.poll(() => page.evaluate(() => getComputedStyle(document.documentElement).getPropertyValue("--color-surface").trim())).toBe("#171a21");
 
   await page.getByRole("button", { name: "切换到浅色模式" }).click();
   await expect(page.locator("html")).toHaveAttribute("data-theme", "light");
-  await expect.poll(() => page.evaluate(() => getComputedStyle(document.documentElement).getPropertyValue("--color-surface").trim())).toBe("#f8fafc");
+  await expect.poll(() => page.evaluate(() => getComputedStyle(document.documentElement).getPropertyValue("--color-surface").trim())).toBe("#ffffff");
 });
 
 test("selects and persists the extended appearance themes", async ({ page }) => {
@@ -2411,6 +2491,124 @@ test("uses the CodeBuddy blue K and rebuilds the native Windows icon resource", 
   expect(iconSource).toContain('fill="#2F6FE4"');
   expect(iconSource).toMatch(/<path\s+d="M154 112h72v119l104-119h88L298 247l128 153h-91L250 294l-24 27v79h-72V112Z"\s+fill="#fff"\s*\/>/);
   expect(buildScript).toContain('println!("cargo:rerun-if-changed=icons/icon.ico");');
+});
+
+test("resizes both layout dividers and restores preferred widths after responsive changes", async ({ page }) => {
+  await page.setViewportSize({ width: 1536, height: 900 });
+  await page.goto("/");
+  await page.getByRole("button", { name: "工作台", exact: true }).click();
+  const left = page.getByRole("separator", { name: "调整侧边栏宽度" });
+  const right = page.getByRole("separator", { name: "调整右侧面板宽度" });
+  const width = (selector: string) => page.locator(selector).evaluate((element) => element.getBoundingClientRect().width);
+  await expect(left).toBeVisible();
+  await expect(right).toBeVisible();
+  const drag = async (handle: typeof left, delta: number) => {
+    const box = (await handle.boundingBox())!;
+    await page.mouse.move(box.x + box.width / 2, box.y + 90);
+    await page.mouse.down();
+    await page.mouse.move(box.x + box.width / 2 + delta, box.y + 90, { steps: 8 });
+    await page.mouse.up();
+  };
+  const initialLeft = await width(".sidebar");
+  const initialRight = await width(".workbench-panel");
+  await drag(left, 70);
+  await expect.poll(() => width(".sidebar")).toBeCloseTo(initialLeft + 70, 0);
+  await drag(right, -160);
+  await expect.poll(() => width(".workbench-panel")).toBeCloseTo(initialRight + 160, 0);
+  await page.locator(".composer textarea").fill("保留拖动后的草稿");
+  await right.focus();
+  await page.keyboard.press("ArrowLeft");
+  const preferredRight = initialRight + 170;
+  await expect.poll(() => width(".workbench-panel")).toBeCloseTo(preferredRight, 0);
+  for (const viewportWidth of [900, 721, 700, 375, 1536]) {
+    await page.setViewportSize({ width: viewportWidth, height: 900 });
+    if (viewportWidth <= 720) {
+      await expect(left).toBeHidden();
+      await expect(right).toBeHidden();
+    } else {
+      await expect.poll(() => width(".conversation")).toBeGreaterThanOrEqual(360);
+      await expect.poll(() => page.locator(".composer").evaluate((element) => element.scrollWidth - element.clientWidth)).toBeLessThanOrEqual(1);
+    }
+    await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth - innerWidth)).toBeLessThanOrEqual(1);
+  }
+  await expect(page.locator(".composer textarea")).toHaveValue("保留拖动后的草稿");
+  await expect.poll(() => width(".sidebar")).toBeCloseTo(initialLeft + 70, 0);
+  await expect.poll(() => width(".workbench-panel")).toBeCloseTo(preferredRight, 0);
+  await page.reload();
+  await page.getByRole("button", { name: "工作台", exact: true }).click();
+  await expect.poll(() => width(".sidebar")).toBeCloseTo(initialLeft + 70, 0);
+  await expect.poll(() => width(".workbench-panel")).toBeCloseTo(preferredRight, 0);
+  await left.dblclick();
+  await right.dblclick();
+  await expect.poll(() => width(".sidebar")).toBeCloseTo(initialLeft, 0);
+  await expect.poll(() => width(".workbench-panel")).toBeCloseTo(initialRight, 0);
+});
+
+test("bounds divider dragging across an iframe and releases capture on cancellation", async ({ page }) => {
+  await page.setViewportSize({ width: 1536, height: 900 });
+  await page.route("https://resize.example.test/**", (route) => route.fulfill({ contentType: "text/html; charset=utf-8", body: "<input aria-label='网页输入' value='页面保持挂载'>" }));
+  await page.goto("/");
+  await page.getByRole("button", { name: "工作台", exact: true }).click();
+  await page.getByRole("tab", { name: "浏览器" }).click();
+  await page.getByRole("textbox", { name: "网址" }).fill("https://resize.example.test/");
+  await page.getByRole("textbox", { name: "网址" }).press("Enter");
+  const input = page.frameLocator(".browser-host iframe").getByRole("textbox", { name: "网页输入" });
+  await expect(input).toHaveValue("页面保持挂载");
+  const right = page.getByRole("separator", { name: "调整右侧面板宽度" });
+  const panelWidth = () => page.locator(".workbench-panel").evaluate((element) => element.getBoundingClientRect().width);
+  const startWidth = await panelWidth();
+  const box = (await right.boundingBox())!;
+  await page.mouse.move(box.x + 4, box.y + 200);
+  await page.mouse.down();
+  await page.mouse.move(1500, box.y + 200, { steps: 8 });
+  await expect.poll(panelWidth).toBe(320);
+  await page.mouse.move(5, box.y + 200, { steps: 8 });
+  await expect.poll(() => page.locator(".conversation").evaluate((element) => element.getBoundingClientRect().width)).toBeGreaterThanOrEqual(420);
+  await page.keyboard.press("Escape");
+  await page.mouse.up();
+  await expect(page.locator(".workbench-panel")).toBeVisible();
+  await expect.poll(panelWidth).toBeCloseTo(startWidth, 0);
+  await expect(page.locator(".workbench")).not.toHaveClass(/workbench--resizing/);
+  await input.fill("拖动后仍可输入");
+  await right.focus();
+  await page.keyboard.press("Home");
+  await expect.poll(panelWidth).toBe(320);
+  await page.keyboard.press("End");
+  await expect.poll(() => page.locator(".conversation").evaluate((element) => element.getBoundingClientRect().width)).toBeGreaterThanOrEqual(420);
+  await page.keyboard.press("Enter");
+  await expect.poll(panelWidth).toBeCloseTo(startWidth, 0);
+  await expect(input).toHaveValue("拖动后仍可输入");
+  await page.getByRole("button", { name: "工作台", exact: true }).click();
+  await expect(right).toBeHidden();
+  await expect(page.getByRole("separator", { name: "调整侧边栏宽度" })).toBeVisible();
+});
+
+test("keeps background dividers below the change review dialog", async ({ page }) => {
+  await page.setViewportSize({ width: 1536, height: 900 });
+  await page.goto("/");
+  await page.getByRole("button", { name: "工作台", exact: true }).click();
+  await page.locator(".changes-toggle").first().click();
+  await page.locator(".change-file-item").first().click();
+  await expect(page.locator(".review-overlay")).toBeVisible();
+  for (const name of ["调整侧边栏宽度", "调整右侧面板宽度"]) {
+    const bounds = (await page.getByRole("separator", { name }).boundingBox())!;
+    const hitInsideReview = await page.evaluate(({ x, y }) => Boolean(document.elementFromPoint(x, y)?.closest(".review-overlay")), { x: bounds.x + bounds.width / 2, y: bounds.y + 200 });
+    expect(hitInsideReview).toBe(true);
+  }
+});
+
+test("ignores malformed saved panel widths and still allows resizing", async ({ page }) => {
+  await page.addInitScript(() => localStorage.setItem("kcoder_panel_widths_v1", '{"sidebar":-100,"panel":"900"}'));
+  await page.setViewportSize({ width: 1536, height: 900 });
+  await page.goto("/");
+  await page.getByRole("button", { name: "工作台", exact: true }).click();
+  const left = page.getByRole("separator", { name: "调整侧边栏宽度" });
+  const right = page.getByRole("separator", { name: "调整右侧面板宽度" });
+  await expect(left).toHaveAttribute("aria-valuenow", "232");
+  await expect(right).toHaveAttribute("aria-valuenow", "430");
+  await left.focus();
+  await page.keyboard.press("ArrowRight");
+  await expect.poll(() => page.locator(".sidebar").evaluate((element) => element.getBoundingClientRect().width)).toBe(242);
 });
 
 test("keeps the mid-width workbench bounded without toolbar overflow", async ({ page }, testInfo) => {
@@ -2883,13 +3081,16 @@ test("streams thinking, safe reasoning summaries, compact command states, and fi
 });
 
 test("renders streamed assistant markdown as structured content", async ({ page }, testInfo) => {
-  await page.goto("/");
+  await page.route("https://example.com/tracker.png", route => route.fulfill({
+    contentType: "image/png", body: Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=", "base64"),
+  }));
+  await page.goto("/", { waitUntil: "domcontentloaded" });
   await expect(page.getByRole("heading", { name: "Phase 6 workbench" })).toBeVisible();
   await page.evaluate(() => {
     localStorage.setItem("kcoder_skin", "codebuddy");
     localStorage.setItem("kcoder_theme", "dark");
   });
-  await page.reload();
+  await page.reload({ waitUntil: "domcontentloaded" });
 
   await page.evaluate(() => {
     const emit = (window as unknown as { __emitAgentEvent: (event: unknown) => void }).__emitAgentEvent;
@@ -2911,8 +3112,8 @@ test("renders streamed assistant markdown as structured content", async ({ page 
   await expect(liveMessage.locator("th")).toHaveText(["字段", "作用"]);
   await expect(liveMessage.locator(".markdown-code-block code")).toContainText("const ready = true;");
   await expect(liveMessage.getByRole("button", { name: "复制代码" })).toBeVisible();
-  await expect(liveMessage.locator("img")).toHaveCount(0);
-  await expect(liveMessage.locator(".markdown-image-placeholder")).toHaveText("远程图片");
+  await expect(liveMessage.locator("img")).toHaveCount(1);
+  await expect(liveMessage.getByRole("button", { name: "查看图片 远程图片" })).toBeVisible();
   await liveMessage.scrollIntoViewIfNeeded();
   await page.screenshot({ path: testInfo.outputPath("assistant-markdown.png"), fullPage: true });
 });
@@ -4543,8 +4744,8 @@ test("restores a pending user question after reopening the thread", async ({ pag
   });
   await page.goto("/");
   await expect(page.locator(".user-input-question-text").getByText("Choose an approach", { exact: true })).toBeVisible();
-  await expect.poll(() => page.locator(".user-input-question-text").evaluate((element) => getComputedStyle(element).color)).toBe("rgb(227, 232, 240)");
-  await expect.poll(() => page.getByRole("button", { name: "Fast", exact: true }).evaluate((element) => getComputedStyle(element).color)).toBe("rgb(227, 232, 240)");
+  await expect.poll(() => page.locator(".user-input-question-text").evaluate((element) => getComputedStyle(element).color)).toBe("rgb(232, 235, 242)");
+  await expect.poll(() => page.getByRole("button", { name: "Fast", exact: true }).evaluate((element) => getComputedStyle(element).color)).toBe("rgb(232, 235, 242)");
   await page.getByRole("button", { name: "Fast", exact: true }).click();
   await page.getByRole("button", { name: "提交回答", exact: true }).click();
   await expect.poll(() => page.evaluate(() => (window as unknown as { __invoked: string[] }).__invoked.filter((command) => command === "resolve_user_input").length)).toBe(1);
@@ -6434,4 +6635,60 @@ test("ordinary conversation keeps its independent plan progress", async ({ page 
   await expect(details.locator(".plan-progress-step--in_progress")).toContainText("验证实现");
   await page.reload();
   await expect(progress).toContainText("第 2/2 步");
+});
+
+test("previews markdown data, remote, workspace and browser artifact images safely", async ({ page }) => {
+  const png = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+  await page.route("https://images.example/test.png", route => route.fulfill({ contentType: "image/png", body: Buffer.from(png.split(",")[1], "base64") }));
+  await page.goto("/", { waitUntil: "domcontentloaded" });
+  await expect(page.getByRole("heading", { name: "Phase 6 workbench" })).toBeVisible();
+  await page.evaluate((png) => {
+    const win = window as any;
+    const original = win.__TAURI_INTERNALS__.invoke;
+    win.__imageReads = [];
+    win.__TAURI_INTERNALS__.invoke = (command: string, args: any) => {
+      if (command === "read_message_image" || command === "read_browser_artifact") {
+        win.__imageReads.push({ command, ...args });
+        if (args.path?.includes("missing")) return Promise.reject(new Error("missing"));
+        return Promise.resolve(png);
+      }
+      return original(command, args);
+    };
+    const base = { schemaVersion: 1, threadId: "thread-1", turnId: "markdown-images" };
+    win.__emitAgentEvent({ ...base, type: "turn_started", phase: "responding" });
+    win.__emitAgentEvent({ ...base, type: "text_delta", phase: "responding", delta: [
+      `![内嵌图片](${png})`,
+      "![网络图片](https://images.example/test.png)",
+      "![本地图片](docs/example.png)",
+      "![绝对路径](<D:/code/k-coder/docs/example.png>)",
+      "1750000000000-0123456789abcdef.png",
+      "![丢失图片](docs/missing.png)",
+      "![危险图片](javascript:alert(1))",
+      "![矢量脚本](data:image/svg+xml;base64,PHN2Zy8+)",
+      "`1750000000001-0123456789abcdef.png`",
+      "[1750000000002-0123456789abcdef.png][shot]\n\n[shot]: https://images.example/result",
+      "[1750000000003-0123456789abcdef.png][]\n\n[1750000000003-0123456789abcdef.png]: https://images.example/result",
+    ].join("\n\n") });
+  }, png);
+  const message = page.locator(".message--assistant").last();
+  for (const name of ["内嵌图片", "网络图片", "本地图片", "绝对路径", "1750000000000-0123456789abcdef.png"]) {
+    const button = message.getByRole("button", { name: `查看图片 ${name}`, exact: true });
+    await expect(button).toBeVisible();
+    await expect.poll(() => button.locator("img").evaluate((img: HTMLImageElement) => img.naturalWidth)).toBe(1);
+    await button.click();
+    await expect(page.getByRole("dialog", { name, exact: true })).toBeVisible();
+    await page.keyboard.press("Escape");
+    await expect(button).toBeFocused();
+  }
+  await expect(message.getByText("图片加载失败：丢失图片", { exact: true })).toBeVisible();
+  await expect(message.locator("img")).toHaveCount(5);
+  for (const name of ["1750000000002-0123456789abcdef.png", "1750000000003-0123456789abcdef.png"]) {
+    await expect(message.getByRole("link", { name, exact: true })).toHaveAttribute("href", "https://images.example/result");
+  }
+  expect(await page.evaluate(() => Array.from(new Map((window as any).__imageReads.map((read: unknown) => [JSON.stringify(read), read])).values()))).toEqual([
+    { command: "read_message_image", threadId: "thread-1", path: "docs/example.png" },
+    { command: "read_message_image", threadId: "thread-1", path: "D:/code/k-coder/docs/example.png" },
+    { command: "read_browser_artifact", name: "1750000000000-0123456789abcdef.png" },
+    { command: "read_message_image", threadId: "thread-1", path: "docs/missing.png" },
+  ]);
 });

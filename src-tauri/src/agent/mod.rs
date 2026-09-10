@@ -59,7 +59,7 @@ const PROGRESS_CHECK_WINDOW: usize = 5;
 const MAX_NO_PROGRESS_WINDOWS: usize = 3;
 const MAX_PROTOCOL_RETRIES: usize = 5;
 pub const DEFAULT_SOFT_TURN_PROVIDER_CALLS: u32 = 100;
-pub const DEFAULT_SOFT_TURN_TOTAL_TOKENS: u64 = 1_000_000;
+pub const DEFAULT_SOFT_TURN_TOTAL_TOKENS: u64 = 5_000_000;
 pub const DEFAULT_SOFT_TURN_DURATION_MS: u64 = 10 * 60 * 1_000;
 
 const TURN_CONTINUATION_TOOL_CALL_ID: &str = "runtime-turn-continuation";
@@ -6384,6 +6384,28 @@ mod tests {
             SoftTurnSegmentUsage {
                 provider_calls: 100,
                 total_tokens: 0,
+                duration_ms: 0,
+            }
+            .exceeds(limits)
+        );
+    }
+
+    #[test]
+    fn soft_turn_default_requests_continuation_at_five_million_tokens() {
+        let limits = SoftTurnLimits::default();
+
+        assert!(
+            !SoftTurnSegmentUsage {
+                provider_calls: 1,
+                total_tokens: 4_999_999,
+                duration_ms: 0,
+            }
+            .exceeds(limits)
+        );
+        assert!(
+            SoftTurnSegmentUsage {
+                provider_calls: 1,
+                total_tokens: 5_000_000,
                 duration_ms: 0,
             }
             .exceeds(limits)
