@@ -65,6 +65,7 @@ export function ImagePreviewDialog({ image, onClose }: ImagePreviewDialogProps) 
           <img
             src={image.dataUrl}
             alt={image.name}
+            referrerPolicy="no-referrer"
             onMouseDown={(event) => event.stopPropagation()}
           />
         </div>

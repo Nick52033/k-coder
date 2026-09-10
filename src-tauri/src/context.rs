@@ -301,6 +301,15 @@ pub fn compact(
         )),
         estimated_after_tokens: 0,
     };
+    // Text summaries cannot stand in for pixels. Retain one bounded upload batch,
+    // even when tool output or a workspace mutation pushed it out of the tail.
+    if let Some(image_message) = messages.iter().rev().find(|message| {
+        matches!(message, ProviderMessage::UserContent { images, .. } if !images.is_empty())
+    }) {
+        if !kept.contains(image_message) {
+            kept.insert(0, image_message.clone());
+        }
+    }
     let result = render_provider_history(Some(&summary), &kept);
     summary.estimated_after_tokens = estimate_tokens(&result);
     (summary, result)
@@ -629,6 +638,24 @@ fn bound(value: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compaction_preserves_latest_image_bytes_after_tool_work() {
+        let image = ProviderMessage::UserContent {
+            text: "分析这张图".into(),
+            images: vec![crate::providers::ProviderImage {
+                name: "example.png".into(),
+                data_url: "data:image/png;base64,AA==".into(),
+            }],
+        };
+        let mut messages = vec![image.clone()];
+        messages.extend((0..10).map(|_| ProviderMessage::Text {
+            role: MessageRole::Assistant,
+            text: "work in progress ".repeat(100),
+        }));
+        let (_, compacted) = compact_once(&messages, 2_000);
+        assert_eq!(compacted.iter().filter(|m| **m == image).count(), 1);
+    }
 
     fn compact_once(
         messages: &[ProviderMessage],

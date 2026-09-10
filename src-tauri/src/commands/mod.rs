@@ -1313,6 +1313,37 @@ pub fn list_browser_artifacts(state: State<'_, AppState>) -> CommandResult<Vec<B
         .map_err(|error| CommandError::new("browser", error))
 }
 
+#[tauri::command(rename_all = "camelCase")]
+pub fn read_browser_artifact(state: State<'_, AppState>, name: String) -> CommandResult<String> {
+    use base64::Engine as _;
+    let bytes = state
+        .advanced()
+        .browser
+        .read_artifact(&name)
+        .map_err(|error| CommandError::new("browser", error))?;
+    Ok(format!(
+        "data:image/png;base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    ))
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn read_message_image(
+    state: State<'_, AppState>,
+    thread_id: String,
+    path: String,
+) -> CommandResult<String> {
+    let root = state
+        .resolve_thread_workspace(&thread_id)
+        .await
+        .map_err(|error| CommandError::new("workspace_mismatch", error))?
+        .ok_or_else(|| CommandError::new("image", "无项目会话不能读取工作区图片"))?;
+    tauri::async_runtime::spawn_blocking(move || workbench::read_message_image(&root, &path))
+        .await
+        .map_err(|error| CommandError::new("image", error))?
+        .map_err(|error| CommandError::new("image", error))
+}
+
 #[tauri::command]
 pub async fn close_browser_session(state: State<'_, AppState>) -> CommandResult<()> {
     state

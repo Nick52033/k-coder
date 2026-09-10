@@ -331,6 +331,8 @@ export function getBrowserSettings() { return invoke<BrowserSettings>("get_brows
 export function saveBrowserSettings(settings: BrowserSettings) { return invoke<BrowserSettings>("save_browser_settings", { settings }); }
 export function listBrowserAudit() { return invoke<BrowserAuditEvent[]>("list_browser_audit"); }
 export function listBrowserArtifacts() { return invoke<BrowserArtifact[]>("list_browser_artifacts"); }
+export function readBrowserArtifact(name: string) { return invoke<string>("read_browser_artifact", { name }); }
+export function readMessageImage(threadId: string, path: string) { return invoke<string>("read_message_image", { threadId, path }); }
 export function closeBrowserSession() { return invoke<void>("close_browser_session"); }
 export function extractDocumentContent(relativePath: string) { return invoke<DocumentContent>("extract_document_content", { relativePath }); }
 export function getAdvancedMetrics() { return invoke<MetricsSnapshot>("advanced_metrics"); }

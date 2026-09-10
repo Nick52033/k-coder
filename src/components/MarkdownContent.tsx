@@ -1,7 +1,8 @@
 import { Check, Copy, FileDiff } from "lucide-react";
 import { Children, isValidElement, memo, type ReactNode, useState } from "react";
-import ReactMarkdown, { type Components } from "react-markdown";
+import ReactMarkdown, { defaultUrlTransform, type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
+import { isDisplayImageSource, MarkdownImage } from "./MarkdownImage";
 
 const PROPOSED_PLAN = /<proposed_plan>([\s\S]*?)(?:<\/proposed_plan>|$)/g;
 
@@ -41,7 +42,7 @@ export const MarkdownContent = memo(function MarkdownContent({ text }: { text: s
 const MarkdownDocument = memo(
   function MarkdownDocument({ text }: { text: string }) {
     return (
-      <ReactMarkdown remarkPlugins={[remarkGfm]} components={markdownComponents} skipHtml>
+      <ReactMarkdown remarkPlugins={[remarkGfm, remarkArtifactImages]} components={markdownComponents} urlTransform={(url, key, node) => node.tagName === "img" && key === "src" ? (isDisplayImageSource(url) ? url : "") : defaultUrlTransform(url)} skipHtml>
         {text}
       </ReactMarkdown>
     );
@@ -49,13 +50,38 @@ const MarkdownDocument = memo(
   (prev, next) => prev.text === next.text,
 );
 
+// Rewrite text nodes only: links, alt text and code retain their original content.
+type MarkdownNode = { type: string; value?: string; children?: MarkdownNode[]; url?: string; alt?: string };
+function remarkArtifactImages() {
+  return (tree: MarkdownNode) => {
+    const walk = (node: MarkdownNode) => {
+      if (!node.children || ["link", "linkReference", "image", "code", "inlineCode", "html"].includes(node.type)) return;
+      node.children = node.children.flatMap(child => {
+        if (child.type !== "text" || !child.value) { walk(child); return [child]; }
+        const nodes: MarkdownNode[] = [];
+        let offset = 0;
+        // In a partial stream, an unfinished code span/reference link is still
+        // a text node. Do not treat its filename as a standalone artifact.
+        for (const match of child.value.matchAll(/(?<![\w/\\.\-`\[\]])\d{10,20}-[0-9a-f]{16,64}\.png\b/gi)) {
+          if (match.index > offset) nodes.push({ type: "text", value: child.value.slice(offset, match.index) });
+          nodes.push({ type: "image", url: match[0], alt: match[0] });
+          offset = match.index + match[0].length;
+        }
+        if (offset < child.value.length) nodes.push({ type: "text", value: child.value.slice(offset) });
+        return nodes;
+      });
+    };
+    walk(tree);
+  };
+}
+
 const markdownComponents: Components = {
   a: ({ children, ...props }) => (
     <a {...props} target="_blank" rel="noreferrer">
       {children}
     </a>
   ),
-  img: ({ alt }) => <span className="markdown-image-placeholder">{alt || "图片"}</span>,
+  img: ({ src, alt }) => <MarkdownImage source={typeof src === "string" ? src : ""} alt={alt ?? ""} />,
   pre: ({ children }) => <CodeBlock>{children}</CodeBlock>,
   table: ({ children, ...props }) => (
     <div className="markdown-table-wrap">

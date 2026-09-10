@@ -426,6 +426,57 @@ pub fn extract_attachment(
     })
 }
 
+/// Image-only display boundary. Absolute model paths confer no authority: the
+/// canonical target must still be a regular file within this thread's workspace.
+pub fn read_message_image(root: &Path, source: &str) -> Result<String, WorkbenchError> {
+    use std::io::Read;
+    let requested = Path::new(source);
+    if requested
+        .components()
+        .any(|part| matches!(part, Component::ParentDir))
+    {
+        return Err(WorkbenchError::Invalid(
+            "parent traversal is not allowed".into(),
+        ));
+    }
+    let root = canonical_workspace(root)?;
+    let candidate = if requested.is_absolute() {
+        requested
+            .canonicalize()
+            .map_err(|error| WorkbenchError::Io(error.to_string()))?
+    } else {
+        resolve(&root, source, false)?
+    };
+    if !candidate.starts_with(&root) || !candidate.is_file() {
+        return Err(WorkbenchError::Invalid(
+            "image must be a workspace file".into(),
+        ));
+    }
+    let file =
+        std::fs::File::open(candidate).map_err(|error| WorkbenchError::Io(error.to_string()))?;
+    let mut bytes = Vec::new();
+    file.take((MAX_ATTACHMENT_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|error| WorkbenchError::Io(error.to_string()))?;
+    if bytes.len() > MAX_ATTACHMENT_BYTES {
+        return Err(WorkbenchError::Invalid(
+            "image exceeds the 4 MiB preview limit".into(),
+        ));
+    }
+    let mime = match image::guess_format(&bytes) {
+        Ok(image::ImageFormat::Png) => "image/png",
+        Ok(image::ImageFormat::Jpeg) => "image/jpeg",
+        Ok(image::ImageFormat::Gif) => "image/gif",
+        Ok(image::ImageFormat::WebP) => "image/webp",
+        Ok(image::ImageFormat::Bmp) => "image/bmp",
+        _ => return Err(WorkbenchError::Invalid("unsupported image content".into())),
+    };
+    Ok(format!(
+        "data:{mime};base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    ))
+}
+
 pub fn open_external(root: &Path, relative: &str, reveal: bool) -> Result<(), WorkbenchError> {
     let path = resolve(root, relative, false)?;
     let shell_path = shell_compatible_path(&path);
@@ -837,6 +888,61 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let result = open_external(root.path(), "../outside.txt", false);
         assert!(matches!(result, Err(WorkbenchError::Invalid(_))));
+    }
+
+    #[test]
+    fn message_image_reads_relative_and_absolute_raster_files_only() {
+        let root = tempfile::tempdir().unwrap();
+        let png = base64::engine::general_purpose::STANDARD.decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=").unwrap();
+        let file = root.path().join("测试 image.png");
+        std::fs::write(&file, &png).unwrap();
+        let relative = read_message_image(root.path(), "测试 image.png").unwrap();
+        assert!(relative.starts_with("data:image/png;base64,"));
+        assert_eq!(
+            relative,
+            read_message_image(root.path(), file.to_str().unwrap()).unwrap()
+        );
+        std::fs::write(root.path().join("script.png"), "<svg onload='alert(1)'/>").unwrap();
+        assert!(read_message_image(root.path(), "script.png").is_err());
+        assert!(read_message_image(root.path(), ".").is_err());
+        assert!(read_message_image(root.path(), "missing.png").is_err());
+        assert!(read_message_image(root.path(), "../测试 image.png").is_err());
+        let outside = tempfile::tempdir().unwrap();
+        let escaped = outside.path().join("escape.png");
+        std::fs::write(&escaped, &png).unwrap();
+        assert!(read_message_image(root.path(), escaped.to_str().unwrap()).is_err());
+        let oversized = std::fs::File::create(root.path().join("large.png")).unwrap();
+        oversized
+            .set_len((MAX_ATTACHMENT_BYTES + 1) as u64)
+            .unwrap();
+        assert!(read_message_image(root.path(), "large.png").is_err());
+    }
+
+    #[test]
+    fn message_image_rejects_directory_link_escape() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("outside.png"), b"outside").unwrap();
+        let link = root.path().join("linked");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(outside.path(), &link).unwrap();
+        #[cfg(windows)]
+        {
+            let status = Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(&link)
+                .arg(outside.path())
+                .output()
+                .unwrap();
+            assert!(status.status.success());
+        }
+        assert!(read_message_image(root.path(), "linked/outside.png").is_err());
+        assert!(
+            read_message_image(root.path(), link.join("outside.png").to_str().unwrap()).is_err()
+        );
+        // Remove just the junction, before the temporary directory's recursive cleanup.
+        #[cfg(windows)]
+        std::fs::remove_dir(link).unwrap();
     }
 
     #[test]

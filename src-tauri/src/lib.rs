@@ -231,6 +231,8 @@ pub fn run() {
             commands::save_browser_settings,
             commands::list_browser_audit,
             commands::list_browser_artifacts,
+            commands::read_browser_artifact,
+            commands::read_message_image,
             commands::close_browser_session,
             commands::extract_document_content,
             commands::advanced_metrics,

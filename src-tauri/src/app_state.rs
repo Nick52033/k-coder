@@ -978,7 +978,9 @@ impl AppState {
         api_key: String,
     ) -> Result<Arc<dyn Provider>, AppStateError> {
         let provider: Arc<dyn Provider> = match config.transport {
-            ProviderTransport::OpenAiChatCompletions if is_deepseek_model(&config.model) => {
+            ProviderTransport::OpenAiChatCompletions
+                if deepseek_dialect(&config, &config.model) =>
+            {
                 Arc::new(DeepSeekChatCompletionsProvider::new(config, api_key)?)
             }
             ProviderTransport::OpenAiChatCompletions => {
@@ -1491,14 +1493,35 @@ fn is_deepseek_model(model: &str) -> bool {
         })
 }
 
+/// Stored per-model vision declaration, without transport heuristics.
+fn stored_model_declares_vision(config: &ProviderConfig, model_id: &str) -> bool {
+    config
+        .models
+        .iter()
+        .any(|model| model.id == model_id && model.supports_vision)
+}
+
+/// Whether `model_id` is routed through the DeepSeek chat-completions dialect.
+///
+/// The DeepSeek dialect rejects image content, so an explicit per-model
+/// `supportsVision` declaration overrides the model-name heuristic: such a
+/// configuration is an ordinary multimodal OpenAI-compatible endpoint that must
+/// keep the standard `image_url` content shape. Selecting the dedicated
+/// `deep_seek_chat_completions` transport remains authoritative and stays
+/// text-only.
+fn deepseek_dialect(config: &ProviderConfig, model_id: &str) -> bool {
+    config.transport == ProviderTransport::OpenAiChatCompletions
+        && is_deepseek_model(model_id)
+        && !stored_model_declares_vision(config, model_id)
+}
+
 fn model_supports_vision(
     config: &ProviderConfig,
     model: &crate::providers::ProviderModelConfig,
 ) -> bool {
     model.supports_vision
         && config.transport != ProviderTransport::DeepSeekChatCompletions
-        && !(config.transport == ProviderTransport::OpenAiChatCompletions
-            && is_deepseek_model(&model.id))
+        && !deepseek_dialect(config, &model.id)
 }
 
 fn provider_target_specs(
@@ -1746,12 +1769,31 @@ mod tests {
     }
 
     #[test]
-    fn deepseek_chat_completions_is_text_only_even_if_catalog_flags_vision() {
-        for (transport, model) in [
-            (ProviderTransport::DeepSeekChatCompletions, "private-model"),
+    fn vision_declaration_overrides_name_heuristic_but_not_explicit_deepseek_transport() {
+        for (transport, model, declared_vision, expected_vision) in [
+            (
+                ProviderTransport::DeepSeekChatCompletions,
+                "private-model",
+                true,
+                false,
+            ),
             (
                 ProviderTransport::OpenAiChatCompletions,
                 "deepseek-reasoner",
+                true,
+                true,
+            ),
+            (
+                ProviderTransport::OpenAiChatCompletions,
+                "deepseek-flash",
+                true,
+                true,
+            ),
+            (
+                ProviderTransport::OpenAiChatCompletions,
+                "deepseek-reasoner",
+                false,
+                false,
             ),
         ] {
             let config = SaveProviderConfigRequest {
@@ -1766,7 +1808,7 @@ mod tests {
                     display_name: model.to_string(),
                     context_window: 1_000_000,
                     max_output_tokens: Some(256_000),
-                    supports_vision: true,
+                    supports_vision: declared_vision,
                     fallback: false,
                 }],
                 endpoints: Vec::new(),
@@ -1776,8 +1818,18 @@ mod tests {
             .public_config()
             .expect("DeepSeek configuration should validate");
 
-            assert!(!model_supports_vision(&config, config.active_model()));
-            assert!(provider_target_specs(&config, true).is_empty());
+            assert_eq!(
+                model_supports_vision(&config, config.active_model()),
+                expected_vision
+            );
+            assert_eq!(
+                provider_target_specs(&config, true).is_empty(),
+                !expected_vision
+            );
+            assert_eq!(
+                deepseek_dialect(&config, model),
+                transport == ProviderTransport::OpenAiChatCompletions && !declared_vision
+            );
         }
     }
 

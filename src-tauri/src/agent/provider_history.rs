@@ -34,10 +34,15 @@ pub(super) fn provider_history(events: Vec<StoredEvent>, supports_vision: bool) 
     let mut history = Vec::new();
     let mut summary = None;
     let mut user_context = CompactionUserContext::default();
+    let mut latest_image_message = None;
     for event in events {
         let message = match event.kind {
             StoredEventKind::UserMessage { message } => {
                 let message = chat_to_provider(message, supports_vision);
+                if matches!(&message, Some(ProviderMessage::UserContent { images, .. }) if !images.is_empty())
+                {
+                    latest_image_message = message.clone();
+                }
                 if let Some(text) = message.as_ref().and_then(context::user_message_text) {
                     user_context.observe(text);
                 }
@@ -69,6 +74,9 @@ pub(super) fn provider_history(events: Vec<StoredEvent>, supports_vision: bool) 
                 summary: compacted, ..
             } => {
                 history.clear();
+                if let Some(image_message) = &latest_image_message {
+                    history.push(image_message.clone());
+                }
                 summary = Some(compacted);
                 None
             }
@@ -131,6 +139,49 @@ pub(super) fn last_active_context_usage(events: &[StoredEvent]) -> Option<TokenU
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn restored_compaction_preserves_latest_image_without_text_only_leakage() {
+        let message = super::super::input::build_user_message(
+            "分析图片",
+            vec![crate::protocol::ImageAttachment {
+                name: "example.png".into(),
+                data_url: "data:image/png;base64,AA==".into(),
+                ocr_text: None,
+            }],
+            true,
+        )
+        .unwrap();
+        let provider_message = chat_to_provider(message.clone(), true).unwrap();
+        let (summary, _) = context::compact(
+            &[provider_message.clone()],
+            2_000,
+            None,
+            &CompactionUserContext::default(),
+        );
+        let events = vec![
+            StoredEvent::new("thread", None, StoredEventKind::UserMessage { message }),
+            StoredEvent::new(
+                "thread",
+                None,
+                StoredEventKind::ContextCompacted {
+                    summary,
+                    automatic: true,
+                },
+            ),
+        ];
+        assert!(
+            provider_history(events.clone(), true)
+                .request_messages()
+                .contains(&provider_message)
+        );
+        assert!(
+            !provider_history(events, false)
+                .request_messages()
+                .iter()
+                .any(|m| matches!(m, ProviderMessage::UserContent { .. }))
+        );
+    }
 
     #[test]
     fn read_file_metadata_becomes_provider_visible_provenance() {

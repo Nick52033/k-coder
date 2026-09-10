@@ -60,6 +60,7 @@ struct BrowserSession {
 }
 
 struct BrowserInner {
+    data_root: PathBuf,
     settings_path: PathBuf,
     audit_path: PathBuf,
     artifact_dir: PathBuf,
@@ -87,6 +88,9 @@ impl BrowserService {
         fs::create_dir_all(&artifact_dir).map_err(|error| error.to_string())?;
         Ok(Self {
             inner: Arc::new(BrowserInner {
+                data_root: data_root
+                    .canonicalize()
+                    .map_err(|error| error.to_string())?,
                 settings_path,
                 audit_path: root.join("browser-audit.jsonl"),
                 artifact_dir,
@@ -153,6 +157,35 @@ impl BrowserService {
         }
         artifacts.sort_by(|left, right| right.created_at_ms.cmp(&left.created_at_ms));
         Ok(artifacts)
+    }
+
+    pub fn read_artifact(&self, name: &str) -> Result<Vec<u8>, String> {
+        use std::io::Read;
+        if !is_valid_artifact_name(name) {
+            return Err("invalid browser artifact name".into());
+        }
+        let root = self
+            .inner
+            .artifact_dir
+            .canonicalize()
+            .map_err(|error| error.to_string())?;
+        let path = root
+            .join(name)
+            .canonicalize()
+            .map_err(|error| error.to_string())?;
+        if !root.starts_with(&self.inner.data_root) || !path.starts_with(&root) || !path.is_file() {
+            return Err("browser artifact path escapes its storage boundary".into());
+        }
+        let mut bytes = Vec::new();
+        fs::File::open(path)
+            .map_err(|error| error.to_string())?
+            .take((MAX_ARTIFACT_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)
+            .map_err(|error| error.to_string())?;
+        if bytes.len() > MAX_ARTIFACT_BYTES {
+            return Err("browser artifact is no larger than 8 MiB".into());
+        }
+        Ok(bytes)
     }
 
     pub async fn navigate(
@@ -620,6 +653,17 @@ fn map_browser_error(error: String) -> ToolError {
     }
 }
 
+fn is_valid_artifact_name(name: &str) -> bool {
+    let Some(stem) = name.strip_suffix(".png") else {
+        return false;
+    };
+    !stem.is_empty()
+        && stem.len() <= 128
+        && stem
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -640,5 +684,67 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[test]
+    fn artifact_name_validation_rejects_path_traversal() {
+        assert!(is_valid_artifact_name(
+            "1789904635907-376cbe9558c541f23adb972db5f9abdf69a.png"
+        ));
+        for name in [
+            "../escape.png",
+            "a/b.png",
+            "a\\b.png",
+            "..",
+            "notes.txt",
+            ".png",
+            "a.png.exe",
+            "a.png/../b.png",
+        ] {
+            assert!(!is_valid_artifact_name(name), "{name} should be rejected");
+        }
+    }
+
+    #[tokio::test]
+    async fn read_artifact_returns_bytes_and_rejects_invalid_names() {
+        let directory = tempfile::tempdir().unwrap();
+        let service = BrowserService::new(directory.path()).unwrap();
+        let name = "1789904635907-376cbe9558c541f23adb972db5f9abdf69a.png";
+        let artifact = directory
+            .path()
+            .join("advanced")
+            .join("browser-artifacts")
+            .join(name);
+        fs::create_dir_all(artifact.parent().unwrap()).unwrap();
+        fs::write(&artifact, b"png-bytes").unwrap();
+
+        assert_eq!(service.read_artifact(name).unwrap(), b"png-bytes");
+        assert!(service.read_artifact("../escape.png").is_err());
+        assert!(service.read_artifact("missing.png").is_err());
+        let oversized = fs::File::create(&artifact).unwrap();
+        oversized.set_len((MAX_ARTIFACT_BYTES + 1) as u64).unwrap();
+        assert!(service.read_artifact(name).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn read_artifact_rejects_directory_junction_escape() {
+        let directory = tempfile::tempdir().unwrap();
+        let service = BrowserService::new(directory.path()).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let name = "1789904635907-376cbe9558c541f23adb972db5f9abdf69a.png";
+        fs::write(outside.path().join(name), b"outside").unwrap();
+        let artifact_dir = directory.path().join("advanced").join("browser-artifacts");
+        fs::remove_dir(&artifact_dir).unwrap();
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&artifact_dir)
+            .arg(outside.path())
+            .output()
+            .unwrap();
+        assert!(status.status.success());
+        let result = service.read_artifact(name);
+        fs::remove_dir(artifact_dir).unwrap();
+        assert!(result.is_err());
     }
 }
