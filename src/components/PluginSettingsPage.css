@@ -369,14 +369,14 @@
 }
 
 .plugin-confirm-actions .danger-button {
-  border-color: var(--color-error);
-  color: #fff;
-  background: var(--color-error);
+  border-color: var(--color-error-solid);
+  color: var(--color-on-error);
+  background: var(--color-error-solid);
 }
 
 .plugin-confirm-actions .danger-button:hover:not(:disabled) {
-  border-color: var(--color-error-text);
-  background: var(--color-error-text);
+  border-color: var(--color-error-solid-hover);
+  background: var(--color-error-solid-hover);
 }
 
 .plugin-spin {

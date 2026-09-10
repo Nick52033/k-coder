@@ -24,7 +24,7 @@ export const THEME_STORAGE_KEY = "kcoder_theme";
 
 export const THEME_OPTIONS: ThemeOption[] = [
   { id: "light", label: "浅色", description: "清晰明亮", icon: "sun", swatch: ["#ffffff", "#365cce"] },
-  { id: "dark", label: "深色", description: "柔和暗色", icon: "moon", swatch: ["#171a21", "#91adff"] },
+  { id: "dark", label: "深色", description: "靛蓝夜色", icon: "moon", swatch: ["#1e1e2e", "#7aa2ff"] },
   { id: "arctic", label: "Arctic", description: "冰川蓝白", icon: "cloud", swatch: ["#f2f8fb", "#1687a7"] },
   { id: "crt-green", label: "CRT Green", description: "荧光绿屏", icon: "monitor", swatch: ["#08110c", "#78f6a5"] },
   { id: "ember", label: "Ember", description: "炭火橙红", icon: "flame", swatch: ["#201719", "#f97316"] },
@@ -32,7 +32,7 @@ export const THEME_OPTIONS: ThemeOption[] = [
   { id: "synthwave", label: "Synthwave", description: "霓虹夜色", icon: "moon", swatch: ["#171326", "#f472b6"] },
   { id: "terminal", label: "Terminal", description: "琥珀终端", icon: "terminal", swatch: ["#0f1110", "#f5b94c"] },
   { id: "vapor", label: "Vapor", description: "雾紫柔光", icon: "waves", swatch: ["#faf8ff", "#8b73d6"] },
-  { id: "system", label: "跟随系统", description: "使用系统偏好", icon: "monitor", swatch: ["#f3f5f8", "#91adff"] },
+  { id: "system", label: "跟随系统", description: "使用系统偏好", icon: "monitor", swatch: ["#f3f5f8", "#7aa2ff"] },
 ];
 
 const THEME_IDS = new Set<ThemeId>(THEME_OPTIONS.map((option) => option.id));

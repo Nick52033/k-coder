@@ -2173,7 +2173,7 @@ test("renders the MCP settings tool in dark mode", async ({ page }, testInfo) =>
   await expect.poll(() => dialog.locator(".mcp-json-workspace").evaluate((element) => ({
     background: getComputedStyle(element).backgroundColor,
     surface: getComputedStyle(document.documentElement).getPropertyValue("--color-surface").trim(),
-  }))).toEqual({ background: "rgb(23, 26, 33)", surface: "#171a21" });
+  }))).toEqual({ background: "rgb(30, 30, 46)", surface: "#1e1e2e" });
   await page.screenshot({ path: testInfo.outputPath("mcp-settings-dark.png") });
 });
 
@@ -2208,6 +2208,16 @@ test("manages local plugins from backend facts", async ({ page }, testInfo) => {
   await review.getByRole("button", { name: "删除 review-tools" }).click();
   const confirm = page.getByRole("dialog", { name: "删除插件" });
   await expect(confirm.getByText("review-tools", { exact: true })).toBeVisible();
+  // 破坏性实心按钮的填充与前景是两个独立角色，任何主题下都必须能读懂。
+  await expect.poll(() => confirm.locator(".danger-button").evaluate((element) => {
+    const css = getComputedStyle(element);
+    const luminance = (rgb: string) => {
+      const c = rgb.match(/[\d.]+/g)!.slice(0, 3).map(Number).map((x) => x / 255).map((x) => x <= 0.04045 ? x / 12.92 : ((x + 0.055) / 1.055) ** 2.4);
+      return c[0] * 0.2126 + c[1] * 0.7152 + c[2] * 0.0722;
+    };
+    const a = luminance(css.color), b = luminance(css.backgroundColor);
+    return (Math.max(a, b) + 0.05) / (Math.min(a, b) + 0.05);
+  })).toBeGreaterThanOrEqual(4.5);
   await confirm.getByRole("button", { name: "取消", exact: true }).click();
   expect(await page.evaluate(() => (
     window as unknown as { __invoked: string[] }
@@ -2284,7 +2294,7 @@ test("renders local plugin settings in dark mode", async ({ page }, testInfo) =>
   await expect.poll(() => settings.locator(".plugin-row-icon").first().evaluate((element) => ({
     background: getComputedStyle(element).backgroundColor,
     panel: getComputedStyle(document.documentElement).getPropertyValue("--color-surface-panel").trim(),
-  }))).toEqual({ background: "rgb(18, 21, 27)", panel: "#12151b" });
+  }))).toEqual({ background: "rgb(24, 24, 37)", panel: "#181825" });
   await page.screenshot({ path: testInfo.outputPath("plugin-settings-dark.png") });
 });
 
@@ -2388,7 +2398,7 @@ test("supports a light CodeBuddy appearance", async ({ page }) => {
 
   await page.getByRole("button", { name: "切换到深色模式" }).click();
   await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
-  await expect.poll(() => page.evaluate(() => getComputedStyle(document.documentElement).getPropertyValue("--color-surface").trim())).toBe("#171a21");
+  await expect.poll(() => page.evaluate(() => getComputedStyle(document.documentElement).getPropertyValue("--color-surface").trim())).toBe("#1e1e2e");
 
   await page.getByRole("button", { name: "切换到浅色模式" }).click();
   await expect(page.locator("html")).toHaveAttribute("data-theme", "light");
@@ -4744,8 +4754,8 @@ test("restores a pending user question after reopening the thread", async ({ pag
   });
   await page.goto("/");
   await expect(page.locator(".user-input-question-text").getByText("Choose an approach", { exact: true })).toBeVisible();
-  await expect.poll(() => page.locator(".user-input-question-text").evaluate((element) => getComputedStyle(element).color)).toBe("rgb(232, 235, 242)");
-  await expect.poll(() => page.getByRole("button", { name: "Fast", exact: true }).evaluate((element) => getComputedStyle(element).color)).toBe("rgb(232, 235, 242)");
+  await expect.poll(() => page.locator(".user-input-question-text").evaluate((element) => getComputedStyle(element).color)).toBe("rgb(230, 232, 245)");
+  await expect.poll(() => page.getByRole("button", { name: "Fast", exact: true }).evaluate((element) => getComputedStyle(element).color)).toBe("rgb(230, 232, 245)");
   await page.getByRole("button", { name: "Fast", exact: true }).click();
   await page.getByRole("button", { name: "提交回答", exact: true }).click();
   await expect.poll(() => page.evaluate(() => (window as unknown as { __invoked: string[] }).__invoked.filter((command) => command === "resolve_user_input").length)).toBe(1);

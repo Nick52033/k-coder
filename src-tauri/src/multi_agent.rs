@@ -457,6 +457,9 @@ impl MultiAgentCoordinator {
         context: SubagentExecutionContext,
         parent_cancellation: CancellationToken,
     ) -> Result<SubagentView, MultiAgentError> {
+        // Models routinely send an empty string for optional string fields. A blank parent
+        // means "direct child", not a lookup for an agent with an empty id.
+        let parent_agent_id = parent_agent_id.filter(|id| !id.trim().is_empty());
         validate_request(&request, &context.tools, parent_agent_id.as_deref(), self)?;
         let permit = self.acquire_permit()?;
         let fork_mode = ForkMode::parse(request.fork_turns.as_deref())?;
@@ -1037,14 +1040,18 @@ fn validate_request(
             "timeout must be between 1 and {MAX_SUBAGENT_RUNTIME_MS} ms"
         )));
     }
-    if parent_agent_id.is_some_and(|id| {
-        manager
+    if let Some(id) = parent_agent_id {
+        // A missing parent is a missing parent; reporting it as a depth violation sends the
+        // caller looking for nesting problems that do not exist.
+        let parent = manager
             .get(id)
-            .map_or(true, |parent| parent.depth >= MAX_SUBAGENT_DEPTH)
-    }) {
-        return Err(MultiAgentError::Limit(format!(
-            "maximum subagent depth is {MAX_SUBAGENT_DEPTH}"
-        )));
+            .map_err(|_| MultiAgentError::NotFound(id.into()))?;
+        if parent.depth >= MAX_SUBAGENT_DEPTH {
+            return Err(MultiAgentError::Limit(format!(
+                "maximum subagent depth is {MAX_SUBAGENT_DEPTH}; agent {id} is already at depth {} — do this work yourself or nest from a shallower agent",
+                parent.depth
+            )));
+        }
     }
     tools.restricted_to(&normalized_capabilities(&request.capabilities))?;
     Ok(())
@@ -1258,7 +1265,7 @@ impl ToolHandler for AgentToolHandler {
             AgentToolOperation::Create => (
                 "create_agent",
                 "Create a bounded subagent for an independent task and return immediately while it runs in the background. Start independent delegated tasks first, then do your own non-overlapping work before waiting. Do not duplicate delegated work just to stay busy.",
-                json!({"task":{"type":"string"},"label":{"type":"string"},"capabilities":{"type":"array","items":{"type":"string"}},"tokenBudget":{"type":"integer","minimum":1,"description":"Omit unless you know the task is small. The default is unlimited, and once the budget is exhausted the subagent hard-fails with `token_budget_exceeded` and resume_agent refuses to relaunch it (deadlock). Prefer omitting and rely on timeoutMs + Compaction."},"timeoutMs":{"type":"integer","minimum":1},"forkTurns":{"type":"string","description":"`none` (default) starts an empty thread, `all` replays the parent history, or a positive integer replays the last N parent turns."},"parentAgentId":{"type":"string","description":"Omit for a direct child of this agent; set to a subagent id to delegate one level deeper."}}),
+                json!({"task":{"type":"string"},"label":{"type":"string"},"capabilities":{"type":"array","items":{"type":"string"}},"tokenBudget":{"type":"integer","minimum":1,"description":"Omit unless you know the task is small. The default is unlimited, and once the budget is exhausted the subagent hard-fails with `token_budget_exceeded` and resume_agent refuses to relaunch it (deadlock). Prefer omitting and rely on timeoutMs + Compaction."},"timeoutMs":{"type":"integer","minimum":1},"forkTurns":{"type":"string","description":"`none` (default) starts an empty thread, `all` replays the parent history, or a positive integer replays the last N parent turns."},"parentAgentId":{"type":"string","description":"Omit this field (do not send an empty string) to create a direct child of this agent. Set it to an existing subagent id only to nest one level deeper; nesting is capped at depth 3."}}),
                 vec!["task"],
             ),
             AgentToolOperation::Wait => (
@@ -1450,6 +1457,7 @@ fn optional_string_arg(arguments: &Value, name: &str) -> Option<String> {
     arguments
         .get(name)
         .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
         .map(str::to_string)
 }
 fn tool_json(value: &impl Serialize) -> Result<ToolResult, ToolError> {
@@ -2099,6 +2107,73 @@ mod tests {
         }
         assert_eq!(deepest, MAX_SUBAGENT_DEPTH);
         parent_cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn blank_parent_agent_id_creates_a_direct_child() {
+        let data = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let repository = Arc::new(JsonlThreadRepository::new(data.path()).unwrap());
+        let provider = Arc::new(FakeProvider::text(&["late"]).with_delay(Duration::from_secs(10)));
+        let manager = MultiAgentCoordinator::new(data.path()).unwrap();
+        let parent_cancel = CancellationToken::new();
+
+        let agent = manager
+            .create(
+                request("parent", "blank parent"),
+                Some("   ".into()),
+                context(
+                    repository,
+                    workspace.path(),
+                    provider,
+                    Arc::new(NoopSubagentPublisher),
+                ),
+                parent_cancel.child_token(),
+            )
+            .await
+            .expect("a blank parentAgentId means a direct child, not a missing parent");
+
+        assert_eq!(agent.parent_agent_id, None);
+        assert_eq!(agent.depth, 1);
+        assert!(agent.agent_path.starts_with("/root/"));
+        parent_cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn unknown_parent_agent_id_is_reported_as_missing() {
+        let data = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let repository = Arc::new(JsonlThreadRepository::new(data.path()).unwrap());
+        let provider = Arc::new(FakeProvider::text(&["late"]).with_delay(Duration::from_secs(10)));
+        let manager = MultiAgentCoordinator::new(data.path()).unwrap();
+
+        let result = manager
+            .create(
+                request("parent", "unknown parent"),
+                Some("does-not-exist".into()),
+                context(
+                    repository,
+                    workspace.path(),
+                    provider,
+                    Arc::new(NoopSubagentPublisher),
+                ),
+                CancellationToken::new(),
+            )
+            .await;
+
+        assert!(
+            matches!(result, Err(MultiAgentError::NotFound(_))),
+            "an unknown parent must not be reported as a depth violation: {result:?}"
+        );
+    }
+
+    #[test]
+    fn blank_optional_agent_arguments_are_treated_as_absent() {
+        let arguments = json!({"parentAgentId": "", "forkTurns": "", "label": ""});
+
+        assert_eq!(optional_string_arg(&arguments, "parentAgentId"), None);
+        assert_eq!(optional_string_arg(&arguments, "forkTurns"), None);
+        assert_eq!(optional_string_arg(&arguments, "label"), None);
     }
 
     #[tokio::test]

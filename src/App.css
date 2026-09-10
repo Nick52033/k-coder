@@ -163,12 +163,19 @@
   --color-error-text: #8e2f2f;
   --color-error-bg: #fff7f7;
   --color-error-border: #e1b9b9;
+  /* 破坏性实心填充与它上面的前景色是相互独立的两件事：填充必须够暗才能承载浅色文字，
+     前景必须够亮才能在深色表面上阅读，不能共用一个令牌。默认回退到旧行为。 */
+  --color-error-solid: var(--color-error);
+  --color-error-solid-hover: var(--color-error-text);
+  --color-on-error: var(--color-surface);
   --color-success: #2c9b70;
   --color-success-text: #247454;
   --color-warning: #b37618;
   --color-warning-dot: #d6972f;
   --color-user-msg-bg: #eef3f0;
   --color-user-msg-border: #d6dfd9;
+  /* 窗口框架（标题栏）自成一层：它横跨整窗，不能用卡片面的亮度铺满整条。 */
+  --color-surface-chrome: var(--color-surface-raised);
   --color-item-active-bg: #e2ebe6;
   --color-item-active-text: #183e30;
   --color-item-active-border: #c9dad1;
@@ -191,41 +198,59 @@
 }
 
 /* ════════════════════════════════════════════
-   🎨 Skin: CodeBuddy — 冷调蓝灰 (Cursor 风格)
-   ════════════════════════════════════════════ */
+   🎨 皮肤：CodeBuddy —「靛蓝夜航」深色
+   ════════════════════════════════════════════
+   美学方向：单一靛蓝色族承载所有中性面（色相 ≈243°、饱和度 16%~24%）。参考图实测活动栏/标签条 #11111B、会话区 #181825、大画面 #1E1E2E、
+   输入框 #313244、输入框内胶囊 #414255。参考图是"靛蓝黑"——R≈G、B 明显更高（约 +11~+19），
+   不是中性灰。框架只留一档：标题栏与侧栏同色，48px 通栏不再单独切出第二条深色带；
+   品牌蓝（色相 ≈222°）是唯一强操作色，只落在可交互与选中元素上，不铺大面积；
+   输入区/卡片相对会话区刻意拉开约 19 级，是全屏的焦点面。
+   语义色按同一温度冷却为珊瑚红 / 鼠尾草绿 / 沙金，替换原来的通用红绿黄；
+   破坏性实心填充单列 --color-error-solid（够暗以承载浅色文字），
+   前景 --color-error 保持够亮，保证在深色表面上的可读性。 */
 [data-skin="codebuddy"][data-theme="dark"] {
-  --color-brand: #91adff;
-  --color-brand-hover: #adc1ff;
-  --color-brand-light: #a8bfff;
-  --color-brand-ring: rgba(145, 173, 255, 0.22);
-  --color-ink: #e8ebf2;
-  --color-ink-rich: #f1f3f8;
-  --color-ink-muted: #bac2cf;
-  --color-ink-subtle: #a8b2c2;
-  --color-ink-faint: #a4adbd;
-  --color-surface: #171a21;
-  --color-surface-raised: #20242d;
-  --color-surface-panel: #12151b;
-  --color-surface-hover: #2b303b;
-  --color-border: #303641;
-  --color-border-strong: #485161;
-  --color-border-input: #737f92;
-  --color-error: #F87171;
-  --color-error-text: #FCA5A5;
-  --color-error-bg: rgba(248, 113, 113, 0.12);
-  --color-error-border: rgba(248, 113, 113, 0.28);
-  --color-success: #34D399;
-  --color-success-text: #6EE7B7;
-  --color-warning: #FBBF24;
-  --color-warning-dot: #FCD34D;
-  --color-user-msg-bg: #232833;
+  /* 操作色：全屏唯一强色 */
+  --color-brand: #7aa2ff;
+  --color-brand-hover: #95b4ff;
+  --color-brand-light: #b0c7ff;
+  --color-brand-ring: rgba(122, 162, 255, 0.22);
+  /* 墨色五档：正文 → 元信息；最暗一档受卡片面 4.5:1 约束，不能再压暗 */
+  --color-ink: #e6e8f5;
+  --color-ink-rich: #f4f6ff;
+  --color-ink-muted: #c2c7dd;
+  --color-ink-subtle: #a8aec9;
+  --color-ink-faint: #9ea4bf;
+  /* 中性面三档：框架（标题栏 + 侧栏）→ 内容区 → 卡片/输入区 */
+  --color-surface-chrome: #181825;
+  --color-surface-panel: #181825;
+  --color-surface: #1e1e2e;
+  --color-surface-raised: #313244;
+  --color-surface-hover: #414255;
+  /* 边界：分隔线要同时在本体面与卡片面上可见，所以取两档之间的中间值 */
+  --color-border: #2c2c40;
+  --color-border-strong: #45475a;
+  --color-border-input: #585b70;
+  /* 语义色：冷却到与其他面色同一温度 */
+  --color-error: #f38ba8;
+  --color-error-text: #f9b8c6;
+  --color-error-bg: rgba(243, 139, 168, 0.12);
+  --color-error-border: rgba(243, 139, 168, 0.3);
+  --color-error-solid: #a83e56;
+  --color-error-solid-hover: #bf4a64;
+  --color-on-error: #ffffff;
+  --color-success: #a6e3a1;
+  --color-success-text: #c8f2c4;
+  --color-warning: #f9e2af;
+  --color-warning-dot: #fce9c4;
+  /* 选中态：品牌蓝约 18% 混入会话区，保证与操作色同源 */
+  --color-user-msg-bg: #282839;
   --color-user-msg-border: transparent;
-  --color-item-active-bg: #28334d;
-  --color-item-active-text: #b4c7ff;
-  --color-item-active-border: #566b99;
-  --color-disabled-bg: #2b303b;
-  --color-disabled-text: #778191;
-  background: #12151b;
+  --color-item-active-bg: #2f3654;
+  --color-item-active-text: #b8c6ff;
+  --color-item-active-border: #4c5170;
+  --color-disabled-bg: #2a2a3c;
+  --color-disabled-text: #6c7086;
+  background: #181825;
   color-scheme: dark;
 }
 
@@ -1133,14 +1158,14 @@ button {
 }
 
 .agent-button--danger {
-  border-color: var(--color-error);
-  background: var(--color-error);
-  color: white;
+  border-color: var(--color-error-solid);
+  background: var(--color-error-solid);
+  color: var(--color-on-error);
 }
 
 .agent-button--danger:hover:not(:disabled) {
-  background: var(--color-error-hover);
-  border-color: var(--color-error-hover);
+  background: var(--color-error-solid-hover);
+  border-color: var(--color-error-solid-hover);
 }
 
 /* Error Alert */
@@ -1173,7 +1198,7 @@ button {
   height: 48px;
   padding: 0 12px 0 14px;
   border-bottom: 1px solid var(--color-border);
-  background: var(--color-surface-raised);
+  background: var(--color-surface-chrome);
   transition: background-color var(--transition-fast);
 }
 
@@ -1249,8 +1274,8 @@ button {
 }
 
 .window-control--close:hover {
-  color: #ffffff;
-  background: var(--color-error);
+  color: var(--color-on-error);
+  background: var(--color-error-solid);
 }
 
 .runtime-state {
@@ -2758,8 +2783,8 @@ button {
 
 .turn-timeline-tool--failed .subagent-task-chip:hover,
 .turn-timeline-tool--failed .subagent-task-chip:focus-visible {
-  background: var(--color-error);
-  color: var(--color-surface);
+  background: var(--color-error-solid);
+  color: var(--color-on-error);
 }
 
 .turn-tool-duration {
@@ -5060,7 +5085,8 @@ button {
   place-items: center;
   border: 0;
   border-radius: var(--radius-sm);
-  background: var(--color-error);
+  color: var(--color-on-error);
+  background: var(--color-error-solid);
   cursor: pointer;
   transition: background-color var(--transition-fast), opacity var(--transition-fast), transform var(--transition-fast);
 }
@@ -5070,7 +5096,7 @@ button {
 }
 
 .stop-button:hover {
-  background: var(--color-error-text);
+  background: var(--color-error-solid-hover);
 }
 
 .stop-button:disabled {
@@ -7106,10 +7132,10 @@ button {
   padding: 0 16px;
   align-items: center;
   gap: 6px;
-  border: 1px solid var(--color-danger);
+  border: 1px solid var(--color-error-solid);
   border-radius: var(--radius-sm);
-  color: #fff;
-  background: var(--color-danger);
+  color: var(--color-on-error);
+  background: var(--color-error-solid);
   cursor: pointer;
   font-size: var(--font-size-base);
   font-weight: var(--font-weight-medium);
@@ -7117,8 +7143,8 @@ button {
 }
 
 .danger-button:hover {
-  background: var(--color-danger-hover);
-  border-color: var(--color-danger-hover);
+  background: var(--color-error-solid-hover);
+  border-color: var(--color-error-solid-hover);
 }
 
 .danger-button:disabled {
@@ -7881,7 +7907,7 @@ button {
   background: var(--color-brand);
 }
 .claude-approval-choice--reject.is-highlight .claude-approval-index {
-  background: var(--color-error);
+  background: var(--color-error-solid);
 }
 .claude-approval-label { font-weight: 500; }
 .claude-approval-desc {
