@@ -2266,6 +2266,7 @@ mod tests {
 
     use super::*;
     use crate::extensions::mcp::OsMcpSecretStore;
+    use crate::extensions::plugin_root_for_workspace;
     use crate::logging::StructuredLogger;
     use crate::persistence::ProjectionDb;
 
@@ -2314,13 +2315,13 @@ mod tests {
     }
 
     fn write_test_plugin_skill(
-        data: &Path,
+        workspace: &Path,
         folder: &str,
         plugin_name: &str,
         skill_name: &str,
         body: &str,
     ) {
-        let root = data.join("plugins").join(folder);
+        let root = plugin_root_for_workspace(workspace).join(folder);
         fs::create_dir_all(root.join(".codex-plugin")).unwrap();
         fs::write(
             root.join(".codex-plugin/plugin.json"),
@@ -2770,16 +2771,16 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         write_catalog_fallbacks(builtin.path(), |_| "SHARED-FALLBACK-BODY".into());
         write_test_plugin_skill(
-            data.path(),
+            workspace.path(),
             "superpowers-package",
             "superpowers",
             "writing-plans",
             &"x".repeat(MAX_WORKFLOW_SKILL_BODY_BYTES + 1),
         );
         let service = test_extension_service(data.path(), builtin.path());
-        service.plugin_overview(true).unwrap();
+        service.plugin_overview(workspace.path(), true).unwrap();
         service
-            .set_plugin_enabled("superpowers@local", true)
+            .set_plugin_enabled(workspace.path(), "superpowers@local", true)
             .unwrap();
         service
             .prepare(workspace.path(), CancellationToken::new())

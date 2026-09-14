@@ -289,7 +289,7 @@ test.beforeEach(async ({ page }) => {
       },
       overview: extensionOverview,
     };
-    const pluginRootPath = "C:\\Users\\demo\\AppData\\Local\\k-coder\\runtime-data\\plugins";
+    const pluginRootPath = "D:\\code\\k-coder\\.k-coder\\plugins";
     let pluginOverview = {
       schemaVersion: 1,
       rootPath: pluginRootPath,
@@ -2187,7 +2187,7 @@ test("manages local plugins from backend facts", async ({ page }, testInfo) => {
   await expect.poll(() => page.evaluate(() => (
     window as unknown as { __invocationArgs: Record<string, unknown> }
   ).__invocationArgs.plugin_overview)).toEqual({ refresh: true });
-  await expect(settings.locator(".plugin-root")).toContainText(/runtime-data\\plugins/);
+  await expect(settings.locator(".plugin-root")).toContainText(/\.k-coder\\plugins/);
   for (const state of ["未启用", "已加载", "部分可用", "已阻止", "无效"]) {
     await expect(settings.getByText(state, { exact: true }).first()).toBeVisible();
   }

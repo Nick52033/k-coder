@@ -245,7 +245,7 @@
     },
     overview: extensionOverview
   };
-  const pluginRootPath = "C:\\Users\\demo\\AppData\\Local\\k-coder\\runtime-data\\plugins";
+  const pluginRootPath = "D:\\code\\k-coder\\.k-coder\\plugins";
   let pluginOverview = {
     schemaVersion: 1,
     rootPath: pluginRootPath,

@@ -22,6 +22,8 @@ use crate::tools::{ToolContext, ToolError, ToolHandler};
 
 use super::mcp::{self, McpLaunchOptions, McpSecretStore, McpServerConfig, McpTransportConfig};
 
+const PLUGIN_ROOT_PARENT: &str = ".k-coder";
+const PLUGIN_ROOT_DIRECTORY: &str = "plugins";
 const PLUGIN_OVERVIEW_SCHEMA_VERSION: u32 = 1;
 const MAX_PLUGIN_CANDIDATES: usize = 128;
 const MAX_PLUGIN_MANIFEST_BYTES: usize = 256 * 1024;
@@ -140,7 +142,7 @@ struct PluginActivation {
 
 #[derive(Clone)]
 pub struct PluginHost {
-    root: PathBuf,
+    root: Arc<RwLock<Option<PathBuf>>>,
     projection: ProjectionDb,
     index: Arc<RwLock<HashMap<String, IndexedPlugin>>>,
     deletion_targets: Arc<RwLock<HashMap<String, PathBuf>>>,
@@ -159,16 +161,15 @@ pub struct PreparedPluginExtensions {
 }
 
 impl PluginHost {
-    pub fn new(data_root: PathBuf, projection: ProjectionDb) -> Self {
-        let root = data_root.join("plugins");
+    pub fn new(projection: ProjectionDb) -> Self {
         Self {
             overview: Arc::new(RwLock::new(PluginOverview {
                 schema_version: PLUGIN_OVERVIEW_SCHEMA_VERSION,
-                root_path: user_facing_path(&root),
+                root_path: String::new(),
                 plugins: Vec::new(),
                 error: None,
             })),
-            root,
+            root: Arc::new(RwLock::new(None)),
             projection,
             index: Arc::new(RwLock::new(HashMap::new())),
             deletion_targets: Arc::new(RwLock::new(HashMap::new())),
@@ -177,6 +178,39 @@ impl PluginHost {
             activations: Arc::new(RwLock::new(HashMap::new())),
             next_generation: Arc::new(AtomicU64::new(1)),
             host_failed: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Binds the local plugin root to the active workspace. The root is
+    /// `<workspace>/.k-coder/plugins`; local plugins are project scoped and sit
+    /// next to the project level skills, rules and MCP configuration. Returns
+    /// `true` when the bound root changed, which invalidates the cached
+    /// overview of the previous project.
+    pub fn set_workspace(&self, workspace: &Path) -> bool {
+        let root = plugin_root_for_workspace(workspace);
+        let mut guard = self.root.write().expect("plugin root lock poisoned");
+        if guard.as_deref() == Some(root.as_path()) {
+            return false;
+        }
+        *guard = Some(root.clone());
+        drop(guard);
+        self.overview
+            .write()
+            .expect("plugin overview lock poisoned")
+            .root_path = user_facing_path(&root);
+        true
+    }
+
+    fn current_root(&self) -> Option<PathBuf> {
+        self.root.read().expect("plugin root lock poisoned").clone()
+    }
+
+    fn empty_overview(&self, root_path: String) -> PluginOverview {
+        PluginOverview {
+            schema_version: PLUGIN_OVERVIEW_SCHEMA_VERSION,
+            root_path,
+            plugins: Vec::new(),
+            error: None,
         }
     }
 
@@ -191,12 +225,35 @@ impl PluginHost {
     }
 
     fn scan_inner(&self) -> Result<PluginOverview, PluginError> {
-        ensure_plugin_host_root(&self.root)?;
+        let root = match self.current_root() {
+            Some(root) => root,
+            None => {
+                self.reset_runtime_state();
+                let overview = self.empty_overview(String::new());
+                *self
+                    .overview
+                    .write()
+                    .expect("plugin overview lock poisoned") = overview.clone();
+                return Ok(overview);
+            }
+        };
+        if !plugin_root_present(&root)? {
+            // The active project simply has no plugin directory yet. Drop every
+            // capability of the previous workspace but keep the persisted enable
+            // intent, so switching back does not silently disable plugins.
+            self.reset_runtime_state();
+            let overview = self.empty_overview(user_facing_path(&root));
+            *self
+                .overview
+                .write()
+                .expect("plugin overview lock poisoned") = overview.clone();
+            return Ok(overview);
+        }
         if self.host_failed.load(Ordering::Acquire) {
             self.reset_missing_enabled(&HashSet::new())?;
         }
         let mut candidates = Vec::new();
-        for entry in fs::read_dir(&self.root).map_err(|error| PluginError::Io(error.to_string()))? {
+        for entry in fs::read_dir(&root).map_err(|error| PluginError::Io(error.to_string()))? {
             let path = entry
                 .map_err(|error| PluginError::Io(error.to_string()))?
                 .path();
@@ -206,19 +263,11 @@ impl PluginHost {
         }
         candidates.sort();
         if candidates.len() > MAX_PLUGIN_CANDIDATES {
-            self.index
-                .write()
-                .expect("plugin index lock poisoned")
-                .clear();
-            self.deletion_targets
-                .write()
-                .expect("plugin deletion lock poisoned")
-                .clear();
-            self.revoke_all_activations();
+            self.reset_runtime_state();
             self.reset_missing_enabled(&HashSet::new())?;
             let overview = PluginOverview {
                 schema_version: PLUGIN_OVERVIEW_SCHEMA_VERSION,
-                root_path: user_facing_path(&self.root),
+                root_path: user_facing_path(&root),
                 plugins: Vec::new(),
                 error: Some(format!(
                     "local plugin root contains more than {MAX_PLUGIN_CANDIDATES} candidates"
@@ -291,7 +340,7 @@ impl PluginHost {
                 continue;
             }
             if let Some(path) = paths.first()
-                && let Ok(target) = safe_plugin_deletion_target(&self.root, path)
+                && let Ok(target) = safe_plugin_deletion_target(&root, path)
             {
                 diagnostic.deletable = true;
                 next_deletion_targets.insert(diagnostic.id.clone(), target);
@@ -313,7 +362,7 @@ impl PluginHost {
 
         let overview = PluginOverview {
             schema_version: PLUGIN_OVERVIEW_SCHEMA_VERSION,
-            root_path: user_facing_path(&self.root),
+            root_path: user_facing_path(&root),
             plugins: diagnostics,
             error: None,
         };
@@ -343,7 +392,10 @@ impl PluginHost {
         };
         let overview = PluginOverview {
             schema_version: PLUGIN_OVERVIEW_SCHEMA_VERSION,
-            root_path: user_facing_path(&self.root),
+            root_path: self
+                .current_root()
+                .map(|root| user_facing_path(&root))
+                .unwrap_or_default(),
             plugins: Vec::new(),
             error: Some(error.to_string()),
         };
@@ -352,6 +404,18 @@ impl PluginHost {
             .write()
             .expect("plugin overview lock poisoned") = overview;
         error
+    }
+
+    fn reset_runtime_state(&self) {
+        self.index
+            .write()
+            .expect("plugin index lock poisoned")
+            .clear();
+        self.deletion_targets
+            .write()
+            .expect("plugin deletion lock poisoned")
+            .clear();
+        self.revoke_all_activations();
     }
 
     fn load_candidate(
@@ -715,8 +779,11 @@ impl PluginHost {
             .expect("plugin index lock poisoned")
             .get(plugin_id)
             .cloned();
-        let revalidated = safe_plugin_deletion_target(&self.root, &canonical_target)
-            .map_err(PluginError::Config)?;
+        let root = self.current_root().ok_or_else(|| {
+            PluginError::Config("local plugin root is not bound to a workspace".into())
+        })?;
+        let revalidated =
+            safe_plugin_deletion_target(&root, &canonical_target).map_err(PluginError::Config)?;
         if revalidated != canonical_target {
             return Err(PluginError::Config(
                 "plugin deletion target changed since discovery".into(),
@@ -2221,31 +2288,46 @@ fn safe_plugin_deletion_target(root: &Path, path: &Path) -> Result<PathBuf, Stri
     Ok(canonical_target)
 }
 
-fn ensure_plugin_host_root(root: &Path) -> Result<(), PluginError> {
-    let data_root = root
+/// Local plugins live in the active project so that they travel with the
+/// workspace instead of the machine wide application data directory.
+pub fn plugin_root_for_workspace(workspace: &Path) -> PathBuf {
+    workspace
+        .join(PLUGIN_ROOT_PARENT)
+        .join(PLUGIN_ROOT_DIRECTORY)
+}
+
+/// Reports whether the project plugin root can be scanned. A missing root is a
+/// normal project state and never an error: the host must not create a plugin
+/// directory inside a workspace the user did not ask for.
+fn plugin_root_present(root: &Path) -> Result<bool, PluginError> {
+    let parent = root
         .parent()
         .ok_or_else(|| PluginError::Config("plugin root has no trusted parent".into()))?;
-    reject_link_or_reparse(data_root).map_err(PluginError::Config)?;
-    match fs::symlink_metadata(root) {
-        Ok(_) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            fs::create_dir(root).map_err(|error| PluginError::Io(error.to_string()))?;
-        }
-        Err(error) => return Err(PluginError::Io(error.to_string())),
+    if !path_exists(parent)? || !path_exists(root)? {
+        return Ok(false);
     }
-    ensure_no_links(data_root, root).map_err(PluginError::Config)?;
-    let canonical_data_root = data_root
+    reject_link_or_reparse(parent).map_err(PluginError::Config)?;
+    ensure_no_links(parent, root).map_err(PluginError::Config)?;
+    let canonical_parent = parent
         .canonicalize()
         .map_err(|error| PluginError::Io(error.to_string()))?;
     let canonical_root = root
         .canonicalize()
         .map_err(|error| PluginError::Io(error.to_string()))?;
-    if canonical_root.parent() != Some(canonical_data_root.as_path()) || !canonical_root.is_dir() {
+    if canonical_root.parent() != Some(canonical_parent.as_path()) || !canonical_root.is_dir() {
         return Err(PluginError::Config(
-            "plugin root must be a real direct child of the application data root".into(),
+            "plugin root must be a real direct child of the project .k-coder directory".into(),
         ));
     }
-    Ok(())
+    Ok(true)
+}
+
+fn path_exists(path: &Path) -> Result<bool, PluginError> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(PluginError::Io(error.to_string())),
+    }
 }
 
 fn ensure_no_links(root: &Path, path: &Path) -> Result<(), String> {
@@ -2413,6 +2495,7 @@ mod tests {
 
     use super::{
         MAX_PLUGIN_CANDIDATES, MAX_PLUGIN_RESOURCE_ENTRIES, MAX_PLUGIN_SKILLS, PluginHost,
+        plugin_root_for_workspace,
     };
     use crate::extensions::mcp::{McpError, McpSecretStore};
     use crate::persistence::ProjectionDb;
@@ -2435,6 +2518,16 @@ mod tests {
         }
     }
 
+    fn plugin_host_with(workspace: &Path, projection: ProjectionDb) -> PluginHost {
+        let host = PluginHost::new(projection);
+        host.set_workspace(workspace);
+        host
+    }
+
+    fn plugin_host(workspace: &Path) -> PluginHost {
+        plugin_host_with(workspace, ProjectionDb::memory().unwrap())
+    }
+
     fn write_manifest(plugin_root: &Path, value: serde_json::Value) {
         let manifest_dir = plugin_root.join(".codex-plugin");
         fs::create_dir_all(&manifest_dir).unwrap();
@@ -2455,7 +2548,7 @@ mod tests {
     fn discovers_direct_codex_plugin_as_disabled_with_stable_id() {
         let data = tempfile::tempdir().unwrap();
         write_manifest(
-            &data.path().join("plugins/review-package"),
+            &data.path().join(".k-coder/plugins/review-package"),
             json!({
                 "name": "review-tools",
                 "version": "1.2.3",
@@ -2463,14 +2556,14 @@ mod tests {
                 "futureField": { "preserved": true }
             }),
         );
-        fs::create_dir_all(data.path().join("plugins/not-a-plugin")).unwrap();
+        fs::create_dir_all(data.path().join(".k-coder/plugins/not-a-plugin")).unwrap();
 
-        let host = PluginHost::new(data.path().to_path_buf(), ProjectionDb::memory().unwrap());
+        let host = plugin_host(data.path());
         let overview = host.scan().unwrap();
 
         assert_eq!(
             overview.root_path,
-            data.path().join("plugins").to_string_lossy()
+            plugin_root_for_workspace(data.path()).to_string_lossy()
         );
         assert_eq!(overview.plugins.len(), 1);
         assert_eq!(overview.plugins[0].id, "review-tools@local");
@@ -2484,11 +2577,11 @@ mod tests {
     #[test]
     fn invalid_manifest_is_isolated_from_valid_plugins() {
         let data = tempfile::tempdir().unwrap();
-        let invalid = data.path().join("plugins/broken");
+        let invalid = data.path().join(".k-coder/plugins/broken");
         fs::create_dir_all(invalid.join(".codex-plugin")).unwrap();
         fs::write(invalid.join(".codex-plugin/plugin.json"), b"{").unwrap();
         write_manifest(
-            &data.path().join("plugins/valid"),
+            &data.path().join(".k-coder/plugins/valid"),
             json!({
                 "name": "valid-tools",
                 "version": "1.0.0",
@@ -2496,9 +2589,7 @@ mod tests {
             }),
         );
 
-        let overview = PluginHost::new(data.path().to_path_buf(), ProjectionDb::memory().unwrap())
-            .scan()
-            .unwrap();
+        let overview = plugin_host(data.path()).scan().unwrap();
 
         assert_eq!(overview.plugins.len(), 2);
         assert_eq!(overview.plugins[0].state, PluginState::Invalid);
@@ -2518,7 +2609,7 @@ mod tests {
         let data = tempfile::tempdir().unwrap();
         for folder in ["first", "second"] {
             write_manifest(
-                &data.path().join("plugins").join(folder),
+                &data.path().join(".k-coder/plugins").join(folder),
                 json!({
                     "name": "duplicate",
                     "version": "1.0.0",
@@ -2527,9 +2618,7 @@ mod tests {
             );
         }
 
-        let overview = PluginHost::new(data.path().to_path_buf(), ProjectionDb::memory().unwrap())
-            .scan()
-            .unwrap();
+        let overview = plugin_host(data.path()).scan().unwrap();
 
         assert_eq!(overview.plugins.len(), 2);
         assert!(overview.plugins.iter().all(|plugin| {
@@ -2544,7 +2633,7 @@ mod tests {
         let data = tempfile::tempdir().unwrap();
         fs::create_dir_all(data.path().join("outside")).unwrap();
         write_manifest(
-            &data.path().join("plugins/escaping"),
+            &data.path().join(".k-coder/plugins/escaping"),
             json!({
                 "name": "escaping",
                 "version": "1.0.0",
@@ -2553,9 +2642,7 @@ mod tests {
             }),
         );
 
-        let overview = PluginHost::new(data.path().to_path_buf(), ProjectionDb::memory().unwrap())
-            .scan()
-            .unwrap();
+        let overview = plugin_host(data.path()).scan().unwrap();
 
         assert_eq!(overview.plugins[0].state, PluginState::Invalid);
         assert!(
@@ -2571,7 +2658,7 @@ mod tests {
     fn rejects_escaping_paths_in_known_unsupported_components() {
         let data = tempfile::tempdir().unwrap();
         write_manifest(
-            &data.path().join("plugins/escaping-app"),
+            &data.path().join(".k-coder/plugins/escaping-app"),
             json!({
                 "name": "escaping-app",
                 "version": "1.0.0",
@@ -2580,9 +2667,7 @@ mod tests {
             }),
         );
 
-        let overview = PluginHost::new(data.path().to_path_buf(), ProjectionDb::memory().unwrap())
-            .scan()
-            .unwrap();
+        let overview = plugin_host(data.path()).scan().unwrap();
 
         assert_eq!(overview.plugins[0].state, PluginState::Invalid);
         assert!(
@@ -2609,7 +2694,7 @@ mod tests {
             write_manifest(
                 &data
                     .path()
-                    .join(format!("plugins/escaping-interface-{index}")),
+                    .join(format!(".k-coder/plugins/escaping-interface-{index}")),
                 json!({
                     "name": format!("escaping-interface-{index}"),
                     "version": "1.0.0",
@@ -2619,9 +2704,7 @@ mod tests {
             );
         }
 
-        let overview = PluginHost::new(data.path().to_path_buf(), ProjectionDb::memory().unwrap())
-            .scan()
-            .unwrap();
+        let overview = plugin_host(data.path()).scan().unwrap();
 
         assert_eq!(overview.plugins.len(), 4);
         assert!(overview.plugins.iter().all(|plugin| {
@@ -2633,13 +2716,11 @@ mod tests {
     #[test]
     fn manifest_size_limit_invalidates_only_that_plugin() {
         let data = tempfile::tempdir().unwrap();
-        let root = data.path().join("plugins/oversized/.codex-plugin");
+        let root = data.path().join(".k-coder/plugins/oversized/.codex-plugin");
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("plugin.json"), vec![b' '; 256 * 1024 + 1]).unwrap();
 
-        let overview = PluginHost::new(data.path().to_path_buf(), ProjectionDb::memory().unwrap())
-            .scan()
-            .unwrap();
+        let overview = plugin_host(data.path()).scan().unwrap();
 
         assert_eq!(overview.plugins[0].state, PluginState::Invalid);
         assert!(
@@ -2656,7 +2737,10 @@ mod tests {
         let data = tempfile::tempdir().unwrap();
         for index in 0..=MAX_PLUGIN_CANDIDATES {
             write_manifest(
-                &data.path().join("plugins").join(format!("plugin-{index}")),
+                &data
+                    .path()
+                    .join(".k-coder/plugins")
+                    .join(format!("plugin-{index}")),
                 json!({
                     "name": format!("plugin-{index}"),
                     "version": "1.0.0",
@@ -2665,9 +2749,7 @@ mod tests {
             );
         }
 
-        let overview = PluginHost::new(data.path().to_path_buf(), ProjectionDb::memory().unwrap())
-            .scan()
-            .unwrap();
+        let overview = plugin_host(data.path()).scan().unwrap();
 
         assert!(overview.plugins.is_empty());
         assert!(overview.error.as_deref().unwrap().contains("128"));
@@ -2677,20 +2759,18 @@ mod tests {
     fn malformed_required_fields_and_non_utf8_manifests_are_isolated() {
         let data = tempfile::tempdir().unwrap();
         write_manifest(
-            &data.path().join("plugins/missing"),
+            &data.path().join(".k-coder/plugins/missing"),
             json!({ "name": "missing-version", "description": "Missing" }),
         );
         write_manifest(
-            &data.path().join("plugins/invalid-name"),
+            &data.path().join(".k-coder/plugins/invalid-name"),
             json!({ "name": "Invalid Name", "version": "1", "description": "Invalid" }),
         );
-        let binary = data.path().join("plugins/binary/.codex-plugin");
+        let binary = data.path().join(".k-coder/plugins/binary/.codex-plugin");
         fs::create_dir_all(&binary).unwrap();
         fs::write(binary.join("plugin.json"), [0xff, 0xfe]).unwrap();
 
-        let overview = PluginHost::new(data.path().to_path_buf(), ProjectionDb::memory().unwrap())
-            .scan()
-            .unwrap();
+        let overview = plugin_host(data.path()).scan().unwrap();
 
         assert_eq!(overview.plugins.len(), 3);
         assert!(
@@ -2707,7 +2787,7 @@ mod tests {
         let data = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
         write_manifest(
-            &data.path().join("plugins/absolute"),
+            &data.path().join(".k-coder/plugins/absolute"),
             json!({
                 "name": "absolute-plugin",
                 "version": "1.0.0",
@@ -2715,7 +2795,7 @@ mod tests {
                 "skills": outside.path().to_string_lossy()
             }),
         );
-        let crowded = data.path().join("plugins/crowded");
+        let crowded = data.path().join(".k-coder/plugins/crowded");
         write_manifest(
             &crowded,
             json!({
@@ -2732,9 +2812,7 @@ mod tests {
             );
         }
 
-        let overview = PluginHost::new(data.path().to_path_buf(), ProjectionDb::memory().unwrap())
-            .scan()
-            .unwrap();
+        let overview = plugin_host(data.path()).scan().unwrap();
 
         assert_eq!(overview.plugins.len(), 2);
         assert!(
@@ -2761,7 +2839,7 @@ mod tests {
     fn oversized_manifest_display_fields_are_invalid_and_diagnostics_stay_bounded() {
         let data = tempfile::tempdir().unwrap();
         write_manifest(
-            &data.path().join("plugins/verbose"),
+            &data.path().join(".k-coder/plugins/verbose"),
             json!({
                 "name": "verbose-plugin",
                 "version": "v".repeat(129),
@@ -2769,9 +2847,7 @@ mod tests {
             }),
         );
 
-        let overview = PluginHost::new(data.path().to_path_buf(), ProjectionDb::memory().unwrap())
-            .scan()
-            .unwrap();
+        let overview = plugin_host(data.path()).scan().unwrap();
         let plugin = &overview.plugins[0];
 
         assert_eq!(plugin.state, PluginState::Invalid);
@@ -2783,7 +2859,7 @@ mod tests {
     #[test]
     fn indexes_codex_skill_with_optional_k_coder_metadata() {
         let data = tempfile::tempdir().unwrap();
-        let plugin = data.path().join("plugins/review");
+        let plugin = data.path().join(".k-coder/plugins/review");
         write_manifest(
             &plugin,
             json!({
@@ -2798,9 +2874,7 @@ mod tests {
             "---\nname: review\ndescription: Review the workspace\n---\n# Review\n",
         );
 
-        let overview = PluginHost::new(data.path().to_path_buf(), ProjectionDb::memory().unwrap())
-            .scan()
-            .unwrap();
+        let overview = plugin_host(data.path()).scan().unwrap();
 
         assert_eq!(overview.plugins[0].components.skill_count, 1);
         assert_eq!(overview.plugins[0].state, PluginState::Disabled);
@@ -2810,7 +2884,7 @@ mod tests {
     #[test]
     fn indexed_skill_debug_never_contains_its_body() {
         let data = tempfile::tempdir().unwrap();
-        let plugin = data.path().join("plugins/review");
+        let plugin = data.path().join(".k-coder/plugins/review");
         write_manifest(
             &plugin,
             json!({
@@ -2824,7 +2898,7 @@ mod tests {
             "review",
             "---\nname: review\ndescription: Review\n---\nUNIQUE-PRIVATE-PLUGIN-BODY",
         );
-        let host = PluginHost::new(data.path().to_path_buf(), ProjectionDb::memory().unwrap());
+        let host = plugin_host(data.path());
         host.scan().unwrap();
 
         let index = host.index.read().expect("plugin index lock poisoned");
@@ -2837,7 +2911,7 @@ mod tests {
     #[test]
     fn resource_entry_budget_is_shared_by_every_skill_in_one_plugin() {
         let data = tempfile::tempdir().unwrap();
-        let plugin = data.path().join("plugins/bounded-tree");
+        let plugin = data.path().join(".k-coder/plugins/bounded-tree");
         write_manifest(
             &plugin,
             json!({
@@ -2860,9 +2934,7 @@ mod tests {
             }
         }
 
-        let overview = PluginHost::new(data.path().to_path_buf(), ProjectionDb::memory().unwrap())
-            .scan()
-            .unwrap();
+        let overview = plugin_host(data.path()).scan().unwrap();
 
         assert_eq!(overview.plugins[0].state, PluginState::Invalid);
         assert!(
@@ -2879,7 +2951,7 @@ mod tests {
         let data = tempfile::tempdir().unwrap();
         let workspace = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
-        let plugin = data.path().join("plugins/review");
+        let plugin = data.path().join(".k-coder/plugins/review");
         write_manifest(
             &plugin,
             json!({
@@ -2896,7 +2968,7 @@ mod tests {
         let references = plugin.join("skills/review/references");
         fs::create_dir_all(&references).unwrap();
         fs::write(references.join("checklist.md"), "CHECKLIST-CONTENT").unwrap();
-        let host = PluginHost::new(data.path().to_path_buf(), ProjectionDb::memory().unwrap());
+        let host = plugin_host(data.path());
         host.scan().unwrap();
         let overview = host.set_enabled("review-tools@local", true).unwrap();
         assert_eq!(overview.plugins[0].state, PluginState::Loaded);
@@ -2989,7 +3061,7 @@ mod tests {
     fn linked_skill_resource_invalidates_the_plugin_without_reading_the_target() {
         let data = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
-        let plugin = data.path().join("plugins/review");
+        let plugin = data.path().join(".k-coder/plugins/review");
         write_manifest(
             &plugin,
             json!({
@@ -3014,9 +3086,7 @@ mod tests {
             return;
         }
 
-        let overview = PluginHost::new(data.path().to_path_buf(), ProjectionDb::memory().unwrap())
-            .scan()
-            .unwrap();
+        let overview = plugin_host(data.path()).scan().unwrap();
 
         assert_eq!(overview.plugins[0].state, PluginState::Invalid);
         assert!(
@@ -3031,7 +3101,7 @@ mod tests {
     #[test]
     fn maps_stdio_http_and_oauth_plugin_mcp_entries_without_secrets() {
         let data = tempfile::tempdir().unwrap();
-        let plugin = data.path().join("plugins/review");
+        let plugin = data.path().join(".k-coder/plugins/review");
         write_manifest(
             &plugin,
             json!({
@@ -3067,7 +3137,7 @@ mod tests {
         )
         .unwrap();
 
-        let host = PluginHost::new(data.path().to_path_buf(), ProjectionDb::memory().unwrap());
+        let host = plugin_host(data.path());
         let overview = host.scan().unwrap();
         let servers = host.indexed_mcp_for_test("review-tools@local");
 
@@ -3141,7 +3211,7 @@ mod tests {
     #[test]
     fn missing_mcp_command_degrades_available_skills_instead_of_invalidating_them() {
         let data = tempfile::tempdir().unwrap();
-        let plugin = data.path().join("plugins/review");
+        let plugin = data.path().join(".k-coder/plugins/review");
         write_manifest(
             &plugin,
             json!({
@@ -3163,7 +3233,7 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        let host = PluginHost::new(data.path().to_path_buf(), ProjectionDb::memory().unwrap());
+        let host = plugin_host(data.path());
 
         host.scan().unwrap();
         let overview = host.set_enabled("review-tools@local", true).unwrap();
@@ -3184,7 +3254,7 @@ mod tests {
     #[tokio::test]
     async fn missing_mcp_credential_degrades_skills_without_registering_mcp_tools() {
         let data = tempfile::tempdir().unwrap();
-        let plugin = data.path().join("plugins/review");
+        let plugin = data.path().join(".k-coder/plugins/review");
         write_manifest(
             &plugin,
             json!({
@@ -3212,7 +3282,7 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        let host = PluginHost::new(data.path().to_path_buf(), ProjectionDb::memory().unwrap());
+        let host = plugin_host(data.path());
         host.scan().unwrap();
         host.set_enabled("credential-plugin@local", true).unwrap();
 
@@ -3248,7 +3318,7 @@ mod tests {
             ("underscore", "a_b".to_string(), "server".to_string()),
             ("long", long_plugin_name, long_server_name),
         ] {
-            let plugin = data.path().join("plugins").join(folder);
+            let plugin = data.path().join(".k-coder/plugins").join(folder);
             write_manifest(
                 &plugin,
                 json!({
@@ -3268,7 +3338,7 @@ mod tests {
             )
             .unwrap();
         }
-        let host = PluginHost::new(data.path().to_path_buf(), ProjectionDb::memory().unwrap());
+        let host = plugin_host(data.path());
 
         let overview = host.scan().unwrap();
         let ids = overview
@@ -3313,7 +3383,7 @@ mod tests {
                 json!([]),
             ),
         ] {
-            let plugin = data.path().join("plugins").join(folder);
+            let plugin = data.path().join(".k-coder/plugins").join(folder);
             write_manifest(
                 &plugin,
                 json!({
@@ -3338,7 +3408,7 @@ mod tests {
             )
             .unwrap();
         }
-        let host = PluginHost::new(data.path().to_path_buf(), ProjectionDb::memory().unwrap());
+        let host = plugin_host(data.path());
         host.scan().unwrap();
         host.set_enabled("good-plugin@local", true).unwrap();
         host.set_enabled("broken-plugin@local", true).unwrap();
@@ -3392,7 +3462,7 @@ mod tests {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("test-fixtures")
             .join("mcp-server.mjs");
-        let plugin = data.path().join("plugins/revocable");
+        let plugin = data.path().join(".k-coder/plugins/revocable");
         write_manifest(
             &plugin,
             json!({
@@ -3415,7 +3485,7 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        let host = PluginHost::new(data.path().to_path_buf(), ProjectionDb::memory().unwrap());
+        let host = plugin_host(data.path());
         host.scan().unwrap();
         host.set_enabled("revocable-plugin@local", true).unwrap();
         let server_id = host.indexed_mcp_for_test("revocable-plugin@local")[0]
@@ -3500,7 +3570,7 @@ mod tests {
     #[test]
     fn plugin_enablement_persists_and_disappearance_resets_it() {
         let data = tempfile::tempdir().unwrap();
-        let plugin = data.path().join("plugins/review");
+        let plugin = data.path().join(".k-coder/plugins/review");
         write_manifest(
             &plugin,
             json!({
@@ -3515,11 +3585,11 @@ mod tests {
             "---\nname: review\ndescription: Review\n---\n# Review\n",
         );
         let projection = ProjectionDb::memory().unwrap();
-        let first = PluginHost::new(data.path().to_path_buf(), projection.clone());
+        let first = plugin_host_with(data.path(), projection.clone());
         first.scan().unwrap();
         first.set_enabled("review-tools@local", true).unwrap();
 
-        let second = PluginHost::new(data.path().to_path_buf(), projection.clone());
+        let second = plugin_host_with(data.path(), projection.clone());
         let restored = second.scan().unwrap();
         assert!(restored.plugins[0].enabled);
         fs::remove_dir_all(&plugin).unwrap();
@@ -3550,7 +3620,7 @@ mod tests {
     async fn host_failure_revokes_cached_reads_and_persisted_enablement() {
         let data = tempfile::tempdir().unwrap();
         let workspace = tempfile::tempdir().unwrap();
-        let plugin = data.path().join("plugins/review");
+        let plugin = data.path().join(".k-coder/plugins/review");
         write_manifest(
             &plugin,
             json!({
@@ -3565,12 +3635,12 @@ mod tests {
             "---\nname: review\ndescription: Review\n---\n# Review\n",
         );
         let projection = ProjectionDb::memory().unwrap();
-        let host = PluginHost::new(data.path().to_path_buf(), projection.clone());
+        let host = plugin_host_with(data.path(), projection.clone());
         host.scan().unwrap();
         host.set_enabled("review-tools@local", true).unwrap();
         let retained = host.read_handlers()[0].clone();
-        fs::remove_dir_all(data.path().join("plugins")).unwrap();
-        fs::write(data.path().join("plugins"), "not a directory").unwrap();
+        fs::remove_dir_all(data.path().join(".k-coder/plugins")).unwrap();
+        fs::write(data.path().join(".k-coder/plugins"), "not a directory").unwrap();
 
         assert!(host.scan().is_err());
         assert!(host.overview().plugins.is_empty());
@@ -3603,7 +3673,7 @@ mod tests {
     #[test]
     fn delete_uses_the_disabled_indexed_direct_child_and_clears_setting() {
         let data = tempfile::tempdir().unwrap();
-        let plugin = data.path().join("plugins/review");
+        let plugin = data.path().join(".k-coder/plugins/review");
         write_manifest(
             &plugin,
             json!({
@@ -3613,7 +3683,7 @@ mod tests {
             }),
         );
         let projection = ProjectionDb::memory().unwrap();
-        let host = PluginHost::new(data.path().to_path_buf(), projection.clone());
+        let host = plugin_host_with(data.path(), projection.clone());
         host.scan().unwrap();
         host.set_enabled("review-tools@local", true).unwrap();
         let enabled_error = host.delete("review-tools@local").unwrap_err();
@@ -3636,10 +3706,10 @@ mod tests {
     #[test]
     fn invalid_plugin_with_a_unique_safe_root_can_be_deleted_by_diagnostic_id() {
         let data = tempfile::tempdir().unwrap();
-        let plugin = data.path().join("plugins/broken");
+        let plugin = data.path().join(".k-coder/plugins/broken");
         fs::create_dir_all(plugin.join(".codex-plugin")).unwrap();
         fs::write(plugin.join(".codex-plugin/plugin.json"), "{broken").unwrap();
-        let host = PluginHost::new(data.path().to_path_buf(), ProjectionDb::memory().unwrap());
+        let host = plugin_host(data.path());
         let overview = host.scan().unwrap();
         let diagnostic = &overview.plugins[0];
         assert_eq!(diagnostic.state, PluginState::Invalid);
@@ -3663,15 +3733,15 @@ mod tests {
                 "description": "Outside"
             }),
         );
-        fs::create_dir_all(data.path().join("plugins")).unwrap();
-        let link = data.path().join("plugins/linked");
+        fs::create_dir_all(data.path().join(".k-coder/plugins")).unwrap();
+        let link = data.path().join(".k-coder/plugins/linked");
         #[cfg(unix)]
         std::os::unix::fs::symlink(outside.path(), &link).unwrap();
         #[cfg(windows)]
         if std::os::windows::fs::symlink_dir(outside.path(), &link).is_err() {
             return;
         }
-        let host = PluginHost::new(data.path().to_path_buf(), ProjectionDb::memory().unwrap());
+        let host = plugin_host(data.path());
 
         let overview = host.scan().unwrap();
 
@@ -3705,14 +3775,14 @@ mod tests {
                 "description": "Must remain outside"
             }),
         );
-        let link = data.path().join("plugins");
+        let link = data.path().join(".k-coder/plugins");
         #[cfg(unix)]
         std::os::unix::fs::symlink(outside.path(), &link).unwrap();
         #[cfg(windows)]
         if std::os::windows::fs::symlink_dir(outside.path(), &link).is_err() {
             return;
         }
-        let host = PluginHost::new(data.path().to_path_buf(), ProjectionDb::memory().unwrap());
+        let host = plugin_host(data.path());
 
         let error = host.scan().unwrap_err();
 
@@ -3722,29 +3792,80 @@ mod tests {
     }
 
     #[test]
-    fn linked_application_data_root_is_rejected_before_creating_plugin_directory() {
-        let parent = tempfile::tempdir().unwrap();
+    fn linked_project_dot_koder_directory_is_rejected() {
+        let workspace = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
-        let link = parent.path().join("linked-data");
+        let link = workspace.path().join(".k-coder");
+        fs::create_dir_all(outside.path().join("plugins/review")).unwrap();
         #[cfg(unix)]
         std::os::unix::fs::symlink(outside.path(), &link).unwrap();
         #[cfg(windows)]
         if std::os::windows::fs::symlink_dir(outside.path(), &link).is_err() {
             return;
         }
-        let host = PluginHost::new(link, ProjectionDb::memory().unwrap());
+        let host = plugin_host(workspace.path());
 
         let error = host.scan().unwrap_err();
 
         assert!(error.to_string().contains("symbolic link"));
-        assert!(!outside.path().join("plugins").exists());
         assert!(host.overview().plugins.is_empty());
+        assert!(host.overview().error.is_some());
+    }
+
+    #[test]
+    fn project_without_plugin_directory_reports_no_plugins_without_touching_the_workspace() {
+        let data = tempfile::tempdir().unwrap();
+
+        let host = plugin_host(data.path());
+        let overview = host.scan().unwrap();
+
+        assert!(overview.plugins.is_empty());
+        assert_eq!(overview.error, None);
+        assert_eq!(
+            overview.root_path,
+            plugin_root_for_workspace(data.path()).to_string_lossy()
+        );
+        assert!(!data.path().join(".k-coder").exists());
+    }
+
+    #[test]
+    fn switching_to_a_project_without_plugins_keeps_the_persisted_enable_intent() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let projection = ProjectionDb::memory().unwrap();
+        let plugin = first.path().join(".k-coder/plugins/review");
+        write_manifest(
+            &plugin,
+            json!({
+                "name": "review-tools",
+                "version": "1.0.0",
+                "description": "Review helpers"
+            }),
+        );
+        write_skill(
+            &plugin,
+            "review",
+            "---\nname: review\ndescription: Review\n---\n# Review\n",
+        );
+        let host = plugin_host_with(first.path(), projection.clone());
+        host.set_enabled("review-tools@local", true).unwrap();
+
+        host.set_workspace(second.path());
+        let elsewhere = host.scan().unwrap();
+        assert!(elsewhere.plugins.is_empty());
+
+        host.set_workspace(first.path());
+        let back = host.scan().unwrap();
+
+        assert_eq!(back.plugins.len(), 1);
+        assert!(back.plugins[0].enabled);
+        assert_eq!(back.plugins[0].state, PluginState::Loaded);
     }
 
     #[test]
     fn plugin_revision_changes_when_indexed_skill_content_changes() {
         let data = tempfile::tempdir().unwrap();
-        let plugin = data.path().join("plugins/review");
+        let plugin = data.path().join(".k-coder/plugins/review");
         write_manifest(
             &plugin,
             json!({
@@ -3758,7 +3879,7 @@ mod tests {
             "review",
             "---\nname: review\ndescription: Review\n---\n# Before\n",
         );
-        let host = PluginHost::new(data.path().to_path_buf(), ProjectionDb::memory().unwrap());
+        let host = plugin_host(data.path());
         let before = host.revision().unwrap();
         fs::write(
             plugin.join("skills/review/SKILL.md"),

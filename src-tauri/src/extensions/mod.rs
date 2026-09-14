@@ -25,6 +25,7 @@ use crate::tools::{ToolContext, ToolError, ToolHandler, ToolHookRunner};
 use self::hooks::{HookConfig, HookPipeline};
 use self::mcp::{McpSecretStore, McpServerConfig};
 use self::plugins::PluginHost;
+pub use self::plugins::plugin_root_for_workspace;
 
 const MAX_INSTRUCTION_FILE_BYTES: usize = 256 * 1024;
 const MAX_RUNTIME_INSTRUCTION_BYTES: usize = 48 * 1024;
@@ -1039,7 +1040,7 @@ impl ExtensionService {
     ) -> Self {
         let audit_path = data_root.join("extension-audit.jsonl");
         let audit = load_audit(&audit_path);
-        let plugins = PluginHost::new(data_root.clone(), projection.clone());
+        let plugins = PluginHost::new(projection.clone());
         Self {
             data_root,
             builtin_skills_root,
@@ -1186,6 +1187,7 @@ impl ExtensionService {
             });
         }
 
+        self.plugins.set_workspace(&workspace);
         let plugin_prepared = self
             .plugins
             .prepare(self.secrets.clone(), cancellation.clone())
@@ -1303,6 +1305,7 @@ impl ExtensionService {
                 Err(error) => return Err(ExtensionError::Io(error.to_string())),
             }
         }
+        self.plugins.set_workspace(workspace);
         let plugin_revision = self.plugins.revision()?;
         self.record_auto_disabled_plugins();
         plugin_revision.hash(&mut hasher);
@@ -1555,8 +1558,13 @@ impl ExtensionService {
         overview
     }
 
-    pub fn plugin_overview(&self, refresh: bool) -> Result<PluginOverview, ExtensionError> {
-        let result = if refresh {
+    pub fn plugin_overview(
+        &self,
+        workspace: &Path,
+        refresh: bool,
+    ) -> Result<PluginOverview, ExtensionError> {
+        let workspace_changed = self.plugins.set_workspace(workspace);
+        let result = if refresh || workspace_changed {
             self.plugins.scan()
         } else {
             Ok(self.plugins.overview())
@@ -1567,9 +1575,11 @@ impl ExtensionService {
 
     pub fn set_plugin_enabled(
         &self,
+        workspace: &Path,
         plugin_id: &str,
         enabled: bool,
     ) -> Result<PluginOverview, ExtensionError> {
+        self.plugins.set_workspace(workspace);
         let result = self.plugins.set_enabled(plugin_id, enabled);
         self.record_auto_disabled_plugins();
         self.record(
@@ -1582,7 +1592,12 @@ impl ExtensionService {
         Ok(result?)
     }
 
-    pub fn delete_plugin(&self, plugin_id: &str) -> Result<PluginOverview, ExtensionError> {
+    pub fn delete_plugin(
+        &self,
+        workspace: &Path,
+        plugin_id: &str,
+    ) -> Result<PluginOverview, ExtensionError> {
+        self.plugins.set_workspace(workspace);
         let result = self.plugins.delete(plugin_id);
         self.record_auto_disabled_plugins();
         self.record(
@@ -3022,8 +3037,8 @@ mod tests {
         write_test_skill(&root.join(group), name, body);
     }
 
-    fn write_test_plugin(data_root: &Path, folder: &str, name: &str) -> PathBuf {
-        let plugin_root = data_root.join("plugins").join(folder);
+    fn write_test_plugin(workspace: &Path, folder: &str, name: &str) -> PathBuf {
+        let plugin_root = plugin_root_for_workspace(workspace).join(folder);
         fs::create_dir_all(plugin_root.join(".codex-plugin")).unwrap();
         fs::write(
             plugin_root.join(".codex-plugin/plugin.json"),
@@ -3360,16 +3375,16 @@ mod tests {
         let data = tempfile::tempdir().unwrap();
         let workspace = tempfile::tempdir().unwrap();
         write_test_skill(&data.path().join("skills"), "review", "FALLBACK-BODY");
-        write_test_plugin(data.path(), "review-package", "review-tools");
+        write_test_plugin(workspace.path(), "review-package", "review-tools");
         let service = ExtensionService::new(
             data.path().into(),
             ProjectionDb::memory().unwrap(),
             Arc::new(mcp::OsMcpSecretStore::new()),
             StructuredLogger::new(data.path()).unwrap(),
         );
-        service.plugin_overview(true).unwrap();
+        service.plugin_overview(workspace.path(), true).unwrap();
         service
-            .set_plugin_enabled("review-tools@local", true)
+            .set_plugin_enabled(workspace.path(), "review-tools@local", true)
             .unwrap();
         service
             .prepare(workspace.path(), CancellationToken::new())
@@ -3398,7 +3413,7 @@ mod tests {
             let workspace = tempfile::tempdir().unwrap();
             write_test_skill(&data.path().join("skills"), "review", "FALLBACK-BODY");
             if create_disabled_plugin {
-                write_test_plugin(data.path(), "review-package", "review-tools");
+                write_test_plugin(workspace.path(), "review-package", "review-tools");
             }
             let service = ExtensionService::new(
                 data.path().into(),
@@ -3458,7 +3473,7 @@ mod tests {
             "review",
             "\r\nSAME-INSTRUCTIONS\r\n",
         );
-        let plugin = write_test_plugin(data.path(), "review-package", "review-tools");
+        let plugin = write_test_plugin(workspace.path(), "review-package", "review-tools");
         fs::write(
             plugin.join("skills/review/SKILL.md"),
             "---\r\nname: review\r\ndescription: Review\r\n---\r\nSAME-INSTRUCTIONS\r\n",
@@ -3470,9 +3485,9 @@ mod tests {
             Arc::new(mcp::OsMcpSecretStore::new()),
             StructuredLogger::new(data.path()).unwrap(),
         );
-        service.plugin_overview(true).unwrap();
+        service.plugin_overview(workspace.path(), true).unwrap();
         service
-            .set_plugin_enabled("review-tools@local", true)
+            .set_plugin_enabled(workspace.path(), "review-tools@local", true)
             .unwrap();
         service
             .prepare(workspace.path(), CancellationToken::new())
@@ -4496,7 +4511,7 @@ mod tests {
     async fn plugin_skill_handlers_and_catalog_share_the_extension_runtime() {
         let data = tempfile::tempdir().unwrap();
         let workspace = tempfile::tempdir().unwrap();
-        let plugin_root = write_test_plugin(data.path(), "review-package", "review-tools");
+        let plugin_root = write_test_plugin(workspace.path(), "review-package", "review-tools");
         let projection = ProjectionDb::memory().unwrap();
         let logger = StructuredLogger::new(data.path()).unwrap();
         let service = ExtensionService::new(
@@ -4506,10 +4521,10 @@ mod tests {
             logger,
         );
 
-        let discovered = service.plugin_overview(true).unwrap();
+        let discovered = service.plugin_overview(workspace.path(), true).unwrap();
         assert!(!discovered.plugins[0].enabled);
         service
-            .set_plugin_enabled("review-tools@local", true)
+            .set_plugin_enabled(workspace.path(), "review-tools@local", true)
             .unwrap();
         let prepared = service
             .prepare(workspace.path(), CancellationToken::new())
@@ -4529,7 +4544,7 @@ mod tests {
         assert!(!catalog.contains("PLUGIN-REVIEW-BODY"));
 
         service
-            .set_plugin_enabled("review-tools@local", false)
+            .set_plugin_enabled(workspace.path(), "review-tools@local", false)
             .unwrap();
         let prepared = service
             .prepare(workspace.path(), CancellationToken::new())
@@ -4549,10 +4564,10 @@ mod tests {
         );
 
         service
-            .set_plugin_enabled("review-tools@local", true)
+            .set_plugin_enabled(workspace.path(), "review-tools@local", true)
             .unwrap();
         fs::remove_dir_all(plugin_root).unwrap();
-        let missing = service.plugin_overview(true).unwrap();
+        let missing = service.plugin_overview(workspace.path(), true).unwrap();
         assert!(missing.plugins.is_empty());
         assert_eq!(
             projection

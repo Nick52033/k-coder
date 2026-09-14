@@ -17,7 +17,7 @@ use crate::execution::{BundledTools, CommandRuntime, ExecutionError, NativePtyRu
 use crate::extensions::mcp::OsMcpSecretStore;
 use crate::extensions::{
     ExtensionError, ExtensionOverview, ExtensionService, McpConfigView, SaveUserRuleRequest,
-    UserRulesView,
+    UserRulesView, plugin_root_for_workspace,
 };
 use crate::knowledge::KnowledgeService;
 use crate::logging::StructuredLogger;
@@ -624,8 +624,9 @@ impl AppState {
     }
 
     pub async fn plugin_overview(&self, refresh: bool) -> PluginOverview {
+        let workspace = self.workspace_root();
         if refresh && let Err(error) = self.prepare_extensions(true).await {
-            return match self.extensions.plugin_overview(true) {
+            return match self.extensions.plugin_overview(&workspace, true) {
                 Ok(mut overview) => {
                     let refresh_error = format!("extension refresh failed: {error}");
                     overview.error = Some(
@@ -637,17 +638,17 @@ impl AppState {
                     overview
                 }
                 Err(plugin_error) => {
-                    let mut overview = self.cached_plugin_overview();
+                    let mut overview = self.cached_plugin_overview(&workspace);
                     overview.plugins.clear();
                     overview.error = Some(plugin_error.to_string());
                     overview
                 }
             };
         }
-        match self.extensions.plugin_overview(false) {
+        match self.extensions.plugin_overview(&workspace, false) {
             Ok(overview) => overview,
             Err(error) => {
-                let mut overview = self.cached_plugin_overview();
+                let mut overview = self.cached_plugin_overview(&workspace);
                 overview.plugins.clear();
                 overview.error = Some(error.to_string());
                 overview
@@ -655,14 +656,12 @@ impl AppState {
         }
     }
 
-    fn cached_plugin_overview(&self) -> PluginOverview {
+    fn cached_plugin_overview(&self, workspace: &Path) -> PluginOverview {
         self.extensions
-            .plugin_overview(false)
+            .plugin_overview(workspace, false)
             .unwrap_or_else(|_| PluginOverview {
                 schema_version: 1,
-                root_path: self
-                    .data_root
-                    .join("plugins")
+                root_path: plugin_root_for_workspace(workspace)
                     .to_string_lossy()
                     .into_owned(),
                 plugins: Vec::new(),
@@ -675,22 +674,26 @@ impl AppState {
         plugin_id: &str,
         enabled: bool,
     ) -> Result<PluginOverview, AppStateError> {
-        self.extensions.set_plugin_enabled(plugin_id, enabled)?;
+        let workspace = self.workspace_root();
+        self.extensions
+            .set_plugin_enabled(&workspace, plugin_id, enabled)?;
         self.prepare_extensions(true).await?;
-        Ok(self.extensions.plugin_overview(false)?)
+        Ok(self.extensions.plugin_overview(&workspace, false)?)
     }
 
     pub async fn delete_plugin(&self, plugin_id: &str) -> Result<PluginOverview, AppStateError> {
-        self.extensions.set_plugin_enabled(plugin_id, false)?;
+        let workspace = self.workspace_root();
+        self.extensions
+            .set_plugin_enabled(&workspace, plugin_id, false)?;
         let mut rebuild_errors = Vec::new();
         if let Err(error) = self.prepare_extensions(true).await {
             rebuild_errors.push(error.to_string());
         }
-        self.extensions.delete_plugin(plugin_id)?;
+        self.extensions.delete_plugin(&workspace, plugin_id)?;
         if let Err(error) = self.prepare_extensions(true).await {
             rebuild_errors.push(error.to_string());
         }
-        let mut overview = self.extensions.plugin_overview(false)?;
+        let mut overview = self.extensions.plugin_overview(&workspace, false)?;
         if !rebuild_errors.is_empty() {
             let rebuild_error = format!("extension refresh failed: {}", rebuild_errors.join("; "));
             overview.error = Some(
@@ -2668,7 +2671,7 @@ mod tests {
     async fn plugin_lifecycle_rebuilds_the_registry_and_prepare_failures_drop_stale_tools() {
         let data = tempfile::tempdir().unwrap();
         let workspace = tempfile::tempdir().unwrap();
-        let plugin = data.path().join("plugins/review-package");
+        let plugin = workspace.path().join(".k-coder/plugins/review-package");
         std::fs::create_dir_all(plugin.join(".codex-plugin")).unwrap();
         std::fs::write(
             plugin.join(".codex-plugin/plugin.json"),
@@ -2782,7 +2785,7 @@ mod tests {
     async fn plugin_overview_keeps_discovered_rows_when_other_extension_config_is_invalid() {
         let data = tempfile::tempdir().unwrap();
         let workspace = tempfile::tempdir().unwrap();
-        let plugin = data.path().join("plugins/review-package");
+        let plugin = workspace.path().join(".k-coder/plugins/review-package");
         std::fs::create_dir_all(plugin.join(".codex-plugin")).unwrap();
         std::fs::write(
             plugin.join(".codex-plugin/plugin.json"),

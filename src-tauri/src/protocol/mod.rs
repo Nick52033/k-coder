@@ -1243,13 +1243,13 @@ mod tests {
     fn plugin_overview_uses_the_versioned_public_contract() {
         let overview = PluginOverview {
             schema_version: 1,
-            root_path: r"D:\data\runtime-data\plugins".into(),
+            root_path: r"D:\code\k-coder\.k-coder\plugins".into(),
             plugins: vec![PluginDiagnostic {
                 id: "review-tools@local".into(),
                 name: "review-tools".into(),
                 version: "1.2.3".into(),
                 description: "Review helpers".into(),
-                path: r"D:\data\runtime-data\plugins\review-tools".into(),
+                path: r"D:\code\k-coder\.k-coder\plugins\review-tools".into(),
                 enabled: true,
                 state: PluginState::Degraded,
                 deletable: true,
