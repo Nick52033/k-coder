@@ -152,13 +152,26 @@ pub enum ProviderError {
     Unavailable(String),
     #[error("provider response was invalid: {0}")]
     InvalidResponse(String),
+    #[error("provider response was invalid: {0}")]
+    InvalidToolArguments(String),
     #[error("provider stream ended before completion")]
     Interrupted,
 }
 
 impl ProviderError {
     pub(crate) fn turn_error(&self, message: String) -> crate::protocol::TurnError {
-        if self.rate_limit_delay().is_some() {
+        if matches!(
+            self,
+            Self::InvalidResponse(_) | Self::InvalidToolArguments(_)
+        ) {
+            crate::protocol::TurnError {
+                code: "provider_invalid_response".into(),
+                message,
+                retryable: true,
+                category: crate::protocol::TurnErrorCategory::Protocol,
+                details: None,
+            }
+        } else if self.rate_limit_delay().is_some() {
             crate::protocol::TurnError {
                 code: "rate_limited".into(),
                 message,
@@ -202,7 +215,10 @@ impl ProviderError {
             Self::Http { status, .. } => matches!(*status, 408 | 429 | 502 | 503 | 504),
             Self::Unavailable(_) => true,
             Self::RateLimited { .. } => true,
-            Self::Cancelled | Self::InvalidResponse(_) | Self::Interrupted => false,
+            Self::Cancelled
+            | Self::InvalidResponse(_)
+            | Self::InvalidToolArguments(_)
+            | Self::Interrupted => false,
         }
     }
 }
@@ -222,6 +238,30 @@ pub trait Provider: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::ProviderError;
+
+    #[test]
+    fn invalid_provider_arguments_are_retryable_protocol_failures_not_user_errors() {
+        for error in [
+            ProviderError::InvalidToolArguments(
+                "tool call request_user_input: trailing characters".into(),
+            ),
+            ProviderError::InvalidResponse(
+                "invalid JSON arguments containing permission or api key".into(),
+            ),
+        ] {
+            let classified = error.turn_error(error.to_string());
+            assert_eq!(classified.code, "provider_invalid_response");
+            assert_eq!(
+                classified.category,
+                crate::protocol::TurnErrorCategory::Protocol
+            );
+            assert!(classified.retryable);
+            assert!(!error.is_transient());
+        }
+        let input = crate::protocol::TurnError::classify("invalid input: missing thread".into());
+        assert_eq!(input.code, "invalid_input");
+        assert!(!input.retryable);
+    }
 
     #[test]
     fn classifies_only_supported_pre_stream_failures_as_transient() {

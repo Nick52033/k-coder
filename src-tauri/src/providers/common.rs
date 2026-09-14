@@ -153,6 +153,9 @@ pub(super) fn redact_error(error: ProviderError, secret: &str) -> ProviderError 
         ProviderError::InvalidResponse(message) => {
             ProviderError::InvalidResponse(redact(&message, secret))
         }
+        ProviderError::InvalidToolArguments(message) => {
+            ProviderError::InvalidToolArguments(redact(&message, secret))
+        }
         ProviderError::Unavailable(message) => ProviderError::Unavailable(redact(&message, secret)),
         other => other,
     }
@@ -300,6 +303,18 @@ mod tests {
             ),
             ProviderError::InvalidResponse(_)
         ));
+    }
+
+    #[test]
+    fn redacts_secrets_from_typed_tool_argument_errors() {
+        let error = redact_error(
+            ProviderError::InvalidToolArguments(
+                "tool secret-key returned invalid JSON arguments".into(),
+            ),
+            "secret-key",
+        );
+        assert!(matches!(error, ProviderError::InvalidToolArguments(_)));
+        assert!(!error.to_string().contains("secret-key"));
     }
 
     #[test]

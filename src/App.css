@@ -8299,6 +8299,22 @@ button {
   background: var(--color-surface-raised);
 }
 
+.log-source {
+  margin-top: 6px;
+  color: var(--color-ink-subtle);
+  font-size: var(--font-size-sm);
+  overflow-wrap: anywhere;
+}
+
+.log-clear-confirm {
+  color: var(--color-ink);
+  padding-bottom: 10px;
+}
+
+.log-clear-confirm button + button { margin-left: 8px; }
+.log-viewer-header .log-viewer-title { margin-right: auto; }
+.log-viewer-header { gap: 12px; }
+
 .log-viewer-title {
   display: flex;
   align-items: center;
@@ -8391,6 +8407,7 @@ button {
 
 .log-row-head {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 10px;
   font-size: var(--font-size-sm);
@@ -8417,6 +8434,8 @@ button {
 .log-badge--error { color: #dc2626; background: rgba(220, 38, 38, 0.16); }
 
 .log-event {
+  overflow-wrap: anywhere;
+  min-width: 0;
   color: var(--color-ink);
   font-weight: var(--font-weight-medium);
   font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);

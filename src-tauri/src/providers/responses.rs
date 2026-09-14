@@ -347,7 +347,7 @@ fn parse_sse_data(data: &str) -> Result<ParsedResponsesEvent, ProviderError> {
                         )
                     })?;
                 let arguments = serde_json::from_str(&arguments).map_err(|error| {
-                    ProviderError::InvalidResponse(format!(
+                    ProviderError::InvalidToolArguments(format!(
                         "function call {name} returned invalid JSON arguments: {error}"
                     ))
                 })?;
@@ -445,6 +445,19 @@ mod tests {
             ProviderEvent::ProviderContext { provider, .. } if provider == "openai_responses"
         ));
         assert!(parse_sse_data(r#"{"type":"response.completed","response":{"usage":{"input_tokens":3,"output_tokens":2}}}"#).unwrap().completed);
+    }
+
+    #[test]
+    fn rejects_trailing_tool_arguments_with_a_retryable_typed_error() {
+        let data = serde_json::json!({
+            "type": "response.output_item.done",
+            "item": { "type": "function_call", "call_id": "call-input", "name": "request_user_input",
+                "arguments": "{\"questions\":[]}, {\"private\":\"fixture-secret\"}" }
+        });
+        let error = parse_sse_data(&data.to_string()).err().unwrap();
+        assert!(matches!(error, ProviderError::InvalidToolArguments(_)));
+        assert!(!error.to_string().contains("fixture-secret"));
+        assert!(error.turn_error(error.to_string()).retryable);
     }
 
     #[test]

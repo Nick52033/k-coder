@@ -769,6 +769,27 @@ impl AppState {
         self.logger.clone()
     }
 
+    pub async fn read_runtime_logs(
+        &self,
+        query: crate::logging::LogQuery,
+    ) -> std::io::Result<crate::logging::LogQueryResult> {
+        let mut result = self.logger.read_logs(query)?;
+        // Use repository metadata, including subagent threads. Missing/deleted sources
+        // keep their original ID; a metadata failure must not hide diagnostic logs.
+        if let Ok(threads) = self.repository.list_threads().await {
+            let titles: HashMap<_, _> = threads
+                .into_iter()
+                .map(|thread| (thread.id, thread.title))
+                .collect();
+            for record in &mut result.records {
+                if let Some(id) = &record.thread_id {
+                    record.thread_title = titles.get(id).cloned();
+                }
+            }
+        }
+        Ok(result)
+    }
+
     pub fn subagents(&self) -> MultiAgentCoordinator {
         self.subagents.clone()
     }
@@ -1850,6 +1871,53 @@ mod tests {
             self.api_keys.lock().unwrap().remove(provider_id);
             Ok(())
         }
+    }
+
+    #[tokio::test]
+    async fn runtime_log_sources_follow_original_thread_and_keep_missing_ids() {
+        let data = tempfile::tempdir().unwrap();
+        let state =
+            AppState::with_credentials(data.path(), Arc::new(FakeCredentials::default())).unwrap();
+        let first = state.repository.create_thread().await.unwrap();
+        let second = state.repository.create_thread().await.unwrap();
+        state
+            .repository
+            .rename_thread(&first.id, "来源对话 A".into())
+            .await
+            .unwrap();
+        for id in [&first.id, &second.id, &"deleted-thread".to_string()] {
+            state
+                .logger
+                .log("error", "turn_failed", serde_json::json!({"threadId":id}))
+                .unwrap();
+        }
+        state
+            .logger
+            .log("error", "application_error", serde_json::json!({}))
+            .unwrap();
+        let result = state
+            .read_runtime_logs(crate::logging::LogQuery {
+                limit: None,
+                level: None,
+                event: None,
+                after_timestamp_ms: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            result.records[0].thread_title.as_deref(),
+            Some("来源对话 A")
+        );
+        assert_eq!(
+            result.records[1].thread_title.as_deref(),
+            Some(second.title.as_str())
+        );
+        assert_eq!(
+            result.records[2].thread_id.as_deref(),
+            Some("deleted-thread")
+        );
+        assert!(result.records[2].thread_title.is_none());
+        assert!(result.records[3].thread_id.is_none());
     }
 
     #[test]

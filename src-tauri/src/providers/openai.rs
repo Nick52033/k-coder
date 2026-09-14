@@ -398,9 +398,9 @@ impl ToolCallAccumulator {
                     ));
                 }
                 let arguments = serde_json::from_str(&pending.arguments).map_err(|error| {
-                    ProviderError::InvalidResponse(format!(
-                        "tool call {} returned invalid JSON arguments: {error}\nRaw arguments: {}",
-                        pending.name, pending.arguments
+                    ProviderError::InvalidToolArguments(format!(
+                        "tool call {} returned invalid JSON arguments: {error}",
+                        pending.name
                     ))
                 })?;
                 Ok(ToolCall {
@@ -1206,8 +1206,35 @@ mod tests {
         });
         assert!(matches!(
             accumulator.take(),
-            Err(ProviderError::InvalidResponse(_))
+            Err(ProviderError::InvalidToolArguments(_))
         ));
+    }
+
+    #[test]
+    fn rejects_a_malformed_question_batch_without_emitting_a_partial_call_or_raw_arguments() {
+        let mut accumulator = ToolCallAccumulator::default();
+        for (index, name, arguments) in [
+            (0, "list_directory", r#"{"path":"."}"#),
+            (
+                1,
+                "request_user_input",
+                r#"{"questions":[{"question":"Q1 fixture-private","options":["A","B"]}]}, {"question":"Q2","options":["C","D"]}]}"#,
+            ),
+        ] {
+            accumulator.push(OpenAiToolCallDelta {
+                index,
+                id: Some(format!("call-{index}")),
+                function: Some(OpenAiFunctionDelta {
+                    name: Some(name.into()),
+                    arguments: Some(arguments.into()),
+                }),
+            });
+        }
+        let error = accumulator.take().unwrap_err();
+        assert!(matches!(error, ProviderError::InvalidToolArguments(_)));
+        assert!(error.to_string().contains("trailing characters"));
+        assert!(!error.to_string().contains("fixture-private"));
+        assert!(accumulator.take().unwrap().is_empty());
     }
 
     #[test]

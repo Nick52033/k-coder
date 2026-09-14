@@ -86,6 +86,7 @@ fn retryable(error: &ProviderError) -> bool {
         }
         ProviderError::Cancelled
         | ProviderError::InvalidResponse(_)
+        | ProviderError::InvalidToolArguments(_)
         | ProviderError::Interrupted => false,
     }
 }
@@ -136,6 +137,9 @@ mod tests {
         }));
         assert!(!retryable(&ProviderError::Interrupted));
         assert!(!retryable(&ProviderError::InvalidResponse("bad".into())));
+        assert!(!retryable(&ProviderError::InvalidToolArguments(
+            "bad".into()
+        )));
     }
 
     #[tokio::test]

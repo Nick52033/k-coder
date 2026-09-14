@@ -502,6 +502,10 @@ export function readLogs(query: LogQuery = {}): Promise<LogQueryResult> {
   });
 }
 
+export function clearLogs(confirmed: boolean): Promise<void> {
+  return invoke<void>("clear_logs", { confirmed });
+}
+
 export function subscribeToAgentEvents(
   handler: (event: AgentEvent) => void,
 ): Promise<UnlistenFn> {

@@ -171,6 +171,7 @@ struct ReadRevisionCoverage {
     redundant_batches: usize,
     last_redundant_batch: Option<usize>,
     recovery_delivered_batch: Option<usize>,
+    post_recovery_retry_count: usize,
     rehydration_available: bool,
     rehydrated_batch: Option<usize>,
 }
@@ -272,7 +273,22 @@ impl ReadObservationTracker {
                 coverage.last_redundant_batch = Some(provider_batch);
             }
             return Some(
-                if coverage.recovery_delivered_batch == Some(provider_batch) {
+                if coverage.recovery_delivered_batch == Some(provider_batch)
+                    && coverage.post_recovery_retry_count == 0
+                {
+                    // Give the Provider one bounded grace response after the
+                    // correction was delivered. Compaction can make a model
+                    // repeat a tiny prefix before it consumes the instruction.
+                    coverage.post_recovery_retry_count = 1;
+                    coverage.recovery_delivered_batch = None;
+                    ReadObservationDecision::RecoveryRequired {
+                        path: observation.0,
+                        revision: observation.1,
+                        start_line: observation.2,
+                        end_line: observation.3,
+                        overlap_percent: observation.4,
+                    }
+                } else if coverage.recovery_delivered_batch == Some(provider_batch) {
                     ReadObservationDecision::RepeatedLoop {
                         path: observation.0,
                         revision: observation.1,
@@ -303,6 +319,7 @@ impl ReadObservationTracker {
         coverage.redundant_batches = 0;
         coverage.last_redundant_batch = None;
         coverage.recovery_delivered_batch = None;
+        coverage.post_recovery_retry_count = 0;
         coverage.intervals.push((start_line, end_line));
         coverage
             .intervals
@@ -1410,7 +1427,7 @@ impl AgentRuntime {
                                 .get(transient_retry_count)
                                 .copied()
                                 .map(|delay| (error.rate_limit_delay().unwrap_or(delay), true))
-                        } else if is_incomplete_tool_call_error(&error)
+                        } else if is_retryable_protocol_stream_error(&error)
                             && protocol_retry_count < MAX_PROTOCOL_RETRIES
                         {
                             Some((protocol_retry_delay(protocol_retry_count), false))
@@ -1452,15 +1469,22 @@ impl AgentRuntime {
                                 "{} (已自动重试 {} 次)",
                                 error, transient_retry_count
                             )
-                        } else if is_incomplete_tool_call_error(&error)
+                        } else if is_retryable_protocol_stream_error(&error)
                             && protocol_retry_count > 0
                         {
                             format!("{} (已重试 {} 次)", error, protocol_retry_count)
                         } else {
                             error.to_string()
                         };
+                        let mut turn_error = error.turn_error(message);
+                        if is_retryable_protocol_stream_error(&error) {
+                            turn_error.details = Some(json!({
+                                "protocolRetries": protocol_retry_count,
+                                "outputAlreadyStarted": false,
+                            }));
+                        }
                         return self
-                            .finish_failed_with_error(&thread_id, &turn_id, error.turn_error(message), &publisher)
+                            .finish_failed_with_error(&thread_id, &turn_id, turn_error, &publisher)
                             .await;
                     }
                 };
@@ -1876,8 +1900,15 @@ impl AgentRuntime {
                             } else {
                                 error.to_string()
                             };
+                            let mut turn_error = error.turn_error(message);
+                            if is_retryable_protocol_stream_error(&error) {
+                                turn_error.details = Some(json!({
+                                    "protocolRetries": protocol_retry_count,
+                                    "outputAlreadyStarted": attempt_had_output,
+                                }));
+                            }
                             return self
-                                .finish_failed_with_error(&thread_id, &turn_id, error.turn_error(message), &publisher)
+                                .finish_failed_with_error(&thread_id, &turn_id, turn_error, &publisher)
                                 .await;
                         }
                         None => {
@@ -3468,11 +3499,10 @@ impl AgentRuntime {
     }
 }
 
-fn is_incomplete_tool_call_error(error: &ProviderError) -> bool {
-    matches!(error, ProviderError::InvalidResponse(message) if message.to_ascii_lowercase().contains("incomplete tool call"))
-}
-
 fn is_retryable_protocol_stream_error(error: &ProviderError) -> bool {
+    if matches!(error, ProviderError::InvalidToolArguments(_)) {
+        return true;
+    }
     let ProviderError::InvalidResponse(message) = error else {
         return false;
     };
@@ -7128,6 +7158,139 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn invalid_tool_arguments_before_stream_retry_the_same_request() {
+        let (_directory, _repository, runtime, thread_id) = runtime_fixture().await;
+        let provider = Arc::new(PreStreamProvider::new(vec![
+            Err(ProviderError::InvalidToolArguments(
+                "trailing characters".into(),
+            )),
+            Ok(vec![
+                Ok(ProviderEvent::TextDelta {
+                    delta: "recovered".into(),
+                }),
+                Ok(ProviderEvent::Completed),
+            ]),
+        ]));
+        let outcome = runtime
+            .run_turn(
+                provider.clone(),
+                "fake".into(),
+                RunTurnRequest {
+                    thread_id,
+                    input: "retry malformed arguments".into(),
+                    agent_mode: None,
+                },
+                CancellationToken::new(),
+                Arc::new(RecordingPublisher::default()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome.state, TurnState::Completed);
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].messages, requests[1].messages);
+    }
+
+    #[tokio::test]
+    async fn cancelling_invalid_tool_argument_backoff_prevents_another_request() {
+        let (_directory, _repository, runtime, thread_id) = runtime_fixture().await;
+        let provider = Arc::new(FakeProvider::new(vec![Err(
+            ProviderError::InvalidToolArguments("trailing characters".into()),
+        )]));
+        let cancellation = CancellationToken::new();
+        let run_provider = provider.clone();
+        let run_cancellation = cancellation.clone();
+        let run = tokio::spawn(async move {
+            runtime
+                .run_turn(
+                    run_provider,
+                    "fake".into(),
+                    RunTurnRequest {
+                        thread_id,
+                        input: "cancel retry".into(),
+                        agent_mode: None,
+                    },
+                    run_cancellation,
+                    Arc::new(RecordingPublisher::default()),
+                )
+                .await
+                .unwrap()
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while provider.requests().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        cancellation.cancel();
+        assert_eq!(run.await.unwrap().state, TurnState::Cancelled);
+        assert_eq!(provider.requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn invalid_tool_arguments_exhaust_retry_budget_then_allow_manual_retry() {
+        let (_directory, repository, runtime, thread_id) = runtime_fixture().await;
+        let provider = Arc::new(FakeProvider::script(
+            (0..=MAX_PROTOCOL_RETRIES)
+                .map(|_| {
+                    vec![Err(ProviderError::InvalidToolArguments(
+                        "trailing characters".into(),
+                    ))]
+                })
+                .collect(),
+        ));
+        let failed = runtime
+            .run_turn(
+                provider.clone(),
+                "fake".into(),
+                RunTurnRequest {
+                    thread_id: thread_id.clone(),
+                    input: "ask a question".into(),
+                    agent_mode: None,
+                },
+                CancellationToken::new(),
+                Arc::new(RecordingPublisher::default()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(failed.state, TurnState::Failed);
+        assert_eq!(provider.requests().len(), MAX_PROTOCOL_RETRIES + 1);
+        let history = repository.read_thread_history(&thread_id).await.unwrap();
+        let error = history.last_turn.unwrap().error.unwrap();
+        assert_eq!(error.code, "provider_invalid_response");
+        assert!(error.retryable);
+        assert!(error.message.contains("已重试 5 次"));
+        assert_eq!(
+            error.details,
+            Some(json!({ "protocolRetries": 5, "outputAlreadyStarted": false }))
+        );
+        let completed = runtime
+            .retry_turn(
+                Arc::new(FakeProvider::text(&["recovered"])),
+                "fake".into(),
+                thread_id.clone(),
+                AgentMode::Craft,
+                CancellationToken::new(),
+                Arc::new(RecordingPublisher::default()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(completed.state, TurnState::Completed);
+        assert_eq!(
+            repository
+                .read_thread(&thread_id)
+                .await
+                .unwrap()
+                .messages
+                .iter()
+                .filter(|message| message.role == MessageRole::User)
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn retryable_provider_failure_counts_failed_attempt_usage() {
         let (_directory, repository, runtime, thread_id) = runtime_fixture().await;
         let provider = Arc::new(FakeProvider::script(vec![
@@ -7139,7 +7302,7 @@ mod tests {
                         total_tokens: 5,
                     },
                 }),
-                Err(ProviderError::InvalidResponse(
+                Err(ProviderError::InvalidToolArguments(
                     "function call returned invalid JSON arguments".into(),
                 )),
             ],
@@ -7294,7 +7457,7 @@ mod tests {
                     total_tokens: 5,
                 },
             }),
-            Err(ProviderError::InvalidResponse(
+            Err(ProviderError::InvalidToolArguments(
                 "function call returned invalid JSON arguments".into(),
             )),
         ]]));

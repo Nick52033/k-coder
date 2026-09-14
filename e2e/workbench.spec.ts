@@ -6702,3 +6702,90 @@ test("previews markdown data, remote, workspace and browser artifact images safe
     { command: "read_message_image", threadId: "thread-1", path: "docs/missing.png" },
   ]);
 });
+
+async function installRuntimeLogFixture(page: import('@playwright/test').Page) {
+  await page.evaluate(() => {
+    const internals = (window as unknown as { __TAURI_INTERNALS__: { invoke: (command: string, args?: Record<string, unknown>) => Promise<unknown> } }).__TAURI_INTERNALS__;
+    const original = internals.invoke;
+    const state = { clearCount: 0, failClear: false, cleared: false, readCount: 0 };
+    Object.assign(window, { runtimeLogTest: state });
+    internals.invoke = async (command, args) => {
+      if (command === 'clear_logs') {
+        if (args?.confirmed !== true) throw new Error('Confirmation missing');
+        state.clearCount += 1;
+        if (state.failClear) throw new Error('日志文件暂时不可写');
+        state.cleared = true;
+        return;
+      }
+      if (command === 'read_logs') {
+        state.readCount += 1;
+        const records = state.cleared
+          ? [{ timestampMs: 1750000000004, level: 'info', event: 'logs_cleared', fields: {}, threadId: null, threadTitle: null }]
+          : [
+            { timestampMs: 1750000000000, level: 'info', event: 'turn_requested', fields: {}, threadId: 'thread-1', threadTitle: '来源对话 A' },
+            { timestampMs: 1750000000001, level: 'error', event: 'turn_failed', fields: { message: '模型请求失败' }, threadId: 'thread-2', threadTitle: '来源对话 B' },
+            { timestampMs: 1750000000002, level: 'error', event: 'legacy_failed', fields: {}, threadId: 'deleted-thread', threadTitle: null },
+            { timestampMs: 1750000000003, level: 'error', event: 'runtime_failed', fields: {}, threadId: null, threadTitle: null },
+          ];
+        const filtered = records.filter(r => (!args?.level || r.level === args.level) && (!args?.event || r.event === args.event));
+        return { records: filtered, total: filtered.length };
+      }
+      return original(command, args);
+    };
+  });
+}
+
+test('runtime logs show two levels, original conversation sources and confirmed cleanup', async ({ page }) => {
+  await page.goto('/');
+  await installRuntimeLogFixture(page);
+  const viewport = page.viewportSize();
+  // The existing sidebar is hidden at narrow widths; open then test the dialog at the target width.
+  await page.setViewportSize({ width: 1280, height: 820 });
+  await page.getByTitle('查看本地运行日志').click();
+  if (viewport) await page.setViewportSize(viewport);
+  const dialog = page.getByRole('dialog', { name: '本地运行日志' });
+  await expect(dialog.getByLabel('级别').locator('option')).toHaveText(['全部级别', 'Info', 'Error']);
+  await expect(dialog.locator('.log-row')).toHaveCount(4);
+  await expect(dialog.locator('.log-time').first()).not.toContainText('Invalid');
+  await expect(dialog.locator('.log-source')).toHaveText([
+    '来源：应用运行时（无关联对话）', '来源：对话名称不可用 （deleted-thread）', '来源：来源对话 B （thread-2）',
+  ]);
+  await dialog.getByRole('button', { name: '清理日志', exact: true }).click();
+  await expect(dialog.getByRole('group', { name: '确认清理运行日志' })).toBeVisible();
+  await dialog.getByRole('button', { name: '取消', exact: true }).click();
+  await expect(dialog.locator('.log-row')).toHaveCount(4);
+  await expect.poll(() => page.evaluate(() => (window as any).runtimeLogTest.clearCount)).toBe(0);
+  await dialog.getByLabel('级别').selectOption('error');
+  await dialog.getByRole('button', { name: '刷新', exact: true }).click();
+  await expect(dialog.locator('.log-row')).toHaveCount(3);
+  await dialog.getByRole('button', { name: '清理日志', exact: true }).click();
+  await dialog.getByRole('button', { name: '确认清理', exact: true }).click();
+  await expect(dialog).toContainText('历史运行日志已清理');
+  await expect(dialog.locator('.log-row')).toHaveCount(0);
+  await dialog.getByLabel('级别').selectOption('');
+  await dialog.getByRole('button', { name: '刷新', exact: true }).click();
+  await expect(dialog.locator('.log-row')).toHaveCount(1);
+  await expect(dialog.locator('.log-event')).toHaveText('logs_cleared');
+  expect(await dialog.evaluate(el => el.scrollWidth <= el.clientWidth)).toBe(true);
+});
+
+test('runtime log cleanup failure preserves records and permits retry', async ({ page }) => {
+  await page.goto('/');
+  await installRuntimeLogFixture(page);
+  const viewport = page.viewportSize();
+  // The existing sidebar is hidden at narrow widths; open then test the dialog at the target width.
+  await page.setViewportSize({ width: 1280, height: 820 });
+  await page.getByTitle('查看本地运行日志').click();
+  if (viewport) await page.setViewportSize(viewport);
+  const dialog = page.getByRole('dialog', { name: '本地运行日志' });
+  await expect(dialog.locator('.log-row')).toHaveCount(4);
+  await page.evaluate(() => { (window as any).runtimeLogTest.failClear = true; });
+  await dialog.getByRole('button', { name: '清理日志', exact: true }).click();
+  await dialog.getByRole('button', { name: '确认清理', exact: true }).click();
+  await expect(dialog.getByRole('alert')).toContainText('日志文件暂时不可写');
+  await expect(dialog.locator('.log-row')).toHaveCount(4);
+  await page.evaluate(() => { (window as any).runtimeLogTest.failClear = false; });
+  await dialog.getByRole('button', { name: '确认清理', exact: true }).click();
+  await expect(dialog.locator('.log-row')).toHaveCount(1);
+  await expect(dialog.getByRole('alert')).toHaveCount(0);
+});

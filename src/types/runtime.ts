@@ -961,13 +961,15 @@ export interface UserInputSnapshot {
   resolution: UserInputResolution | null;
 }
 
-export type LogLevel = "trace" | "debug" | "info" | "warn" | "error";
+export type LogLevel = "info" | "error";
 
 export interface LogRecord {
   timestampMs: number;
   level: string;
   event: string;
   fields: unknown;
+  threadId: string | null;
+  threadTitle: string | null;
 }
 
 export interface LogQueryResult {

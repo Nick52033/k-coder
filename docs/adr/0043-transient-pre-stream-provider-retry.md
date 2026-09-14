@@ -28,6 +28,13 @@ DeepSeek V4 的当前工具 Turn 已能正确回传 `reasoning_content`、`tool_
 - 公共事件 schema v7 新增 `provider_retry_waiting`，仅包含线程、Turn 与预计请求时间。它是瞬时展示信息，不进入模型上下文；主对话与子任务详情显示倒计时，实际发请求或收到终态时清除。子任务快照可附带可选 `retryAtMs`，旧快照兼容。
 - 最终失败从 ProviderError 类型生成 `rate_limited` 错误码；兼容历史字符串中的 `HTTP 429:`，不再依赖供应商错误正文是否包含 `rate limit`。
 
+## 2026-09-14：工具 JSON 参数错误恢复（P10-174）
+
+- Chat Completions、Responses 与 Anthropic 的工具参数 JSON 解析失败统一返回 `ProviderError::InvalidToolArguments`。诊断保留工具名、JSON 错误位置，不附加完整原始参数；严格解析失败时不猜测括号、不截取首个合法对象执行。
+- Provider 的 `InvalidToolArguments` 和 `InvalidResponse` 按 Rust 类型映射为 `provider_invalid_response`、Protocol、`retryable=true`，不再由正文中的 `invalid json`、`permission`、`api key` 等字样误分类为用户输入或授权错误。真正的宿主无效输入仍不可重试。
+- 流前和流内统一使用独立的协议重试规则，最多 5 次；流内必须没有正文、摘要、工具或 Provider 上下文输出。取消可中断退避；协议失败不触发备用供应商切换。失败携带有界诊断 `protocolRetries`、`outputAlreadyStarted`，方便区分次数耗尽与已有输出。
+- 手动重试一直由失败/取消的 Turn 终态决定，不以错误的 `retryable` 字段作为后端门禁；本次不修改或重写已有会话事实。新增端到端回归确认格式失败后手动重试仍能完成且不重复用户消息。
+
 ## 影响
 
 - 单端点遇到短暂 `503` 时，运行时可以在 7 秒退避窗口内自行恢复，不再要求用户立即连续创建多个重试 Turn。

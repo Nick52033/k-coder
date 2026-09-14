@@ -929,8 +929,8 @@ impl KnowledgeService {
         });
         self.publish_progress(job, context);
         let (level, event) = match state {
-            "failed" => ("warn", "knowledge_index_job_failed"),
-            "cancelled" => ("warn", "knowledge_index_job_cancelled"),
+            "failed" => ("error", "knowledge_index_job_failed"),
+            "cancelled" => ("info", "knowledge_index_job_cancelled"),
             _ => ("info", "knowledge_index_job_completed"),
         };
         self.log_event(
@@ -2146,9 +2146,9 @@ impl KnowledgeService {
         })?;
         if record.thread_id != thread_id || record.turn_id != turn_id {
             self.log_event(
-                "warn",
+                "error",
                 "knowledge_citation_rejected",
-                json!({ "reason": "turn_mismatch" }),
+                json!({ "reason": "turn_mismatch", "threadId": thread_id, "turnId": turn_id }),
             );
             return Err(KnowledgeError::coded(
                 "KC_CITATION_FORBIDDEN",
@@ -2599,7 +2599,7 @@ impl KnowledgeService {
                 metrics.embedding_retries = metrics.embedding_retries.saturating_add(retry_count);
             });
             self.log_event(
-                if status == 200 { "info" } else { "warn" },
+                if status == 200 { "info" } else { "error" },
                 "knowledge_embedding_batch",
                 json!({
                     "jobId": job_id,

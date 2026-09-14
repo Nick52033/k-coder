@@ -687,7 +687,7 @@ pub fn runtime_status(state: State<'_, AppState>) -> RuntimeStatus {
 }
 
 #[tauri::command]
-pub fn read_logs(
+pub async fn read_logs(
     state: State<'_, AppState>,
     limit: Option<usize>,
     level: Option<String>,
@@ -701,8 +701,16 @@ pub fn read_logs(
         after_timestamp_ms,
     };
     state
+        .read_runtime_logs(query)
+        .await
+        .map_err(|error| CommandError::internal(error.to_string()))
+}
+
+#[tauri::command]
+pub fn clear_logs(state: State<'_, AppState>, confirmed: bool) -> Result<(), CommandError> {
+    state
         .logger()
-        .read_logs(query)
+        .clear_logs(confirmed)
         .map_err(|error| CommandError::internal(error.to_string()))
 }
 

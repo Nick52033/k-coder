@@ -278,7 +278,7 @@ impl Provider for AnthropicMessagesProvider {
                                             let arguments = if tool.arguments.is_empty() { json!({}) } else {
                                                 match serde_json::from_str(&tool.arguments) {
                                                     Ok(arguments) => arguments,
-                                                    Err(error) => { yield Err(ProviderError::InvalidResponse(format!("tool call {} returned invalid JSON arguments: {error}", tool.name))); return; }
+                                                    Err(error) => { yield Err(ProviderError::InvalidToolArguments(format!("tool call {} returned invalid JSON arguments: {error}", tool.name))); return; }
                                                 }
                                             };
                                             yield Ok(ProviderEvent::ToolCall { call: ToolCall {

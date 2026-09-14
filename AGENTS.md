@@ -61,3 +61,9 @@ cargo test --manifest-path src-tauri/Cargo.toml
 ```
 
 未启动 `pnpm tauri dev` 并实际验证变更路径时，不得声称桌面工作流已经完成。
+
+## 本地运行与源码修改约定
+
+- 客户端运行/安装目录固定为 D:\apps\k-coder\。
+- 代码、测试和文档修改只在源码仓库 D:\code\Nick\k-coder\ 中进行；不得把源码改动写入安装目录。
+- 需要验证安装端行为时，先构建源码，再明确记录是否部署到安装目录。
