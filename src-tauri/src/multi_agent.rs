@@ -2405,7 +2405,11 @@ mod tests {
             schema.contains("\"tokenBudget\""),
             "schema missing tokenBudget: {schema}"
         );
-        assert!(definition.description.contains("explicitly requested by the user"));
+        assert!(
+            definition
+                .description
+                .contains("explicitly requested by the user")
+        );
         assert!(schema.contains("explicitly requested by the user"));
         assert!(schema.contains("input and output tokens"));
         assert!(!schema.contains("unless you know the task is small"));
@@ -2413,5 +2417,91 @@ mod tests {
             schema.contains("exhausted") && schema.contains("resume_agent"),
             "create_agent tokenBudget description should explain exhausted + resume_agent refusal: {schema}"
         );
+    }
+
+    #[tokio::test]
+    async fn inherited_subagent_usage_only_stops_with_an_explicit_budget() {
+        for budget in [None, Some(8_000)] {
+            let data = tempfile::tempdir().unwrap();
+            let workspace = tempfile::tempdir().unwrap();
+            let repository = Arc::new(JsonlThreadRepository::new(data.path()).unwrap());
+            let parent = repository.create_thread().await.unwrap();
+            let usage = |input_tokens, output_tokens| {
+                Ok(ProviderEvent::Usage {
+                    usage: TokenUsage {
+                        input_tokens,
+                        output_tokens,
+                        total_tokens: input_tokens + output_tokens,
+                    },
+                })
+            };
+            let provider = Arc::new(FakeProvider::script(vec![
+                vec![
+                    Ok(ProviderEvent::ToolCall {
+                        call: serde_json::from_value(json!({
+                            "id": "inspect", "name": "list_directory",
+                            "arguments": {"path": "."}, "metadata": {}
+                        }))
+                        .unwrap(),
+                    }),
+                    usage(7_476, 302),
+                    Ok(ProviderEvent::Completed),
+                ],
+                vec![
+                    Ok(ProviderEvent::TextDelta {
+                        delta: "analysis complete".into(),
+                    }),
+                    usage(56_218, 402),
+                    Ok(ProviderEvent::Completed),
+                ],
+            ]));
+            let manager = MultiAgentCoordinator::new(data.path()).unwrap();
+            let mut request = request(&parent.id, "inspect the workspace");
+            request.token_budget = budget;
+            request.fork_turns = Some("all".into());
+            let execution = context(
+                repository,
+                workspace.path(),
+                provider.clone(),
+                Arc::new(NoopSubagentPublisher),
+            );
+            let agent = manager
+                .create(request, None, execution.clone(), CancellationToken::new())
+                .await
+                .unwrap();
+            let result = manager
+                .wait(&agent.id, 2_000, CancellationToken::new())
+                .await
+                .unwrap();
+            assert_eq!(result.tokens_used, 64_398);
+            assert_eq!(result.token_budget, budget);
+            assert_eq!(provider.requests().len(), 2);
+            if budget.is_some() {
+                assert_eq!(result.state, SubagentState::Failed);
+                assert_eq!(
+                    result.error.as_deref(),
+                    Some("token_budget_exceeded: used 64398 of 8000 tokens")
+                );
+                assert!(matches!(
+                    manager.resume(&agent.id, None, execution).await,
+                    Err(MultiAgentError::Limit(_))
+                ));
+                assert_eq!(
+                    provider.requests().len(),
+                    2,
+                    "resume must not spend more of an exhausted budget"
+                );
+            } else {
+                assert_eq!(result.state, SubagentState::Completed);
+                assert_eq!(result.summary.as_deref(), Some("analysis complete"));
+            }
+            let restored = MultiAgentCoordinator::new(data.path())
+                .unwrap()
+                .get(&agent.id)
+                .unwrap();
+            assert_eq!(restored.tokens_used, 64_398);
+            assert_eq!(restored.token_budget, budget);
+            assert_eq!(restored.state, result.state);
+        }
     }
 }
