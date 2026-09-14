@@ -1,0 +1,4 @@
+interface:
+  display_name: "Controlled Browser"
+  short_description: "Use k-Coder's separate controlled browser session with audited native browser tools."
+  default_prompt: "Open an HTTP(S) page in the controlled browser and verify its visible behavior."

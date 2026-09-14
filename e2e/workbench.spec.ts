@@ -4100,6 +4100,27 @@ test("pastes common Excel workbooks and sends extracted sheet content", async ({
   ).__runTurnCalls[0]?.request?.input)).toContain("[工作表: 预算]\n项目\t金额\n住宿\t128.5");
 });
 
+test("imports one image when clipboard files and items expose the same entry", async ({ page }) => {
+  await page.goto("/");
+  const composer = page.getByRole("textbox", { name: "消息" });
+  await composer.evaluate((element) => {
+    const bytes = new Uint8Array([137, 80, 78, 71]);
+    const file = new File([bytes], "image.png", { type: "image/png", lastModified: 1 });
+    const duplicateItemFile = new File([bytes], "image.png", { type: "image/png", lastModified: 2 });
+    const event = new Event("paste", { bubbles: true, cancelable: true });
+    Object.defineProperty(event, "clipboardData", {
+      value: {
+        files: [file],
+        items: [{ kind: "file", getAsFile: () => duplicateItemFile }],
+      },
+    });
+    element.dispatchEvent(event);
+  });
+
+  await expect(page.getByLabel("待发送附件").locator(".attachment-tag")).toHaveCount(1);
+  await expect(page.getByAltText("image.png")).toBeVisible();
+});
+
 test("sends images without frontend OCR and opens the conversation preview", async ({ page }, testInfo) => {
   await page.goto("/");
   const composer = page.getByRole("textbox", { name: "消息" });
@@ -4120,6 +4141,7 @@ test("sends images without frontend OCR and opens the conversation preview", asy
   });
 
   await expect(page.getByAltText("ocr-fixture.png")).toBeVisible();
+  await expect(page.getByLabel("待发送附件").locator(".attachment-tag")).toHaveCount(1);
   await expect.poll(() => page.evaluate(() => (window as unknown as { __invoked: string[] }).__invoked.filter((command) => command === "recognize_image").length)).toBe(0);
   await expect(page.getByText("hidden OCR fixture", { exact: true })).toHaveCount(0);
   await expect(page.getByText("查看识别文字", { exact: true })).toHaveCount(0);
@@ -6569,6 +6591,46 @@ test("rate limit waiting and all child states are visible with only one wait cal
 });
 
 
+test("exhausted subagent budget disables resume in detail and list while ordinary failures remain resumable", async ({ page }) => {
+  await page.addInitScript(() => {
+    localStorage.setItem("kcoder_e2e_subagents", JSON.stringify([
+      { id: "budget-child", label: "测试范围分析", tokenBudget: 8000, tokensUsed: 64398,
+        error: "token_budget_exceeded: used 64398 of 8000 tokens" },
+      { id: "network-child", label: "网络失败", tokenBudget: null, tokensUsed: 64398,
+        error: "provider unavailable" },
+      { id: "remaining-child", label: "尚有预算", tokenBudget: 8000, tokensUsed: 7999,
+        error: "provider unavailable" },
+      { id: "exact-child", label: "恰好耗尽", tokenBudget: 8000, tokensUsed: 8000,
+        error: "provider unavailable" },
+    ].map((child, index) => ({
+      schemaVersion: 1, parentAgentId: null, parentThreadId: "thread-1", threadId: `budget-thread-${index}`,
+      task: "检查文档", state: "failed", depth: 1, workspaceRoot: "D:\\code\\k-coder", capabilities: ["read_file"],
+      timeoutMs: 600000, createdAtMs: index + 1, updatedAtMs: index + 10, summary: null, turnCount: 1,
+      ...child,
+    }))));
+  });
+  await page.goto("/");
+  const summary = page.getByRole("region", { name: "本会话子智能体状态" });
+  await summary.getByRole("button").filter({ hasText: "测试范围分析" }).click();
+  const drawer = page.getByRole("complementary", { name: "子智能体", exact: true });
+  await expect(drawer.getByRole("button", { name: "恢复", exact: true })).toBeDisabled();
+  await expect(drawer.getByRole("alert")).toContainText("Token 预算已耗尽");
+  await expect(drawer.getByRole("alert")).toContainText("无法恢复");
+  await expect(drawer.getByRole("alert")).toContainText("64,398 / 8,000 tokens");
+  await drawer.getByRole("button", { name: "返回列表" }).click();
+  for (const label of ["测试范围分析", "恰好耗尽"]) {
+    await expect(drawer.locator(".subagent-row").filter({ hasText: label }).getByRole("button", { name: "恢复", exact: true })).toBeDisabled();
+  }
+  for (const label of ["网络失败", "尚有预算"]) {
+    const row = drawer.locator(".subagent-row").filter({ hasText: label });
+    await expect(row.getByRole("button", { name: "恢复", exact: true })).toBeEnabled();
+    await row.locator(".subagent-row-main").click();
+    await expect(drawer.getByRole("button", { name: "恢复", exact: true })).toBeEnabled();
+    await expect(drawer.getByRole("alert")).not.toContainText("Token 预算已耗尽");
+    await drawer.getByRole("button", { name: "返回列表" }).click();
+  }
+});
+
 test("shows direct subagent creation in a conversation without messages", async ({ page }) => {
   await page.addInitScript(() => {
     localStorage.setItem("kcoder_e2e_subagents", "[]");
@@ -6639,6 +6701,15 @@ test("ordinary conversation keeps its independent plan progress", async ({ page 
   await expect(progress).toHaveCount(1);
   await expect(progress).toContainText("第 2/2 步");
   await expect(progress).toContainText("1 个文件已更新");
+  await page.evaluate(() => {
+    (window as unknown as { __emitAgentEvent: (event: unknown) => void }).__emitAgentEvent({
+      schemaVersion: 1, threadId: "thread-1", turnId: "turn-1", phase: "responding",
+      type: "todo_updated",
+      todos: [{ content: "检查工作区", activeForm: "正在检查工作区", status: "in_progress" }],
+    });
+  });
+  await expect(page.getByText(/任务清单 \d+\/\d+ 已完成/)).toHaveCount(0);
+  await expect(progress).toHaveCount(1);
   await progress.click();
   const details = page.getByRole("dialog", { name: "执行计划详情" });
   await expect(details.locator(".plan-progress-step--completed")).toContainText("检查工作区");

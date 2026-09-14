@@ -60,7 +60,6 @@ import { ModelSelector } from "./components/ModelSelector";
 import { ContextProgress } from "./components/ContextProgress";
 import { ApprovalModeSelector } from "./components/ApprovalModeSelector";
 import { ReasoningSelector } from "./components/ReasoningSelector";
-import { TodoList } from "./components/TodoList";
 import { SubagentSummary } from "./SubagentSummary";
 import { ConversationTurnActivity, isVisibleConversationTimelineItem } from "./components/ConversationActivity";
 import { MarkdownContent } from "./components/MarkdownContent";
@@ -274,12 +273,14 @@ function boundUtf8(value: string, maxBytes: number): { value: string; bytes: num
 }
 
 function clipboardFiles(data: DataTransfer): File[] {
-  const files = [...Array.from(data.files)];
-  for (const item of Array.from(data.items)) {
-    if (item.kind !== "file") continue;
-    const file = item.getAsFile();
-    if (file) files.push(file);
-  }
+  // `files` and file items describe the same clipboard entries. Prefer the
+  // FileList and only fall back to items for browsers that leave it empty.
+  const files = data.files.length > 0
+    ? Array.from(data.files)
+    : Array.from(data.items)
+      .filter((item) => item.kind === "file")
+      .map((item) => item.getAsFile())
+      .filter((file): file is File => file !== null);
   const seen = new Set<string>();
   return files.filter((file) => {
     const key = `${file.name}\u0000${file.size}\u0000${file.lastModified}\u0000${file.type}`;
@@ -464,7 +465,6 @@ function App() {
     goal,
     workflows,
     workflowRun,
-    todos,
     historyNextCursor,
     historyLoading,
     loading,
@@ -2405,11 +2405,6 @@ function App() {
                   </button>
                 </div>
               )}
-              {/* 任务清单 */}
-              {activeThreadId && todos.get(activeThreadId) && (
-                <TodoList todos={todos.get(activeThreadId)!} />
-              )}
-
               {displayMessages.map((message) => {
                 if (message.role === "assistant" && message.turnId && (
                   groupedRetryTurnIds.has(message.turnId) || steeredTurnIds.has(message.turnId)

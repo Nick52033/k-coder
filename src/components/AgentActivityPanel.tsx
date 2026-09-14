@@ -44,6 +44,12 @@ interface AgentActivityPanelProps {
 
 const activeStates = new Set<SubagentState>(["queued", "running", "blocked"]);
 
+function isTokenBudgetExhausted(agent: SubagentView) {
+  return agent.tokenBudget != null && agent.tokensUsed >= agent.tokenBudget;
+}
+
+const exhaustedBudgetHint = "Token 预算已耗尽，无法恢复此子任务。请在主对话中重新安排任务；如需继续使用有限预算，请明确指定新的额度。";
+
 interface DetailLine {
   id: string;
   kind: "text" | "tool" | "note";
@@ -357,7 +363,9 @@ function SubagentRow({ agent, selected, onSelect, onStop, onResume }: SubagentRo
             className="agent-button agent-button--secondary"
             type="button"
             onClick={onResume}
-            title="恢复"
+            disabled={isTokenBudgetExhausted(agent)}
+            aria-label="恢复"
+            title={isTokenBudgetExhausted(agent) ? exhaustedBudgetHint : "恢复"}
           >
             <RotateCcw size={13} />
           </button>
@@ -458,7 +466,9 @@ function SubagentDetail({ agent, onBack, onStop, onResume, onError }: SubagentDe
             停止
           </button>
         ) : ["failed", "cancelled", "timed_out"].includes(agent.state) ? (
-          <button className="agent-button agent-button--secondary" type="button" onClick={onResume}>
+          <button className="agent-button agent-button--secondary" type="button" onClick={onResume}
+            disabled={isTokenBudgetExhausted(agent)}
+            title={isTokenBudgetExhausted(agent) ? exhaustedBudgetHint : undefined}>
             <RotateCcw size={13} />
             恢复
           </button>
@@ -521,7 +531,13 @@ function SubagentDetail({ agent, onBack, onStop, onResume, onError }: SubagentDe
           </div>
         )}
         {activeStates.has(agent.state) && agent.retryAtMs && <div className="agent-retry-wait" role="status"><RetryWaitingLabel retryAtMs={agent.retryAtMs} /></div>}
-        {agent.error && <div className="agent-error">{agent.error}</div>}
+        {["failed", "cancelled", "timed_out"].includes(agent.state) && isTokenBudgetExhausted(agent) ? (
+          <div className="agent-error" role="alert">
+            <p>{exhaustedBudgetHint}</p>
+            <p>累计输入与输出：{formatTokenUsage(agent.tokensUsed, agent.tokenBudget)}</p>
+            {agent.error && <p>{agent.error}</p>}
+          </div>
+        ) : agent.error && <div className="agent-error" role="alert">{agent.error}</div>}
       </div>
 
       <form

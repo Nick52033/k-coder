@@ -1,0 +1,43 @@
+{
+  "name": "browser",
+  "version": "26.601.21317",
+  "description": "通过 k-Coder 浏览器工具打开页面、读取内容、输入、点击和截图。操作使用独立浏览器会话，与工作台网页预览分开。",
+  "author": {
+    "name": "OpenAI"
+  },
+  "homepage": "https://github.com/openai/openai/tree/master/lib/browser_use/plugin",
+  "repository": "https://github.com/openai/openai/tree/master/lib/browser_use/plugin",
+  "license": "Proprietary",
+  "keywords": [
+    "browser",
+    "automation",
+    "chrome",
+    "iab",
+    "node-repl",
+    "browser-client"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Browser",
+    "shortDescription": "Control k-Coder's external browser session",
+    "longDescription": "Navigate HTTP(S) pages in a separate controlled browser, inspect visible text, use CSS selectors to click or type, and capture audited screenshots. Localhost remains an explicit browser setting and this session is separate from the preview iframe.",
+    "developerName": "OpenAI",
+    "category": "Engineering",
+    "capabilities": [
+      "Interactive",
+      "Read",
+      "Write"
+    ],
+    "websiteURL": "https://openai.com/",
+    "privacyPolicyURL": "https://openai.com/policies/row-privacy-policy/",
+    "termsOfServiceURL": "https://openai.com/policies/row-terms-of-use/",
+    "defaultPrompt": [
+      "Test my local web flow with the controlled browser"
+    ],
+    "brandColor": "#013B7B",
+    "composerIcon": "./assets/composer-icon.png",
+    "logo": "./assets/browser.png",
+    "screenshots": []
+  },
+  "bundledContentVariant": "single-tab"
+}

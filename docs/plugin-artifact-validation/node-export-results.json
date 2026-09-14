@@ -1,0 +1,10 @@
+{
+  "artifactImport": true,
+  "presentationJsxImport": true,
+  "workbookExport": true,
+  "workbookRender": false,
+  "workbookRenderError": "Rendering skipped by explicit smoke-test option.",
+  "presentationExport": true,
+  "presentationRender": false,
+  "presentationRenderError": "Rendering skipped by explicit smoke-test option."
+}

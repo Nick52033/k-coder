@@ -2,6 +2,8 @@ import { useEffect, useState } from "react";
 import {
   AlertCircle,
   Boxes,
+  ChevronDown,
+  FolderOpen,
   LoaderCircle,
   Puzzle,
   RefreshCw,
@@ -114,6 +116,7 @@ export function PluginSettingsPage() {
         <div>
           <p className="settings-eyebrow">扩展</p>
           <h3 id="plugin-page-title">本地插件</h3>
+          <p className="plugin-page-description">为当前项目扩展技能与工具，按需启用。</p>
         </div>
         <button
           className="plugin-icon-button"
@@ -124,12 +127,16 @@ export function PluginSettingsPage() {
           onClick={() => void load(true)}
         >
           {loading ? <LoaderCircle className="plugin-spin" size={16} /> : <RefreshCw size={16} />}
+          <span>刷新</span>
         </button>
       </div>
 
       <div className="plugin-root" title={overview?.rootPath ?? ""}>
-        <Puzzle size={15} />
-        <span>{overview?.rootPath ?? "正在读取插件目录..."}</span>
+        <FolderOpen size={18} aria-hidden="true" />
+        <div>
+          <span className="plugin-root-label">项目插件目录</span>
+          <span className="plugin-root-path">{overview?.rootPath ?? (loading ? "正在读取插件目录..." : "插件目录读取失败")}</span>
+        </div>
       </div>
 
       {(error || overview?.error) && (
@@ -139,10 +146,23 @@ export function PluginSettingsPage() {
         </div>
       )}
 
-      {!loading && plugins.length === 0 ? (
+      {overview && (
+        <div className="plugin-list-heading">
+          <h4>已发现 <span>{plugins.length}</span></h4>
+          <span>{plugins.filter((plugin) => plugin.enabled).length} 个已启用</span>
+        </div>
+      )}
+
+      {loading && !overview ? (
+        <div className="plugin-empty" role="status">
+          <LoaderCircle className="plugin-spin" size={24} />
+          <span>正在读取插件…</span>
+        </div>
+      ) : !loading && plugins.length === 0 ? (
         <div className="plugin-empty">
-          <Puzzle size={22} />
-          <span>未发现插件</span>
+          <div className="plugin-empty-icon"><Puzzle size={28} /></div>
+          <strong>未发现插件</strong>
+          <p>将插件文件夹放入项目插件目录，然后点击刷新。</p>
         </div>
       ) : (
         <div className="plugin-list" aria-label="本地插件列表">
@@ -152,7 +172,7 @@ export function PluginSettingsPage() {
             return (
               <article className={`plugin-row plugin-row--${plugin.state}`} key={`${plugin.id}:${plugin.path}`}>
                 <div className="plugin-row-icon" aria-hidden="true">
-                  <Puzzle size={17} />
+                  <Puzzle size={20} />
                 </div>
                 <div className="plugin-row-body">
                   <div className="plugin-row-heading">
@@ -162,9 +182,24 @@ export function PluginSettingsPage() {
                       {stateLabels[plugin.state]}
                     </span>
                   </div>
-                  {plugin.description && <p className="plugin-description">{plugin.description}</p>}
-                  <div className="plugin-path" title={plugin.path}>{plugin.path}</div>
+                  {plugin.description && (plugin.description.length > 160 ? (
+                    <details className="plugin-description-details">
+                      <summary>
+                        <span className="plugin-description plugin-description-preview">{plugin.description}</span>
+                        <span className="plugin-description-toggle">
+                          <ChevronDown size={13} aria-hidden="true" />
+                          <span className="plugin-description-expand">展开说明</span>
+                          <span className="plugin-description-collapse">收起说明</span>
+                        </span>
+                      </summary>
+                      <p className="plugin-description">{plugin.description}</p>
+                    </details>
+                  ) : <p className="plugin-description">{plugin.description}</p>)}
                   {componentSummary(plugin)}
+                  <div className="plugin-path" title={plugin.path}>
+                    <FolderOpen size={13} aria-hidden="true" />
+                    <span>{plugin.path}</span>
+                  </div>
                   {(plugin.warnings.length > 0 || plugin.error) && (
                     <div className="plugin-diagnostics">
                       {plugin.warnings.map((warning) => <span key={warning}>{warning}</span>)}
@@ -181,7 +216,7 @@ export function PluginSettingsPage() {
                       disabled={toggleDisabled}
                       onChange={(event) => void handleToggle(plugin, event.currentTarget.checked)}
                     />
-                    <span aria-hidden="true" />
+                    <span className="plugin-switch-track" aria-hidden="true" />
                   </label>
                   <button
                     className="plugin-delete-button"
@@ -212,6 +247,7 @@ export function PluginSettingsPage() {
               <h4 id="plugin-delete-title">删除插件</h4>
               <strong>{pendingDelete.name}</strong>
             </div>
+            <div className="plugin-confirm-notice">将删除此插件文件夹及其中的文件。此操作无法撤销。</div>
             <p title={pendingDelete.path}>{pendingDelete.path}</p>
             <div className="plugin-confirm-actions">
               <button

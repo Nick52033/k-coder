@@ -2380,7 +2380,6 @@ fn metadata_is_reparse_point(_metadata: &fs::Metadata) -> bool {
 fn unsupported_components(path: &Path, manifest: &PluginManifest) -> usize {
     [
         manifest.apps.is_some() || path_entry_exists(&path.join(".app.json")),
-        manifest.interface.is_some(),
         path_entry_exists(&path.join("hooks.json")),
         path_entry_exists(&path.join("agents")),
         path_entry_exists(&path.join("commands")),
@@ -2542,6 +2541,37 @@ mod tests {
         let skill_dir = plugin_root.join("skills").join(folder);
         fs::create_dir_all(&skill_dir).unwrap();
         fs::write(skill_dir.join("SKILL.md"), content).unwrap();
+    }
+
+    #[test]
+    fn interface_metadata_does_not_degrade_usable_skills_but_apps_still_do() {
+        let workspace = tempfile::tempdir().unwrap();
+        let root = workspace.path().join(".k-coder/plugins/display");
+        let manifest = json!({
+            "name": "display", "version": "1", "description": "Display metadata",
+            "interface": { "displayName": "Display", "brandColor": "#107C41" }
+        });
+        write_manifest(&root, manifest.clone());
+        write_skill(
+            &root,
+            "review",
+            "---\nname: review\ndescription: Review code\n---\nRead and review code.",
+        );
+        let host = plugin_host(workspace.path());
+        host.scan().unwrap();
+        host.set_enabled("display@local", true).unwrap();
+        let overview = host.scan().unwrap();
+        assert_eq!(overview.plugins[0].state, PluginState::Loaded);
+        assert_eq!(overview.plugins[0].components.unsupported_count, 0);
+        assert!(overview.plugins[0].warnings.is_empty());
+
+        let mut manifest_with_apps = manifest;
+        manifest_with_apps["apps"] = json!("./.app.json");
+        fs::write(root.join(".app.json"), r#"{"apps":{}}"#).unwrap();
+        write_manifest(&root, manifest_with_apps);
+        let overview = host.scan().unwrap();
+        assert_eq!(overview.plugins[0].state, PluginState::Degraded);
+        assert_eq!(overview.plugins[0].components.unsupported_count, 1);
     }
 
     #[test]

@@ -1264,8 +1264,8 @@ impl ToolHandler for AgentToolHandler {
         let (name, description, properties, required) = match self.operation {
             AgentToolOperation::Create => (
                 "create_agent",
-                "Create a bounded subagent for an independent task and return immediately while it runs in the background. Start independent delegated tasks first, then do your own non-overlapping work before waiting. Do not duplicate delegated work just to stay busy.",
-                json!({"task":{"type":"string"},"label":{"type":"string"},"capabilities":{"type":"array","items":{"type":"string"}},"tokenBudget":{"type":"integer","minimum":1,"description":"Omit unless you know the task is small. The default is unlimited, and once the budget is exhausted the subagent hard-fails with `token_budget_exceeded` and resume_agent refuses to relaunch it (deadlock). Prefer omitting and rely on timeoutMs + Compaction."},"timeoutMs":{"type":"integer","minimum":1},"forkTurns":{"type":"string","description":"`none` (default) starts an empty thread, `all` replays the parent history, or a positive integer replays the last N parent turns."},"parentAgentId":{"type":"string","description":"Omit this field (do not send an empty string) to create a direct child of this agent. Set it to an existing subagent id only to nest one level deeper; nesting is capped at depth 3."}}),
+                "Create a bounded subagent for an independent task and return immediately while it runs in the background. Start independent delegated tasks first, then do your own non-overlapping work before waiting. Do not duplicate delegated work just to stay busy. Omit tokenBudget unless explicitly requested by the user; never invent a budget based on task size or desired answer length.",
+                json!({"task":{"type":"string"},"label":{"type":"string"},"capabilities":{"type":"array","items":{"type":"string"}},"tokenBudget":{"type":"integer","minimum":1,"description":"Omit unless explicitly requested by the user. The default is unlimited. This is a cumulative hard limit on input and output tokens across all model requests and follow-up turns, including replayed history and tool results, NOT an answer-length limit. Do not estimate a budget for small tasks. Once exhausted, the subagent fails with token_budget_exceeded and resume_agent refuses to relaunch it; Compaction does not reset consumed tokens."},"timeoutMs":{"type":"integer","minimum":1},"forkTurns":{"type":"string","description":"`none` (default) starts an empty thread, `all` replays the parent history, or a positive integer replays the last N parent turns. Inherited history consumes input tokens on model requests; use only the history needed for the task."},"parentAgentId":{"type":"string","description":"Omit this field (do not send an empty string) to create a direct child of this agent. Set it to an existing subagent id only to nest one level deeper; nesting is capped at depth 3."}}),
                 vec!["task"],
             ),
             AgentToolOperation::Wait => (
@@ -1282,7 +1282,7 @@ impl ToolHandler for AgentToolHandler {
             ),
             AgentToolOperation::Resume => (
                 "resume_agent",
-                "Resume a failed or cancelled subagent, optionally with a new message.",
+                "Resume a failed or cancelled subagent, optionally with a new message. An exhausted tokenBudget cannot be resumed; do not repeatedly retry it or create a replacement to bypass a user-requested budget.",
                 json!({"agentId":{"type":"string"},"message":{"type":"string"}}),
                 vec!["agentId"],
             ),
@@ -2382,7 +2382,7 @@ mod tests {
     }
 
     #[test]
-    fn create_agent_tool_description_warns_about_token_budget_deadlock() {
+    fn create_agent_tool_requires_user_requested_token_budget() {
         // Only the tool definition matters here; nothing executes, so the handler
         // gets the cheapest valid context.
         let data = tempfile::tempdir().unwrap();
@@ -2405,10 +2405,10 @@ mod tests {
             schema.contains("\"tokenBudget\""),
             "schema missing tokenBudget: {schema}"
         );
-        assert!(
-            schema.contains("deadlock"),
-            "create_agent tokenBudget description should warn about the deadlock risk: {schema}"
-        );
+        assert!(definition.description.contains("explicitly requested by the user"));
+        assert!(schema.contains("explicitly requested by the user"));
+        assert!(schema.contains("input and output tokens"));
+        assert!(!schema.contains("unless you know the task is small"));
         assert!(
             schema.contains("exhausted") && schema.contains("resume_agent"),
             "create_agent tokenBudget description should explain exhausted + resume_agent refusal: {schema}"

@@ -1,0 +1,6 @@
+{"kind":"deck","id":"pr/xuew87","name":"Deck"}
+{"kind":"layout","layoutId":"c5683a95-5849-4c76-8f61-84482e2293d1","name":"Master","type":"master"}
+{"kind":"layout","layoutId":"4c5704fb-7186-49ad-929b-4cbfde204280","name":"Title Slide","type":"title"}
+{"kind":"slide","id":"sl/zvblft","slide":1,"title":"k-Coder artifact runtime","textShapes":1}
+{"kind":"textbox","id":"sh/algfaxwb","slide":1,"text":"k-Coder artifact runtime","textPreview":"k-Coder artifact runtime","textChars":24,"textLines":1,"bbox":[60,60,1120,120]}
+{"kind":"notes","id":"nt/zvblft","slide":1,"text":""}
