@@ -1194,7 +1194,11 @@ struct RunCommandArguments {
     command: String,
     #[serde(default)]
     cwd: String,
-    #[serde(default = "default_command_timeout_ms")]
+    #[serde(
+        default = "default_command_timeout_ms",
+        rename = "timeoutMs",
+        alias = "timeout_ms"
+    )]
     timeout_ms: u64,
 }
 
@@ -2025,6 +2029,44 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn run_command_honors_public_timeout_ms() {
+        let directory = tempfile::tempdir().unwrap();
+        let tool = RunCommandTool {
+            runtime: CommandRuntime::new(directory.path()).unwrap(),
+        };
+        let command = if cfg!(windows) {
+            "Start-Sleep -Seconds 2"
+        } else {
+            "sleep 2"
+        };
+        let result = tool
+            .execute(
+                &context(directory.path()),
+                json!({ "command": command, "timeoutMs": 10 }),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert_eq!(result.metadata["state"]["state"], "timed_out");
+    }
+
+    #[test]
+    fn run_command_timeout_arguments_preserve_defaults_and_legacy_spelling() {
+        for (value, expected) in [
+            (json!({ "command": "echo test" }), 120_000),
+            (
+                json!({ "command": "echo test", "timeoutMs": 660_000 }),
+                660_000,
+            ),
+            (json!({ "command": "echo test", "timeout_ms": 25 }), 25),
+        ] {
+            let arguments: RunCommandArguments = serde_json::from_value(value).unwrap();
+            assert_eq!(arguments.timeout_ms, expected);
+        }
     }
 
     #[tokio::test]

@@ -36,6 +36,7 @@ use crate::tools::{
 };
 
 mod input;
+pub(crate) mod instructions;
 pub mod mailbox;
 mod provider_history;
 pub mod thread_operation;
@@ -60,7 +61,8 @@ const MAX_NO_PROGRESS_WINDOWS: usize = 3;
 const MAX_PROTOCOL_RETRIES: usize = 5;
 pub const DEFAULT_SOFT_TURN_PROVIDER_CALLS: u32 = 100;
 pub const DEFAULT_SOFT_TURN_TOTAL_TOKENS: u64 = 5_000_000;
-pub const DEFAULT_SOFT_TURN_DURATION_MS: u64 = 10 * 60 * 1_000;
+// Tool execution and provider latency alone must not interrupt an authorized turn.
+pub const DEFAULT_SOFT_TURN_DURATION_MS: Option<u64> = None;
 
 const TURN_CONTINUATION_TOOL_CALL_ID: &str = "runtime-turn-continuation";
 const TURN_CONTINUE: &str = "continue";
@@ -71,7 +73,7 @@ const TURN_STOP: &str = "stop";
 pub struct SoftTurnLimits {
     provider_calls: u32,
     total_tokens: u64,
-    duration_ms: u64,
+    duration_ms: Option<u64>,
 }
 
 impl Default for SoftTurnLimits {
@@ -90,7 +92,7 @@ impl SoftTurnLimits {
         Self {
             provider_calls: provider_calls.max(1),
             total_tokens: total_tokens.max(1),
-            duration_ms,
+            duration_ms: Some(duration_ms),
         }
     }
 }
@@ -135,7 +137,9 @@ impl SoftTurnSegmentUsage {
         self.provider_calls > 0
             && (self.provider_calls >= limits.provider_calls
                 || self.total_tokens >= limits.total_tokens
-                || self.duration_ms >= limits.duration_ms)
+                || limits
+                    .duration_ms
+                    .is_some_and(|duration_ms| self.duration_ms >= duration_ms))
     }
 }
 
@@ -2792,6 +2796,10 @@ impl AgentRuntime {
     ) -> Result<TurnContinuationDecision, AgentRuntimeError> {
         let request_id = Uuid::new_v4().to_string();
         let created_at_ms = now_ms();
+        let time_allowance = limits
+            .duration_ms
+            .map(|duration_ms| format!(" / {} 秒", duration_ms.div_ceil(1_000)))
+            .unwrap_or_default();
         let request = UserInputRequest {
             id: request_id,
             thread_id: thread_id.to_string(),
@@ -2800,13 +2808,13 @@ impl AgentRuntime {
             kind: UserInputRequestKind::TurnContinuation,
             questions: vec![UserInputQuestion {
                 question: format!(
-                    "当前执行段已调用模型 {} 次、累计消耗 {} tokens、运行 {} 秒。继续后会获得新一段额度（{} 次调用 / {} tokens / {} 秒）。如需继续，请发送“继续”（点击“继续执行”即可）；也可以选择“压缩后继续”或“停止执行”。",
+                    "当前执行段已调用模型 {} 次、累计消耗 {} tokens、运行 {} 秒。继续后会获得新一段额度（{} 次调用 / {} tokens{}）。如需继续，请发送“继续”（点击“继续执行”即可）；也可以选择“压缩后继续”或“停止执行”。",
                     usage.provider_calls,
                     usage.total_tokens,
                     usage.duration_ms.div_ceil(1_000),
                     limits.provider_calls,
                     limits.total_tokens,
-                    limits.duration_ms.div_ceil(1_000),
+                    time_allowance,
                 ),
                 options: vec![
                     TURN_CONTINUE.to_string(),
@@ -6393,6 +6401,49 @@ mod tests {
             }
             .exceeds(limits)
         );
+    }
+
+    #[test]
+    fn soft_turn_default_does_not_pause_for_elapsed_time_alone() {
+        for duration_ms in [599_999, 600_000, 644_000, 86_400_000] {
+            assert!(
+                !SoftTurnSegmentUsage {
+                    provider_calls: 21,
+                    total_tokens: 599_384,
+                    duration_ms,
+                }
+                .exceeds(SoftTurnLimits::default()),
+                "productive turn paused after {duration_ms} ms"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn soft_turn_default_continuation_prompt_has_no_time_allowance() {
+        let (_directory, repository, runtime, thread_id) = runtime_fixture().await;
+        let publisher: Arc<dyn EventPublisher> = Arc::new(UserInputResolvingPublisher::new(
+            runtime.user_input_manager(),
+            TURN_CONTINUE,
+        ));
+        runtime
+            .request_turn_continuation(
+                &thread_id,
+                "default-limit-prompt",
+                SoftTurnSegmentUsage {
+                    provider_calls: 100,
+                    total_tokens: 599_384,
+                    duration_ms: 644_000,
+                },
+                SoftTurnLimits::default(),
+                CancellationToken::new(),
+                &publisher,
+            )
+            .await
+            .unwrap();
+        let detail = repository.read_thread(&thread_id).await.unwrap();
+        let question = &detail.user_inputs[0].request.questions[0].question;
+        assert!(question.contains("运行 644 秒"));
+        assert!(question.contains("100 次调用 / 5000000 tokens）"));
     }
 
     #[test]

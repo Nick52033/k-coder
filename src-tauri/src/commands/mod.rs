@@ -493,6 +493,7 @@ fn build_system_prompt(
 
     // 2. workspace — 工作区信息
     if let Some(workspace_root) = workspace_root {
+        sections.push(crate::agent::instructions::TASK_EXECUTION.to_string());
         // 移除 Windows 扩展路径前缀 \\?\ 避免 JSON 转义问题
         let workspace_path = workspace_root
             .display()
@@ -3579,6 +3580,19 @@ mod tests {
             "wait_agent",
         ];
         for request in [&direct_request, &mailbox_request] {
+            assert!(
+                request["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|message| {
+                        message["role"] == "system"
+                            && message["content"].as_str().is_some_and(|text| {
+                                text.contains(crate::agent::instructions::TASK_EXECUTION)
+                            })
+                    }),
+                "project retries must receive shared task guidance"
+            );
             let provider_names = provider_tool_names(request);
             assert_eq!(disclosed_tool_names(request), provider_names);
             for expected in delegation_tools {
@@ -3590,6 +3604,7 @@ mod tests {
         }
 
         let standalone_names = provider_tool_names(&standalone_request);
+        assert!(!standalone_request.to_string().contains("<task_execution>"));
         assert_eq!(disclosed_tool_names(&standalone_request), standalone_names);
         assert!(standalone_names.iter().all(|name| {
             PROJECT_FREE_TOOL_NAMES.contains(&name.as_str())
