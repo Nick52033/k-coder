@@ -1,0 +1,6 @@
+{
+  "enabledPlugins": {
+    "webapp-testing@cb_teams_marketplace": true,
+    "ppt-implement@cb_teams_marketplace": true
+  }
+}
