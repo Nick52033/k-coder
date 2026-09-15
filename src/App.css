@@ -596,7 +596,7 @@ button {
 }
 
 .workbench {
-  --workspace-inset: 12px;
+  --workspace-inset: 8px;
   --workspace-content-top: calc(48px + 2 * var(--workspace-inset));
   position: relative;
   display: grid;

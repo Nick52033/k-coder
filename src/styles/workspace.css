@@ -2,22 +2,23 @@
    Keep layout tracks, panel resizing and disclosure state owned by App.css. */
 :root {
   --workspace-radius: 12px;
+  --workspace-card-radius: 10px;
   --workspace-gap: 8px;
   --workspace-gutter: clamp(18px, 3%, 40px);
 }
 
 .titlebar {
   border: 1px solid var(--color-border);
-  border-radius: var(--workspace-radius);
+  border-radius: var(--workspace-card-radius);
 }
 
 .titlebar .window-control--close {
-  border-radius: 0 calc(var(--workspace-radius) - 1px) calc(var(--workspace-radius) - 1px) 0;
+  border-radius: 0 calc(var(--workspace-card-radius) - 1px) calc(var(--workspace-card-radius) - 1px) 0;
 }
 
 .workbench > :is(.sidebar, .conversation, .workbench-panel, .subagent-drawer) {
   border: 1px solid var(--color-border);
-  border-radius: var(--workspace-radius);
+  border-radius: var(--workspace-card-radius);
   overflow: hidden;
 }
 
@@ -194,7 +195,6 @@
 .composer .send-button:active:not(:disabled) { transform: none; }
 
 @media (max-width: 720px) {
-  .workbench { --workspace-inset: 8px; }
   .titlebar { padding-left: 10px; }
   .titlebar-actions { gap: 4px; }
   .window-control { width: 34px; }

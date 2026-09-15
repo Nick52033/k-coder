@@ -45,17 +45,17 @@ const { writeFileSync } = require('node:fs');
           });
           expect(metrics.theme).toBe(theme);
           for (const inset of [metrics.titleTop, metrics.titleLeft, metrics.titleRight, metrics.panelTop]) {
-            expect(inset).toBeCloseTo(viewport > 720 ? 12 : 8, 0);
+            expect(inset).toBeCloseTo(8, 0);
           }
-          expect(metrics.left).toBeCloseTo(viewport > 720 ? 12 : 8, 0);
-          expect(metrics.top).toBeCloseTo(viewport > 720 ? 12 : 8, 0);
-          expect(metrics.right).toBeCloseTo(viewport > 720 ? 12 : 8, 0);
-          expect(metrics.bottom).toBeCloseTo(viewport > 720 ? 12 : 8, 0);
+          expect(metrics.left).toBeCloseTo(8, 0);
+          expect(metrics.top).toBeCloseTo(8, 0);
+          expect(metrics.right).toBeCloseTo(8, 0);
+          expect(metrics.bottom).toBeCloseTo(8, 0);
           expect(metrics.overflow).toBeLessThanOrEqual(1);
           expect(metrics.titleOverflow).toBeLessThanOrEqual(1);
           expect(metrics.composerOverflow).toBeLessThanOrEqual(1);
           if (viewport > 720) {
-            expect(metrics.gap).toBeCloseTo(12, 0);
+            expect(metrics.gap).toBeCloseTo(8, 0);
             expect(metrics.chatWidth).toBeGreaterThanOrEqual(viewport > 1180 ? 419.5 : 359.5);
           }
           await expect(page.locator('.composer textarea')).toHaveValue('卡片之间留出空隙，输入草稿在调整窗口后保留。');

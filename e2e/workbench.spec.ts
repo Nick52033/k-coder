@@ -1785,7 +1785,7 @@ test("supports the primary workbench inspection flow", async ({ page }, testInfo
   const backdropBox = await previewBackdrop.boundingBox();
   const dialogBox = await previewDialog.boundingBox();
   expect(viewport).not.toBeNull();
-  const contentTop = 48 + 2 * (viewport!.width > 720 ? 12 : 8);
+  const contentTop = 48 + 2 * 8;
   expect(backdropBox).toMatchObject({ x: 0, y: contentTop, width: viewport!.width, height: viewport!.height - contentTop });
   expect(dialogBox).not.toBeNull();
   expect(Math.abs((dialogBox!.x + dialogBox!.width / 2) - (viewport!.width / 2))).toBeLessThanOrEqual(1);
@@ -2565,7 +2565,7 @@ test("resizes both layout dividers and restores preferred widths after responsiv
       handleReceivesPointer: document.elementFromPoint(handle.x + handle.width / 2, handle.y + 90)?.getAttribute('role') === 'separator',
     };
   });
-  expect(cards).toEqual({ titleTop: 12, titleLeft: 12, titleRight: 12, left: 12, top: 12, sidebarGap: 12, panelGap: 12, right: 12, bottom: 12, handleInGap: true, handleReceivesPointer: true });
+  expect(cards).toEqual({ titleTop: 8, titleLeft: 8, titleRight: 8, left: 8, top: 8, sidebarGap: 8, panelGap: 8, right: 8, bottom: 8, handleInGap: true, handleReceivesPointer: true });
   const drag = async (handle: typeof left, delta: number) => {
     const box = (await handle.boundingBox())!;
     await page.mouse.move(box.x + box.width / 2, box.y + 90);

@@ -32,7 +32,7 @@ export function usePanelWidths(panelOpen: boolean) {
   const sidebarVisible = viewport > 720 && (!panelOpen || viewport > 1180);
   const panelVisible = panelOpen && viewport > 720;
   // Match the card grid's outer insets and one gap per visible divider.
-  const availableWidth = viewport - 12 * (2 + Number(sidebarVisible) + Number(panelVisible));
+  const availableWidth = viewport - 8 * (2 + Number(sidebarVisible) + Number(panelVisible));
   const conversationMin = viewport > 1180 ? 420 : 360;
   const sidebar = sidebarVisible
     ? clamp(preferred.sidebar ?? (viewport > 1180 ? 232 : 210), 200, Math.min(400, availableWidth - conversationMin - (panelVisible ? 320 : 0)))
