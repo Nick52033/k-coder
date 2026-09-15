@@ -207,6 +207,9 @@ impl OpenAiChatCompletionsProvider {
                 if let Some(effort) = request.reasoning_effort.openai_value() {
                     payload["reasoning_effort"] = json!(effort);
                 }
+                if let Some(max_tokens) = self.config.active_model().max_output_tokens {
+                    payload[chat_output_limit_parameter(&request.model)] = json!(max_tokens);
+                }
             }
             ChatCompletionsDialect::DeepSeek(_) => {
                 let (thinking_enabled, effort) = deepseek_reasoning(request.reasoning_effort);
@@ -590,6 +593,26 @@ impl Provider for DeepSeekChatCompletionsProvider {
         cancellation: CancellationToken,
     ) -> Result<ProviderStream, ProviderError> {
         self.inner.stream(request, cancellation).await
+    }
+}
+
+fn chat_output_limit_parameter(model: &str) -> &'static str {
+    // Modern OpenAI reasoning models require max_completion_tokens. Compatible
+    // third-party endpoints (including vision-enabled DeepSeek aliases) retain
+    // max_tokens without changing their message or reasoning dialect.
+    let model = model
+        .rsplit('/')
+        .next()
+        .unwrap_or(model)
+        .to_ascii_lowercase();
+    if ["gpt-5", "gpt-6", "o1", "o3", "o4"].iter().any(|family| {
+        model
+            .strip_prefix(family)
+            .is_some_and(|suffix| suffix.is_empty() || suffix.starts_with(['-', '.']))
+    }) {
+        "max_completion_tokens"
+    } else {
+        "max_tokens"
     }
 }
 
@@ -1467,6 +1490,101 @@ mod tests {
 
         assert_eq!(payload["reasoning_effort"], "xhigh");
         assert!(payload.get("thinking").is_none());
+    }
+
+    #[test]
+    fn chat_output_limit_respects_config_and_model_parameter() {
+        for (model, parameter) in [
+            ("deepseek-flash", "max_tokens"),
+            ("glm-5.3-flash", "max_tokens"),
+            ("gpt-4.1", "max_tokens"),
+            ("gpt-4o", "max_tokens"),
+            ("gpt-5", "max_completion_tokens"),
+            ("gpt-5.6-sol", "max_completion_tokens"),
+            ("gpt-6-astra", "max_completion_tokens"),
+            ("openai/gpt-5-mini", "max_completion_tokens"),
+            ("o1", "max_completion_tokens"),
+            ("o3-mini", "max_completion_tokens"),
+            ("openai/o4-mini", "max_completion_tokens"),
+            ("gpt-50-custom", "max_tokens"),
+            ("o3custom", "max_tokens"),
+        ] {
+            for limit in [None, Some(65_355)] {
+                let mut config = provider_config(model);
+                config.transport = ProviderTransport::OpenAiChatCompletions;
+                config.models = vec![ProviderModelConfig {
+                    id: model.into(),
+                    display_name: model.into(),
+                    context_window: 200_000,
+                    max_output_tokens: limit,
+                    supports_vision: true,
+                    fallback: false,
+                }];
+                let provider = OpenAiChatCompletionsProvider::new(config, "secret".into())
+                    .expect("provider should build");
+                let payload = provider
+                    .payload(&ProviderRequest {
+                        model: model.into(),
+                        ..provider_request(ReasoningEffort::Off, Vec::new())
+                    })
+                    .unwrap();
+                assert_eq!(
+                    payload.get(parameter),
+                    limit.map(|value| json!(value)).as_ref(),
+                    "{model}"
+                );
+                let other = if parameter == "max_tokens" {
+                    "max_completion_tokens"
+                } else {
+                    "max_tokens"
+                };
+                assert!(
+                    payload.get(other).is_none(),
+                    "{model}: do not send both limits"
+                );
+                assert!(payload.get("thinking").is_none());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_output_limit_reaches_wire_and_length_discards_pending_tools() {
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"truncated-write\",\"function\":{\"name\":\"write_file\",\"arguments\":\"{\\\"path\\\":\\\"draft.js\\\",\\\"content\\\":\\\"unfinished\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}],\"usage\":{\"prompt_tokens\":12354,\"completion_tokens\":8192}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let (base_url, mut requests, server) = spawn_sse_server(vec![body]).await;
+        let mut config = provider_config("deepseek-flash");
+        config.transport = ProviderTransport::OpenAiChatCompletions;
+        config.base_url = base_url;
+        config.models = vec![ProviderModelConfig {
+            id: "deepseek-flash".into(),
+            display_name: "deepseek-flash".into(),
+            context_window: 200_000,
+            max_output_tokens: Some(65_355),
+            supports_vision: true,
+            fallback: false,
+        }];
+        let provider = OpenAiChatCompletionsProvider::new(config, "secret".into()).unwrap();
+        let events: Vec<_> = provider
+            .stream(
+                ProviderRequest {
+                    model: "deepseek-flash".into(),
+                    ..provider_request(ReasoningEffort::Off, Vec::new())
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap()
+            .collect()
+            .await;
+        let request = requests.recv().await.unwrap();
+        server.await.unwrap();
+        assert_eq!(request["max_tokens"], 65_355);
+        assert!(matches!(events.as_slice(), [
+            Ok(ProviderEvent::Usage { usage }), Err(ProviderError::InvalidResponse(message))
+        ] if usage.input_tokens == 12_354 && usage.output_tokens == 8_192 && message.contains("length")));
     }
 
     #[test]

@@ -387,6 +387,8 @@ function App() {
   const [themeMode, setThemeModeState] = useState<ThemeId>(() =>
     parseThemePreference(readStored<string>(THEME_STORAGE_KEY, "light")),
   );
+  const [backgroundEnabled, setBackgroundEnabled] = useState(() => localStorage.getItem("kcoder_background_enabled") !== "false");
+  const [backgroundOpacity, setBackgroundOpacity] = useState(() => Number(localStorage.getItem("kcoder_background_opacity") ?? "0.58"));
   const [systemPrefersDark, setSystemPrefersDark] = useState(() =>
     typeof window !== "undefined" && window.matchMedia?.("(prefers-color-scheme: dark)").matches === true,
   );
@@ -703,6 +705,8 @@ function App() {
     document.documentElement.setAttribute("data-theme", resolvedTheme);
     document.documentElement.setAttribute("data-theme-preference", themeMode);
   }, [resolvedTheme, themeMode]);
+  useEffect(() => { localStorage.setItem("kcoder_background_enabled", String(backgroundEnabled)); }, [backgroundEnabled]);
+  useEffect(() => { localStorage.setItem("kcoder_background_opacity", String(backgroundOpacity)); }, [backgroundOpacity]);
 
   // ===== 线程-项目关联管理 =====
   const saveThreadProjectMap = (map: Record<string, string>) => {
@@ -2028,7 +2032,7 @@ function App() {
   }
 
   return (
-    <main style={panelWidths.style} className={cn("workbench", (workbenchOpen || agentPanelOpen) && "workbench--panel-open", panelWidths.resizing && "workbench--resizing")}>
+    <main style={{ ...panelWidths.style, "--background-opacity": backgroundOpacity } as React.CSSProperties} className={cn("workbench", backgroundEnabled && "workbench--background", (workbenchOpen || agentPanelOpen) && "workbench--panel-open", panelWidths.resizing && "workbench--resizing")}>
       <header className="titlebar" data-tauri-drag-region>
         <div className="brand" data-tauri-drag-region>
           <span className="brand-mark" aria-hidden="true">
@@ -3058,7 +3062,7 @@ function App() {
       </aside>
 
       {settingsOpen && (
-        <SettingsDialog
+          <SettingsDialog
           initialSection={settingsSection}
           provider={providerConfig}
           providers={providerConfigs}
@@ -3070,7 +3074,11 @@ function App() {
           error={error}
           themeMode={themeMode}
           onClose={() => setSettingsOpen(false)}
-          onSelectTheme={selectTheme}
+            onSelectTheme={selectTheme}
+            backgroundEnabled={backgroundEnabled}
+            backgroundOpacity={backgroundOpacity}
+            onBackgroundEnabledChange={setBackgroundEnabled}
+            onBackgroundOpacityChange={setBackgroundOpacity}
           onSaveProvider={saveProvider}
           onActivateProvider={activateProvider}
           onDeleteProvider={deleteProvider}

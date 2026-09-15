@@ -37,3 +37,7 @@
 ## 2026-09-10 图片能力声明补充
 
 按 ADR 0058，普通 `open_ai_chat_completions` 配置中显式 `supportsVision=true` 的模型保留通用多模态协议，覆盖模型名 DeepSeek 启发式，避免网关别名导致原图被转换为 OCR 文本。显式选择 `deep_seek_chat_completions` 仍按纯文本协议处理；未声明图片能力的模型继续遵循原名称匹配规则。
+
+## 2026-09-15 普通 Chat Completions 最大输出补充
+
+真实 TokenHub/deepseek-flash 会话因配置支持图片而进入普通方言，该分支此前未发送已保存的 `maxOutputTokens=65355`，最后一次请求在输出 8192 tokens 后收到 `length`。普通兼容方言现同样发送 `max_tokens`，不通过关闭图片声明或强制切换 DeepSeek 协议修复漏参。已知 OpenAI GPT-5/GPT-6 与 o1/o3/o4 家族使用 `max_completion_tokens`；未设置上限时继续省略。该修订补全请求配置，`length` 失败、Usage 计入、未完成工具调用拒绝与重试边界保持既有约束。

@@ -463,6 +463,8 @@ test.beforeEach(async ({ page }) => {
       search_workspace_files: [
         { name: "App.tsx", path: "src/App.tsx", isDirectory: false, size: 240, modifiedAtMs: 2 },
         { name: "README.md", path: "README.md", isDirectory: false, size: 120, modifiedAtMs: 2 },
+        { name: "package.json", path: "package.json", isDirectory: false, size: 640, modifiedAtMs: 2 },
+        { name: "App.css", path: "src/App.css", isDirectory: false, size: 320, modifiedAtMs: 2 },
       ],
       preview_workspace_file: { path: "README.md", name: "README.md", language: "markdown", content: "# k-Coder", dataUrl: null, size: 9, truncated: false, editable: true, contentHash: "hash-readme" },
       save_workspace_file: { path: "README.md", name: "README.md", language: "markdown", content: "# k-Coder\n\nEdited", dataUrl: null, size: 17, truncated: false, editable: true, contentHash: "hash-edited" },
@@ -3147,6 +3149,15 @@ test("wakes workspace files with @ and enabled Skills with /", async ({ page }) 
   await page.goto("/");
   const composer = page.getByRole("textbox", { name: "消息" });
 
+  await composer.fill("@");
+  await expect(page.locator(".composer-suggestion-group-title")).toHaveText([/^代码/, /^文档与数据/, /^配置/, /^样式与资源/]);
+  await expect(page.getByRole("group", { name: "代码，1 项" })).toBeVisible();
+  await expect(page.getByRole("group", { name: "文档与数据，1 项" })).toBeVisible();
+  await expect(page.getByRole("group", { name: "配置，1 项" })).toBeVisible();
+  await expect(page.getByRole("group", { name: "样式与资源，1 项" })).toBeVisible();
+  await composer.press("ArrowDown");
+  await expect(page.getByRole("option", { name: /README\.md/ })).toHaveAttribute("aria-selected", "true");
+
   await composer.fill("@src/");
   await expect(page.locator(".composer-suggestions")).toBeVisible();
   await expect(page.getByRole("option", { name: /src\/App\.tsx/ })).toBeVisible();
@@ -3155,7 +3166,7 @@ test("wakes workspace files with @ and enabled Skills with /", async ({ page }) 
 
   await composer.fill("/re");
   await expect(page.getByRole("option", { name: /\/review/ })).toBeVisible();
-  await composer.press("Enter");
+  await page.getByRole("option", { name: /\/review/ }).click();
   await expect(composer).toHaveValue("/review ");
 });
 

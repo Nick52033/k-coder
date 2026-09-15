@@ -204,6 +204,10 @@ interface SettingsDialogProps {
   workflowRun: WorkflowRunView | null;
   error: string;
   themeMode: ThemeId;
+  backgroundEnabled: boolean;
+  backgroundOpacity: number;
+  onBackgroundEnabledChange: (enabled: boolean) => void;
+  onBackgroundOpacityChange: (opacity: number) => void;
   onClose: () => void;
   onSelectTheme: (theme: ThemeId) => void;
   onSaveProvider: (request: SaveProviderConfigRequest) => Promise<boolean>;
@@ -241,6 +245,10 @@ export function SettingsDialog({
   workflowRun,
   error,
   themeMode,
+  backgroundEnabled,
+  backgroundOpacity,
+  onBackgroundEnabledChange,
+  onBackgroundOpacityChange,
   onClose,
   onSelectTheme,
   onSaveProvider,
@@ -329,7 +337,7 @@ export function SettingsDialog({
                 onDelete={onDeleteProvider}
               />
             ) : section === "appearance" ? (
-              <AppearancePage themeMode={themeMode} onSelectTheme={onSelectTheme} />
+              <AppearancePage themeMode={themeMode} onSelectTheme={onSelectTheme} backgroundEnabled={backgroundEnabled} backgroundOpacity={backgroundOpacity} onBackgroundEnabledChange={onBackgroundEnabledChange} onBackgroundOpacityChange={onBackgroundOpacityChange} />
             ) : section === "usage" ? (
               <UsagePage />
             ) : section === "knowledge" ? (
@@ -2027,9 +2035,17 @@ function skillScopeText(scope: string) {
 function AppearancePage({
   themeMode,
   onSelectTheme,
+  backgroundEnabled,
+  backgroundOpacity,
+  onBackgroundEnabledChange,
+  onBackgroundOpacityChange,
 }: {
   themeMode: ThemeId;
   onSelectTheme: (theme: ThemeId) => void;
+  backgroundEnabled: boolean;
+  backgroundOpacity: number;
+  onBackgroundEnabledChange: (enabled: boolean) => void;
+  onBackgroundOpacityChange: (opacity: number) => void;
 }) {
   const iconForTheme = {
     sun: Sun,
@@ -2094,6 +2110,13 @@ function AppearancePage({
             );
           })}
         </div>
+      </div>
+      <div className="appearance-theme-section appearance-background-section">
+        <div className="appearance-section-heading"><div><p className="settings-eyebrow">会话背景</p><h4>背景图</h4></div><span className="appearance-current-theme">本机显示</span></div>
+        <div className="background-preview" aria-label="会话背景预览" />
+        <label className="background-toggle"><input type="checkbox" checked={backgroundEnabled} onChange={(e) => onBackgroundEnabledChange(e.target.checked)} /> 显示会话背景图</label>
+        <label className="background-opacity">图片可见度 <input type="range" min="0.2" max="0.85" step="0.01" value={backgroundOpacity} disabled={!backgroundEnabled} onChange={(e) => onBackgroundOpacityChange(Number(e.target.value))} /><output>{Math.round(backgroundOpacity * 100)}%</output></label>
+        <small className="settings-page-description">使用内置预览图验证透明面板效果；关闭后恢复纯色工作区。</small>
       </div>
     </section>
   );
