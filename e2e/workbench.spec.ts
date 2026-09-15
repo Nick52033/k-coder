@@ -1785,10 +1785,11 @@ test("supports the primary workbench inspection flow", async ({ page }, testInfo
   const backdropBox = await previewBackdrop.boundingBox();
   const dialogBox = await previewDialog.boundingBox();
   expect(viewport).not.toBeNull();
-  expect(backdropBox).toMatchObject({ x: 0, y: 48, width: viewport!.width, height: viewport!.height - 48 });
+  const contentTop = 48 + 2 * (viewport!.width > 720 ? 12 : 8);
+  expect(backdropBox).toMatchObject({ x: 0, y: contentTop, width: viewport!.width, height: viewport!.height - contentTop });
   expect(dialogBox).not.toBeNull();
   expect(Math.abs((dialogBox!.x + dialogBox!.width / 2) - (viewport!.width / 2))).toBeLessThanOrEqual(1);
-  expect(Math.abs((dialogBox!.y + dialogBox!.height / 2) - ((viewport!.height + 48) / 2))).toBeLessThanOrEqual(1);
+  expect(Math.abs((dialogBox!.y + dialogBox!.height / 2) - ((viewport!.height + contentTop) / 2))).toBeLessThanOrEqual(1);
   await page.screenshot({ path: testInfo.outputPath("workspace-markdown-preview-centered.png"), fullPage: true });
   await previewDialog.getByRole("button", { name: "源码", exact: true }).click();
   const editor = previewDialog.locator(".monaco-editor");
@@ -2301,8 +2302,15 @@ test("renders local plugin settings in dark mode", async ({ page }, testInfo) =>
 });
 
 test("professional workspace stays readable and stable in both appearances", async ({ page }, testInfo) => {
-  for (const theme of ["light", "dark"]) {
-    await page.addInitScript((value) => localStorage.setItem("kcoder_theme", value), theme);
+  for (const { theme, background } of [
+    { theme: "light", background: true }, { theme: "dark", background: true },
+    { theme: "light", background: false }, { theme: "dark", background: false },
+  ]) {
+    await page.setViewportSize({ width: 1280, height: 820 });
+    await page.addInitScript(({ theme, background }) => {
+      localStorage.setItem("kcoder_theme", theme);
+      localStorage.setItem("kcoder_background_enabled", String(background));
+    }, { theme, background });
     await page.goto("/");
     await expect(page.getByRole("heading", { name: "Phase 6 workbench" })).toBeVisible();
     const reading = await page.evaluate(() => {
@@ -2331,7 +2339,19 @@ test("professional workspace stays readable and stable in both appearances", asy
     expect(reading.secondary).toBeGreaterThanOrEqual(4.5);
     expect(reading.metadata).toBeGreaterThanOrEqual(4.5);
     const input = page.getByRole("textbox", { name: "消息", exact: true });
+    const compactHeight = await input.evaluate((element) => element.getBoundingClientRect().height);
+    expect(compactHeight).toBeLessThanOrEqual(70);
+    await input.fill(Array.from({ length: 18 }, (_, index) => `第 ${index + 1} 行：多行草稿自适应`).join("\n"));
+    const expanded = await input.evaluate((element) => ({
+      height: element.getBoundingClientRect().height,
+      scroll: element.scrollHeight,
+      client: element.clientHeight,
+    }));
+    expect(expanded.height).toBeGreaterThan(compactHeight);
+    expect(expanded.height).toBeLessThanOrEqual(240);
+    expect(expanded.scroll).toBeGreaterThan(expanded.client);
     await input.fill("A 方向布局验证：保持输入草稿");
+    await expect.poll(() => input.evaluate((element) => element.getBoundingClientRect().height)).toBe(compactHeight);
     await expect.poll(() => input.evaluate((element) => getComputedStyle(element).transform)).toBe("none");
     for (const width of [1280, 1024, 853, 375]) {
       await page.setViewportSize({ width, height: 820 });
@@ -2343,9 +2363,24 @@ test("professional workspace stays readable and stable in both appearances", asy
       }));
       expect(overflow.composer).toBeLessThanOrEqual(1);
       expect(overflow.page).toBeLessThanOrEqual(1);
+      const alignment = await page.evaluate(() => {
+        const list = document.querySelector(".message-list")!.getBoundingClientRect();
+        const composer = document.querySelector(".composer")!.getBoundingClientRect();
+        const area = document.querySelector(".message-area")!.getBoundingClientRect();
+        return { left: list.left - composer.left, right: list.right - composer.right, overlap: area.bottom - composer.top };
+      });
+      expect(Math.abs(alignment.left)).toBeLessThanOrEqual(1);
+      expect(Math.abs(alignment.right)).toBeLessThanOrEqual(1);
+      expect(alignment.overlap).toBeLessThanOrEqual(1);
     }
     await page.setViewportSize({ width: 1280, height: 820 });
-    await page.screenshot({ path: testInfo.outputPath(`professional-${theme}.png`) });
+    await page.getByRole("tab", { name: "项目", exact: true }).click();
+    const projectToggle = page.locator('.project-group-toggle').first();
+    if (await projectToggle.getAttribute("aria-expanded") === "false") await projectToggle.click();
+    await expect(page.locator('.thread-item-main[aria-current="page"]')).toHaveCount(1);
+    await page.screenshot({ path: testInfo.outputPath(`professional-${theme}-${background ? "background" : "solid"}.png`) });
+    await page.setViewportSize({ width: 375, height: 820 });
+    await page.screenshot({ path: testInfo.outputPath(`professional-${theme}-${background ? "background" : "solid"}-narrow.png`) });
   }
 });
 
@@ -2514,6 +2549,23 @@ test("resizes both layout dividers and restores preferred widths after responsiv
   const width = (selector: string) => page.locator(selector).evaluate((element) => element.getBoundingClientRect().width);
   await expect(left).toBeVisible();
   await expect(right).toBeVisible();
+  const cards = await page.evaluate(() => {
+    const box = (selector: string) => document.querySelector(selector)!.getBoundingClientRect();
+    const sidebar = box('.sidebar');
+    const chat = box('.conversation');
+    const panel = box('.workbench-panel');
+    const handle = box('.panel-resize-handle--sidebar');
+    return {
+      titleTop: box('.titlebar').top, titleLeft: box('.titlebar').left,
+      titleRight: innerWidth - box('.titlebar').right,
+      left: sidebar.left, top: sidebar.top - box('.titlebar').bottom,
+      sidebarGap: chat.left - sidebar.right, panelGap: panel.left - chat.right,
+      right: innerWidth - panel.right, bottom: innerHeight - chat.bottom,
+      handleInGap: handle.left >= sidebar.right && handle.right <= chat.left,
+      handleReceivesPointer: document.elementFromPoint(handle.x + handle.width / 2, handle.y + 90)?.getAttribute('role') === 'separator',
+    };
+  });
+  expect(cards).toEqual({ titleTop: 12, titleLeft: 12, titleRight: 12, left: 12, top: 12, sidebarGap: 12, panelGap: 12, right: 12, bottom: 12, handleInGap: true, handleReceivesPointer: true });
   const drag = async (handle: typeof left, delta: number) => {
     const box = (await handle.boundingBox())!;
     await page.mouse.move(box.x + box.width / 2, box.y + 90);

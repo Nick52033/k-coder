@@ -388,6 +388,7 @@ function App() {
     parseThemePreference(readStored<string>(THEME_STORAGE_KEY, "light")),
   );
   const [backgroundEnabled, setBackgroundEnabled] = useState(() => localStorage.getItem("kcoder_background_enabled") !== "false");
+  const [backgroundImage, setBackgroundImage] = useState(() => localStorage.getItem("kcoder_background_image") || "/chat-background.png");
   const [backgroundOpacity, setBackgroundOpacity] = useState(() => Number(localStorage.getItem("kcoder_background_opacity") ?? "0.58"));
   const [systemPrefersDark, setSystemPrefersDark] = useState(() =>
     typeof window !== "undefined" && window.matchMedia?.("(prefers-color-scheme: dark)").matches === true,
@@ -706,6 +707,7 @@ function App() {
     document.documentElement.setAttribute("data-theme-preference", themeMode);
   }, [resolvedTheme, themeMode]);
   useEffect(() => { localStorage.setItem("kcoder_background_enabled", String(backgroundEnabled)); }, [backgroundEnabled]);
+  useEffect(() => { if (backgroundImage.startsWith("data:image/")) localStorage.setItem("kcoder_background_image", backgroundImage); else localStorage.removeItem("kcoder_background_image"); }, [backgroundImage]);
   useEffect(() => { localStorage.setItem("kcoder_background_opacity", String(backgroundOpacity)); }, [backgroundOpacity]);
 
   // ===== 线程-项目关联管理 =====
@@ -2032,7 +2034,7 @@ function App() {
   }
 
   return (
-    <main style={{ ...panelWidths.style, "--background-opacity": backgroundOpacity } as React.CSSProperties} className={cn("workbench", backgroundEnabled && "workbench--background", (workbenchOpen || agentPanelOpen) && "workbench--panel-open", panelWidths.resizing && "workbench--resizing")}>
+    <main style={{ ...panelWidths.style, "--background-opacity": backgroundOpacity, "--background-image": `url("${backgroundImage}")` } as React.CSSProperties} className={cn("workbench", backgroundEnabled && "workbench--background", (workbenchOpen || agentPanelOpen) && "workbench--panel-open", panelWidths.resizing && "workbench--resizing")}>
       <header className="titlebar" data-tauri-drag-region>
         <div className="brand" data-tauri-drag-region>
           <span className="brand-mark" aria-hidden="true">
@@ -2043,7 +2045,7 @@ function App() {
         <div className="titlebar-actions">
           <span className={cn("runtime-state", runtimeError && "runtime-state--error")}>
             {runtimeError ? <CircleAlert size={14} /> : <Activity size={14} />}
-            {runtimeError ? "运行时不可用" : runtime ? "运行时就绪" : "正在连接"}
+            <span className="runtime-state-label">{runtimeError ? "运行时不可用" : runtime ? "运行时就绪" : "正在连接"}</span>
           </span>
           <div className="titlebar-segmented" role="group" aria-label="面板切换">
             <button
@@ -2198,8 +2200,7 @@ function App() {
                 const isThreadRunning = Boolean(activeTurns[thread.id]);
                 return (
                   <div className={cn("thread-item", thread.id === activeThreadId && "thread-item--active")} key={thread.id}>
-                    <button className="thread-item-main" type="button" onClick={() => void selectSessionThread(thread)}>
-                      <MessageSquare size={15} />
+                    <button className="thread-item-main" type="button" aria-current={thread.id === activeThreadId ? "page" : undefined} onClick={() => void selectSessionThread(thread)}>
                       <span>{thread.title}</span>
                       {isThreadRunning && (
                         <Loader2 className="spin thread-item-spinner" size={12} aria-label="正在生成" />
@@ -2327,8 +2328,7 @@ function App() {
                               const isThreadRunning = Boolean(activeTurns[thread.id]);
                               return (
                                 <div className={cn("thread-item thread-item--child", thread.id === activeThreadId && "thread-item--active")} key={thread.id}>
-                                  <button className="thread-item-main" type="button" onClick={() => void selectSessionThread(thread)}>
-                                    <MessageSquare size={14} />
+                                  <button className="thread-item-main" type="button" aria-current={thread.id === activeThreadId ? "page" : undefined} onClick={() => void selectSessionThread(thread)}>
                                     <span>{thread.title}</span>
                                     {isThreadRunning && (
                                       <Loader2 className="spin thread-item-spinner" size={12} aria-label="正在生成" />
@@ -3077,8 +3077,10 @@ function App() {
             onSelectTheme={selectTheme}
             backgroundEnabled={backgroundEnabled}
             backgroundOpacity={backgroundOpacity}
+            backgroundImage={backgroundImage}
             onBackgroundEnabledChange={setBackgroundEnabled}
             onBackgroundOpacityChange={setBackgroundOpacity}
+            onBackgroundImageChange={setBackgroundImage}
           onSaveProvider={saveProvider}
           onActivateProvider={activateProvider}
           onDeleteProvider={deleteProvider}

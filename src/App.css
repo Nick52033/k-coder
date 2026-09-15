@@ -596,6 +596,8 @@ button {
 }
 
 .workbench {
+  --workspace-inset: 12px;
+  --workspace-content-top: calc(48px + 2 * var(--workspace-inset));
   position: relative;
   display: grid;
   grid-template-columns: var(--sidebar-width, 232px) minmax(0, 1fr);
@@ -604,20 +606,30 @@ button {
   height: 100vh;
   height: 100dvh;
   min-height: 0;
+  padding: var(--workspace-inset);
+  gap: var(--workspace-inset);
   overflow: hidden;
-  background: var(--color-surface);
+  background: var(--color-surface-chrome);
 }
 
 .workbench--background { background: transparent; }
 .workbench--background::before {
   content: ""; position: absolute; inset: 0; z-index: 0; pointer-events: none;
-  background: linear-gradient(rgba(255,255,255,var(--background-opacity, .58)), rgba(255,255,255,var(--background-opacity, .58))), url('/chat-background.png') center / cover no-repeat;
+  background: linear-gradient(color-mix(in srgb, var(--color-surface) calc(var(--background-opacity, .58) * 100%), transparent), color-mix(in srgb, var(--color-surface) calc(var(--background-opacity, .58) * 100%), transparent)), var(--background-image, url('/chat-background.png')) center / cover no-repeat;
 }
-.workbench--background > * { position: relative; z-index: 1; }
-.workbench--background .conversation { background: color-mix(in srgb, var(--color-surface) 28%, transparent); }
+.workbench--background > :is(.titlebar, .sidebar, .conversation) { position: relative; z-index: 1; }
+.workbench--background > :is(.workbench-panel, .subagent-drawer) { z-index: 1; }
+.workbench--background .conversation {
+  background: color-mix(in srgb, var(--color-surface) 88%, transparent);
+  /* Diffuse image details behind prose without blurring the content itself. */
+  backdrop-filter: blur(12px);
+}
 .workbench--background .message-area { background: transparent; }
-.workbench--background .sidebar { background: color-mix(in srgb, var(--color-surface-raised) 82%, transparent); }
-.workbench--background .composer { background: color-mix(in srgb, var(--color-surface-raised) 86%, transparent); backdrop-filter: blur(8px); }
+.workbench--background .sidebar {
+  background: color-mix(in srgb, var(--color-surface-raised) 92%, transparent);
+  backdrop-filter: blur(8px);
+}
+.workbench--background .composer { background: var(--color-surface-raised); }
 
 /* 打开工作台：对话区让出第三列，工作台成为右侧面板（不再是覆盖浮层） */
 .workbench--panel-open {
@@ -627,8 +639,8 @@ button {
 .panel-resize-handle {
   position: absolute;
   z-index: 11;
-  top: 48px;
-  bottom: 0;
+  top: var(--workspace-content-top);
+  bottom: var(--workspace-inset);
   width: 8px;
   cursor: col-resize;
   touch-action: none;
@@ -636,8 +648,8 @@ button {
   outline: none;
 }
 
-.panel-resize-handle--sidebar { left: calc(var(--sidebar-width) - 4px); }
-.panel-resize-handle--panel { right: calc(var(--panel-width) - 4px); }
+.panel-resize-handle--sidebar { left: calc(var(--sidebar-width) + 1.5 * var(--workspace-inset) - 4px); }
+.panel-resize-handle--panel { right: calc(var(--panel-width) + 1.5 * var(--workspace-inset) - 4px); }
 .panel-resize-handle::after {
   content: "";
   position: absolute;
@@ -654,7 +666,7 @@ button {
   content: "";
   position: absolute;
   z-index: 10;
-  inset: 48px 0 0;
+  inset: var(--workspace-content-top) 0 0;
   cursor: col-resize;
 }
 
@@ -1992,11 +2004,6 @@ button {
   transition: background-color var(--transition-fast), color var(--transition-fast);
 }
 
-.thread-item-main > svg {
-  flex-shrink: 0;
-  color: var(--color-ink-subtle);
-}
-
 .thread-item-main > .thread-item-spinner {
   flex-shrink: 0;
   color: var(--color-brand, var(--color-item-active-text));
@@ -2019,7 +2026,6 @@ button {
   background: var(--color-item-active-bg);
 }
 .thread-item--active .thread-item-main { color: var(--color-item-active-text); font-weight: var(--font-weight-medium); }
-.thread-item--active .thread-item-main > svg { color: var(--color-item-active-text); }
 
 .thread-empty {
   display: flex;
@@ -2109,7 +2115,7 @@ button {
 }
 
 .message-list {
-  width: min(100%, 1040px);
+  width: min(100%, 820px);
   min-width: 0;
   max-width: 100%;
   margin: 0 auto;
@@ -4095,8 +4101,25 @@ button {
   cursor: pointer;
 }
 
-.background-preview { height: 112px; margin: 10px 0 12px; border: 1px solid var(--color-border); border-radius: 10px; background: linear-gradient(rgba(255,255,255,.55),rgba(255,255,255,.55)),url('/chat-background.png') center / cover; }
+.appearance-background-section {
+  margin-top: 24px;
+}
+
+.background-preview {
+  height: clamp(240px, 40vh, 420px);
+  margin: 12px 0;
+  border: 1px solid var(--color-border);
+  border-radius: 10px;
+  background-color: var(--color-surface-panel);
+  background-image: linear-gradient(rgba(255,255,255,.55),rgba(255,255,255,.55)),url('/chat-background.png');
+  background-position: center;
+  background-size: 100% 100%, contain;
+  background-repeat: no-repeat;
+}
 .background-toggle, .background-opacity { display:flex; align-items:center; gap:10px; font-size: var(--font-size-sm); margin: 10px 0; }
+.background-upload { display:inline-flex; align-items:center; gap:8px; margin: 4px 0 8px; padding: 7px 10px; border: 1px solid var(--color-border); border-radius: 7px; color: var(--color-brand); cursor:pointer; font-size: var(--font-size-sm); }
+.background-upload input { width: 0; height: 0; overflow: hidden; opacity: 0; position: absolute; }
+.background-reset { border: 0; padding: 0; background: transparent; color: var(--color-ink-subtle); cursor: pointer; font-size: var(--font-size-xs); }
 .background-opacity input[type=range] { flex:1; accent-color: var(--color-brand); }
 .background-opacity output { min-width: 38px; text-align:right; color: var(--color-ink-muted); }
 

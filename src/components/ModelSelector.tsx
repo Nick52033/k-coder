@@ -185,7 +185,7 @@ export function ModelSelector({
         aria-haspopup="listbox"
         aria-expanded={isOpen}
         aria-controls={isOpen ? "model-selector-options" : undefined}
-        title={provider ? "切换模型" : "请先在设置中配置模型"}
+        title={provider ? `${providerName} / ${currentModel?.displayName || currentModelId} · ${currentModelId}` : "请先在设置中配置模型"}
       >
         <span className="model-selector-current">
           <small>{providerName}</small>

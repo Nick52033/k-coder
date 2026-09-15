@@ -4,7 +4,21 @@
   --workspace-radius: 12px;
   --workspace-gap: 8px;
   --workspace-gutter: clamp(18px, 3%, 40px);
-  --workspace-shadow: 0 3px 16px color-mix(in srgb, var(--color-ink) 5%, transparent);
+}
+
+.titlebar {
+  border: 1px solid var(--color-border);
+  border-radius: var(--workspace-radius);
+}
+
+.titlebar .window-control--close {
+  border-radius: 0 calc(var(--workspace-radius) - 1px) calc(var(--workspace-radius) - 1px) 0;
+}
+
+.workbench > :is(.sidebar, .conversation, .workbench-panel, .subagent-drawer) {
+  border: 1px solid var(--color-border);
+  border-radius: var(--workspace-radius);
+  overflow: hidden;
 }
 
 .sidebar {
@@ -18,7 +32,7 @@
 
 .sidebar-primary-nav-button.is-active {
   border-color: transparent;
-  box-shadow: inset 2px 0 var(--color-brand);
+  box-shadow: none;
 }
 
 .thread-section {
@@ -46,16 +60,37 @@
 .thread-search { min-height: 34px; margin-top: 12px; border-radius: 8px; }
 .thread-search input { font-size: var(--font-size-sm); }
 .thread-item-main { min-height: 36px; padding: 8px 54px 8px 10px; font-size: var(--font-size-sm); }
-.thread-item--active { border-radius: 7px; }
+.thread-item--active {
+  border-radius: 7px;
+  background: color-mix(in srgb, var(--color-brand) 12%, var(--color-surface));
+}
+.thread-item--active .thread-item-main {
+  color: var(--color-ink);
+  font-weight: var(--font-weight-semibold);
+}
+.thread-item-main:focus-visible { outline: 2px solid var(--color-brand); outline-offset: -2px; }
 .project-group-header { height: auto; min-height: 34px; }
 .project-group-count { background: transparent; }
 .sidebar-footer { padding-top: 10px; }
 .sidebar-settings-button { font-size: var(--font-size-sm); }
 
-.conversation-header { padding-inline: var(--workspace-gutter); }
+.conversation {
+  container-type: inline-size;
+  --workspace-gutter: clamp(18px, 3cqw, 40px);
+  --conversation-content-width: min(820px, calc(100cqw - 2 * var(--workspace-gutter)));
+}
+.conversation-header {
+  padding-inline: var(--workspace-gutter);
+  border-bottom-color: color-mix(in srgb, var(--color-border) 65%, transparent);
+}
 .conversation-header h1 { font-size: 16px; font-weight: var(--font-weight-semibold); }
-.message-area--populated { padding-top: 28px; }
+.message-area--populated {
+  padding: 28px 0 24px;
+  scrollbar-gutter: stable both-edges;
+}
+.message-list { width: var(--conversation-content-width); }
 .message { margin-bottom: 26px; }
+.message:last-child { margin-bottom: 0; }
 .message-content { line-height: 1.75; }
 .message--user .message-content { padding: 12px 16px; border-radius: var(--workspace-radius); }
 .turn-progress-text { line-height: 1.75; }
@@ -65,7 +100,7 @@
 .message-changes { margin-top: 12px; border-color: transparent; background: transparent; }
 .message-changes .changes-toggle { padding-inline: 0; }
 .goal-slim {
-  width: min(1040px, calc(100% - 36px));
+  width: var(--conversation-content-width);
   border-color: transparent;
   background: transparent;
 }
@@ -78,16 +113,17 @@
 .plan-progress:not(.plan-progress--failed) .plan-progress-trigger[aria-expanded="true"] { border-color: var(--color-brand); }
 
 .composer {
-  width: min(1040px, calc(100% - 2 * var(--workspace-gutter)));
+  width: var(--conversation-content-width);
   max-width: calc(100% - 2 * var(--workspace-gutter));
-  margin: 0 auto 22px;
+  margin: 0 auto 18px;
+  border-color: var(--color-border);
   border-radius: var(--workspace-radius);
   background: var(--color-surface-raised);
-  box-shadow: var(--workspace-shadow);
+  box-shadow: none;
 }
 .composer:focus-within {
   border-color: var(--color-brand);
-  box-shadow: 0 0 0 2px var(--color-brand-ring), var(--workspace-shadow);
+  box-shadow: 0 0 0 2px var(--color-brand-ring);
 }
 .composer-quick-actions {
   min-height: 36px;
@@ -98,13 +134,30 @@
   gap: 4px;
 }
 .composer-quick-action:hover { border-color: transparent; color: var(--color-ink); }
-.composer textarea { padding: 10px 16px 14px; font-size: 15px; line-height: 1.65; }
+.composer textarea {
+  field-sizing: content;
+  min-height: 64px;
+  max-height: min(240px, 28vh);
+  padding: 10px 16px 12px;
+  overflow-y: auto;
+  font-size: 15px;
+  line-height: 1.65;
+}
+.composer textarea::placeholder { color: var(--color-ink-subtle); opacity: 1; }
 /* The composer owns focus feedback; nested textarea glow caused a second box
    and a one-pixel jump in enhanced-animations.css. */
 [data-theme] .composer textarea:focus { transform: none; box-shadow: none; }
 .composer-controls { padding: 6px 10px 10px; gap: var(--workspace-gap); }
 .composer-options { gap: 4px; flex-wrap: wrap; }
-.composer-options .model-selector { min-width: 0; }
+.composer-options .model-selector { flex-basis: 180px; min-width: 0; }
+.composer-actions::before { display: none; }
+.composer-actions { align-self: end; }
+/* Keep the model recognizable before showing its secondary provider label.
+   Full provider/model information remains in the selector and its tooltip. */
+@container (max-width: 960px) {
+  .composer-options .model-selector-current small,
+  .composer-options .model-selector-current > span { display: none; }
+}
 .composer .send-button { color: var(--color-surface); background: var(--color-brand); border-color: transparent; }
 .composer .send-button:hover:not(:disabled) { background: var(--color-brand-hover); }
 .composer .send-button:disabled { background: var(--color-disabled-bg); color: var(--color-disabled-text); }
@@ -141,9 +194,32 @@
 .composer .send-button:active:not(:disabled) { transform: none; }
 
 @media (max-width: 720px) {
+  .workbench { --workspace-inset: 8px; }
+  .titlebar { padding-left: 10px; }
+  .titlebar-actions { gap: 4px; }
+  .window-control { width: 34px; }
+  .workbench.workbench--panel-open > :is(.workbench-panel, .subagent-drawer) {
+    position: fixed;
+    z-index: 30;
+    inset: var(--workspace-content-top) var(--workspace-inset) var(--workspace-inset);
+    width: auto;
+    box-shadow: none;
+  }
   .composer { margin-bottom: 12px; }
   .composer-quick-actions { padding-inline: 6px; gap: 2px; }
   .composer-controls { padding-inline: 6px; }
+}
+
+@media (max-width: 520px) {
+  .titlebar .brand strong { display: none; }
+  .runtime-state-label {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
 }
 
 @media (prefers-contrast: high) {

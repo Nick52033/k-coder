@@ -37,7 +37,7 @@
 .file-preview-backdrop {
   position: fixed;
   z-index: 55;
-  top: 48px;
+  top: var(--workspace-content-top, 48px);
   right: 0;
   bottom: 0;
   left: 0;

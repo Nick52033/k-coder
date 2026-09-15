@@ -206,8 +206,10 @@ interface SettingsDialogProps {
   themeMode: ThemeId;
   backgroundEnabled: boolean;
   backgroundOpacity: number;
+  backgroundImage: string;
   onBackgroundEnabledChange: (enabled: boolean) => void;
   onBackgroundOpacityChange: (opacity: number) => void;
+  onBackgroundImageChange: (image: string) => void;
   onClose: () => void;
   onSelectTheme: (theme: ThemeId) => void;
   onSaveProvider: (request: SaveProviderConfigRequest) => Promise<boolean>;
@@ -247,8 +249,10 @@ export function SettingsDialog({
   themeMode,
   backgroundEnabled,
   backgroundOpacity,
+  backgroundImage,
   onBackgroundEnabledChange,
   onBackgroundOpacityChange,
+  onBackgroundImageChange,
   onClose,
   onSelectTheme,
   onSaveProvider,
@@ -337,7 +341,7 @@ export function SettingsDialog({
                 onDelete={onDeleteProvider}
               />
             ) : section === "appearance" ? (
-              <AppearancePage themeMode={themeMode} onSelectTheme={onSelectTheme} backgroundEnabled={backgroundEnabled} backgroundOpacity={backgroundOpacity} onBackgroundEnabledChange={onBackgroundEnabledChange} onBackgroundOpacityChange={onBackgroundOpacityChange} />
+              <AppearancePage themeMode={themeMode} onSelectTheme={onSelectTheme} backgroundEnabled={backgroundEnabled} backgroundOpacity={backgroundOpacity} backgroundImage={backgroundImage} onBackgroundEnabledChange={onBackgroundEnabledChange} onBackgroundOpacityChange={onBackgroundOpacityChange} onBackgroundImageChange={onBackgroundImageChange} />
             ) : section === "usage" ? (
               <UsagePage />
             ) : section === "knowledge" ? (
@@ -2037,15 +2041,19 @@ function AppearancePage({
   onSelectTheme,
   backgroundEnabled,
   backgroundOpacity,
+  backgroundImage,
   onBackgroundEnabledChange,
   onBackgroundOpacityChange,
+  onBackgroundImageChange,
 }: {
   themeMode: ThemeId;
   onSelectTheme: (theme: ThemeId) => void;
   backgroundEnabled: boolean;
   backgroundOpacity: number;
+  backgroundImage: string;
   onBackgroundEnabledChange: (enabled: boolean) => void;
   onBackgroundOpacityChange: (opacity: number) => void;
+  onBackgroundImageChange: (image: string) => void;
 }) {
   const iconForTheme = {
     sun: Sun,
@@ -2113,7 +2121,9 @@ function AppearancePage({
       </div>
       <div className="appearance-theme-section appearance-background-section">
         <div className="appearance-section-heading"><div><p className="settings-eyebrow">会话背景</p><h4>背景图</h4></div><span className="appearance-current-theme">本机显示</span></div>
-        <div className="background-preview" aria-label="会话背景预览" />
+        <div className="background-preview" aria-label="会话背景预览" style={{ backgroundImage: `linear-gradient(rgba(255,255,255,.55),rgba(255,255,255,.55)),url("${backgroundImage}")` }} />
+        <label className="background-upload"><span>上传背景图</span><input type="file" accept="image/png,image/jpeg,image/webp,image/gif" onChange={(event) => { const file = event.target.files?.[0]; if (!file) return; if (file.size > 4 * 1024 * 1024) { event.currentTarget.value = ""; return; } const reader = new FileReader(); reader.onload = () => { if (typeof reader.result === "string") onBackgroundImageChange(reader.result); }; reader.readAsDataURL(file); event.currentTarget.value = ""; }} /></label>
+        {backgroundImage.startsWith("data:image/") && <button type="button" className="background-reset" onClick={() => onBackgroundImageChange("/chat-background.png")}>恢复内置背景</button>}
         <label className="background-toggle"><input type="checkbox" checked={backgroundEnabled} onChange={(e) => onBackgroundEnabledChange(e.target.checked)} /> 显示会话背景图</label>
         <label className="background-opacity">图片可见度 <input type="range" min="0.2" max="0.85" step="0.01" value={backgroundOpacity} disabled={!backgroundEnabled} onChange={(e) => onBackgroundOpacityChange(Number(e.target.value))} /><output>{Math.round(backgroundOpacity * 100)}%</output></label>
         <small className="settings-page-description">使用内置预览图验证透明面板效果；关闭后恢复纯色工作区。</small>

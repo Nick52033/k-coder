@@ -31,14 +31,16 @@ export function usePanelWidths(panelOpen: boolean) {
 
   const sidebarVisible = viewport > 720 && (!panelOpen || viewport > 1180);
   const panelVisible = panelOpen && viewport > 720;
+  // Match the card grid's outer insets and one gap per visible divider.
+  const availableWidth = viewport - 12 * (2 + Number(sidebarVisible) + Number(panelVisible));
   const conversationMin = viewport > 1180 ? 420 : 360;
   const sidebar = sidebarVisible
-    ? clamp(preferred.sidebar ?? (viewport > 1180 ? 232 : 210), 200, Math.min(400, viewport - conversationMin - (panelVisible ? 320 : 0)))
+    ? clamp(preferred.sidebar ?? (viewport > 1180 ? 232 : 210), 200, Math.min(400, availableWidth - conversationMin - (panelVisible ? 320 : 0)))
     : 0;
-  const panelMax = Math.max(320, Math.min(900, viewport - sidebar - conversationMin));
+  const panelMax = Math.max(320, Math.min(900, availableWidth - sidebar - conversationMin));
   const defaultPanel = viewport > 1180 ? clamp(viewport * 0.28, 360, 440) : clamp(viewport * 0.34, 320, 400);
   const panel = panelVisible ? clamp(preferred.panel ?? defaultPanel, 320, panelMax) : 0;
-  const sidebarMax = Math.max(200, Math.min(400, viewport - panel - conversationMin));
+  const sidebarMax = Math.max(200, Math.min(400, availableWidth - panel - conversationMin));
 
   return {
     style: { "--sidebar-width": `${sidebar}px`, "--panel-width": `${panel}px` } as CSSProperties,
