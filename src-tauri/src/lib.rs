@@ -3,10 +3,13 @@ pub mod agent;
 pub mod app_state;
 pub mod commands;
 pub mod context;
+pub mod entities;
 pub mod execution;
 pub mod extensions;
 pub mod knowledge;
 pub mod logging;
+pub mod memory;
+pub mod mobile;
 pub mod multi_agent;
 pub mod ocr;
 pub mod patch;
@@ -115,7 +118,17 @@ pub fn run() {
                     .knowledge()
                     .attach_logger(app_state.logger().clone());
             }
+            // 移动网关：设备登记表和本机证书都放在应用数据目录下。
+            let mobile_service = mobile::MobileService::new(
+                app.handle().clone(),
+                app.path().app_data_dir()?.join("runtime-data"),
+            )
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+            app.manage(mobile_service);
+            // 只有在用户此前显式开启过局域网访问时才自动恢复监听。
+            app.state::<mobile::MobileService>().restore_on_startup()?;
             scheduled_tasks::spawn_scheduler(app.handle().clone());
+            commands::spawn_memory_maintenance_scheduler(app.handle().clone());
 
             // 创建系统托盘
             let show = MenuItem::with_id(app, "show", "显示窗口", true, None::<&str>)?;
@@ -222,11 +235,27 @@ pub fn run() {
             commands::test_embedding_connection,
             commands::search_knowledge,
             commands::read_knowledge_citation,
+            commands::record_knowledge_feedback,
+            commands::list_knowledge_retrieval_events,
+            commands::list_knowledge_entities,
+            commands::list_knowledge_facts,
+            commands::review_knowledge_fact,
+            commands::query_knowledge_relations,
+            commands::run_knowledge_retrieval_evaluation,
             commands::get_memory_settings,
+            commands::set_memory_settings,
             commands::set_memory_enabled,
             commands::list_memories,
             commands::upsert_memory,
+            commands::list_memory_candidates,
+            commands::review_memory_candidate,
             commands::delete_memory,
+            commands::clear_memories,
+            commands::get_memory_maintenance_settings,
+            commands::set_memory_maintenance_settings,
+            commands::accept_memory_maintenance_disclosure,
+            commands::run_memory_maintenance,
+            commands::cancel_memory_maintenance,
             commands::get_browser_settings,
             commands::save_browser_settings,
             commands::list_browser_audit,
@@ -308,6 +337,14 @@ pub fn run() {
             commands::resolve_approval,
             commands::resolve_user_input,
             commands::undo_change,
+            commands::mobile::mobile_status,
+            commands::mobile::mobile_start,
+            commands::mobile::mobile_stop,
+            commands::mobile::mobile_create_pairing,
+            commands::mobile::mobile_approve_pairing,
+            commands::mobile::mobile_deny_pairing,
+            commands::mobile::mobile_revoke_device,
+            commands::mobile::mobile_set_capabilities,
             commands::start_command,
             commands::command_status,
             commands::read_command_output,

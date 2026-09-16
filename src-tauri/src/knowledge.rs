@@ -4,7 +4,15 @@
 //! source file remains the source of truth and SQLite contains only metadata,
 //! chunks and FTS projections. Semantic vectors are an optional extension point
 //! and never weaken the workspace or citation boundaries.
+//!
+//! `retrieval` holds the pure ranking rules (fixed weights, signal normalisation, deterministic
+//! query rewrite and the knowledge budget). It has no SQL and no Provider, so the ordering contract
+//! is reproducible and reviewable on its own; this file keeps the I/O.
 
+pub mod evaluation;
+pub mod retrieval;
+
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -26,6 +34,10 @@ use crate::logging::StructuredLogger;
 use crate::persistence::ProjectionDb;
 use crate::protocol::{ToolDefinition, ToolResult, ToolRisk};
 use crate::providers::CredentialStore;
+use crate::storage::knowledge_entity_repository::{
+    FEEDBACK_TYPES, KnowledgeEntityEventKind, KnowledgeEntityRepository, KnowledgeFeedbackRecord,
+    KnowledgeRetrievalEventRecord,
+};
 use crate::tools::{ToolContext, ToolError, ToolHandler};
 
 const PARSER_VERSION: &str = "text-v1";
@@ -41,6 +53,54 @@ const EMBEDDING_ENCODING: &str = "float";
 const EMBEDDING_CREDENTIAL: &str = "embedding-api-key:siliconflow";
 const QUERY_EMBEDDING_CACHE_CAPACITY: usize = 128;
 const QUERY_EMBEDDING_CACHE_TTL: Duration = Duration::from_secs(10 * 60);
+/// One citation never carries more than this much text, whether the window came from `search` or
+/// from a later `read_knowledge_citation`.
+const MAX_CITATION_WINDOW_BYTES: usize = 16 * 1024;
+/// Upper bound on the revisions a single purge reports for fact expiry.
+///
+/// A source keeps one revision per content change and every one of them is removed with the source,
+/// so the list is capped to keep the expiry pass bounded rather than proportional to the history.
+const MAX_PURGED_REVISIONS_FOR_EXPIRY: usize = 512;
+/// The path channel matches substrings, so one-character terms would recall nearly every source.
+const MIN_PATH_TERM_CHARS: usize = 2;
+const MAX_PATH_TERMS: usize = 8;
+
+/// Every recall channel below selects the same ten columns in the same order, because they all feed
+/// [`map_candidate`]: id, title, text, path, revision, start line, end line, ordinal, updated at,
+/// source id. Changing that order means changing `map_candidate` with it.
+
+/// The FTS5 recall channel. The title channel reuses it verbatim with a column-filtered `MATCH`
+/// expression, so both share one visibility filter and one ranking function.
+const MATCH_RECALL_SQL: &str = "SELECT k.id,k.title,k.text,s.relative_path,r.id,k.start_line,\
+     k.end_line,k.ordinal,r.created_at_ms,s.id
+     FROM knowledge_chunks_fts f JOIN knowledge_chunks k ON k.id=f.chunk_id
+     JOIN knowledge_revisions r ON r.id=k.revision_id AND r.active=1
+     JOIN knowledge_sources s ON s.id=r.source_id
+     JOIN knowledge_collections c ON c.id=s.collection_id AND c.enabled=1 AND c.deleted=0
+     WHERE c.scope_key=?1 AND knowledge_chunks_fts MATCH ?2
+     ORDER BY bm25(knowledge_chunks_fts) LIMIT ?3";
+
+/// Reads the ordinals a citation window may cover, under exactly the same visibility filter as the
+/// recall channels, so a disabled collection can never leak into a citation.
+const REVISION_WINDOW_SQL: &str = "SELECT k.id,k.title,k.text,s.relative_path,r.id,k.start_line,\
+     k.end_line,k.ordinal,r.created_at_ms,s.id
+     FROM knowledge_chunks k
+     JOIN knowledge_revisions r ON r.id=k.revision_id AND r.active=1
+     JOIN knowledge_sources s ON s.id=r.source_id
+     JOIN knowledge_collections c ON c.id=s.collection_id AND c.enabled=1 AND c.deleted=0
+     WHERE k.revision_id=?1 AND k.ordinal BETWEEN ?2 AND ?3
+     ORDER BY k.ordinal";
+
+/// Paths are stored with the platform separator, so the comparison normalises to forward slashes.
+const NORMALIZED_PATH: &str = "replace(lower(s.relative_path),'\\','/')";
+
+const PATH_RECALL_PREFIX: &str = "SELECT k.id,k.title,k.text,s.relative_path,r.id,k.start_line,\
+     k.end_line,k.ordinal,r.created_at_ms,s.id
+     FROM knowledge_chunks k
+     JOIN knowledge_revisions r ON r.id=k.revision_id AND r.active=1
+     JOIN knowledge_sources s ON s.id=r.source_id
+     JOIN knowledge_collections c ON c.id=s.collection_id AND c.enabled=1 AND c.deleted=0
+     WHERE c.scope_key=?1 AND (";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -314,6 +374,9 @@ impl KnowledgeError {
 pub struct KnowledgeService {
     db: ProjectionDb,
     repository: KnowledgeRepository,
+    /// The versioned fact log for retrieval events and user feedback. The ranking reads feedback
+    /// back from here, so a rating outlives the in-process citation map.
+    structured: KnowledgeEntityRepository,
     credentials: Arc<dyn CredentialStore>,
     citations: Arc<Mutex<HashMap<String, CitationRecord>>>,
     active_jobs: Arc<Mutex<HashMap<String, CancellationToken>>>,
@@ -328,11 +391,37 @@ pub struct KnowledgeService {
     observed_jobs: Arc<Mutex<HashSet<String>>>,
 }
 
+/// The provenance of a citation the current turn actually received.
+///
+/// The structured knowledge layer needs the chunk, the revision and the collection a citation
+/// belongs to, and it has to get them from here rather than from a model payload: this lookup
+/// applies the same turn binding and the same active-revision check as [`KnowledgeService::read_citation`],
+/// so a fact can only be attributed to a citation this turn was given and to a revision that is
+/// still live. "No source, no relation" therefore holds before the fact layer even sees the input.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CitationSource {
+    pub citation_id: String,
+    pub chunk_id: String,
+    pub revision_id: String,
+    pub collection_id: String,
+    pub path: String,
+    pub locator: String,
+}
+
 #[derive(Debug, Clone)]
 struct CitationRecord {
     thread_id: String,
     turn_id: String,
     chunk_id: String,
+    /// Ordinal range already concatenated into `citation.text`, so `read_citation` never repeats a
+    /// chunk it already handed out.
+    included_start: i64,
+    included_end: i64,
+    /// Line range the stored citation text covers, kept so widening the window does not have to
+    /// re-parse the locator.
+    line_start: i64,
+    line_end: i64,
     citation: KnowledgeCitation,
 }
 
@@ -341,6 +430,9 @@ struct PurgedKnowledgeRows {
     chunk_ids: HashSet<String>,
     chunk_count: usize,
     vector_count: usize,
+    /// Revisions this purge removed, so the structured layer can expire the facts derived from
+    /// them. Collected before the delete because the rows are gone afterwards.
+    revision_ids: Vec<String>,
 }
 
 #[derive(Debug, Default)]
@@ -746,9 +838,11 @@ impl KnowledgeService {
     ) -> Self {
         let repository = KnowledgeRepository::new(db.clone());
         let _ = repository.rebuild_projection();
+        let structured = KnowledgeEntityRepository::new(db.clone());
         let service = Self {
             db,
             repository,
+            structured,
             credentials,
             citations: Arc::new(Mutex::new(HashMap::new())),
             active_jobs: Arc::new(Mutex::new(HashMap::new())),
@@ -762,6 +856,15 @@ impl KnowledgeService {
             metrics: Arc::new(Mutex::new(KnowledgeIndexMetrics::default())),
             observed_jobs: Arc::new(Mutex::new(HashSet::new())),
         };
+        // The structured projection is a cache of its own fact log, so a rebuild only costs I/O when
+        // that log actually exists. A failure is visible but never blocks startup.
+        if let Err(error) = service.structured.rebuild_projection() {
+            service.log_event(
+                "warn",
+                "knowledge_structured_projection_rebuild_failed",
+                json!({"error": error.to_string()}),
+            );
+        }
         service.recover_interrupted_jobs();
         service.ensure_worker();
         service
@@ -1303,6 +1406,7 @@ impl KnowledgeService {
         let purged = self.purge_sources(&source_ids)?;
         drop(guards);
         self.remove_deleted_runtime_state(&source_ids, &purged.chunk_ids);
+        self.expire_facts_for_purged_revisions(&purged);
         self.repository
             .append(KnowledgeEventKind::CollectionDeleted {
                 id: collection_id.to_owned(),
@@ -1368,6 +1472,7 @@ impl KnowledgeService {
         let purged = self.purge_sources(&source_ids)?;
         drop(guards);
         self.remove_deleted_runtime_state(&source_ids, &purged.chunk_ids);
+        self.expire_facts_for_purged_revisions(&purged);
         self.repository.append(KnowledgeEventKind::SourceDeleted {
             id: source_id.to_owned(),
         })?;
@@ -1414,6 +1519,19 @@ impl KnowledgeService {
                 let tx = connection.transaction()?;
                 let mut purged = PurgedKnowledgeRows::default();
                 for source_id in source_ids {
+                    // Collected before the rows are deleted, because expiry is decided afterwards.
+                    let revision_ids = {
+                        let mut statement = tx.prepare(
+                            "SELECT id FROM knowledge_revisions WHERE source_id=?1 ORDER BY id LIMIT ?2",
+                        )?;
+                        statement
+                            .query_map(
+                                params![source_id, MAX_PURGED_REVISIONS_FOR_EXPIRY as i64],
+                                |row| row.get::<_, String>(0),
+                            )?
+                            .collect::<Result<Vec<_>, _>>()?
+                    };
+                    purged.revision_ids.extend(revision_ids);
                     let chunk_ids = query_strings(
                         &tx,
                         "SELECT id FROM knowledge_chunks WHERE revision_id IN (SELECT id FROM knowledge_revisions WHERE source_id=?1)",
@@ -1448,6 +1566,30 @@ impl KnowledgeService {
                 Ok(purged)
             })
             .map_err(|error| KnowledgeError::Storage(error.to_string()))
+    }
+
+    /// Design §4.1: removing a source revision expires the facts derived from it instead of
+    /// deleting them, so the audit trail and the historical citation survive.
+    ///
+    /// The expiry is recorded on the structured fact log, which lives in the same projection
+    /// database but a different repository. `knowledge` deliberately does not learn about
+    /// `entities`; `knowledge_facts_expired_for_revision` is the seam Task 1 defined for exactly
+    /// this transition, and it is idempotent, so replaying it after a crash is harmless.
+    fn expire_facts_for_purged_revisions(&self, purged: &PurgedKnowledgeRows) {
+        for revision_id in &purged.revision_ids {
+            if let Err(error) =
+                self.structured
+                    .append(KnowledgeEntityEventKind::FactsExpiredForRevision {
+                        source_revision_id: revision_id.clone(),
+                    })
+            {
+                self.log_event(
+                    "warn",
+                    "knowledge_fact_expiry_failed",
+                    json!({"revisionId": revision_id, "error": error.to_string()}),
+                );
+            }
+        }
     }
 
     fn remove_deleted_runtime_state(&self, source_ids: &[String], chunk_ids: &HashSet<String>) {
@@ -1859,6 +2001,32 @@ impl KnowledgeService {
         query: &str,
         limit: usize,
     ) -> Result<KnowledgeSearchResponse, KnowledgeError> {
+        self.search_with_options(
+            workspace,
+            thread_id,
+            turn_id,
+            query,
+            limit,
+            &retrieval::SearchOptions::default(),
+        )
+        .await
+    }
+
+    /// One retrieval pass: four recall channels, fixed-weight fusion, source deduplication,
+    /// neighbour expansion and the knowledge budget.
+    ///
+    /// The lexical channel is the floor, so a failure there fails the search. The semantic, title
+    /// and path channels only widen the candidate set: each of them degrades to "no extra recall"
+    /// and records a warning instead of closing the search.
+    pub async fn search_with_options(
+        &self,
+        workspace: &Path,
+        thread_id: &str,
+        turn_id: &str,
+        query: &str,
+        limit: usize,
+        options: &retrieval::SearchOptions,
+    ) -> Result<KnowledgeSearchResponse, KnowledgeError> {
         let started = Instant::now();
         let query = query.trim();
         if query.is_empty() {
@@ -1876,47 +2044,119 @@ impl KnowledgeService {
             });
         }
         let scope_key = scope_key(workspace)?;
-        let terms = fts_query(query);
-        if terms.is_empty() {
+        if fts_query(query).is_empty() {
             return Err(KnowledgeError::coded(
                 "KC_QUERY_EMPTY",
                 "knowledge query has no searchable terms",
             ));
         }
-        let lexical_limit = limit.saturating_mul(8).clamp(limit, 50);
-        let rows = self.db.with_connection(|connection| {
-            let mut statement = connection.prepare(
-                "SELECT k.id,k.title,k.text,s.relative_path,r.id,k.start_line,k.end_line
-                 FROM knowledge_chunks_fts f JOIN knowledge_chunks k ON k.id=f.chunk_id
-                 JOIN knowledge_revisions r ON r.id=k.revision_id AND r.active=1
-                 JOIN knowledge_sources s ON s.id=r.source_id
-                 JOIN knowledge_collections c ON c.id=s.collection_id AND c.enabled=1 AND c.deleted=0
-                 WHERE c.scope_key=?1 AND knowledge_chunks_fts MATCH ?2 ORDER BY bm25(knowledge_chunks_fts) LIMIT ?3")?;
-            let mapped = statement.query_map(params![scope_key,terms,lexical_limit as i64], |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,String>(3)?,row.get::<_,String>(4)?,row.get::<_,i64>(5)?,row.get::<_,i64>(6)?)))?.collect::<Result<Vec<_>,_>>()?;
-            Ok(mapped)
-        }).map_err(|error| KnowledgeError::Storage(error.to_string()))?;
-        let mut semantic_ranks = HashMap::<String, usize>::new();
-        let mut retrieval_mode = "lexical_only";
-        let mut fallback_code = if self.embedding_settings()?.semantic_enabled {
+
+        // Query rewrite. The deterministic rules always run, so the original query is always the
+        // first rewrite; the optional model rewrite can only extend an already-bounded list, and a
+        // failure leaves the deterministic list untouched.
+        let mut rewrites = retrieval::deterministic_rewrite(query, &options.hints);
+        if let Some(rewriter) = &options.rewriter {
+            match rewriter.rewrite(query, &options.hints).await {
+                Ok(values) => {
+                    let mut merged = vec![query.to_owned()];
+                    merged.extend(values);
+                    rewrites = retrieval::bound_rewrites(merged);
+                }
+                Err(code) => self.log_event(
+                    "warn",
+                    "knowledge_query_rewrite_failed",
+                    json!({"code": code}),
+                ),
+            }
+        }
+
+        let mut recalled = HashMap::<String, ChannelCandidate>::new();
+        let mut channels = Vec::<&'static str>::new();
+        for rewrite in &rewrites {
+            let lexical_terms = fts_query(rewrite);
+            if lexical_terms.is_empty() {
+                continue;
+            }
+            let rows = self.recall_channel(
+                MATCH_RECALL_SQL,
+                params![
+                    scope_key,
+                    lexical_terms,
+                    retrieval::MAX_CHANNEL_CANDIDATES as i64
+                ],
+            )?;
+            merge_channel(&mut recalled, rank_rows(rows), RecallChannel::Lexical);
+        }
+        if !recalled.is_empty() {
+            channels.push(RecallChannel::Lexical.label());
+        }
+
+        // The title channel reuses the same FTS index restricted to the `title` column, which is
+        // what makes code symbols and headings recallable on their own.
+        let title_terms = column_fts_query("title", query);
+        if !title_terms.is_empty() {
+            match self.recall_channel(
+                MATCH_RECALL_SQL,
+                params![
+                    scope_key,
+                    title_terms,
+                    retrieval::MAX_CHANNEL_CANDIDATES as i64
+                ],
+            ) {
+                Ok(rows) if !rows.is_empty() => {
+                    channels.push(RecallChannel::Title.label());
+                    merge_channel(&mut recalled, rank_rows(rows), RecallChannel::Title);
+                }
+                Ok(_) => {}
+                Err(error) => self.log_event(
+                    "warn",
+                    "knowledge_recall_channel_failed",
+                    json!({"channel": RecallChannel::Title.label(), "code": error.code()}),
+                ),
+            }
+        }
+        let path_rows = self.recall_paths(&scope_key, query);
+        if !path_rows.is_empty() {
+            channels.push(RecallChannel::Path.label());
+            merge_channel(&mut recalled, rank_rows(path_rows), RecallChannel::Path);
+        }
+
+        // Semantic recall is bounded to one embedding call: the rewrites only feed the lexical
+        // channels, so a model rewrite can never multiply the embedding cost.
+        let embedding = self.embedding_settings()?;
+        let mut fallback_code = if embedding.semantic_enabled {
             Some("KC_EMBEDDING_UNAVAILABLE")
         } else {
             Some("KC_EMBEDDING_NOT_CONFIGURED")
         };
-        let embedding = self.embedding_settings()?;
         if embedding.semantic_enabled && embedding.embedding_configured {
             match self.embed_query(query).await {
                 Ok(query_vector) => {
                     let scan_limit = embedding.max_vector_scan_chunks;
-                    let vector_rows = self.db.with_connection(|connection| {
-                    let mut statement = connection.prepare(
-                        "SELECT k.id,e.vector,e.dimension FROM knowledge_chunk_embeddings e
-                         JOIN knowledge_chunks k ON k.id=e.chunk_id
-                         JOIN knowledge_revisions r ON r.id=k.revision_id AND r.active=1 AND r.embedding_status='semantic_ready'
-                         JOIN knowledge_sources s ON s.id=r.source_id
-                         JOIN knowledge_collections c ON c.id=s.collection_id AND c.enabled=1 AND c.deleted=0
-                         WHERE c.scope_key=?1 AND e.provider=?2 AND e.model=?3 ORDER BY k.id LIMIT ?4")?;
-                    statement.query_map(params![scope_key, EMBEDDING_PROVIDER, EMBEDDING_MODEL, scan_limit as i64], |row| Ok((row.get::<_,String>(0)?,row.get::<_,Vec<u8>>(1)?,row.get::<_,i64>(2)? as usize)))?.collect::<Result<Vec<_>,_>>()
-                }).map_err(|error| KnowledgeError::Storage(error.to_string()))?;
+                    let vector_rows = self
+                        .db
+                        .with_connection(|connection| {
+                            let mut statement = connection.prepare(
+                                "SELECT k.id,e.vector,e.dimension FROM knowledge_chunk_embeddings e
+                                 JOIN knowledge_chunks k ON k.id=e.chunk_id
+                                 JOIN knowledge_revisions r ON r.id=k.revision_id AND r.active=1 AND r.embedding_status='semantic_ready'
+                                 JOIN knowledge_sources s ON s.id=r.source_id
+                                 JOIN knowledge_collections c ON c.id=s.collection_id AND c.enabled=1 AND c.deleted=0
+                                 WHERE c.scope_key=?1 AND e.provider=?2 AND e.model=?3 ORDER BY k.id LIMIT ?4")?;
+                            statement
+                                .query_map(
+                                    params![scope_key, EMBEDDING_PROVIDER, EMBEDDING_MODEL, scan_limit as i64],
+                                    |row| {
+                                        Ok((
+                                            row.get::<_, String>(0)?,
+                                            row.get::<_, Vec<u8>>(1)?,
+                                            row.get::<_, i64>(2)? as usize,
+                                        ))
+                                    },
+                                )?
+                                .collect::<Result<Vec<_>, _>>()
+                        })
+                        .map_err(|error| KnowledgeError::Storage(error.to_string()))?;
                     let mut ranked = vector_rows
                         .into_iter()
                         .filter_map(|(id, bytes, dimension)| {
@@ -1939,16 +2179,42 @@ impl KnowledgeService {
                             .partial_cmp(&left.1)
                             .unwrap_or(std::cmp::Ordering::Equal)
                     });
-                    for (rank, (id, _score)) in
-                        ranked.into_iter().take(limit.saturating_mul(2)).enumerate()
-                    {
-                        semantic_ranks.insert(id, rank + 1);
-                    }
-                    if !semantic_ranks.is_empty() {
-                        retrieval_mode = "hybrid";
-                        fallback_code = None;
-                    } else {
+                    let order = ranked
+                        .into_iter()
+                        .take(retrieval::MAX_CHANNEL_CANDIDATES)
+                        .map(|(id, _)| id)
+                        .collect::<Vec<_>>();
+                    if order.is_empty() {
                         fallback_code = Some("KC_EMBEDDING_RESPONSE_INVALID");
+                    } else {
+                        // Only the chunks no earlier channel returned need a second lookup; the rest
+                        // already carry their row and only need their semantic rank recorded.
+                        let missing = order
+                            .iter()
+                            .filter(|id| !recalled.contains_key(*id))
+                            .cloned()
+                            .collect::<Vec<_>>();
+                        let mut fetched = HashMap::new();
+                        if !missing.is_empty() {
+                            for row in self.recall_chunks_by_id(&missing)? {
+                                fetched.insert(row.chunk_id.clone(), row);
+                            }
+                        }
+                        let mut rows = Vec::new();
+                        for (index, id) in order.iter().enumerate() {
+                            if let Some(row) = fetched.remove(id) {
+                                rows.push((index + 1, row));
+                            } else if let Some(existing) = recalled.get(id) {
+                                rows.push((index + 1, existing.chunk.clone()));
+                            }
+                        }
+                        if rows.is_empty() {
+                            fallback_code = Some("KC_EMBEDDING_RESPONSE_INVALID");
+                        } else {
+                            channels.push(RecallChannel::Semantic.label());
+                            merge_channel(&mut recalled, rows, RecallChannel::Semantic);
+                            fallback_code = None;
+                        }
                     }
                 }
                 Err(error) => {
@@ -1956,60 +2222,180 @@ impl KnowledgeService {
                 }
             }
         }
-        let mut candidates = rows
-            .into_iter()
-            .enumerate()
-            .map(|(rank, row)| (row, rank + 1))
+        let retrieval_mode = if channels.contains(&"semantic") {
+            "hybrid"
+        } else {
+            "lexical_only"
+        };
+        let candidate_count = recalled.len();
+
+        // Fixed-weight fusion. A chunk the user rated before carries that rating into the ranking,
+        // which is the only channel that learns from this installation.
+        let feedback = if recalled.is_empty() {
+            HashMap::new()
+        } else {
+            let ids = recalled.keys().cloned().collect::<Vec<_>>();
+            self.structured
+                .feedback_totals_for_chunks(&ids)
+                .map_err(|error| KnowledgeError::Storage(error.to_string()))?
+                .into_iter()
+                .map(|total| (total.chunk_id, (total.useful, total.negative)))
+                .collect::<HashMap<_, _>>()
+        };
+        let now_ms = crate::storage::now_ms();
+        let mut scored = recalled
+            .into_values()
+            .map(|candidate| {
+                let (useful, negative) = feedback
+                    .get(&candidate.chunk.chunk_id)
+                    .copied()
+                    .unwrap_or((0, 0));
+                let signals = retrieval::RetrievalSignals {
+                    lexical: retrieval::rank_signal(candidate.lexical_rank),
+                    semantic: retrieval::rank_signal(candidate.semantic_rank),
+                    title_or_symbol: retrieval::title_or_symbol_signal(
+                        query,
+                        &candidate.chunk.title,
+                    ),
+                    path_match: retrieval::path_match_signal(query, &candidate.chunk.path),
+                    freshness: retrieval::freshness_signal(
+                        candidate.chunk.revision_created_at_ms,
+                        now_ms,
+                    ),
+                    user_feedback: retrieval::feedback_signal(useful, negative),
+                };
+                (candidate, signals)
+            })
             .collect::<Vec<_>>();
-        let lexical_ids = candidates
-            .iter()
-            .map(|(row, _)| row.0.clone())
-            .collect::<std::collections::HashSet<_>>();
-        if !semantic_ranks.is_empty() {
-            let missing = semantic_ranks
-                .keys()
-                .filter(|id| !lexical_ids.contains(*id))
-                .cloned()
-                .collect::<Vec<_>>();
-            if !missing.is_empty() {
-                let semantic_rows = self.db.with_connection(|connection| {
-                    let mut statement = connection.prepare("SELECT k.id,k.title,k.text,s.relative_path,r.id,k.start_line,k.end_line FROM knowledge_chunks k JOIN knowledge_revisions r ON r.id=k.revision_id AND r.active=1 AND r.embedding_status='semantic_ready' JOIN knowledge_sources s ON s.id=r.source_id JOIN knowledge_collections c ON c.id=s.collection_id AND c.enabled=1 AND c.deleted=0 WHERE c.scope_key=?1 AND k.id IN (SELECT chunk_id FROM knowledge_chunk_embeddings WHERE provider=?2 AND model=?3) ORDER BY k.id LIMIT ?4")?;
-                    statement.query_map(params![scope_key,EMBEDDING_PROVIDER,EMBEDDING_MODEL, embedding.max_vector_scan_chunks as i64], |row| Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,String>(2)?,row.get::<_,String>(3)?,row.get::<_,String>(4)?,row.get::<_,i64>(5)?,row.get::<_,i64>(6)?)))?.collect::<Result<Vec<_>,_>>()
-                }).map_err(|error| KnowledgeError::Storage(error.to_string()))?;
-                for row in semantic_rows {
-                    if !lexical_ids.contains(&row.0) && semantic_ranks.contains_key(&row.0) {
-                        candidates.push((row, 0));
-                    }
-                }
+        scored.sort_by(|left, right| {
+            right
+                .1
+                .score()
+                .partial_cmp(&left.1.score())
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| {
+                    left.0
+                        .lexical_rank
+                        .unwrap_or(usize::MAX)
+                        .cmp(&right.0.lexical_rank.unwrap_or(usize::MAX))
+                })
+                .then_with(|| left.0.chunk.path.cmp(&right.0.chunk.path))
+                .then_with(|| left.0.chunk.ordinal.cmp(&right.0.chunk.ordinal))
+                .then_with(|| left.0.chunk.chunk_id.cmp(&right.0.chunk.chunk_id))
+        });
+
+        // "去除同一来源的重复 chunk": one hit per source keeps the six slots diverse instead of
+        // letting a single long file fill all of them.
+        let mut seen_sources = HashSet::new();
+        let mut pool = Vec::new();
+        for (candidate, signals) in scored {
+            if !seen_sources.insert(candidate.chunk.source_id.clone()) {
+                continue;
             }
-            candidates.sort_by(|left, right| {
-                let left_score = rrf_score(left.1, semantic_ranks.get(&left.0.0).copied());
-                let right_score = rrf_score(right.1, semantic_ranks.get(&right.0.0).copied());
-                right_score
-                    .partial_cmp(&left_score)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
+            pool.push((candidate, signals));
+            if pool.len() >= retrieval::MAX_KNOWLEDGE_CHUNKS {
+                break;
+            }
         }
+
+        // Neighbour expansion. Every window is read back from the hit's own revision, so a citation
+        // can never mix two revisions of the same file.
+        let mut ranges = HashMap::<String, (i64, i64)>::new();
+        for (candidate, _) in &pool {
+            let ordinal = candidate.chunk.ordinal;
+            ranges
+                .entry(candidate.chunk.revision.clone())
+                .and_modify(|range| {
+                    range.0 = range.0.min(ordinal - 1);
+                    range.1 = range.1.max(ordinal + 1);
+                })
+                .or_insert((ordinal - 1, ordinal + 1));
+        }
+        let mut revision_chunks = HashMap::<String, Vec<(i64, String, i64, i64)>>::new();
+        for (revision, (low, high)) in &ranges {
+            let rows = self.recall_channel(REVISION_WINDOW_SQL, params![revision, low, high])?;
+            revision_chunks.insert(
+                revision.clone(),
+                rows.into_iter()
+                    .map(|row| (row.ordinal, row.text, row.start_line, row.end_line))
+                    .collect(),
+            );
+        }
+        let windows = pool
+            .iter()
+            .map(|(candidate, _)| {
+                let window = revision_chunks
+                    .get(&candidate.chunk.revision)
+                    .and_then(|chunks| citation_window(chunks, candidate.chunk.ordinal));
+                (candidate.chunk.chunk_id.clone(), window)
+            })
+            .collect::<HashMap<_, _>>();
+
+        let budget = retrieval::KnowledgeBudget::new(
+            match options.budget_percent {
+                Some(percent) => percent,
+                None => self.usize_setting(
+                    "knowledge.budget_percent",
+                    retrieval::DEFAULT_KNOWLEDGE_BUDGET_PERCENT,
+                    retrieval::MIN_KNOWLEDGE_BUDGET_PERCENT,
+                    retrieval::MAX_KNOWLEDGE_BUDGET_PERCENT,
+                )?,
+            },
+            options
+                .working_context_tokens
+                .unwrap_or(retrieval::DEFAULT_WORKING_CONTEXT_TOKENS),
+        );
+        let expanded_chars = pool
+            .iter()
+            .map(|(candidate, _)| {
+                windows
+                    .get(&candidate.chunk.chunk_id)
+                    .and_then(|window| window.as_ref())
+                    .map_or(0, |window| window.text.chars().count())
+            })
+            .collect::<Vec<_>>();
+        let selected = retrieval::select_within_budget(&expanded_chars, budget.max_chars());
+
         let mut results = Vec::new();
         let mut citations = self
             .citations
             .lock()
             .map_err(|_| KnowledgeError::Storage("citation lock poisoned".into()))?;
-        let candidate_count = candidates.len();
-        for (rank, ((chunk_id, title, text, path, revision, start, end), lexical_rank)) in
-            candidates.into_iter().take(limit).enumerate()
-        {
+        for index in selected {
+            if index >= limit {
+                continue;
+            }
+            let (candidate, signals) = &pool[index];
             if citations.len() >= MAX_CITATIONS {
                 citations.clear();
             }
+            let window = windows
+                .get(&candidate.chunk.chunk_id)
+                .and_then(|window| window.as_ref());
+            let (text, line_start, line_end, included_start, included_end) = match window {
+                Some(window) => (
+                    window.text.clone(),
+                    window.start_line,
+                    window.end_line,
+                    window.included_start,
+                    window.included_end,
+                ),
+                None => (
+                    candidate.chunk.text.clone(),
+                    candidate.chunk.start_line,
+                    candidate.chunk.end_line,
+                    candidate.chunk.ordinal,
+                    candidate.chunk.ordinal,
+                ),
+            };
             let citation_id = Uuid::new_v4().to_string();
-            let locator = format!("L{}-{}", start, end);
+            let locator = format!("L{line_start}-{line_end}");
             let citation = KnowledgeCitation {
                 citation_id: citation_id.clone(),
-                path: path.clone(),
+                path: candidate.chunk.path.clone(),
                 locator: locator.clone(),
                 text: text.clone(),
-                revision: revision.clone(),
+                revision: candidate.chunk.revision.clone(),
                 is_current_revision: true,
             };
             citations.insert(
@@ -2017,37 +2403,67 @@ impl KnowledgeService {
                 CitationRecord {
                     thread_id: thread_id.into(),
                     turn_id: turn_id.into(),
-                    chunk_id: chunk_id.clone(),
+                    chunk_id: candidate.chunk.chunk_id.clone(),
+                    included_start,
+                    included_end,
+                    line_start,
+                    line_end,
                     citation,
                 },
             );
             results.push(KnowledgeSearchResult {
                 citation_id,
-                title,
-                path,
+                title: candidate.chunk.title.clone(),
+                path: candidate.chunk.path.clone(),
                 locator,
                 preview: preview(&text),
-                revision,
-                score: if !semantic_ranks.is_empty() {
-                    rrf_score(lexical_rank, semantic_ranks.get(&chunk_id).copied())
-                } else {
-                    1.0 / (rank as f64 + 1.0)
-                },
-                lexical_rank,
-                semantic_rank: semantic_ranks.get(&chunk_id).copied(),
+                revision: candidate.chunk.revision.clone(),
+                score: signals.score(),
+                lexical_rank: candidate.lexical_rank.unwrap_or(0),
+                semantic_rank: candidate.semantic_rank,
             });
-            let _ = chunk_id;
         }
+        drop(citations);
         let returned = results.len();
+
+        // The retrieval event is a fact, but it is telemetry: a failure to record it must never turn
+        // a usable answer into an error. The raw query is never persisted, only its digest.
+        if let Err(error) = self
+            .structured
+            .append(KnowledgeEntityEventKind::RetrievalRecorded(
+                KnowledgeRetrievalEventRecord {
+                    id: Uuid::new_v4().to_string(),
+                    thread_id: thread_id.to_owned(),
+                    turn_id: turn_id.to_owned(),
+                    query_hash: hash_text(query).chars().take(16).collect(),
+                    retrieval_mode: retrieval_mode.to_owned(),
+                    result_count: candidate_count as u64,
+                    selected_citation_count: returned as u64,
+                    latency_ms: started.elapsed().as_millis() as u64,
+                    created_at_ms: crate::storage::now_ms(),
+                },
+            ))
+        {
+            self.log_event(
+                "warn",
+                "knowledge_retrieval_event_failed",
+                json!({"error": error.to_string()}),
+            );
+        }
         self.log_event(
             "info",
             "knowledge_search_completed",
             json!({
                 "queryHash": hash_text(query).chars().take(12).collect::<String>(),
                 "retrievalMode": retrieval_mode,
+                "channels": &channels,
+                "rewriteCount": rewrites.len(),
                 "candidates": candidate_count,
                 "returned": returned,
                 "truncated": returned >= limit,
+                "budgetPercent": budget.percent(),
+                "budgetChars": budget.max_chars(),
+                "expandedChars": expanded_chars.iter().sum::<usize>(),
                 "fallbackCode": fallback_code,
                 "durationMs": started.elapsed().as_millis() as u64,
             }),
@@ -2055,8 +2471,165 @@ impl KnowledgeService {
         Ok(KnowledgeSearchResponse {
             success: true,
             results,
-            metadata: json!({"retrievalMode":retrieval_mode,"embeddingModel":EMBEDDING_MODEL,"fallbackCode":fallback_code}),
+            metadata: json!({
+                "retrievalMode": retrieval_mode,
+                "embeddingModel": EMBEDDING_MODEL,
+                "fallbackCode": fallback_code,
+                "channels": &channels,
+                "rewriteCount": rewrites.len(),
+                "budgetPercent": budget.percent(),
+                "budgetChars": budget.max_chars(),
+            }),
         })
+    }
+
+    /// Runs one recall channel query and maps every row into a candidate.
+    fn recall_channel(
+        &self,
+        sql: &str,
+        parameters: &[&dyn rusqlite::ToSql],
+    ) -> Result<Vec<CandidateChunk>, KnowledgeError> {
+        self.db
+            .with_connection(|connection| {
+                let mut statement = connection.prepare(sql)?;
+                statement
+                    .query_map(parameters, map_candidate)?
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .map_err(|error| KnowledgeError::Storage(error.to_string()))
+    }
+
+    /// Re-reads the rows a channel named but did not carry (the semantic channel only knows ids).
+    fn recall_chunks_by_id(
+        &self,
+        chunk_ids: &[String],
+    ) -> Result<Vec<CandidateChunk>, KnowledgeError> {
+        let placeholders = vec!["?"; chunk_ids.len()].join(",");
+        let sql = format!(
+            "SELECT k.id,k.title,k.text,s.relative_path,r.id,k.start_line,k.end_line,k.ordinal,
+               r.created_at_ms,s.id
+             FROM knowledge_chunks k
+             JOIN knowledge_revisions r ON r.id=k.revision_id AND r.active=1
+             JOIN knowledge_sources s ON s.id=r.source_id
+             JOIN knowledge_collections c ON c.id=s.collection_id AND c.enabled=1 AND c.deleted=0
+             WHERE k.id IN ({placeholders})"
+        );
+        let mut parameters: Vec<&dyn rusqlite::ToSql> = Vec::new();
+        for chunk_id in chunk_ids {
+            parameters.push(chunk_id);
+        }
+        self.recall_channel(&sql, &parameters)
+    }
+
+    /// Path recall channel. It only widens the candidate set, so a failure is recorded as a warning
+    /// and reads as "no path recall" instead of closing the search.
+    fn recall_paths(&self, scope_key: &str, query: &str) -> Vec<CandidateChunk> {
+        let terms = path_terms(query);
+        if terms.is_empty() {
+            return Vec::new();
+        }
+        let mut sql = String::from(PATH_RECALL_PREFIX);
+        for index in 0..terms.len() {
+            if index > 0 {
+                sql.push_str(" OR ");
+            }
+            // Wrapped in `%` so a file-name-only hit is recallable: the stored path carries the
+            // extension (`persistence.md`), while the term is the bare stem (`persistence`).
+            sql.push_str(&format!("{NORMALIZED_PATH} LIKE '%'||?{}||'%'", index + 2));
+        }
+        sql.push_str(&format!(
+            ") ORDER BY length(s.relative_path) ASC,k.ordinal ASC LIMIT ?{}",
+            terms.len() + 2
+        ));
+        let limit = retrieval::MAX_CHANNEL_CANDIDATES as i64;
+        let mut parameters: Vec<&dyn rusqlite::ToSql> = vec![&scope_key];
+        for term in &terms {
+            parameters.push(term);
+        }
+        parameters.push(&limit);
+        match self.recall_channel(&sql, &parameters) {
+            Ok(rows) => rows,
+            Err(error) => {
+                self.log_event(
+                    "warn",
+                    "knowledge_recall_channel_failed",
+                    json!({"channel": RecallChannel::Path.label(), "code": error.code()}),
+                );
+                Vec::new()
+            }
+        }
+    }
+
+    /// Records a user rating for a citation this turn already returned.
+    ///
+    /// The rating is bound to the chunk *and* the revision the citation was built from, so the
+    /// ranking signal survives a restart instead of dying with the in-process citation map. Only
+    /// citations the current turn actually returned can be rated.
+    pub fn record_feedback(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        citation_id: &str,
+        feedback_type: &str,
+    ) -> Result<KnowledgeFeedbackRecord, KnowledgeError> {
+        if !FEEDBACK_TYPES.contains(&feedback_type) {
+            return Err(KnowledgeError::coded(
+                "KC_INVALID_ARGUMENT",
+                format!("feedbackType must be one of {}", FEEDBACK_TYPES.join(", ")),
+            ));
+        }
+        let citations = self
+            .citations
+            .lock()
+            .map_err(|_| KnowledgeError::Storage("citation lock poisoned".into()))?;
+        let record = citations.get(citation_id).ok_or_else(|| {
+            KnowledgeError::coded("KC_CITATION_FORBIDDEN", "citation is unknown or expired")
+        })?;
+        if record.thread_id != thread_id || record.turn_id != turn_id {
+            self.log_event(
+                "error",
+                "knowledge_feedback_rejected",
+                json!({ "reason": "turn_mismatch", "threadId": thread_id, "turnId": turn_id }),
+            );
+            return Err(KnowledgeError::coded(
+                "KC_CITATION_FORBIDDEN",
+                "citation is not bound to this turn",
+            ));
+        }
+        let feedback = KnowledgeFeedbackRecord {
+            id: Uuid::new_v4().to_string(),
+            citation_id: citation_id.to_owned(),
+            feedback_type: feedback_type.to_owned(),
+            created_at_ms: crate::storage::now_ms(),
+            chunk_id: Some(record.chunk_id.clone()),
+            source_revision_id: Some(record.citation.revision.clone()),
+        };
+        drop(citations);
+        self.structured
+            .append(KnowledgeEntityEventKind::FeedbackRecorded(feedback.clone()))
+            .map_err(|error| KnowledgeError::Storage(error.to_string()))?;
+        Ok(feedback)
+    }
+
+    /// Retrieval telemetry for one thread, newest first.
+    pub fn list_retrieval_events(
+        &self,
+        thread_id: &str,
+        limit: u32,
+    ) -> Result<Vec<KnowledgeRetrievalEventRecord>, KnowledgeError> {
+        self.structured
+            .list_retrieval_events(thread_id, limit)
+            .map_err(|error| KnowledgeError::Storage(error.to_string()))
+    }
+
+    /// The ratings recorded for one citation, oldest first.
+    pub fn feedback_for_citation(
+        &self,
+        citation_id: &str,
+    ) -> Result<Vec<KnowledgeFeedbackRecord>, KnowledgeError> {
+        self.structured
+            .list_feedback(citation_id)
+            .map_err(|error| KnowledgeError::Storage(error.to_string()))
     }
 
     async fn embed_query(&self, query: &str) -> Result<Vec<f32>, KnowledgeError> {
@@ -2157,8 +2730,10 @@ impl KnowledgeService {
         }
         let chunk_id = record.chunk_id.clone();
         let base = record.citation.clone();
+        let (included_start, included_end) = (record.included_start, record.included_end);
+        let (citation_line_start, citation_line_end) = (record.line_start, record.line_end);
         drop(citations);
-        let (revision_id, ordinal): (String, i64) = self
+        let (revision_id, _ordinal): (String, i64) = self
             .db
             .with_connection(|connection| {
                 connection.query_row(
@@ -2189,51 +2764,168 @@ impl KnowledgeService {
         if before == 0 && after == 0 {
             return Ok(base);
         }
+        // `search` already handed out one neighbour on each side, so `before` / `after` widen the
+        // window *beyond* what the citation carries instead of repeating it.
+        let window_low = included_start.saturating_sub(before as i64);
+        let window_high = included_end.saturating_add(after as i64);
         let context = self
             .db
             .with_connection(|connection| {
                 let mut statement = connection.prepare(
-                    "SELECT text,start_line,end_line FROM knowledge_chunks
+                    "SELECT ordinal,text,start_line,end_line FROM knowledge_chunks
                      WHERE revision_id=?1 AND ordinal BETWEEN ?2 AND ?3 ORDER BY ordinal",
                 )?;
                 statement
-                    .query_map(
-                        params![
-                            revision_id,
-                            ordinal.saturating_sub(before as i64),
-                            ordinal.saturating_add(after as i64)
-                        ],
-                        |row| {
-                            Ok((
-                                row.get::<_, String>(0)?,
-                                row.get::<_, i64>(1)?,
-                                row.get::<_, i64>(2)?,
-                            ))
-                        },
-                    )?
+                    .query_map(params![revision_id, window_low, window_high], |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, i64>(2)?,
+                            row.get::<_, i64>(3)?,
+                        ))
+                    })?
                     .collect::<Result<Vec<_>, _>>()
             })
             .map_err(|error| KnowledgeError::Storage(error.to_string()))?;
-        let mut combined = String::new();
-        let mut start_line = None;
-        let mut end_line = None;
-        for (text, start, end) in context {
-            if combined.len() + text.len() + usize::from(!combined.is_empty()) * 2 > 16 * 1024 {
+        let mut leading = Vec::new();
+        let mut trailing = Vec::new();
+        for (ordinal, text, start, end) in context {
+            if (included_start..=included_end).contains(&ordinal) {
+                continue;
+            }
+            if ordinal < included_start {
+                leading.push((text, start, end));
+            } else {
+                trailing.push((text, start, end));
+            }
+        }
+        if leading.is_empty() && trailing.is_empty() {
+            return Ok(base);
+        }
+        let mut start_line = citation_line_start;
+        let mut end_line = citation_line_end;
+        let mut prefix = String::new();
+        for (text, start, end) in &leading {
+            if prefix.len() + text.len() + usize::from(!prefix.is_empty()) * 2
+                > MAX_CITATION_WINDOW_BYTES
+            {
                 break;
             }
-            if !combined.is_empty() {
-                combined.push_str("\n\n");
+            if !prefix.is_empty() {
+                prefix.push_str("\n\n");
             }
-            combined.push_str(&text);
-            start_line = Some(start_line.map_or(start, |value: i64| value.min(start)));
-            end_line = Some(end_line.map_or(end, |value: i64| value.max(end)));
+            prefix.push_str(text);
+            start_line = start_line.min(*start);
+            end_line = end_line.max(*end);
+        }
+        let mut suffix = String::new();
+        for (text, start, end) in &trailing {
+            if prefix.len() + base.text.len() + suffix.len() + text.len() + 2
+                > MAX_CITATION_WINDOW_BYTES
+            {
+                break;
+            }
+            if !suffix.is_empty() {
+                suffix.push_str("\n\n");
+            }
+            suffix.push_str(text);
+            start_line = start_line.min(*start);
+            end_line = end_line.max(*end);
+        }
+        if prefix.is_empty() && suffix.is_empty() {
+            return Ok(base);
+        }
+        let mut combined = prefix;
+        if !combined.is_empty() {
+            combined.push_str("\n\n");
+        }
+        combined.push_str(&base.text);
+        if !suffix.is_empty() {
+            combined.push_str("\n\n");
+            combined.push_str(&suffix);
         }
         let mut result = base;
-        if !combined.is_empty() {
-            result.text = combined;
-            result.locator = format!("L{}-{}", start_line.unwrap_or(0), end_line.unwrap_or(0));
-        }
+        result.text = combined;
+        result.locator = format!("L{start_line}-{end_line}");
         Ok(result)
+    }
+
+    /// Resolves a citation to the chunk, revision and collection it came from.
+    ///
+    /// This is the provenance door for the structured knowledge layer: it enforces the same turn
+    /// binding as [`KnowledgeService::read_citation`] and re-checks that the revision is still the
+    /// active one of a live, enabled collection, so "no source, no relation" cannot be bypassed by
+    /// passing a citation id the caller was never given, or one whose revision has been replaced.
+    pub fn citation_source(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        citation_id: &str,
+    ) -> Result<CitationSource, KnowledgeError> {
+        let (record_thread, record_turn, chunk_id, revision_id, path, locator) = {
+            let citations = self
+                .citations
+                .lock()
+                .map_err(|_| KnowledgeError::Storage("citation lock poisoned".into()))?;
+            let record = citations.get(citation_id).ok_or_else(|| {
+                KnowledgeError::coded("KC_CITATION_FORBIDDEN", "citation is unknown or expired")
+            })?;
+            (
+                record.thread_id.clone(),
+                record.turn_id.clone(),
+                record.chunk_id.clone(),
+                record.citation.revision.clone(),
+                record.citation.path.clone(),
+                record.citation.locator.clone(),
+            )
+        };
+        if record_thread != thread_id || record_turn != turn_id {
+            self.log_event(
+                "error",
+                "knowledge_citation_rejected",
+                json!({ "reason": "turn_mismatch", "threadId": thread_id, "turnId": turn_id }),
+            );
+            return Err(KnowledgeError::coded(
+                "KC_CITATION_FORBIDDEN",
+                "citation is not bound to this turn",
+            ));
+        }
+        let collection_id: String = self
+            .db
+            .with_connection(|connection| {
+                connection.query_row(
+                    "SELECT s.collection_id FROM knowledge_chunks k
+                     JOIN knowledge_revisions r ON r.id=k.revision_id AND r.active=1
+                     JOIN knowledge_sources s ON s.id=r.source_id AND s.active_revision_id=r.id AND s.state!='deleting'
+                     JOIN knowledge_collections c ON c.id=s.collection_id AND c.enabled=1 AND c.deleted=0
+                     WHERE k.id=?1 AND r.id=?2",
+                    params![chunk_id, revision_id],
+                    |row| row.get(0),
+                )
+            })
+            .map_err(|error| {
+                if matches!(
+                    error,
+                    crate::persistence::ProjectionError::Database(
+                        rusqlite::Error::QueryReturnedNoRows
+                    )
+                ) {
+                    KnowledgeError::coded(
+                        "KC_CITATION_STALE",
+                        "citation source is no longer active",
+                    )
+                } else {
+                    KnowledgeError::Storage(error.to_string())
+                }
+            })?;
+        Ok(CitationSource {
+            citation_id: citation_id.to_owned(),
+            chunk_id,
+            revision_id,
+            collection_id,
+            path,
+            locator,
+        })
     }
 
     async fn index_source_inner(
@@ -2815,7 +3507,7 @@ impl ToolHandler for KnowledgeSearchTool {
 #[async_trait]
 impl ToolHandler for KnowledgeCitationTool {
     fn definition(&self) -> ToolDefinition {
-        ToolDefinition { name: "read_knowledge_citation".into(), description: "Read a citation previously issued by search_knowledge in the current turn. Citation ids cannot be used to read arbitrary files.".into(), input_schema: json!({"type":"object","properties":{"citationId":{"type":"string","minLength":1},"before":{"type":"integer","minimum":0,"maximum":1},"after":{"type":"integer","minimum":0,"maximum":1}},"required":["citationId"],"additionalProperties":false}) }
+        ToolDefinition { name: "read_knowledge_citation".into(), description: "Read a citation previously issued by search_knowledge in the current turn. The citation already covers the matching chunk plus one neighbouring chunk on each side and the heading above it; before/after widen that window by one further chunk. Citation ids cannot be used to read arbitrary files.".into(), input_schema: json!({"type":"object","properties":{"citationId":{"type":"string","minLength":1},"before":{"type":"integer","minimum":0,"maximum":1},"after":{"type":"integer","minimum":0,"maximum":1}},"required":["citationId"],"additionalProperties":false}) }
     }
     async fn execute(
         &self,
@@ -3054,19 +3746,6 @@ fn cosine(left: &[f32], right: &[f32]) -> f64 {
         .sum()
 }
 
-fn rrf_score(lexical_rank: usize, semantic_rank: Option<usize>) -> f64 {
-    const RRF_K: f64 = 60.0;
-    let lexical = if lexical_rank == 0 {
-        0.0
-    } else {
-        1.0 / (RRF_K + lexical_rank as f64)
-    };
-    let semantic = semantic_rank
-        .map(|rank| 1.0 / (RRF_K + rank as f64))
-        .unwrap_or(0.0);
-    lexical + semantic
-}
-
 fn preview(text: &str) -> String {
     text.chars().take(600).collect()
 }
@@ -3078,6 +3757,239 @@ fn hash_text(text: &str) -> String {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
+}
+
+/// One row of a recall channel, carrying everything the fusion step needs about a chunk.
+#[derive(Debug, Clone)]
+struct CandidateChunk {
+    chunk_id: String,
+    title: String,
+    text: String,
+    path: String,
+    revision: String,
+    start_line: i64,
+    end_line: i64,
+    ordinal: i64,
+    /// When the revision this chunk belongs to was written. The freshness signal is a property of
+    /// the revision, not of the individual chunk.
+    revision_created_at_ms: u64,
+    source_id: String,
+}
+
+/// The four recall channels the design names. Each keeps its own rank, so the fixed weights are
+/// applied per channel instead of on one blended list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecallChannel {
+    Lexical,
+    Semantic,
+    Title,
+    Path,
+}
+
+impl RecallChannel {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Lexical => "lexical",
+            Self::Semantic => "semantic",
+            Self::Title => "title",
+            Self::Path => "path",
+        }
+    }
+}
+
+/// A candidate plus its rank in every channel that recalled it.
+#[derive(Debug, Clone)]
+struct ChannelCandidate {
+    chunk: CandidateChunk,
+    lexical_rank: Option<usize>,
+    semantic_rank: Option<usize>,
+    title_rank: Option<usize>,
+    path_rank: Option<usize>,
+}
+
+impl ChannelCandidate {
+    fn rank(&self, channel: RecallChannel) -> Option<usize> {
+        match channel {
+            RecallChannel::Lexical => self.lexical_rank,
+            RecallChannel::Semantic => self.semantic_rank,
+            RecallChannel::Title => self.title_rank,
+            RecallChannel::Path => self.path_rank,
+        }
+    }
+
+    fn set_rank(&mut self, channel: RecallChannel, rank: usize) {
+        match channel {
+            RecallChannel::Lexical => self.lexical_rank = Some(rank),
+            RecallChannel::Semantic => self.semantic_rank = Some(rank),
+            RecallChannel::Title => self.title_rank = Some(rank),
+            RecallChannel::Path => self.path_rank = Some(rank),
+        }
+    }
+}
+
+/// The chunk window one citation covers: the hit, the heading run above it and one neighbour on
+/// each side, always from a single revision.
+#[derive(Debug, Clone)]
+struct CitationWindow {
+    text: String,
+    start_line: i64,
+    end_line: i64,
+    included_start: i64,
+    included_end: i64,
+}
+
+fn map_candidate(row: &rusqlite::Row<'_>) -> Result<CandidateChunk, rusqlite::Error> {
+    Ok(CandidateChunk {
+        chunk_id: row.get(0)?,
+        title: row.get(1)?,
+        text: row.get(2)?,
+        path: row.get(3)?,
+        revision: row.get(4)?,
+        start_line: row.get(5)?,
+        end_line: row.get(6)?,
+        ordinal: row.get(7)?,
+        revision_created_at_ms: row.get::<_, i64>(8)?.max(0) as u64,
+        source_id: row.get(9)?,
+    })
+}
+
+/// Turns a channel's row order into explicit 1-based ranks.
+fn rank_rows(rows: Vec<CandidateChunk>) -> Vec<(usize, CandidateChunk)> {
+    rows.into_iter()
+        .enumerate()
+        .map(|(index, row)| (index + 1, row))
+        .collect()
+}
+
+/// Merges one channel's ranked rows into the candidate map.
+///
+/// A chunk recalled by several rewrites keeps its *best* rank in that channel, so adding rewrites can
+/// only widen the candidate set and never demote a chunk the original query already ranked well.
+fn merge_channel(
+    candidates: &mut HashMap<String, ChannelCandidate>,
+    rows: Vec<(usize, CandidateChunk)>,
+    channel: RecallChannel,
+) {
+    for (rank, chunk) in rows {
+        match candidates.entry(chunk.chunk_id.clone()) {
+            Entry::Occupied(mut entry) => {
+                let existing = entry.get_mut();
+                if existing.rank(channel).is_none_or(|current| rank < current) {
+                    existing.set_rank(channel, rank);
+                }
+            }
+            Entry::Vacant(entry) => {
+                let mut candidate = ChannelCandidate {
+                    chunk,
+                    lexical_rank: None,
+                    semantic_rank: None,
+                    title_rank: None,
+                    path_rank: None,
+                };
+                candidate.set_rank(channel, rank);
+                entry.insert(candidate);
+            }
+        }
+    }
+}
+
+/// FTS5 column filter, which is what turns the shared FTS index into the design's separate
+/// title/symbol recall channel.
+///
+/// Terms are joined with `OR`, not `AND`: the lexical channel already requires *every* term, so the
+/// title channel only earns its place by recalling the chunks whose heading matched part of the
+/// query. Ranking still comes from bm25, and the fusion weight keeps this channel at 0.10.
+fn column_fts_query(column: &str, query: &str) -> String {
+    query
+        .split_whitespace()
+        .filter(|term| !term.is_empty())
+        .map(|term| format!("{{{column}}} : \"{}\"", term.replace('"', "")))
+        .collect::<Vec<_>>()
+        .join(" OR ")
+}
+
+/// Terms the path channel may match on. Path wildcards are stripped instead of escaped: `%` and `_`
+/// are not meaningful in a workspace-relative path, so keeping them would only widen the match.
+fn path_terms(query: &str) -> Vec<String> {
+    let mut terms = Vec::new();
+    for raw in query.split_whitespace() {
+        let term = raw
+            .trim_matches(|ch: char| !ch.is_alphanumeric() && ch != '_' && ch != '-' && ch != '.')
+            .to_lowercase();
+        if term.chars().count() < MIN_PATH_TERM_CHARS || terms.contains(&term) {
+            continue;
+        }
+        terms.push(term);
+        if terms.len() >= MAX_PATH_TERMS {
+            break;
+        }
+    }
+    terms
+}
+
+/// A chunk that is nothing but a markdown heading line.
+///
+/// `chunk_text` splits on blank lines, so a heading followed by a blank line becomes exactly such a
+/// chunk — which is the closest thing this codebase has to a parent title.
+fn is_heading_only(text: &str) -> bool {
+    let mut lines = text.lines().filter(|line| !line.trim().is_empty());
+    let Some(first) = lines.next() else {
+        return false;
+    };
+    lines.next().is_none() && first.trim_start().starts_with('#')
+}
+
+/// Builds the citation window for one hit.
+///
+/// The hit always comes first, then the heading run above it, then one neighbour below, so an
+/// oversized neighbour can never push the hit itself out of the window. `included_start` /
+/// `included_end` describe what actually made it in, which is what keeps the window contiguous and
+/// lets a later `read_knowledge_citation` widen it without repeating a chunk.
+fn citation_window(chunks: &[(i64, String, i64, i64)], ordinal: i64) -> Option<CitationWindow> {
+    let index = chunks.iter().position(|(value, ..)| *value == ordinal)?;
+    let mut low = index.saturating_sub(1);
+    // A nested section path is several heading-only chunks in a row, so walk back over the whole
+    // run rather than only the one immediately above the hit.
+    while low > 0 && is_heading_only(&chunks[low].1) && is_heading_only(&chunks[low - 1].1) {
+        low -= 1;
+    }
+    let high = (index + 1).min(chunks.len() - 1);
+
+    let mut text = chunks[index].1.clone();
+    let mut start_line = chunks[index].2;
+    let mut end_line = chunks[index].3;
+    let mut included_low = index;
+    let mut included_high = index;
+
+    let mut position = index;
+    while position > low {
+        position -= 1;
+        let (_, body, start, end) = &chunks[position];
+        if text.len() + body.len() + 2 > MAX_CITATION_WINDOW_BYTES {
+            break;
+        }
+        text = format!("{body}\n\n{text}");
+        start_line = start_line.min(*start);
+        end_line = end_line.max(*end);
+        included_low = position;
+    }
+    if high > index {
+        let (_, body, start, end) = &chunks[high];
+        if text.len() + body.len() + 2 <= MAX_CITATION_WINDOW_BYTES {
+            text.push_str("\n\n");
+            text.push_str(body);
+            start_line = start_line.min(*start);
+            end_line = end_line.max(*end);
+            included_high = high;
+        }
+    }
+    Some(CitationWindow {
+        text,
+        start_line,
+        end_line,
+        included_start: chunks[included_low].0,
+        included_end: chunks[included_high].0,
+    })
 }
 
 fn query_embedding_cache_key(query: &str) -> String {
@@ -3350,6 +4262,14 @@ fn query_strings(
         .collect::<Result<Vec<_>, _>>()
 }
 
+/// The scope key a workspace resolves to.
+///
+/// Exposed so the structured layer applies the same workspace boundary the recall channels use,
+/// instead of inventing a second notion of "which workspace does this belong to".
+pub fn workspace_scope_key(workspace: &Path) -> Result<String, KnowledgeError> {
+    scope_key(workspace)
+}
+
 pub fn knowledge_tool_risks() -> HashMap<String, ToolRisk> {
     HashMap::from([
         ("search_knowledge".into(), ToolRisk::Read),
@@ -3523,17 +4443,13 @@ mod tests {
     }
 
     #[test]
-    fn normalizes_vectors_and_rrf_keeps_both_rank_signals() {
+    fn normalizes_vectors_before_comparing_them() {
         let mut vector = vec![3.0_f32, 4.0];
         normalize_vector(&mut vector).unwrap();
         assert!((f64::from(vector[0]) - 0.6).abs() < 1e-6);
         assert!((f64::from(vector[1]) - 0.8).abs() < 1e-6);
         assert!((cosine(&vector, &vector) - 1.0).abs() < 1e-6);
         assert!(cosine(&vector, &[1.0]).is_nan());
-        assert!(rrf_score(1, Some(1)) > rrf_score(1, None));
-        assert!(rrf_score(0, Some(1)) > rrf_score(0, None));
-        assert!(rrf_score(1, Some(1)) > rrf_score(1, None));
-        assert_eq!(rrf_score(0, None), 0.0);
     }
 
     #[test]
@@ -4705,5 +5621,615 @@ mod tests {
         assert!(!serialized.contains("secret.md"));
         assert!(!serialized.contains("test-key"));
         server.await.unwrap();
+    }
+
+    /// Indexes every relative path into one collection and waits for each job, so a test only has to
+    /// name the files it cares about.
+    async fn index_workspace_files(
+        service: &KnowledgeService,
+        root: &Path,
+        relative_paths: &[&str],
+    ) -> String {
+        let collection = service
+            .upsert_collection(
+                root,
+                UpsertCollectionRequest {
+                    id: None,
+                    name: "Docs".into(),
+                    scope: None,
+                    enabled: true,
+                },
+            )
+            .unwrap();
+        for relative in relative_paths {
+            let source = service
+                .add_source(
+                    root,
+                    AddSourceRequest {
+                        collection_id: collection.id.clone(),
+                        workspace_relative_path: (*relative).into(),
+                    },
+                )
+                .await
+                .unwrap();
+            wait_for_job(service, source.initial_job_id.as_deref().unwrap()).await;
+        }
+        collection.id
+    }
+
+    /// Design §4.1: "来源 revision 删除后事实转为 `expired`，不直接物理删除".
+    ///
+    /// The purge physically removes revisions, chunks, FTS rows and vectors, so the facts derived
+    /// from them have to be expired in the same breath — otherwise a fact would keep pointing at a
+    /// revision that no longer exists and would still be served as an active relation.
+    #[tokio::test]
+    async fn deleting_a_source_expires_the_facts_derived_from_its_revision() {
+        use crate::storage::knowledge_entity_repository as entities_store;
+        use crate::storage::knowledge_entity_repository::KnowledgeEntityEventKind as EntityEvent;
+
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("guide.md"), "cargo test 完成部署").unwrap();
+        let service = KnowledgeService::new(
+            ProjectionDb::memory().unwrap(),
+            Arc::new(FakeCredentialStore::default()),
+        );
+        service.set_enabled(true).unwrap();
+        let collection_id = index_workspace_files(&service, root.path(), &["guide.md"]).await;
+        let source = service
+            .list_sources(root.path(), &collection_id)
+            .unwrap()
+            .remove(0);
+        let revision_id = source.active_revision_id.clone().unwrap();
+        let chunk_id: String = service
+            .db
+            .with_connection(|connection| {
+                connection.query_row(
+                    "SELECT id FROM knowledge_chunks WHERE revision_id=?1 ORDER BY ordinal LIMIT 1",
+                    [&revision_id],
+                    |row| row.get(0),
+                )
+            })
+            .unwrap();
+
+        let entity_id = Uuid::new_v4().to_string();
+        service
+            .structured
+            .append(EntityEvent::EntityUpserted(
+                entities_store::KnowledgeEntityWrite {
+                    id: entity_id.clone(),
+                    collection_id: collection_id.clone(),
+                    entity_type: "concept".into(),
+                    name: "MemoryService".into(),
+                    normalized_name: "memoryservice".into(),
+                    description: None,
+                    confidence: 0.5,
+                    status: "active".into(),
+                    created_at_ms: 1,
+                },
+            ))
+            .unwrap();
+        let fact_id = Uuid::new_v4().to_string();
+        service
+            .structured
+            .append(EntityEvent::FactRecorded(
+                entities_store::KnowledgeFactWrite {
+                    id: fact_id.clone(),
+                    subject_entity_id: entity_id.clone(),
+                    predicate: "depends_on".into(),
+                    object_entity_id: None,
+                    object_text: Some("store".into()),
+                    source_chunk_id: chunk_id,
+                    source_revision_id: revision_id.clone(),
+                    confidence: 0.5,
+                    valid_from_ms: None,
+                    valid_to_ms: None,
+                    status: "active".into(),
+                    created_at_ms: 1,
+                },
+            ))
+            .unwrap();
+        assert_eq!(
+            service
+                .structured
+                .get_fact(&fact_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            "active"
+        );
+
+        service
+            .delete_source(root.path(), &source.source_id, &source.source_id)
+            .await
+            .unwrap();
+
+        let fact = service.structured.get_fact(&fact_id).unwrap().unwrap();
+        assert_eq!(
+            fact.status, "expired",
+            "a removed revision expires its facts instead of deleting them"
+        );
+        // The provenance survives, which is the whole point of expiring rather than deleting.
+        assert_eq!(fact.source_revision_id, revision_id);
+        // The entity itself is untouched: only the reading lost its source.
+        assert_eq!(
+            service
+                .structured
+                .get_entity(&entity_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            "active"
+        );
+        // Expiring is idempotent, so a second record of the same revision changes nothing.
+        service
+            .structured
+            .append(EntityEvent::FactsExpiredForRevision {
+                source_revision_id: revision_id,
+            })
+            .unwrap();
+        assert_eq!(
+            service
+                .structured
+                .get_fact(&fact_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            "expired"
+        );
+    }
+
+    fn channel_names(response: &KnowledgeSearchResponse) -> Vec<String> {
+        response.metadata["channels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    fn result_for<'a>(
+        response: &'a KnowledgeSearchResponse,
+        path: &str,
+    ) -> Option<&'a KnowledgeSearchResult> {
+        response.results.iter().find(|result| result.path == path)
+    }
+
+    #[tokio::test]
+    async fn extra_recall_channels_are_additive_and_reported() {
+        let root = tempfile::tempdir().unwrap();
+        // `both.md` satisfies the lexical AND; `heading.md` only matches half the query inside its
+        // heading, and `persistence.md` only matches through its path.
+        std::fs::write(root.path().join("both.md"), "cargo test 完成部署").unwrap();
+        std::fs::write(root.path().join("heading.md"), "# cargo 速查\n\n无关内容").unwrap();
+        std::fs::write(root.path().join("persistence.md"), "无关内容").unwrap();
+        let service = KnowledgeService::new(
+            ProjectionDb::memory().unwrap(),
+            Arc::new(FakeCredentialStore::default()),
+        );
+        service.set_enabled(true).unwrap();
+        index_workspace_files(
+            &service,
+            root.path(),
+            &["both.md", "heading.md", "persistence.md"],
+        )
+        .await;
+
+        let response = service
+            .search(root.path(), "thread", "turn", "cargo test", 6)
+            .await
+            .unwrap();
+        let channels = channel_names(&response);
+        assert!(
+            channels.contains(&"lexical".to_owned()),
+            "the lexical channel is the floor: {channels:?}"
+        );
+        assert!(
+            channels.contains(&"title".to_owned()),
+            "a partial heading match must be recalled by the title channel: {channels:?}"
+        );
+        assert!(
+            result_for(&response, "heading.md").is_some(),
+            "the title channel must widen the candidate set"
+        );
+
+        let by_path = service
+            .search(root.path(), "thread", "turn", "persistence", 6)
+            .await
+            .unwrap();
+        let path_channels = channel_names(&by_path);
+        assert!(
+            path_channels.contains(&"path".to_owned()),
+            "a filename-only match must be recalled by the path channel: {path_channels:?}"
+        );
+        assert!(
+            result_for(&by_path, "persistence.md").is_some(),
+            "the path channel must recall a file the content never names"
+        );
+    }
+
+    #[tokio::test]
+    async fn citations_carry_the_heading_and_one_neighbour_from_the_same_revision() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(
+            root.path().join("guide.md"),
+            "# 部署指南\n\n第一步 cargo test\n\n第二步 cargo build\n\n第三步 发布",
+        )
+        .unwrap();
+        let service = KnowledgeService::new(
+            ProjectionDb::memory().unwrap(),
+            Arc::new(FakeCredentialStore::default()),
+        );
+        service.set_enabled(true).unwrap();
+        index_workspace_files(&service, root.path(), &["guide.md"]).await;
+
+        let response = service
+            .search(root.path(), "thread", "turn", "cargo test", 6)
+            .await
+            .unwrap();
+        assert_eq!(response.results.len(), 1);
+        let hit = &response.results[0];
+        let base = service
+            .read_citation("thread", "turn", &hit.citation_id, 0, 0)
+            .unwrap();
+        assert!(
+            base.text.contains("# 部署指南"),
+            "the heading above the hit is part of the window: {}",
+            base.text
+        );
+        assert!(base.text.contains("第一步 cargo test"));
+        assert!(
+            base.text.contains("第二步 cargo build"),
+            "one neighbour below the hit is part of the window: {}",
+            base.text
+        );
+        assert!(
+            !base.text.contains("第三步 发布"),
+            "the window must not run away: {}",
+            base.text
+        );
+
+        let widened = service
+            .read_citation("thread", "turn", &hit.citation_id, 1, 1)
+            .unwrap();
+        assert!(
+            widened.text.contains("第三步 发布"),
+            "before/after widen the window beyond what search already returned: {}",
+            widened.text
+        );
+        assert_eq!(
+            widened.text.matches("第一步 cargo test").count(),
+            1,
+            "widening must not repeat a chunk the citation already carried"
+        );
+        assert_eq!(
+            widened.revision, base.revision,
+            "expansion stays inside the citation's revision"
+        );
+        assert_eq!(widened.path, base.path);
+    }
+
+    #[tokio::test]
+    async fn one_source_never_fills_every_result_slot() {
+        let root = tempfile::tempdir().unwrap();
+        // One file with four separate matching paragraphs, and three one-hit files beside it.
+        std::fs::write(
+            root.path().join("many.md"),
+            "alpha cargo test\n\nbeta cargo test\n\ngamma cargo test\n\ndelta cargo test",
+        )
+        .unwrap();
+        for name in ["a.md", "b.md", "c.md"] {
+            std::fs::write(root.path().join(name), format!("{name} cargo test")).unwrap();
+        }
+        let service = KnowledgeService::new(
+            ProjectionDb::memory().unwrap(),
+            Arc::new(FakeCredentialStore::default()),
+        );
+        service.set_enabled(true).unwrap();
+        index_workspace_files(&service, root.path(), &["many.md", "a.md", "b.md", "c.md"]).await;
+
+        let response = service
+            .search(root.path(), "thread", "turn", "cargo test", 6)
+            .await
+            .unwrap();
+        let paths = response
+            .results
+            .iter()
+            .map(|result| result.path.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            paths.len(),
+            paths.iter().collect::<HashSet<_>>().len(),
+            "one hit per source: {paths:?}"
+        );
+        assert!(
+            response.results.len() <= 6,
+            "the design caps one answer at six chunks"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_knowledge_budget_bounds_how_many_chunks_come_back() {
+        let root = tempfile::tempdir().unwrap();
+        for index in 0..6 {
+            // Long enough that a 1% budget cannot hold six expanded windows.
+            std::fs::write(
+                root.path().join(format!("doc-{index}.md")),
+                format!("cargo test {}", "填充文本 ".repeat(180)),
+            )
+            .unwrap();
+        }
+        let service = KnowledgeService::new(
+            ProjectionDb::memory().unwrap(),
+            Arc::new(FakeCredentialStore::default()),
+        );
+        service.set_enabled(true).unwrap();
+        service
+            .db
+            .set_setting("knowledge.max_chunk_tokens", "256")
+            .unwrap();
+        index_workspace_files(
+            &service,
+            root.path(),
+            &[
+                "doc-0.md", "doc-1.md", "doc-2.md", "doc-3.md", "doc-4.md", "doc-5.md",
+            ],
+        )
+        .await;
+
+        let roomy = service
+            .search(root.path(), "thread", "turn", "cargo test", 6)
+            .await
+            .unwrap();
+        assert_eq!(roomy.results.len(), 6);
+        let default_budget = roomy.metadata["budgetChars"].as_u64().unwrap();
+        assert_eq!(roomy.metadata["budgetPercent"].as_u64().unwrap(), 8);
+
+        service
+            .db
+            .set_setting("knowledge.budget_percent", "1")
+            .unwrap();
+        let squeezed = service
+            .search(root.path(), "thread", "turn", "cargo test", 6)
+            .await
+            .unwrap();
+        assert!(
+            squeezed.metadata["budgetChars"].as_u64().unwrap() < default_budget,
+            "a smaller budget must shrink the allowance"
+        );
+        assert!(
+            squeezed.results.len() < 6,
+            "the budget, not the chunk cap, must be what stops the answer: {} results",
+            squeezed.results.len()
+        );
+        assert!(!squeezed.results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn feedback_is_bound_to_the_chunk_and_revision_it_rated() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("guide.md"), "cargo test 完成部署").unwrap();
+        let service = KnowledgeService::new(
+            ProjectionDb::memory().unwrap(),
+            Arc::new(FakeCredentialStore::default()),
+        );
+        service.set_enabled(true).unwrap();
+        index_workspace_files(&service, root.path(), &["guide.md"]).await;
+
+        let response = service
+            .search(root.path(), "thread", "turn", "cargo test", 6)
+            .await
+            .unwrap();
+        let hit = &response.results[0];
+
+        let recorded = service
+            .record_feedback("thread", "turn", &hit.citation_id, "useful")
+            .unwrap();
+        assert_eq!(recorded.citation_id, hit.citation_id);
+        assert_eq!(recorded.feedback_type, "useful");
+        assert_eq!(
+            recorded.source_revision_id.as_deref(),
+            Some(hit.revision.as_str()),
+            "a rating must name the revision it was measured against"
+        );
+        assert!(
+            recorded.chunk_id.is_some(),
+            "a rating must name the chunk it rated"
+        );
+        assert_eq!(
+            service
+                .feedback_for_citation(&hit.citation_id)
+                .unwrap()
+                .len(),
+            1
+        );
+
+        for feedback_type in ["amazing", ""] {
+            assert!(matches!(
+                service.record_feedback("thread", "turn", &hit.citation_id, feedback_type),
+                Err(KnowledgeError::Coded {
+                    code: "KC_INVALID_ARGUMENT",
+                    ..
+                })
+            ));
+        }
+        assert!(matches!(
+            service.record_feedback("other-thread", "turn", &hit.citation_id, "useful"),
+            Err(KnowledgeError::Coded {
+                code: "KC_CITATION_FORBIDDEN",
+                ..
+            })
+        ));
+        assert!(matches!(
+            service.record_feedback("thread", "turn", "unknown-citation", "useful"),
+            Err(KnowledgeError::Coded {
+                code: "KC_CITATION_FORBIDDEN",
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_negative_rating_demotes_a_chunk_and_a_useful_one_promotes_it() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("a.md"), "cargo test 甲").unwrap();
+        std::fs::write(root.path().join("b.md"), "cargo test 乙").unwrap();
+        let service = KnowledgeService::new(
+            ProjectionDb::memory().unwrap(),
+            Arc::new(FakeCredentialStore::default()),
+        );
+        service.set_enabled(true).unwrap();
+        index_workspace_files(&service, root.path(), &["a.md", "b.md"]).await;
+
+        let before = service
+            .search(root.path(), "thread", "turn", "cargo test", 6)
+            .await
+            .unwrap();
+        let demoted = before.results[0].clone();
+        let promoted = before
+            .results
+            .iter()
+            .find(|result| result.citation_id != demoted.citation_id)
+            .unwrap()
+            .clone();
+
+        service
+            .record_feedback("thread", "turn", &demoted.citation_id, "wrong")
+            .unwrap();
+        service
+            .record_feedback("thread", "turn", &promoted.citation_id, "useful")
+            .unwrap();
+
+        let after = service
+            .search(root.path(), "thread", "turn", "cargo test", 6)
+            .await
+            .unwrap();
+        let demoted_after = after
+            .results
+            .iter()
+            .find(|result| result.path == demoted.path)
+            .unwrap();
+        let promoted_after = after
+            .results
+            .iter()
+            .find(|result| result.path == promoted.path)
+            .unwrap();
+        assert!(
+            demoted_after.score < demoted.score,
+            "a rejected chunk must lose score: {} -> {}",
+            demoted.score,
+            demoted_after.score
+        );
+        assert!(
+            promoted_after.score > promoted.score,
+            "a useful chunk must gain score: {} -> {}",
+            promoted.score,
+            promoted_after.score
+        );
+    }
+
+    #[tokio::test]
+    async fn retrieval_events_record_a_digest_instead_of_the_query() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("guide.md"), "cargo test 完成部署").unwrap();
+        let service = KnowledgeService::new(
+            ProjectionDb::memory().unwrap(),
+            Arc::new(FakeCredentialStore::default()),
+        );
+        service.set_enabled(true).unwrap();
+        index_workspace_files(&service, root.path(), &["guide.md"]).await;
+
+        let response = service
+            .search(root.path(), "thread", "turn", "cargo test", 6)
+            .await
+            .unwrap();
+        let events = service.list_retrieval_events("thread", 10).unwrap();
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(event.turn_id, "turn");
+        assert_eq!(event.retrieval_mode, "lexical_only");
+        assert_eq!(event.query_hash.len(), 16);
+        assert!(
+            event.query_hash.chars().all(|ch| ch.is_ascii_hexdigit()),
+            "the persisted digest must be hex: {}",
+            event.query_hash
+        );
+        assert_eq!(event.result_count, 1);
+        assert_eq!(event.selected_citation_count, response.results.len() as u64);
+        assert!(
+            service
+                .list_retrieval_events("other-thread", 10)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn the_deterministic_rewrite_keeps_the_original_query_first() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("guide.md"), "cargo test 完成部署").unwrap();
+        let service = KnowledgeService::new(
+            ProjectionDb::memory().unwrap(),
+            Arc::new(FakeCredentialStore::default()),
+        );
+        service.set_enabled(true).unwrap();
+        index_workspace_files(&service, root.path(), &["guide.md"]).await;
+
+        let options = retrieval::SearchOptions {
+            hints: retrieval::RewriteHints {
+                project_name: Some("k-coder".into()),
+                current_file: Some("src-tauri/src/knowledge.rs".into()),
+                recent_entities: vec!["retrieval".into()],
+            },
+            ..Default::default()
+        };
+        let response = service
+            .search_with_options(root.path(), "thread", "turn", "cargo test", 6, &options)
+            .await
+            .unwrap();
+        assert_eq!(
+            response.metadata["rewriteCount"].as_u64().unwrap(),
+            (retrieval::MAX_REWRITTEN_QUERIES + 1) as u64
+        );
+        assert_eq!(response.results.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_failing_model_rewrite_falls_back_to_the_deterministic_rewrite() {
+        struct FailingRewriter;
+
+        #[async_trait]
+        impl retrieval::QueryRewriter for FailingRewriter {
+            async fn rewrite(
+                &self,
+                _query: &str,
+                _hints: &retrieval::RewriteHints,
+            ) -> Result<Vec<String>, String> {
+                Err("KC_REWRITE_UNAVAILABLE".into())
+            }
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("guide.md"), "cargo test 完成部署").unwrap();
+        let service = KnowledgeService::new(
+            ProjectionDb::memory().unwrap(),
+            Arc::new(FakeCredentialStore::default()),
+        );
+        service.set_enabled(true).unwrap();
+        index_workspace_files(&service, root.path(), &["guide.md"]).await;
+
+        let options = retrieval::SearchOptions {
+            rewriter: Some(Arc::new(FailingRewriter)),
+            ..Default::default()
+        };
+        let response = service
+            .search_with_options(root.path(), "thread", "turn", "cargo test", 6, &options)
+            .await
+            .unwrap();
+        assert_eq!(
+            response.results.len(),
+            1,
+            "a failed rewrite must not close the search"
+        );
+        assert_eq!(response.metadata["rewriteCount"].as_u64().unwrap(), 1);
     }
 }

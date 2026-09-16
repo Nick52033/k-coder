@@ -26,6 +26,17 @@ export interface KnowledgeIndexMetrics { jobsQueued: number; jobsCompleted: numb
 export interface KnowledgeSearchResult { citationId: string; title: string; path: string; locator: string; preview: string; revision: string; score: number; lexicalRank: number; semanticRank: number | null; }
 export interface KnowledgeSearchResponse { success: boolean; results: KnowledgeSearchResult[]; metadata: Record<string, unknown>; }
 export interface KnowledgeCitation { citationId: string; path: string; locator: string; text: string; revision: string; isCurrentRevision: boolean; }
+export type KnowledgeFeedbackType = "useful" | "irrelevant" | "outdated" | "wrong";
+export interface KnowledgeFeedbackRecord { id: string; citationId: string; feedbackType: string; createdAtMs: number; chunkId: string | null; sourceRevisionId: string | null; }
+export interface KnowledgeRetrievalEventRecord { id: string; threadId: string; turnId: string; queryHash: string; retrievalMode: string; resultCount: number; selectedCitationCount: number; latencyMs: number; createdAtMs: number; }
+export type KnowledgeEntityType = "concept" | "module" | "symbol" | "file" | "api" | "config" | "service" | "technology";
+export type KnowledgeEntityStatus = "candidate" | "active" | "rejected";
+export type KnowledgeFactStatus = "candidate" | "active" | "disputed" | "expired" | "rejected";
+export interface KnowledgeEntityRecord { id: string; collectionId: string; entityType: string; name: string; normalizedName: string; description: string | null; confidence: number; status: string; createdAtMs: number; updatedAtMs: number; }
+export interface KnowledgeFactRecord { id: string; subjectEntityId: string; predicate: string; objectEntityId: string | null; objectText: string | null; sourceChunkId: string; sourceRevisionId: string; confidence: number; validFromMs: number | null; validToMs: number | null; status: string; createdAtMs: number; updatedAtMs: number; }
+export interface KnowledgeFactCandidateRecord { fact: KnowledgeFactRecord; collectionId: string; subjectName: string; objectEntityName: string | null; sourcePath: string | null; locator: string | null; }
+export interface KnowledgeRelationRecord { factId: string; subjectEntityId: string; subjectName: string; predicate: string; objectEntityId: string | null; objectEntityName: string | null; objectText: string | null; confidence: number; sourceChunkId: string; sourceRevisionId: string; sourcePath: string | null; locator: string | null; updatedAtMs: number; }
+export interface KnowledgeRelationQueryResult { subject: KnowledgeEntityRecord | null; relations: KnowledgeRelationRecord[]; }
 export interface SetEmbeddingSettingsRequest { semanticEnabled: boolean; batchSize: number; timeoutMs: number; maxVectorScanChunks: number; }
 export interface FileEntry { name: string; path: string; isDirectory: boolean; size: number | null; modifiedAtMs: number | null; }
 export interface FilePreview { path: string; name: string; language: string; content: string | null; dataUrl: string | null; size: number; truncated: boolean; editable: boolean; contentHash: string | null; }
@@ -726,9 +737,125 @@ export interface WorkflowRunView {
 export interface CancelWorkflowRunRequest { threadId: string; runId: string; }
 
 export interface SearchResult { path: string; line: number; column: number; preview: string; score: number; }
-export interface MemorySettings { enabled: boolean; }
-export interface MemoryView { schemaVersion: number; id: string; content: string; source: string; expiresAtMs: number; createdAtMs: number; updatedAtMs: number; deleted: boolean; revision: number; }
-export interface MemoryUpsertRequest { id?: string; content: string; source: string; retentionDays: number; }
+export type MemoryScopeKind = "user" | "workspace" | "project" | "thread";
+export type MemoryType = "preference" | "fact" | "instruction" | "constraint" | "work_state" | "experience";
+export type MemoryStatus = "active" | "deleted" | "expired" | "archived";
+export type MemorySensitivity = "normal" | "private" | "secret_candidate";
+export type MemorySourceType = "user" | "model" | "tool" | "system";
+export type MemoryOperation = "create" | "update" | "merge" | "delete";
+export type MemoryCandidateStatus = "pending" | "accepted" | "rejected";
+export type MemoryCandidateDecision = "accept" | "reject";
+/** A canonical scope string: `user`, or `<kind>:<id>` for workspace/project/thread. */
+export type MemoryScope = string;
+export interface MemorySettings {
+  schemaVersion: number;
+  enabled: boolean;
+  autoAcceptHighConfidence: boolean;
+  defaultTtlDays: number;
+}
+export interface SetMemorySettingsRequest {
+  enabled: boolean;
+  autoAcceptHighConfidence: boolean;
+  defaultTtlDays: number;
+}
+export interface MemoryRecord {
+  id: string;
+  scopeType: MemoryScopeKind;
+  scopeId: string | null;
+  memoryType: MemoryType;
+  normalizedKey: string;
+  content: string;
+  sourceType: MemorySourceType;
+  sourceRef: string | null;
+  confidence: number;
+  sensitivity: MemorySensitivity;
+  status: MemoryStatus;
+  revision: number;
+  expiresAtMs: number | null;
+  createdAtMs: number;
+  updatedAtMs: number;
+}
+export interface MemoryPage {
+  items: MemoryRecord[];
+  nextCursor: string | null;
+  total: number;
+  scope: MemoryScope;
+  status: MemoryStatus;
+}
+export interface MemoryUpsertRequest {
+  memoryId?: string | null;
+  content: string;
+  memoryType: MemoryType;
+  scope: MemoryScope;
+  expiresAtMs?: number | null;
+}
+export interface MemoryUpsertOutcome { memory: MemoryRecord; deduplicated: boolean; }
+export interface MemoryCandidate {
+  id: string;
+  operation: MemoryOperation;
+  targetMemoryId: string | null;
+  scopeType: MemoryScopeKind;
+  scopeId: string | null;
+  memoryType: MemoryType;
+  content: string;
+  normalizedKey: string;
+  reason: string;
+  confidence: number;
+  requiresReview: boolean;
+  status: MemoryCandidateStatus;
+  sourceTurnId: string | null;
+  createdAtMs: number;
+  reviewedAtMs: number | null;
+}
+export interface MemoryClearOutcome { scope: MemoryScope; clearedCount: number; }
+export type MaintenanceOutcome = "never" | "completed" | "failed" | "cancelled" | "interrupted";
+export type MaintenanceTrigger = "manual" | "scheduled";
+export type DreamStatus = "skipped" | "completed" | "failed" | "cancelled";
+export interface MaintenanceSettings {
+  schemaVersion: number;
+  enabled: boolean;
+  dreamEnabled: boolean;
+  remoteDisclosureAccepted: boolean;
+  tokenBudget: number;
+  intervalMs: number;
+  idleAfterMs: number;
+  lastRunAtMs: number | null;
+  lastOutcome: MaintenanceOutcome;
+  runningSinceMs: number | null;
+  threadId: string | null;
+}
+export interface SetMemoryMaintenanceSettingsRequest {
+  enabled: boolean;
+  dreamEnabled: boolean;
+  remoteDisclosureAccepted: boolean;
+  tokenBudget: number;
+  idleAfterMs: number;
+}
+export interface OfflineMaintenanceReport {
+  expiredIds: string[];
+  mergedGroups: MergedKeyGroup[];
+}
+export interface MergedKeyGroup {
+  scope: string;
+  normalizedKey: string;
+  keptId: string;
+  archivedIds: string[];
+}
+export interface DreamReport {
+  status: DreamStatus;
+  proposals: number;
+  accepted: number;
+  pending: number;
+  error: string | null;
+}
+export interface MaintenanceReport {
+  trigger: MaintenanceTrigger;
+  outcome: MaintenanceOutcome;
+  offline: OfflineMaintenanceReport;
+  dream: DreamReport;
+  startedAtMs: number;
+  completedAtMs: number;
+}
 export interface BrowserSettings { enabled: boolean; allowLocalhost: boolean; }
 export interface BrowserAuditEvent { timestampMs: number; action: string; target: string; success: boolean; detail: string; }
 export interface BrowserArtifact { id: string; name: string; mediaType: string; sizeBytes: number; createdAtMs: number; }
@@ -982,4 +1109,57 @@ export interface LogQuery {
   level?: LogLevel;
   event?: string;
   afterTimestampMs?: number;
+}
+
+export type MobileCapability =
+  | "chat"
+  | "approval"
+  | "interrupt"
+  | "fileRead"
+  | "shell"
+  | "settings"
+  | "plugins"
+  | "secrets";
+
+export interface MobileDeviceView {
+  id: string;
+  name: string;
+  platform: string | null;
+  createdAtMs: number;
+  lastSeenAtMs: number;
+  revoked: boolean;
+}
+
+export interface MobilePendingPairingView {
+  id: string;
+  deviceName: string;
+  platform: string | null;
+  createdAtMs: number;
+  expiresAtMs: number;
+}
+
+export interface MobilePairingView {
+  challengeId: string;
+  code: string;
+  uri: string;
+  expiresAtMs: number;
+  tls: boolean;
+  fingerprint: string | null;
+}
+
+export interface MobileStatus {
+  running: boolean;
+  host: string | null;
+  port: number | null;
+  scheme: string | null;
+  fingerprint: string | null;
+  lanAddresses: string[];
+  preferredBindAddress: string | null;
+  preferredPort: number;
+  connections: number;
+  capabilities: MobileCapability[];
+  pairing: MobilePairingView | null;
+  /** 已提交、等待桌面端确认的配对请求；与 `pairing` 的生命周期无关。 */
+  pendingPairings: MobilePendingPairingView[];
+  devices: MobileDeviceView[];
 }

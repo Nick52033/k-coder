@@ -13,6 +13,7 @@ use crate::advanced::{
 };
 use crate::agent::mailbox::{MailboxTurn, QueuedTurnSteerError, ThreadMailbox, TurnControl};
 use crate::agent::thread_operation::{ThreadOperationGate, ThreadOperationGuard};
+use crate::entities::EntityService;
 use crate::execution::{BundledTools, CommandRuntime, ExecutionError, NativePtyRuntime};
 use crate::extensions::mcp::OsMcpSecretStore;
 use crate::extensions::{
@@ -21,6 +22,7 @@ use crate::extensions::{
 };
 use crate::knowledge::KnowledgeService;
 use crate::logging::StructuredLogger;
+use crate::memory::{MemoryMaintenanceService, MemoryService};
 use crate::multi_agent::MultiAgentCoordinator;
 use crate::patch::{PatchError, PatchService};
 use crate::persistence::ProjectionDb;
@@ -38,11 +40,40 @@ use crate::providers::{
     SaveProviderConfigRequest,
 };
 use crate::scheduled_tasks::ScheduledTaskStore;
+use crate::storage::knowledge_entity_repository::KnowledgeEntityRepository;
 use crate::storage::{
     JsonlThreadRepository, StorageError, StoredEvent, StoredEventKind, ThreadRepository,
     ThreadSummary,
 };
 use crate::tools::ToolRegistry;
+
+/// The knowledge and structured-fact tool surface, together with its risk map.
+///
+/// Handlers and risks are built in one place so a tool can never be registered without a risk:
+/// `ToolRegistry::authorization` falls back to the workspace policy when a name is missing from the
+/// map, and that policy classifies an unknown tool as `External` — which would silently turn the
+/// read-only relation query into an approval-gated tool.
+fn structured_knowledge_tools(
+    knowledge: KnowledgeService,
+    entities: EntityService,
+) -> (
+    Vec<Arc<dyn crate::tools::ToolHandler>>,
+    HashMap<String, crate::protocol::ToolRisk>,
+) {
+    let handlers: Vec<Arc<dyn crate::tools::ToolHandler>> = vec![
+        Arc::new(crate::knowledge::KnowledgeSearchTool::new(
+            knowledge.clone(),
+        )),
+        Arc::new(crate::knowledge::KnowledgeCitationTool::new(knowledge)),
+        Arc::new(crate::entities::ProposeKnowledgeFactTool::new(
+            entities.clone(),
+        )),
+        Arc::new(crate::entities::KnowledgeRelationsTool::new(entities)),
+    ];
+    let mut risks = crate::knowledge::knowledge_tool_risks();
+    risks.extend(crate::entities::entity_tool_risks());
+    (handlers, risks)
+}
 
 pub struct AppState {
     started_at: Instant,
@@ -72,6 +103,15 @@ pub struct AppState {
     subagents: MultiAgentCoordinator,
     advanced: AdvancedServices,
     knowledge: KnowledgeService,
+    entities: EntityService,
+    memory: MemoryService,
+    memory_maintenance: MemoryMaintenanceService,
+    /// Wall-clock instant the app last became fully idle, or `None` while a Turn or subagent runs.
+    ///
+    /// Maintenance scheduling reads this through `memory_maintenance_idle_since_ms`; keeping it in
+    /// `AppState` rather than in the maintenance service means the scheduler cannot disagree with the
+    /// runtime about whether the app is busy.
+    maintenance_idle_since_ms: Mutex<Option<u64>>,
     scheduled_tasks: ScheduledTaskStore,
 }
 
@@ -187,6 +227,13 @@ impl AppState {
             NativePtyRuntime::new_with_bundled_tools(&workspace_root, bundled_tools.clone())?;
         let repository = Arc::new(JsonlThreadRepository::new(&data_root)?);
         let knowledge = KnowledgeService::new(repository.projection(), credentials.clone());
+        // The structured fact layer writes to the same projection database and borrows the citation
+        // table, which is what makes "no source, no relation" structural: a proposal can only be
+        // attributed to a citation this turn was actually given.
+        let entities = EntityService::new(
+            KnowledgeEntityRepository::new(repository.projection()),
+            knowledge.clone(),
+        );
         let scheduled_tasks = ScheduledTaskStore::new(&data_root)
             .map_err(|error| AppStateError::Workspace(error.to_string()))?;
         let approval_mode = repository
@@ -213,22 +260,25 @@ impl AppState {
         let subagents = MultiAgentCoordinator::new(&data_root)
             .map_err(|error| AppStateError::MultiAgent(error.to_string()))?;
         let advanced = AdvancedServices::new(&data_root).map_err(AppStateError::Advanced)?;
+        // The Phase 9 memory store owns the `enabled` flag the `recall_memory` tool reads. Seed the
+        // new settings row from it once so upgrading does not silently disable memory.
+        let legacy_memory_enabled = advanced
+            .memory
+            .settings()
+            .map(|settings| settings.enabled)
+            .unwrap_or(false);
+        let memory = MemoryService::new(repository.projection(), legacy_memory_enabled);
+        // Constructing the maintenance service also recovers a run that was in flight when the
+        // process stopped, so a crash mid-Dream cannot leave the projection believing a run is live.
+        let memory_maintenance = MemoryMaintenanceService::new(repository.projection());
         let (advanced_handlers, advanced_risks) = advanced.tool_handlers(&workspace_root);
+        let (structured_handlers, structured_risks) =
+            structured_knowledge_tools(knowledge.clone(), entities.clone());
         let tool_registry = ToolRegistry::workspace_tools_with_execution(
             patch_service.clone(),
             command_runtime.clone(),
         )
-        .with_additional_handlers(
-            vec![
-                Arc::new(crate::knowledge::KnowledgeSearchTool::new(
-                    knowledge.clone(),
-                )),
-                Arc::new(crate::knowledge::KnowledgeCitationTool::new(
-                    knowledge.clone(),
-                )),
-            ],
-            crate::knowledge::knowledge_tool_risks(),
-        )?
+        .with_additional_handlers(structured_handlers, structured_risks)?
         .with_additional_handlers(advanced_handlers, advanced_risks)?;
         Ok(Self {
             started_at: Instant::now(),
@@ -258,6 +308,12 @@ impl AppState {
             subagents,
             advanced,
             knowledge,
+            entities,
+            memory,
+            memory_maintenance,
+            // A freshly started app has no Turn in flight, so it counts as idle from boot. Combined
+            // with `idle_after_ms` this still gives the user a quiet window before the first run.
+            maintenance_idle_since_ms: Mutex::new(Some(crate::storage::now_ms())),
             scheduled_tasks,
         })
     }
@@ -368,6 +424,11 @@ impl AppState {
             .clone()
     }
 
+    /// 应用数据根目录。移动网关用它存放设备登记表和本机证书。
+    pub fn data_root(&self) -> PathBuf {
+        self.data_root.clone()
+    }
+
     pub fn tool_registry(&self) -> ToolRegistry {
         self.tool_registry
             .read()
@@ -381,6 +442,43 @@ impl AppState {
 
     pub fn knowledge(&self) -> KnowledgeService {
         self.knowledge.clone()
+    }
+
+    pub fn entities(&self) -> EntityService {
+        self.entities.clone()
+    }
+
+    pub fn memory(&self) -> MemoryService {
+        self.memory.clone()
+    }
+
+    pub fn memory_maintenance(&self) -> MemoryMaintenanceService {
+        self.memory_maintenance.clone()
+    }
+
+    /// When the app last became idle, or `None` while any Turn or subagent is running.
+    ///
+    /// The scheduler needs a single source of truth for "is the user busy"; this reads the same
+    /// `active_turns` map and subagent registry that turn admission uses, so maintenance can never
+    /// start underneath an in-flight Turn.
+    pub async fn memory_maintenance_idle_since_ms(&self) -> Option<u64> {
+        if !self.active_turns.lock().await.is_empty() || self.subagents.has_active() {
+            return None;
+        }
+        *self.maintenance_idle_since_ms.lock().await
+    }
+
+    /// Records that a Turn just became active, so the idle clock restarts.
+    async fn mark_maintenance_busy(&self) {
+        *self.maintenance_idle_since_ms.lock().await = None;
+    }
+
+    /// Records that the app may be idle again, starting the idle clock when nothing else is running.
+    async fn refresh_maintenance_idle(&self, active_turns: &HashMap<String, ActiveTurn>) {
+        if !active_turns.is_empty() || self.subagents.has_active() {
+            return;
+        }
+        *self.maintenance_idle_since_ms.lock().await = Some(crate::storage::now_ms());
     }
 
     pub fn scheduled_tasks(&self) -> ScheduledTaskStore {
@@ -492,19 +590,13 @@ impl AppState {
         )?;
         let pty = NativePtyRuntime::new_with_bundled_tools(&path, self.bundled_tools.clone())?;
         let (advanced_handlers, advanced_risks) = self.advanced.tool_handlers(&path);
+        let (structured_handlers, structured_risks) =
+            structured_knowledge_tools(self.knowledge(), self.entities());
         let tool_registry = ToolRegistry::workspace_tools_with_execution(
             self.patch_service.clone(),
             command.clone(),
         )
-        .with_additional_handlers(
-            vec![
-                Arc::new(crate::knowledge::KnowledgeSearchTool::new(self.knowledge())),
-                Arc::new(crate::knowledge::KnowledgeCitationTool::new(
-                    self.knowledge(),
-                )),
-            ],
-            crate::knowledge::knowledge_tool_risks(),
-        )?
+        .with_additional_handlers(structured_handlers, structured_risks)?
         .with_additional_handlers(advanced_handlers, advanced_risks)?;
         self.repository
             .projection()
@@ -585,19 +677,13 @@ impl AppState {
 
     fn base_tool_registry(&self, workspace: &Path) -> Result<ToolRegistry, AppStateError> {
         let (advanced_handlers, advanced_risks) = self.advanced.tool_handlers(workspace);
+        let (structured_handlers, structured_risks) =
+            structured_knowledge_tools(self.knowledge(), self.entities());
         Ok(ToolRegistry::workspace_tools_with_execution(
             self.patch_service.clone(),
             self.command_runtime(),
         )
-        .with_additional_handlers(
-            vec![
-                Arc::new(crate::knowledge::KnowledgeSearchTool::new(self.knowledge())),
-                Arc::new(crate::knowledge::KnowledgeCitationTool::new(
-                    self.knowledge(),
-                )),
-            ],
-            crate::knowledge::knowledge_tool_risks(),
-        )?
+        .with_additional_handlers(structured_handlers, structured_risks)?
         .with_additional_handlers(advanced_handlers, advanced_risks)?)
     }
 
@@ -1092,6 +1178,9 @@ impl AppState {
                 control: control.clone(),
             },
         );
+        drop(active_turns);
+        // Start the idle clock over: a Turn is now in flight, so maintenance must not be scheduled.
+        self.mark_maintenance_busy().await;
         Ok((cancellation, control))
     }
 
@@ -1190,6 +1279,8 @@ impl AppState {
             active.control.close();
             self.turn_state_changed.notify_waiters();
         }
+        let active_turns = self.active_turns.lock().await;
+        self.refresh_maintenance_idle(&active_turns).await;
     }
 
     pub async fn cancel_turn(&self, thread_id: &str) -> bool {
@@ -1770,6 +1861,176 @@ mod tests {
                 child_id
             );
         }
+    }
+
+    #[test]
+    fn the_memory_service_is_wired_and_requires_host_issued_confirmation_tokens() {
+        let data = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let state = AppState::with_workspace_and_credentials(
+            data.path(),
+            workspace.path(),
+            Arc::new(FakeCredentials::default()),
+        )
+        .unwrap();
+
+        let settings = state.memory().settings().unwrap();
+        assert!(!settings.enabled);
+        assert!(!settings.auto_accept_high_confidence);
+        assert_eq!(settings.default_ttl_days, 0);
+
+        let memory = state
+            .memory()
+            .upsert(crate::memory::UpsertMemoryCommand {
+                memory_id: None,
+                content: "Use pnpm for scripts".into(),
+                memory_type: crate::memory::MemoryType::Preference,
+                scope: crate::memory::MemoryScope::user(),
+                expires_at_ms: None,
+            })
+            .unwrap()
+            .memory;
+        assert_eq!(memory.scope_type, "user");
+
+        // A guessed token — including a plausible one derived from the scope or another id — must not
+        // delete or clear anything. Only the host-issued value is accepted.
+        for token in ["user", "delete-all", "confirm", &format!("{}x", memory.id)] {
+            assert_eq!(
+                state.memory().delete(&memory.id, token).unwrap_err().code(),
+                "MEM_CONFIRMATION_REQUIRED",
+                "token: {token}"
+            );
+        }
+        assert_eq!(
+            state
+                .memory()
+                .clear(&crate::memory::MemoryScope::user(), "user-scope")
+                .unwrap_err()
+                .code(),
+            "MEM_CONFIRMATION_REQUIRED"
+        );
+        assert_eq!(
+            state
+                .memory()
+                .list(
+                    &crate::memory::MemoryScope::user(),
+                    crate::memory::MemoryStatus::Active,
+                    None,
+                    None,
+                )
+                .unwrap()
+                .total,
+            1
+        );
+
+        let cleared = state
+            .memory()
+            .clear(&crate::memory::MemoryScope::user(), "user")
+            .unwrap();
+        assert_eq!(cleared.cleared_count, 1);
+        assert_eq!(cleared.scope, "user");
+    }
+
+    #[test]
+    fn a_legacy_memory_enabled_flag_seeds_the_new_settings_row_on_upgrade() {
+        let data = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let credentials = Arc::new(FakeCredentials::default());
+        // Simulates an installation that enabled memory before the extension existed.
+        let legacy_dir = data.path().join("advanced");
+        std::fs::create_dir_all(&legacy_dir).unwrap();
+        std::fs::write(
+            legacy_dir.join("memory-settings.json"),
+            br#"{"enabled":true}"#,
+        )
+        .unwrap();
+
+        let state = AppState::with_workspace_and_credentials(
+            data.path(),
+            workspace.path(),
+            credentials.clone(),
+        )
+        .unwrap();
+        assert!(
+            state.memory().settings().unwrap().enabled,
+            "the upgrade must not silently disable memory"
+        );
+
+        // An explicit user choice wins over the legacy flag on the next launch.
+        state.memory().set_settings(false, false, 0).unwrap();
+        drop(state);
+        let reopened =
+            AppState::with_workspace_and_credentials(data.path(), workspace.path(), credentials)
+                .unwrap();
+        assert!(!reopened.memory().settings().unwrap().enabled);
+    }
+
+    #[tokio::test]
+    async fn the_maintenance_idle_clock_follows_turn_admission() {
+        let data = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let state = AppState::with_workspace_and_credentials(
+            data.path(),
+            workspace.path(),
+            Arc::new(FakeCredentials::default()),
+        )
+        .unwrap();
+
+        // A freshly started app is idle from boot, which is what lets a long-running installation
+        // catch up on maintenance without waiting for the user to type something first.
+        let boot_idle = state
+            .memory_maintenance_idle_since_ms()
+            .await
+            .expect("a fresh state is idle");
+        assert!(boot_idle > 0);
+
+        let workspace_root = state.workspace_root();
+        let (_, _control) = state
+            .begin_turn_with_id_in_workspace("thread-1", "turn-1", &workspace_root)
+            .await
+            .unwrap();
+        assert!(
+            state.memory_maintenance_idle_since_ms().await.is_none(),
+            "an in-flight Turn must keep maintenance from being scheduled"
+        );
+
+        state.finish_turn("thread-1").await;
+        let idle_again = state
+            .memory_maintenance_idle_since_ms()
+            .await
+            .expect("finishing the last Turn restarts the idle clock");
+        assert!(idle_again >= boot_idle);
+    }
+
+    #[test]
+    fn a_maintenance_run_interrupted_by_a_crash_is_recovered_as_interrupted() {
+        let data = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let credentials = Arc::new(FakeCredentials::default());
+        let state = AppState::with_workspace_and_credentials(
+            data.path(),
+            workspace.path(),
+            credentials.clone(),
+        )
+        .unwrap();
+        // Simulates a process that died mid-run: the settings row still claims a run is live.
+        state
+            .memory_maintenance()
+            .record_run_started(crate::storage::now_ms())
+            .unwrap();
+        drop(state);
+
+        let reopened =
+            AppState::with_workspace_and_credentials(data.path(), workspace.path(), credentials)
+                .unwrap();
+        let settings = reopened.memory_maintenance().settings().unwrap();
+        assert_eq!(
+            settings.last_outcome,
+            crate::memory::MaintenanceOutcome::Interrupted,
+            "a crashed run must never be reported as a success"
+        );
+        assert_eq!(settings.running_since_ms, None);
+        assert!(!reopened.memory_maintenance().is_running());
     }
 
     #[test]

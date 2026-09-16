@@ -1,0 +1,1117 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<meta name="color-scheme" content="light dark" />
+<title>k-Coder 手机控制</title>
+<style>
+  :root {
+    --bg: #f6f7f9;
+    --surface: #ffffff;
+    --surface-alt: #eef0f4;
+    --border: #d8dbe2;
+    --text: #14161a;
+    --muted: #5b6270;
+    --accent: #185fa5;
+    --accent-soft: #e6f1fb;
+    --danger: #a32d2d;
+    --danger-soft: #fcebeb;
+    --warning: #854f0b;
+    --warning-soft: #faeeda;
+    --success: #0f6e56;
+    --success-soft: #e1f5ee;
+    --radius: 12px;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #14151b;
+      --surface: #1e1f27;
+      --surface-alt: #262832;
+      --border: #343743;
+      --text: #e8eaf2;
+      --muted: #9ba2b4;
+      --accent: #85b7eb;
+      --accent-soft: #1c2a3c;
+      --danger: #f09595;
+      --danger-soft: #3a2020;
+      --warning: #f0c070;
+      --warning-soft: #3a2f16;
+      --success: #7fd3b4;
+      --success-soft: #16302a;
+    }
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { margin: 0; padding: 0; background: var(--bg); color: var(--text);
+    font: 15px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; }
+  body { min-height: 100vh; display: flex; flex-direction: column; }
+  header {
+    position: sticky; top: 0; z-index: 5; background: var(--surface);
+    border-bottom: 1px solid var(--border); padding: 10px 14px;
+    padding-top: calc(10px + env(safe-area-inset-top));
+    display: flex; align-items: center; gap: 10px;
+  }
+  header h1 { font-size: 16px; font-weight: 600; margin: 0; flex: 1; }
+  .status-dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); flex: none; }
+  .status-dot.online { background: var(--success); }
+  .status-dot.connecting { background: var(--warning); }
+  .status-dot.offline { background: var(--danger); }
+  .status-text { font-size: 12px; color: var(--muted); }
+  main { flex: 1; padding: 12px 14px 96px; max-width: 720px; width: 100%; margin: 0 auto; }
+  .card { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius);
+    padding: 12px; margin-bottom: 10px; }
+  .card h2 { font-size: 15px; margin: 0 0 6px; font-weight: 600; }
+  .muted { color: var(--muted); font-size: 13px; }
+  .row { display: flex; align-items: center; gap: 8px; }
+  .spread { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+  button { font: inherit; border-radius: 10px; border: 1px solid var(--border); background: var(--surface-alt);
+    color: var(--text); padding: 9px 14px; min-height: 40px; cursor: pointer; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.danger { background: var(--danger-soft); border-color: var(--danger); color: var(--danger); }
+  button.success { background: var(--success-soft); border-color: var(--success); color: var(--success); }
+  button:disabled { opacity: 0.45; cursor: not-allowed; }
+  textarea { width: 100%; min-height: 76px; resize: vertical; font: inherit; color: var(--text);
+    background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 10px; }
+  .composer { position: fixed; left: 0; right: 0; bottom: 0; background: var(--surface);
+    border-top: 1px solid var(--border); padding: 10px 14px calc(10px + env(safe-area-inset-bottom)); }
+  .composer-inner { max-width: 720px; margin: 0 auto; display: flex; flex-direction: column; gap: 8px; }
+  .composer-actions { display: flex; gap: 8px; justify-content: flex-end; }
+  .pill { font-size: 12px; padding: 2px 8px; border-radius: 999px; background: var(--surface-alt);
+    color: var(--muted); border: 1px solid var(--border); }
+  .pill.running { background: var(--accent-soft); color: var(--accent); border-color: var(--accent); }
+  .pill.approval { background: var(--warning-soft); color: var(--warning); border-color: var(--warning); }
+  .bubble { border-radius: 12px; padding: 10px 12px; margin-bottom: 8px; white-space: pre-wrap; word-break: break-word; }
+  .bubble.user { background: var(--accent-soft); }
+  .bubble.agent { background: var(--surface-alt); }
+  .bubble.tool { background: transparent; border: 1px dashed var(--border); font-size: 13px; color: var(--muted); }
+  .bubble.error { background: var(--danger-soft); color: var(--danger); }
+  .bubble pre { margin: 6px 0 0; white-space: pre-wrap; word-break: break-word; font-size: 12px; }
+  details summary { cursor: pointer; color: var(--muted); font-size: 13px; }
+  .banner { border-radius: var(--radius); padding: 10px 12px; margin-bottom: 10px; font-size: 14px; }
+  .banner.error { background: var(--danger-soft); color: var(--danger); border: 1px solid var(--danger); }
+  .banner.info { background: var(--accent-soft); color: var(--accent); border: 1px solid var(--accent); }
+  .banner.warning { background: var(--warning-soft); color: var(--warning); border: 1px solid var(--warning); }
+  .hidden { display: none !important; }
+  .field { display: flex; flex-direction: column; gap: 6px; margin-bottom: 10px; }
+  .field label { font-size: 13px; color: var(--muted); }
+  input[type=text], input[type=number] { font: inherit; color: var(--text); background: var(--surface);
+    border: 1px solid var(--border); border-radius: 10px; padding: 10px; min-height: 40px; }
+  .choice { display: flex; flex-direction: column; gap: 6px; }
+  .choice button { text-align: left; }
+  footer { font-size: 12px; color: var(--muted); text-align: center; padding: 4px 0 12px; }
+</style>
+</head>
+<body>
+<header>
+  <span class="status-dot" id="dot"></span>
+  <h1 id="title">k-Coder</h1>
+  <span class="status-text" id="statusText">连接中…</span>
+</header>
+
+<main>
+  <div id="banner" class="banner hidden"></div>
+
+  <section id="pairSection" class="hidden">
+    <div class="card">
+      <h2>设备配对</h2>
+      <p class="muted" id="pairHint">正在读取配对信息…</p>
+      <div class="field">
+        <label for="deviceName">设备名称</label>
+        <input type="text" id="deviceName" placeholder="例如：我的手机" autocomplete="off" />
+      </div>
+      <div class="field">
+        <label for="pairCode">电脑屏幕上显示的 6 位校验码</label>
+        <input type="text" id="pairCode" inputmode="numeric" maxlength="6" placeholder="000000" autocomplete="off" />
+      </div>
+      <button class="primary" id="pairButton">提交配对请求</button>
+      <p class="muted" id="pairProgress" style="margin-top:10px"></p>
+    </div>
+  </section>
+
+  <section id="threadsSection" class="hidden">
+    <div class="row spread" style="margin-bottom:8px">
+      <strong>会话</strong>
+      <button id="refreshThreads">刷新</button>
+    </div>
+    <div id="threadList"></div>
+  </section>
+
+  <section id="chatSection" class="hidden">
+    <div class="card">
+      <div class="row spread">
+        <button id="backToThreads">← 返回</button>
+        <span class="pill" id="turnState">空闲</span>
+      </div>
+      <h2 id="chatTitle" style="margin-top:8px">会话</h2>
+      <div class="muted" id="chatMeta"></div>
+    </div>
+    <div id="timeline"></div>
+  </section>
+</main>
+
+<section id="composer" class="composer hidden">
+  <div class="composer-inner">
+    <textarea id="input" placeholder="给 k-Coder 发消息…" rows="2"></textarea>
+    <div class="composer-actions">
+      <button id="interruptButton" class="danger">停止</button>
+      <button id="sendButton" class="primary">发送</button>
+    </div>
+  </div>
+</section>
+
+<script>
+"use strict";
+(function () {
+  const PROTOCOL_VERSION = 1;
+  const STORAGE_KEY = "k-coder-mobile-credentials";
+  const MAX_BACKOFF_MS = 15000;
+  const MAX_REPLAY_LINES = 4000;
+
+  const state = {
+    credentials: null,
+    socket: null,
+    ready: false,
+    initialized: false,
+    accessToken: null,
+    tokenExpiresAt: 0,
+    backoff: 1000,
+    requestSeq: 0,
+    pending: new Map(),
+    view: "threads",
+    threads: [],
+    activeThreadId: null,
+    activeTurnId: null,
+    subscribed: new Map(),
+    thread: null,
+    deltas: new Map(),
+    pairing: null,
+    pairingTimer: null,
+    offlineDraft: "",
+  };
+
+  const el = (id) => document.getElementById(id);
+  const dot = el("dot");
+  const statusText = el("statusText");
+  const banner = el("banner");
+
+  function showBanner(kind, text) {
+    banner.className = "banner " + kind;
+    banner.textContent = text;
+  }
+  function hideBanner() {
+    banner.className = "banner hidden";
+  }
+
+  function loadCredentials() {
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      if (!raw) return null;
+      const parsed = JSON.parse(raw);
+      if (!parsed || !parsed.deviceId || !parsed.deviceSecret) return null;
+      return parsed;
+    } catch (error) {
+      return null;
+    }
+  }
+  function saveCredentials(credentials) {
+    state.credentials = credentials;
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(credentials));
+  }
+
+  function setConnection(kind, text) {
+    dot.className = "status-dot " + kind;
+    statusText.textContent = text;
+  }
+
+  function wsUrl() {
+    const scheme = location.protocol === "https:" ? "wss:" : "ws:";
+    return scheme + "//" + location.host + "/ws";
+  }
+
+  function nextRequestId() {
+    state.requestSeq += 1;
+    return "m" + Date.now().toString(36) + "-" + state.requestSeq;
+  }
+
+  function call(method, params, options) {
+    const opts = options || {};
+    return new Promise((resolve, reject) => {
+      const socket = state.socket;
+      if (!socket || socket.readyState !== WebSocket.OPEN) {
+        reject(new Error("尚未连接到电脑"));
+        return;
+      }
+      if (!state.ready && method !== "initialize" && method !== "initialized" && method !== "auth/refresh") {
+        reject(new Error("连接尚未就绪"));
+        return;
+      }
+      const id = nextRequestId();
+      const timeout = setTimeout(() => {
+        state.pending.delete(id);
+        reject(new Error("请求超时"));
+      }, opts.timeoutMs || 20000);
+      state.pending.set(id, {
+        resolve: (value) => { clearTimeout(timeout); resolve(value); },
+        reject: (error) => { clearTimeout(timeout); reject(error); },
+      });
+      socket.send(JSON.stringify({ jsonrpc: "2.0", id: id, method: method, params: params || {} }));
+    });
+  }
+
+  function send(method, params) {
+    if (!state.socket || state.socket.readyState !== WebSocket.OPEN) return;
+    state.socket.send(JSON.stringify({ jsonrpc: "2.0", method: method, params: params || {} }));
+  }
+
+  function notify(message) {
+    showBanner("error", message);
+    setTimeout(hideBanner, 6000);
+  }
+
+  function describeError(error) {
+    const data = (error && error.data) || {};
+    const kind = data.kind || "error";
+    const messages = {
+      unauthorized: "认证失败，需要重新配对",
+      forbidden: "当前设备没有这个权限",
+      not_found: "目标已不存在",
+      stale_request: "这个请求已经过期，请刷新后重试",
+      rate_limited: "操作太频繁，请稍后再试",
+      server_overloaded: "电脑端正忙，请稍后再试",
+      resume_required: "事件游标已过期，已重新读取会话",
+      unsupported_capability: "这个能力尚未对手机开放",
+      internal_error: "电脑端处理失败",
+    };
+    if (kind === "unauthorized" && state.credentials) {
+      clearCredentials();
+    }
+    return messages[kind] || (error && error.message) || "未知错误";
+  }
+
+  function clearCredentials() {
+    localStorage.removeItem(STORAGE_KEY);
+    state.credentials = null;
+  }
+
+  // ---- 连接与协议 ----
+
+  function connect() {
+    if (state.socket && (state.socket.readyState === WebSocket.OPEN || state.socket.readyState === WebSocket.CONNECTING)) {
+      return;
+    }
+    setConnection("connecting", "连接中…");
+    let socket;
+    try {
+      socket = new WebSocket(wsUrl());
+    } catch (error) {
+      setConnection("offline", "无法连接");
+      scheduleReconnect();
+      return;
+    }
+    state.socket = socket;
+
+    socket.onopen = () => {
+      state.backoff = 1000;
+      handshake();
+    };
+    socket.onmessage = (event) => handleMessage(event.data);
+    socket.onclose = () => {
+      state.ready = false;
+      state.initialized = false;
+      setConnection("offline", "已断开");
+      updateComposerState();
+      scheduleReconnect();
+    };
+    socket.onerror = () => {
+      setConnection("offline", "连接错误");
+    };
+  }
+
+  function scheduleReconnect() {
+    const delay = state.backoff;
+    state.backoff = Math.min(state.backoff * 2, MAX_BACKOFF_MS);
+    setTimeout(() => {
+      if (!state.socket || state.socket.readyState === WebSocket.CLOSED) connect();
+    }, delay);
+  }
+
+  async function handshake() {
+    const credentials = state.credentials;
+    if (!credentials) {
+      setConnection("connecting", "等待配对");
+      showPairing();
+      return;
+    }
+    try {
+      const params = { protocolVersion: PROTOCOL_VERSION, client: { name: "k-coder-mobile", version: "0.1" } };
+      if (state.accessToken && Date.now() < state.tokenExpiresAt - 30000) {
+        params.accessToken = state.accessToken;
+      } else {
+        params.deviceId = credentials.deviceId;
+        params.deviceSecret = credentials.deviceSecret;
+      }
+      const result = await call("initialize", params, { timeoutMs: 15000 });
+      state.initialized = true;
+      state.accessToken = result.accessToken || null;
+      state.tokenExpiresAt = result.accessTokenExpiresAtMs || 0;
+      send("initialized", {});
+      state.ready = true;
+      setConnection("online", "已连接");
+      hideBanner();
+      el("pairSection").classList.add("hidden");
+      await resumeSubscriptions();
+      showThreads();
+      await refreshThreads();
+      if (state.activeThreadId) {
+        await openThread(state.activeThreadId, true);
+      }
+    } catch (error) {
+      const data = (error && error.data) || {};
+      if (data.kind === "unauthorized") {
+        clearCredentials();
+        showPairing();
+        showBanner("warning", "设备凭据已失效，请重新配对。");
+        return;
+      }
+      setConnection("offline", "握手失败");
+      notify(describeError(error));
+    }
+  }
+
+  async function resumeSubscriptions() {
+    for (const threadId of state.subscribed.keys()) {
+      const cursor = state.subscribed.get(threadId) || 0;
+      try {
+        await call("events/resume", { threadId: threadId, afterDeliverySeq: cursor });
+      } catch (error) {
+        const data = (error && error.data) || {};
+        if (data.kind === "resume_required") {
+          await openThread(threadId, true);
+        }
+      }
+    }
+  }
+
+  function handleMessage(raw) {
+    let message;
+    try {
+      message = JSON.parse(raw);
+    } catch (error) {
+      return;
+    }
+    if (message.id !== undefined && message.id !== null && state.pending.has(message.id)) {
+      const pending = state.pending.get(message.id);
+      state.pending.delete(message.id);
+      if (message.error) pending.reject(message.error);
+      else pending.resolve(message.result);
+      return;
+    }
+    if (message.method === "event") {
+      handleEvent(message.params);
+      return;
+    }
+    if (message.method === "resync_required") {
+      showBanner("warning", "连接积压过多，正在重新同步…");
+      const threadId = state.activeThreadId;
+      if (threadId) openThread(threadId, true);
+      return;
+    }
+  }
+
+  // ---- 事件投影 ----
+
+  function handleEvent(params) {
+    if (!params) return;
+    const threadId = params.threadId;
+    if (!threadId) return;
+    const deliverySeq = params.deliverySeq || 0;
+    if (state.subscribed.has(threadId)) {
+      state.subscribed.set(threadId, Math.max(state.subscribed.get(threadId) || 0, deliverySeq));
+    }
+    if (threadId !== state.activeThreadId) {
+      const summary = state.threads.find((thread) => thread.id === threadId);
+      if (summary) {
+        if (params.type === "turn_started") summary.running = true;
+        if (["turn_completed", "turn_failed", "turn_cancelled"].indexOf(params.type) >= 0) {
+          summary.running = false;
+        }
+        if (params.type === "approval_requested") summary.pendingApprovals += 1;
+        if (params.type === "approval_resolved") summary.pendingApprovals = Math.max(0, summary.pendingApprovals - 1);
+        renderThreads();
+      }
+      return;
+    }
+
+    switch (params.type) {
+      case "turn_started":
+        state.activeTurnId = params.turnId;
+        if (state.thread) {
+          state.thread.running = true;
+          state.thread.activeTurnId = params.turnId;
+          state.thread.turns.push({
+            id: params.turnId,
+            state: "streaming",
+            items: [],
+            startedAtMs: Date.now(),
+          });
+        }
+        renderChat();
+        break;
+      case "text_delta":
+        appendDelta(params.itemId, params.delta);
+        break;
+      case "item_started":
+        if (params.itemType === "tool") {
+          if (state.thread) {
+            state.thread.turns.push({ id: params.itemId, state: "running", items: [] });
+          }
+        }
+        break;
+      case "tool_started":
+      case "tool_queued":
+        upsertTool(params.call ? params.call.id : params.itemId, params.call ? params.call.name : "工具", "running");
+        break;
+      case "tool_completed":
+        upsertTool(params.callId, params.name, params.result && params.result.success ? "completed" : "failed",
+          params.result ? params.result.output : null);
+        break;
+      case "approval_requested":
+        if (state.thread) {
+          state.thread.pendingApprovals.push({
+            requestId: params.request.id,
+            toolCallId: params.request.toolCallId,
+            toolName: params.request.toolName,
+            reason: params.request.reason,
+            risk: params.request.risk,
+            createdAtMs: params.request.createdAtMs,
+            paths: (params.request.preview && params.request.preview.files
+              ? params.request.preview.files.map((file) => file.path) : []),
+          });
+        }
+        renderChat();
+        break;
+      case "approval_resolved":
+        if (state.thread) {
+          state.thread.pendingApprovals = state.thread.pendingApprovals.filter(
+            (approval) => approval.requestId !== params.requestId);
+        }
+        renderChat();
+        break;
+      case "user_input_requested":
+        if (state.thread) {
+          state.thread.pendingUserInputs.push({
+            requestId: params.request.id,
+            questions: params.request.questions || [],
+            createdAtMs: params.request.createdAtMs,
+          });
+        }
+        renderChat();
+        break;
+      case "user_input_resolved":
+        if (state.thread) {
+          state.thread.pendingUserInputs = state.thread.pendingUserInputs.filter(
+            (input) => input.requestId !== params.requestId);
+        }
+        renderChat();
+        break;
+      case "turn_completed":
+        if (params.message) {
+          appendDelta(params.turnId + "-final", messageText(params.message));
+        }
+        finishTurn("completed");
+        break;
+      case "turn_failed":
+        if (state.thread) {
+          state.thread.turns.push({
+            id: "error-" + Date.now(),
+            state: "failed",
+            error: params.message,
+            items: [],
+          });
+        }
+        finishTurn("failed");
+        break;
+      case "turn_cancelled":
+        finishTurn("cancelled");
+        break;
+      case "todo_updated":
+        if (state.thread) {
+          state.thread.todos = params.todos || [];
+          renderChat();
+        }
+        break;
+      case "change_applied":
+        if (state.thread && params.changeSet) {
+          state.thread.changes = state.thread.changes || [];
+          state.thread.changes.push({
+            fileCount: (params.changeSet.files || []).length,
+            files: (params.changeSet.files || []).map((file) => file.path),
+          });
+          renderChat();
+        }
+        break;
+      default:
+        break;
+    }
+  }
+
+  function messageText(message) {
+    if (!message || !Array.isArray(message.content)) return "";
+    return message.content.filter((block) => block.type === "text").map((block) => block.text).join("");
+  }
+
+  function finishTurn(kind) {
+    if (state.thread) {
+      state.thread.running = false;
+      state.thread.activeTurnId = null;
+      const last = state.thread.turns[state.thread.turns.length - 1];
+      if (last) last.state = kind;
+    }
+    state.activeTurnId = null;
+    state.deltas.clear();
+    renderChat();
+    updateComposerState();
+  }
+
+  function appendDelta(itemId, delta) {
+    if (!itemId || !delta) return;
+    const current = state.deltas.get(itemId) || "";
+    state.deltas.set(itemId, (current + delta).slice(-MAX_REPLAY_LINES));
+    renderChat();
+  }
+
+  function upsertTool(callId, name, status, excerpt) {
+    if (!callId) return;
+    if (!state.thread) return;
+    state.thread.toolCalls = state.thread.toolCalls || [];
+    const existing = state.thread.toolCalls.find((tool) => tool.callId === callId);
+    if (existing) {
+      existing.status = status;
+      if (excerpt) existing.excerpt = excerpt;
+    } else {
+      state.thread.toolCalls.push({ callId: callId, name: name, status: status, excerpt: excerpt || null });
+    }
+    renderChat();
+  }
+
+  // ---- 渲染 ----
+
+  function renderThreads() {
+    const list = el("threadList");
+    list.textContent = "";
+    if (!state.threads.length) {
+      const empty = document.createElement("div");
+      empty.className = "card muted";
+      empty.textContent = "还没有会话。请先在电脑端创建会话。";
+      list.appendChild(empty);
+      return;
+    }
+    state.threads.forEach((thread) => {
+      const card = document.createElement("div");
+      card.className = "card";
+      const spread = document.createElement("div");
+      spread.className = "spread";
+      const title = document.createElement("h2");
+      title.textContent = thread.title || "(无标题)";
+      spread.appendChild(title);
+      const pills = document.createElement("div");
+      pills.className = "row";
+      if (thread.running) {
+        const pill = document.createElement("span");
+        pill.className = "pill running";
+        pill.textContent = "运行中";
+        pills.appendChild(pill);
+      }
+      if (thread.pendingApprovals > 0) {
+        const pill = document.createElement("span");
+        pill.className = "pill approval";
+        pill.textContent = "待审批 " + thread.pendingApprovals;
+        pills.appendChild(pill);
+      }
+      spread.appendChild(pills);
+      card.appendChild(spread);
+      const meta = document.createElement("div");
+      meta.className = "muted";
+      meta.textContent = new Date(thread.updatedAtMs).toLocaleString();
+      card.appendChild(meta);
+      card.addEventListener("click", () => openThread(thread.id, false));
+      list.appendChild(card);
+    });
+  }
+
+  function renderChat() {
+    const timeline = el("timeline");
+    timeline.textContent = "";
+    const thread = state.thread;
+    if (!thread) return;
+
+    (thread.pendingApprovals || []).forEach((approval) => {
+      timeline.appendChild(renderApproval(approval));
+    });
+    (thread.pendingUserInputs || []).forEach((input) => {
+      timeline.appendChild(renderUserInput(input));
+    });
+
+    (thread.turns || []).forEach((turn) => {
+      if (turn.error) {
+        const bubble = document.createElement("div");
+        bubble.className = "bubble error";
+        bubble.textContent = turn.error;
+        timeline.appendChild(bubble);
+      }
+      (turn.items || []).forEach((item) => timeline.appendChild(renderItem(item)));
+    });
+
+    state.deltas.forEach((text, itemId) => {
+      const bubble = document.createElement("div");
+      bubble.className = "bubble agent";
+      bubble.textContent = text;
+      timeline.appendChild(bubble);
+    });
+
+    if (thread.toolCalls && thread.toolCalls.length) {
+      const details = document.createElement("details");
+      details.className = "card";
+      const summary = document.createElement("summary");
+      summary.textContent = "工具活动（" + thread.toolCalls.length + "）";
+      details.appendChild(summary);
+      thread.toolCalls.forEach((tool) => {
+        const line = document.createElement("div");
+        line.className = "muted";
+        line.textContent = tool.name + " · " + tool.status;
+        details.appendChild(line);
+        if (tool.excerpt) {
+          const pre = document.createElement("pre");
+          pre.textContent = tool.excerpt;
+          details.appendChild(pre);
+        }
+      });
+      timeline.appendChild(details);
+    }
+
+    if (thread.changes && thread.changes.length) {
+      const card = document.createElement("div");
+      card.className = "card";
+      const heading = document.createElement("h2");
+      heading.textContent = "文件变更";
+      card.appendChild(heading);
+      thread.changes.forEach((change) => {
+        const line = document.createElement("div");
+        line.className = "muted";
+        line.textContent = change.fileCount + " 个文件：" + change.files.join("、");
+        card.appendChild(line);
+      });
+      timeline.appendChild(card);
+    }
+
+    if (thread.todos && thread.todos.length) {
+      const card = document.createElement("div");
+      card.className = "card";
+      const heading = document.createElement("h2");
+      heading.textContent = "任务清单";
+      card.appendChild(heading);
+      thread.todos.forEach((todo) => {
+        const line = document.createElement("div");
+        line.className = "muted";
+        line.textContent = "[" + todo.status + "] " + todo.content;
+        card.appendChild(line);
+      });
+      timeline.appendChild(card);
+    }
+
+    const turnState = el("turnState");
+    turnState.textContent = thread.running ? "运行中" : "空闲";
+    turnState.className = "pill" + (thread.running ? " running" : "");
+    el("chatMeta").textContent = thread.running ? "Turn " + (thread.activeTurnId || "") : "空闲";
+    updateComposerState();
+  }
+
+  function renderItem(item) {
+    const bubble = document.createElement("div");
+    if (item.kind === "user_message") {
+      bubble.className = "bubble user";
+      bubble.textContent = item.text || "";
+    } else if (item.kind === "agent_message") {
+      bubble.className = "bubble agent";
+      bubble.textContent = item.text || "";
+    } else if (item.kind === "tool") {
+      bubble.className = "bubble tool";
+      const tool = item.tool || {};
+      bubble.textContent = "工具 " + (tool.name || "") + " · " + (tool.state || "");
+      if (tool.excerpt) {
+        const pre = document.createElement("pre");
+        pre.textContent = tool.excerpt;
+        bubble.appendChild(pre);
+      }
+    } else if (item.kind === "change") {
+      bubble.className = "bubble tool";
+      const change = item.change || {};
+      bubble.textContent = "已修改 " + (change.fileCount || 0) + " 个文件（+" + (change.insertions || 0) + " / -" + (change.deletions || 0) + "）";
+    } else if (item.kind === "context_compaction") {
+      bubble.className = "bubble tool";
+      bubble.textContent = "上下文已压缩";
+    } else {
+      bubble.className = "bubble tool";
+      bubble.textContent = item.text || "";
+    }
+    return bubble;
+  }
+
+  function renderApproval(approval) {
+    const card = document.createElement("div");
+    card.className = "card";
+    const heading = document.createElement("h2");
+    heading.textContent = "需要审批：" + (approval.toolName || "");
+    card.appendChild(heading);
+    const reason = document.createElement("div");
+    reason.className = "muted";
+    reason.textContent = (approval.risk || "") + " · " + (approval.reason || "");
+    card.appendChild(reason);
+    if (approval.paths && approval.paths.length) {
+      const paths = document.createElement("div");
+      paths.className = "muted";
+      paths.textContent = "涉及：" + approval.paths.join("、");
+      card.appendChild(paths);
+    }
+    const actions = document.createElement("div");
+    actions.className = "row";
+    actions.style.marginTop = "8px";
+    const approve = document.createElement("button");
+    approve.className = "success";
+    approve.textContent = "批准";
+    approve.addEventListener("click", () => respondApproval(approval, "approved", approve));
+    const reject = document.createElement("button");
+    reject.className = "danger";
+    reject.textContent = "拒绝";
+    reject.addEventListener("click", () => respondApproval(approval, "rejected", reject));
+    actions.appendChild(approve);
+    actions.appendChild(reject);
+    card.appendChild(actions);
+    return card;
+  }
+
+  async function respondApproval(approval, action, button) {
+    button.disabled = true;
+    try {
+      await call("approval/respond", {
+        requestId: approval.requestId,
+        action: action,
+        toolCallId: approval.toolCallId,
+        expectedCreatedAtMs: approval.createdAtMs,
+      });
+    } catch (error) {
+      notify(describeError(error));
+    } finally {
+      button.disabled = false;
+    }
+  }
+
+  function renderUserInput(input) {
+    const card = document.createElement("div");
+    card.className = "card";
+    const heading = document.createElement("h2");
+    heading.textContent = "需要你的回答";
+    card.appendChild(heading);
+    const answers = [];
+    (input.questions || []).forEach((question) => {
+      const field = document.createElement("div");
+      field.className = "field";
+      const label = document.createElement("label");
+      label.textContent = question.question;
+      field.appendChild(label);
+      if (question.options && question.options.length) {
+        const choice = document.createElement("div");
+        choice.className = "choice";
+        question.options.forEach((option) => {
+          const button = document.createElement("button");
+          button.textContent = option;
+          button.addEventListener("click", () => {
+            answers.push({ question: question.question, answer: option });
+            button.className = "primary";
+            submitUserInput(input, answers, button);
+          });
+          choice.appendChild(button);
+        });
+        field.appendChild(choice);
+      } else {
+        const textarea = document.createElement("textarea");
+        textarea.rows = 2;
+        field.appendChild(textarea);
+        const confirm = document.createElement("button");
+        confirm.textContent = "提交";
+        confirm.addEventListener("click", () => {
+          answers.push({ question: question.question, answer: textarea.value });
+          submitUserInput(input, answers, confirm);
+        });
+        field.appendChild(confirm);
+      }
+      card.appendChild(field);
+    });
+    return card;
+  }
+
+  async function submitUserInput(input, answers, button) {
+    button.disabled = true;
+    try {
+      await call("tool/requestUserInput/respond", {
+        requestId: input.requestId,
+        action: "answered",
+        answers: answers,
+        expectedCreatedAtMs: input.createdAtMs,
+      });
+    } catch (error) {
+      notify(describeError(error));
+    } finally {
+      button.disabled = false;
+    }
+  }
+
+  function updateComposerState() {
+    const send = el("sendButton");
+    const interrupt = el("interruptButton");
+    const input = el("input");
+    const connected = state.ready && state.socket && state.socket.readyState === WebSocket.OPEN;
+    send.disabled = !connected || !state.activeThreadId;
+    interrupt.disabled = !connected || !state.activeThreadId || !state.activeTurnId;
+    input.disabled = !connected || !state.activeThreadId;
+    if (!connected) input.placeholder = "离线：草稿会保留，连接恢复后才能发送";
+    else input.placeholder = "给 k-Coder 发消息…";
+  }
+
+  // ---- 视图切换 ----
+
+  function showPairing() {
+    el("pairSection").classList.remove("hidden");
+    el("threadsSection").classList.add("hidden");
+    el("chatSection").classList.add("hidden");
+    el("composer").classList.add("hidden");
+    readPairingFragment();
+  }
+
+  function showThreads() {
+    el("pairSection").classList.add("hidden");
+    el("threadsSection").classList.remove("hidden");
+    el("chatSection").classList.add("hidden");
+    el("composer").classList.add("hidden");
+    el("title").textContent = "k-Coder";
+  }
+
+  async function showChat() {
+    el("pairSection").classList.add("hidden");
+    el("threadsSection").classList.add("hidden");
+    el("chatSection").classList.remove("hidden");
+    el("composer").classList.remove("hidden");
+    updateComposerState();
+  }
+
+  async function refreshThreads() {
+    if (!state.ready) return;
+    try {
+      const result = await call("thread/list", {});
+      state.threads = result.threads || [];
+      renderThreads();
+    } catch (error) {
+      notify(describeError(error));
+    }
+  }
+
+  async function openThread(threadId, forceReload) {
+    state.activeThreadId = threadId;
+    state.deltas.clear();
+    try {
+      if (!state.subscribed.has(threadId) || forceReload) {
+        const subscribed = await call("thread/subscribe", { threadId: threadId });
+        state.subscribed.set(threadId, subscribed.deliverySeq || 0);
+      }
+      const result = await call("thread/read", { threadId: threadId });
+      state.thread = Object.assign({ toolCalls: [], changes: [], pendingApprovals: [], pendingUserInputs: [], todos: [] }, result.thread);
+      state.activeTurnId = state.thread.activeTurnId || null;
+      el("title").textContent = state.thread.title || "会话";
+      el("chatTitle").textContent = state.thread.title || "会话";
+      showChat();
+      renderChat();
+    } catch (error) {
+      notify(describeError(error));
+    }
+  }
+
+  async function sendMessage() {
+    const input = el("input");
+    const value = input.value.trim();
+    if (!value || !state.activeThreadId) return;
+    if (!state.ready) {
+      notify("尚未连接到电脑，草稿已保留");
+      return;
+    }
+    el("sendButton").disabled = true;
+    try {
+      const result = await call("turn/start", {
+        threadId: state.activeThreadId,
+        input: value,
+        requestId: nextRequestId(),
+      });
+      state.activeTurnId = result.turnId;
+      if (state.thread) {
+        state.thread.running = true;
+        state.thread.activeTurnId = result.turnId;
+      }
+      input.value = "";
+      state.offlineDraft = "";
+      renderChat();
+    } catch (error) {
+      notify(describeError(error));
+    } finally {
+      updateComposerState();
+    }
+  }
+
+  async function interruptTurn() {
+    if (!state.activeThreadId || !state.activeTurnId) return;
+    try {
+      await call("turn/interrupt", {
+        threadId: state.activeThreadId,
+        turnId: state.activeTurnId,
+        requestId: nextRequestId(),
+      });
+    } catch (error) {
+      notify(describeError(error));
+    }
+  }
+
+  // ---- 配对 ----
+
+  function readPairingFragment() {
+    const fragment = location.hash.replace(/^#/, "");
+    if (!fragment) {
+      el("pairHint").textContent = "没有检测到配对链接。请在电脑端重新生成二维码后扫描。";
+      el("pairButton").disabled = true;
+      return;
+    }
+    const params = new URLSearchParams(fragment);
+    const challenge = params.get("c") || "";
+    const parts = challenge.split(".");
+    if (parts.length !== 2) {
+      el("pairHint").textContent = "配对链接无效，请在电脑端重新生成。";
+      el("pairButton").disabled = true;
+      return;
+    }
+    state.pairing = { challengeId: parts[0], challengeSecret: parts[1] };
+    el("pairHint").textContent = "输入电脑屏幕上显示的 6 位校验码后提交，等待电脑确认。";
+    el("pairButton").disabled = false;
+  }
+
+  async function submitPairing() {
+    if (!state.pairing) return;
+    const deviceName = el("deviceName").value.trim() || "手机";
+    const code = el("pairCode").value.trim();
+    if (code.length !== 6) {
+      showBanner("warning", "请输入 6 位校验码。");
+      return;
+    }
+    el("pairButton").disabled = true;
+    try {
+      const response = await fetch("/pair", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          challengeId: state.pairing.challengeId,
+          challengeSecret: state.pairing.challengeSecret,
+          code: code,
+          deviceName: deviceName,
+          platform: navigator.userAgent,
+        }),
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok) {
+        showBanner("error", payload.message || "配对失败");
+        el("pairButton").disabled = false;
+        return;
+      }
+      el("pairProgress").textContent = "已提交，等待电脑端确认…";
+      pollPairing(payload.pendingId);
+    } catch (error) {
+      showBanner("error", "无法连接电脑：" + error.message);
+      el("pairButton").disabled = false;
+    }
+  }
+
+  function pollPairing(pendingId) {
+    if (state.pairingTimer) clearInterval(state.pairingTimer);
+    state.pairingTimer = setInterval(async () => {
+      try {
+        const response = await fetch("/pair/status", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            pendingId: pendingId,
+            challengeSecret: state.pairing.challengeSecret,
+          }),
+        });
+        const payload = await response.json().catch(() => ({}));
+        if (!response.ok) {
+          clearInterval(state.pairingTimer);
+          showBanner("error", payload.message || "配对状态查询失败");
+          el("pairButton").disabled = false;
+          return;
+        }
+        if (payload.status === "approved") {
+          clearInterval(state.pairingTimer);
+          saveCredentials({
+            deviceId: payload.deviceId,
+            deviceSecret: payload.deviceSecret,
+            refreshToken: payload.refreshToken,
+          });
+          el("pairProgress").textContent = "配对成功，正在连接…";
+          history.replaceState(null, "", location.pathname);
+          connect();
+        } else if (payload.status === "denied") {
+          clearInterval(state.pairingTimer);
+          showBanner("warning", "电脑端拒绝了这次配对。");
+          el("pairButton").disabled = false;
+        }
+      } catch (error) {
+        // 网络抖动：继续轮询。
+      }
+    }, 1500);
+  }
+
+  // ---- 启动 ----
+
+  el("pairButton").addEventListener("click", submitPairing);
+  el("refreshThreads").addEventListener("click", refreshThreads);
+  el("sendButton").addEventListener("click", sendMessage);
+  el("interruptButton").addEventListener("click", interruptTurn);
+  el("backToThreads").addEventListener("click", () => {
+    state.activeThreadId = null;
+    showThreads();
+    refreshThreads();
+  });
+  el("input").addEventListener("input", (event) => {
+    state.offlineDraft = event.target.value;
+  });
+  window.addEventListener("online", () => connect());
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible" && (!state.socket || state.socket.readyState !== WebSocket.OPEN)) {
+      connect();
+    }
+  });
+
+  // 手机浏览器在同一文档内只改 hash 时不会重新加载页面。如果用户在已打开
+  // /m/ 的标签页里点开配对链接，启动时的片段解析不会再跑一次，页面会停在
+  // 「没有检测到配对链接」。这里补一次解析，未配对时才接管界面。
+  window.addEventListener("hashchange", () => {
+    if (state.credentials) return;
+    readPairingFragment();
+  });
+
+  state.credentials = loadCredentials();
+  if (state.credentials) {
+    connect();
+  } else {
+    showPairing();
+    setConnection("offline", "未配对");
+  }
+})();
+</script>
+</body>
+</html>

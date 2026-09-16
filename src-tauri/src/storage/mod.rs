@@ -29,7 +29,10 @@ use crate::protocol::{
     UserInputAction, UserInputRequest, UserInputResolution,
 };
 
+mod event_validation;
 mod history_pagination;
+pub mod knowledge_entity_repository;
+pub mod memory_repository;
 mod writer;
 
 use writer::ThreadWriters;

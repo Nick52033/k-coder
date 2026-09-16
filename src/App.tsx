@@ -4,6 +4,7 @@ import { PanelResizeHandle } from "./components/PanelResizeHandle";
 import { usePanelWidths } from "./hooks/usePanelWidths";
 import {
   Activity,
+  ArrowDown,
   ArrowUp,
   AtSign,
   BookOpen,
@@ -389,7 +390,7 @@ function App() {
   );
   const [backgroundEnabled, setBackgroundEnabled] = useState(() => localStorage.getItem("kcoder_background_enabled") !== "false");
   const [backgroundImage, setBackgroundImage] = useState(() => localStorage.getItem("kcoder_background_image") || "/chat-background.png");
-  const [backgroundOpacity, setBackgroundOpacity] = useState(() => Number(localStorage.getItem("kcoder_background_opacity") ?? "0.58"));
+  const [backgroundOpacity, setBackgroundOpacity] = useState(() => Number(localStorage.getItem("kcoder_background_opacity") ?? "0.32"));
   const [systemPrefersDark, setSystemPrefersDark] = useState(() =>
     typeof window !== "undefined" && window.matchMedia?.("(prefers-color-scheme: dark)").matches === true,
   );
@@ -441,6 +442,8 @@ function App() {
   );
   const followLatestRef = useRef(true);
   const scrollFrameRef = useRef<number | null>(null);
+  // 会话区「回到底部」悬浮按钮：只在用户主动离开最新内容时出现。
+  const [scrollToBottomVisible, setScrollToBottomVisible] = useState(false);
   const workspaceOperationCountRef = useRef(0);
   const {
     threads,
@@ -643,13 +646,18 @@ function App() {
         scrollFrameRef.current = null;
       });
     };
-    const updateFollowState = () => {
-      const distanceFromLatest = area.scrollHeight - area.clientHeight - area.scrollTop;
-      followLatestRef.current = distanceFromLatest <= 48;
-    };
+    // 单一事实来源：距底距离同时决定「是否继续跟随最新内容」与「是否显示回到底部按钮」，
+    // 避免两者分叉（例如内容变长但用户已经滚开时）。
+    const atLatestContent = () => area.scrollHeight - area.clientHeight - area.scrollTop <= 48;
     const handleScroll = () => {
-      const distanceFromLatest = area.scrollHeight - area.clientHeight - area.scrollTop;
-      if (distanceFromLatest <= 48) followLatestRef.current = true;
+      const atLatest = atLatestContent();
+      if (atLatest) followLatestRef.current = true;
+      setScrollToBottomVisible(!atLatest);
+    };
+    const updateFollowState = () => {
+      const atLatest = atLatestContent();
+      followLatestRef.current = atLatest;
+      setScrollToBottomVisible(!atLatest);
     };
     const handleWheel = (event: WheelEvent) => {
       if (event.deltaY < 0) followLatestRef.current = false;
@@ -686,9 +694,18 @@ function App() {
 
   useEffect(() => {
     followLatestRef.current = true;
+    setScrollToBottomVisible(false);
     const area = messageAreaRef.current;
     if (area) area.scrollTop = area.scrollHeight;
   }, [activeThreadId]);
+
+  // 「回到底部」：恢复跟随并立即回到最新内容，按钮随滚动状态自动隐藏。
+  function scrollConversationToBottom() {
+    followLatestRef.current = true;
+    setScrollToBottomVisible(false);
+    const area = messageAreaRef.current;
+    if (area) area.scrollTop = area.scrollHeight;
+  }
 
   useEffect(() => {
     const media = window.matchMedia?.("(prefers-color-scheme: dark)");
@@ -2598,6 +2615,19 @@ function App() {
               <h2>从一个明确的任务开始</h2>
               <p>描述你想完成的工作，k-Coder 会在当前项目中协作推进。</p>
               <span className="empty-thread__status">等待你的第一条请求</span>
+            </div>
+          )}
+          {hasConversationContent && scrollToBottomVisible && (
+            <div className="scroll-to-bottom-dock">
+              <button
+                type="button"
+                className="scroll-to-bottom-button"
+                aria-label="回到底部"
+                title="回到底部"
+                onClick={scrollConversationToBottom}
+              >
+                <ArrowDown size={16} aria-hidden="true" />
+              </button>
             </div>
           )}
         </div>

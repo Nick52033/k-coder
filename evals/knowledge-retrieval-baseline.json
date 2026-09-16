@@ -1,0 +1,55 @@
+{
+  "schemaVersion": 1,
+  "corpus": [
+    {
+      "path": "docs/persistence.md",
+      "content": "# Persistence\n\nThe projection database stores sessions, events and the knowledge index in one SQLite file.\n\n## Migration\n\nA migration runs inside a transaction. If it fails the whole block rolls back and the version row is not written.\n"
+    },
+    {
+      "path": "docs/retrieval-scoring.md",
+      "content": "# Retrieval scoring\n\nLexical and semantic recall each carry a fixed weight of 0.35. Freshness and user feedback are worth 0.05 each.\n"
+    },
+    {
+      "path": "docs/memory-service.md",
+      "content": "# Memory service\n\nThe host validates the scope and the TTL. A model may only propose a candidate, and a human decides what becomes active.\n"
+    },
+    {
+      "path": "docs/dream-maintenance.md",
+      "content": "# Dream maintenance\n\nMaintenance runs only when both the interval and the idle window have elapsed. A crash leaves the previous run marked interrupted.\n"
+    },
+    {
+      "path": "docs/telemetry.md",
+      "content": "# Telemetry\n\nA retrieval event stores an opaque digest of the query instead of the raw text.\n"
+    },
+    {
+      "path": "docs/benchmark.md",
+      "content": "Weekly meeting cadence notes. Nothing on this page mentions the measurement tool by name.\n"
+    },
+    {
+      "path": "docs/glossary.md",
+      "content": "# Glossary\n\nUnrelated body text that is present only so this file has a chunk at all.\n"
+    },
+    {
+      "path": "docs/retrieval-history.md",
+      "content": "# Retrieval history\n\nA log of retrieval and scoring experiments that were later discarded. Kept here as a distractor so the recall channels have to rank, not merely match.\n"
+    }
+  ],
+  "queries": [
+    { "id": "migration-rollback", "query": "migration rollback", "relevant": ["docs/persistence.md"] },
+    { "id": "projection-database", "query": "projection database", "relevant": ["docs/persistence.md"] },
+    { "id": "retrieval-scoring", "query": "retrieval scoring", "relevant": ["docs/retrieval-scoring.md"] },
+    { "id": "memory-scope", "query": "memory scope ttl", "relevant": ["docs/memory-service.md"] },
+    { "id": "maintenance-idle", "query": "maintenance idle interval", "relevant": ["docs/dream-maintenance.md"] },
+    { "id": "retrieval-digest", "query": "retrieval digest", "relevant": ["docs/telemetry.md"] },
+    { "id": "filename-only", "query": "benchmark", "relevant": ["docs/benchmark.md"] },
+    { "id": "partial-heading", "query": "glossary absentterm", "relevant": ["docs/glossary.md"] }
+  ],
+  "thresholds": {
+    "recallAt3": 0.875,
+    "recallAt5": 1.0,
+    "mrr": 0.9,
+    "citationCorrectness": 1.0,
+    "availability": 1.0,
+    "maxP95LatencyMs": 2000
+  }
+}

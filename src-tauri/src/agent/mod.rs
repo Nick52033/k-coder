@@ -39,6 +39,7 @@ mod input;
 pub(crate) mod instructions;
 pub mod mailbox;
 mod provider_history;
+pub mod query_rewrite;
 pub mod thread_operation;
 pub(crate) use input::build_user_message;
 use mailbox::TurnControl;

@@ -14,6 +14,27 @@ edition = "2024"
 name = "k_coder_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+[features]
+default = []
+
+# 在 Windows 上跑 `tauri::test` 的 mock runtime 测试。
+#
+# 开启后 build.rs 会给**所有**目标追加 `/MANIFEST:EMBED` +
+# `/MANIFESTINPUT:windows/tests.manifest`，给测试二进制补上 Common Controls v6 声明。
+#
+# 为什么需要：mock runtime 会把窗口层链进测试二进制，从而导入
+# `comctl32.dll!TaskDialogIndirect`（Common Controls v6 专有导出）。二进制缺少 v6 声明时
+# 加载器会解析到 System32 下的 v5.82，报 `STATUS_ENTRYPOINT_NOT_FOUND`（`0xc0000139`），
+# 测试进程在跑任何用例之前就死掉——表现为 `cargo test --lib` 无输出直接失败。
+#
+# 为什么做成可选：`cargo:rustc-link-arg` 是唯一能覆盖 lib 单元测试目标的链接参数作用域
+# （`cargo:rustc-link-arg-tests` 只作用于 `tests/*.rs`，对 lib 单元测试无效），而它同时
+# 也作用于 bin。应用二进制的清单由 `tauri_build` 经 `cargo:rustc-link-arg-bins` 注入，
+# 叠加第二份清单有冲突风险，所以默认关闭，正常构建完全不受影响。
+#
+# 用法：cargo test --lib --features mock-runtime-tests
+mock-runtime-tests = []
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
@@ -26,6 +47,7 @@ tauri-plugin-global-shortcut = "2"
 tauri-plugin-notification = "2"
 async-trait = "0.1"
 async-stream = "0.3"
+axum = { version = "0.8", features = ["ws"] }
 chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 base64 = "0.22"
 calamine = "0.36.1"
@@ -35,6 +57,7 @@ jsonschema = { version = "0.48.1", default-features = false }
 portable-pty = "0.9.0"
 pdf-extract = "0.12.0"
 quick-xml = "0.41.0"
+rcgen = "0.14"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
@@ -45,6 +68,7 @@ similar = "3.1.1"
 thiserror = "2"
 tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
 tokio-util = "0.7"
+tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "ring", "tls12"] }
 url = "2"
 uuid = { version = "1", features = ["serde", "v4"] }
 zip = { version = "8.4.0", default-features = false, features = ["deflate"] }
@@ -72,4 +96,6 @@ keyring = { version = "3.6.3", default-features = false, features = ["linux-nati
 
 [dev-dependencies]
 tempfile = "3"
+tauri = { version = "2", features = ["test"] }
 tokio = { version = "1", features = ["test-util"] }
+tokio-tungstenite = "0.29"

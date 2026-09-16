@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!--
+  Test-only application manifest, embedded by build.rs when the
+  `mock-runtime-tests` feature is enabled.
+
+  It declares the Common Controls v6 dependency so that
+  `comctl32.dll!TaskDialogIndirect` (a v6-only export pulled in through
+  tauri-plugin-dialog -> rfd once the mock runtime links the window layer)
+  can be resolved. Without it the loader binds System32's v5.82, reports
+  STATUS_ENTRYPOINT_NOT_FOUND (0xc0000139), and the test process dies
+  before running a single case.
+
+  KEEP THIS FILE PURE ASCII. mt.exe parses manifests using the ANSI code
+  page rather than the encoding declared above; non-ASCII bytes make it
+  fail with "cannot parse the requested XML data" (LNK1327). See the doc
+  comment on `embed_test_manifest` in build.rs for the full story.
+
+  The application binary does NOT use this file; tauri_build injects its
+  own manifest through cargo:rustc-link-arg-bins.
+-->
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <dependency>
+    <dependentAssembly>
+      <assemblyIdentity
+        type="win32"
+        name="Microsoft.Windows.Common-Controls"
+        version="6.0.0.0"
+        processorArchitecture="*"
+        publicKeyToken="6595b64144ccf1df"
+        language="*"
+      />
+    </dependentAssembly>
+  </dependency>
+</assembly>

@@ -4,6 +4,8 @@ use crate::storage::{
     ThreadSummary, ToolActivitySnapshot, TurnSnapshot, TurnTimelineItem, UserInputSnapshot,
 };
 
+pub mod memory;
+
 pub const PROTOCOL_VERSION: u32 = 1;
 pub const AGENT_EVENT_SCHEMA_VERSION: u32 = 7;
 

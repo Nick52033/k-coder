@@ -3458,6 +3458,78 @@ test("follows streamed growth only while the conversation remains near the lates
   )).toBeLessThanOrEqual(2);
 });
 
+test("pins a scroll-to-bottom button to the conversation while the latest content is out of view", async ({ page }, testInfo) => {
+  await page.goto("/");
+  const area = page.locator(".message-area");
+  const button = page.locator(".scroll-to-bottom-button");
+  await area.evaluate((element) => {
+    const target = element as HTMLElement;
+    target.style.height = "220px";
+    target.style.minHeight = "220px";
+    target.style.maxHeight = "220px";
+    target.scrollTop = target.scrollHeight;
+    target.dispatchEvent(new Event("scroll"));
+  });
+  const emit = (event: Record<string, unknown>) => page.evaluate((payload) => {
+    (window as unknown as { __emitAgentEvent: (value: unknown) => void }).__emitAgentEvent(payload);
+  }, event);
+  const base = { schemaVersion: 1, threadId: "thread-1", turnId: "turn-scroll-to-bottom" };
+  await emit({ ...base, type: "turn_started", phase: "exploring" });
+  await emit({
+    ...base,
+    type: "text_delta",
+    phase: "responding",
+    delta: Array.from(
+      { length: 70 },
+      (_, index) => `回到底部按钮验证第 ${index + 1} 段内容，让会话继续向下生长。`,
+    ).join("\n\n"),
+  });
+  await expect.poll(() => area.evaluate((element) =>
+    element.scrollHeight - element.clientHeight,
+  ), { timeout: 8_000 }).toBeGreaterThan(320);
+  // 贴底时既不需要也不显示按钮。
+  await expect(button).toHaveCount(0);
+
+  await area.evaluate((element) => {
+    const target = element as HTMLElement;
+    target.scrollTop = Math.max(0, target.scrollTop - 160);
+    // 与既有跟随用例一致：向上滚轮事件才会暂停跟随，避免后续内容增长把视口拉回底部。
+    target.dispatchEvent(new WheelEvent("wheel", { deltaY: -160 }));
+    target.dispatchEvent(new Event("scroll"));
+  });
+  await expect(button).toBeVisible();
+
+  // 按钮贴住会话区底部居中，停靠点零高度（显隐不改变 scrollHeight）。
+  const geometry = await page.evaluate(() => {
+    const areaElement = document.querySelector<HTMLElement>(".message-area");
+    const buttonElement = document.querySelector<HTMLElement>(".scroll-to-bottom-button");
+    const dockElement = document.querySelector<HTMLElement>(".scroll-to-bottom-dock");
+    if (!areaElement || !buttonElement || !dockElement) return null;
+    const areaRect = areaElement.getBoundingClientRect();
+    const buttonRect = buttonElement.getBoundingClientRect();
+    return {
+      bottomGap: Math.round(areaRect.bottom - buttonRect.bottom),
+      centerDelta: Math.round(Math.abs(
+        (buttonRect.left + buttonRect.width / 2)
+        - (areaRect.left + areaElement.clientLeft + areaElement.clientWidth / 2),
+      )),
+      dockHeight: Math.round(dockElement.getBoundingClientRect().height),
+    };
+  });
+  expect(geometry).not.toBeNull();
+  expect(geometry!.bottomGap).toBeGreaterThanOrEqual(8);
+  expect(geometry!.bottomGap).toBeLessThanOrEqual(32);
+  expect(geometry!.centerDelta).toBeLessThanOrEqual(2);
+  expect(geometry!.dockHeight).toBe(0);
+  await area.screenshot({ path: testInfo.outputPath("scroll-to-bottom-button.png") });
+
+  await button.click();
+  await expect.poll(() => area.evaluate((element) =>
+    element.scrollHeight - element.clientHeight - element.scrollTop,
+  )).toBeLessThanOrEqual(2);
+  await expect(button).toHaveCount(0);
+});
+
 test("primary send queues behind the active turn and the queued send steers it", async ({ page }, testInfo) => {
   await page.goto("/");
   await page.evaluate(() => {

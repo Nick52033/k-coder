@@ -29,6 +29,22 @@ import {
   setEmbeddingApiKey,
   deleteEmbeddingApiKey,
   testEmbeddingConnection,
+  searchKnowledge,
+  readKnowledgeCitation,
+  recordKnowledgeFeedback,
+  listKnowledgeRetrievalEvents,
+  listKnowledgeEntities,
+  listKnowledgeFacts,
+  reviewKnowledgeFact,
+  queryKnowledgeRelations,
+  getMemorySettings,
+  setMemorySettings,
+  setMemoryEnabled,
+  listMemories,
+  listMemoryCandidates,
+  reviewMemoryCandidate,
+  deleteMemory,
+  clearMemories,
   getWorkspaceState,
 } from "../api/runtime";
 import { useToast } from "./Toast";
@@ -36,6 +52,7 @@ import {
   BarChart3,
   Bot,
   Boxes,
+  Brain,
   Check,
   KeyRound,
   Library,
@@ -79,6 +96,7 @@ import {
   ChevronRight,
   Search,
   LockKeyhole,
+  Smartphone,
 } from "lucide-react";
 import type {
   ProviderConfigView,
@@ -105,9 +123,22 @@ import type {
   KnowledgeSource,
   KnowledgeIndexProgress,
   KnowledgeIndexMetrics,
+  KnowledgeSearchResponse,
+  KnowledgeCitation,
+  KnowledgeFeedbackType,
+  KnowledgeRetrievalEventRecord,
+  KnowledgeEntityRecord,
+  KnowledgeEntityType,
+  KnowledgeFactCandidateRecord,
+  KnowledgeRelationQueryResult,
+  MemorySettings,
+  MemoryRecord,
+  MemoryCandidate,
+  MemoryScopeKind,
 } from "../types/runtime";
 import { toUserFacingPath, workspacePathKey } from "../lib/path";
 import { McpSettingsPage } from "./McpSettingsPage";
+import { MobileSettingsPage } from "./MobileSettingsPage";
 import { PluginSettingsPage } from "./PluginSettingsPage";
 import { RuleSettingsPage } from "./RuleSettingsPage";
 import { THEME_OPTIONS, themeLabel, type ThemeId } from "../lib/theme";
@@ -180,9 +211,11 @@ export type SettingsSection =
   | "robots"
   | "workflows"
   | "knowledge"
+  | "memory"
   | "rules"
   | "general"
   | "browser"
+  | "mobile"
   | "goal";
 
 interface SettingsDefinition {
@@ -229,10 +262,12 @@ const settingsDefinitions: SettingsDefinition[] = [
   { id: "robots", label: "机器人", group: "智能体", icon: Bot, available: true },
   { id: "workflows", label: "Workflows", group: "智能体", icon: Workflow, available: false },
   { id: "knowledge", label: "知识库", group: "知识与规则", icon: Library, available: true },
+  { id: "memory", label: "记忆", group: "知识与规则", icon: Brain, available: true },
   { id: "browser", label: "浏览器自动化", group: "智能体", icon: Globe2, available: true },
   { id: "goal", label: "目标与预算", group: "智能体", icon: Target, available: true },
   { id: "rules", label: "Rules", group: "知识与规则", icon: ShieldCheck, available: true },
   { id: "appearance", label: "外观", group: "应用", icon: Palette, available: true },
+  { id: "mobile", label: "移动设备", group: "应用", icon: Smartphone, available: true },
   { id: "general", label: "通用", group: "应用", icon: Settings, available: false },
 ];
 
@@ -346,6 +381,8 @@ export function SettingsDialog({
               <UsagePage />
             ) : section === "knowledge" ? (
               <KnowledgePage />
+            ) : section === "memory" ? (
+              <MemoryPage activeThreadId={activeThreadId} />
             ) : section === "browser" ? (
               <BrowserPage />
             ) : section === "goal" ? (
@@ -363,6 +400,8 @@ export function SettingsDialog({
               <PluginSettingsPage />
             ) : section === "rules" ? (
               <RuleSettingsPage />
+            ) : section === "mobile" ? (
+              <MobileSettingsPage />
             ) : section === "skills" ? (
               <ExtensionsPage />
             ) : (
@@ -1844,6 +1883,8 @@ function KnowledgePage() {
       </div>
       {metrics?.lastErrorCode ? <p className="settings-help">最近一次索引错误：{metrics.lastErrorCode}</p> : null}
     </section>
+    <KnowledgeRetrievalPanel enabled={settings.enabled} budgetPercent={settings.knowledgeBudgetPercent} />
+    <KnowledgeGraphPanel collections={collections} enabled={settings.enabled} />
     {error && <div className="settings-error" role="alert">{error}</div>}
     {pendingDelete && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && setPendingDelete(null)} onKeyDown={(event) => { if (event.key !== "Escape") return; event.preventDefault(); event.stopPropagation(); setPendingDelete(null); }}>
       <section className="delete-confirm-dialog" role="dialog" aria-modal="true" aria-labelledby="knowledge-delete-title">
@@ -1855,6 +1896,407 @@ function KnowledgePage() {
         </div>
       </section>
     </div>}
+  </section>;
+}
+
+/// 设置页里的检索控制台：手动检索、展开引用、给出反馈，并查看本线程的检索事件。
+///
+/// 这里固定使用 `settings` 作为 threadId / turnId：citation 只对「返回它的那一轮」有效，
+/// 而设置页没有真实 Turn，所以检索与反馈共用同一个宿主生成的伪 Turn，反馈才有 citation 可绑定。
+const KNOWLEDGE_SETTINGS_TURN = "settings";
+
+const KNOWLEDGE_FEEDBACK_OPTIONS: Array<{ type: KnowledgeFeedbackType; label: string }> = [
+  { type: "useful", label: "有用" },
+  { type: "irrelevant", label: "不相关" },
+  { type: "outdated", label: "已过时" },
+  { type: "wrong", label: "有错误" },
+];
+
+function knowledgeMetadataText(metadata: Record<string, unknown>, key: string) {
+  const value = metadata[key];
+  return typeof value === "string" ? value : "";
+}
+
+function knowledgeMetadataNumber(metadata: Record<string, unknown>, key: string) {
+  const value = metadata[key];
+  return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+
+function knowledgeMetadataList(metadata: Record<string, unknown>, key: string) {
+  const value = metadata[key];
+  return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
+}
+
+function shortKnowledgeRevision(revision: string) {
+  return revision.length > 10 ? revision.slice(0, 10) : revision;
+}
+
+function KnowledgeRetrievalPanel({ enabled, budgetPercent }: { enabled: boolean; budgetPercent: number }) {
+  const [query, setQuery] = useState("");
+  const [modelRewrite, setModelRewrite] = useState(false);
+  const [response, setResponse] = useState<KnowledgeSearchResponse | null>(null);
+  const [events, setEvents] = useState<KnowledgeRetrievalEventRecord[]>([]);
+  const [citations, setCitations] = useState<Record<string, KnowledgeCitation>>({});
+  const [ratings, setRatings] = useState<Record<string, KnowledgeFeedbackType>>({});
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  async function refreshEvents() {
+    setEvents(await listKnowledgeRetrievalEvents(KNOWLEDGE_SETTINGS_TURN, 10));
+  }
+
+  useEffect(() => {
+    void refreshEvents().catch((reason) => setError(formatKnowledgeError(reason)));
+  }, []);
+
+  async function search(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const trimmed = query.trim();
+    if (!trimmed) return;
+    setBusy(true);
+    setError("");
+    try {
+      const next = await searchKnowledge(trimmed, 6, KNOWLEDGE_SETTINGS_TURN, KNOWLEDGE_SETTINGS_TURN, modelRewrite);
+      setResponse(next);
+      setCitations({});
+      setRatings({});
+      await refreshEvents();
+    } catch (reason) {
+      setError(formatKnowledgeError(reason));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function reveal(citationId: string) {
+    setBusy(true);
+    setError("");
+    try {
+      const citation = await readKnowledgeCitation(citationId, KNOWLEDGE_SETTINGS_TURN, KNOWLEDGE_SETTINGS_TURN);
+      setCitations((current) => ({ ...current, [citationId]: citation }));
+    } catch (reason) {
+      setError(formatKnowledgeError(reason));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function rate(citationId: string, feedbackType: KnowledgeFeedbackType) {
+    setBusy(true);
+    setError("");
+    try {
+      const record = await recordKnowledgeFeedback(citationId, feedbackType, KNOWLEDGE_SETTINGS_TURN, KNOWLEDGE_SETTINGS_TURN);
+      setRatings((current) => ({ ...current, [citationId]: record.feedbackType as KnowledgeFeedbackType }));
+    } catch (reason) {
+      setError(formatKnowledgeError(reason));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const metadata = response?.metadata ?? {};
+  const retrievalMode = knowledgeMetadataText(metadata, "retrievalMode");
+  const fallbackCode = knowledgeMetadataText(metadata, "fallbackCode");
+  const channels = knowledgeMetadataList(metadata, "channels");
+  const rewriteCount = knowledgeMetadataNumber(metadata, "rewriteCount");
+  const budgetChars = knowledgeMetadataNumber(metadata, "budgetChars");
+
+  return <section className="knowledge-settings-card" aria-labelledby="knowledge-retrieval-title">
+    <div className="knowledge-card-heading"><div><span className="knowledge-section-kicker">检索与反馈</span><h4 id="knowledge-retrieval-title">检索控制台</h4></div><span className="knowledge-card-hint">最多 6 个切片 · 预算 {budgetPercent}%</span></div>
+    <p className="settings-help">用与智能体相同的通道验证索引效果。反馈会绑定到切片与 revision，并在之后的排序中生效。</p>
+    <form className="knowledge-retrieval-form" noValidate onSubmit={(event) => void search(event)}>
+      <label className="knowledge-retrieval-input"><span className="sr-only">检索关键词</span><Search size={15} aria-hidden="true" /><input value={query} maxLength={2000} placeholder="例如：schema 迁移" aria-label="知识库检索关键词" onChange={(event) => setQuery(event.target.value)} /></label>
+      <label className="knowledge-retrieval-toggle" title="额外调用一次模型改写查询，失败时回退到确定性改写"><input type="checkbox" checked={modelRewrite} disabled={busy} onChange={(event) => setModelRewrite(event.target.checked)} />模型改写</label>
+      <button className="primary-button" type="submit" disabled={busy || !enabled || !query.trim()}><Search size={14} />检索</button>
+    </form>
+    {!enabled && <p className="settings-help">知识库已停用，启用后才能检索。</p>}
+    {response && <div className="knowledge-retrieval-meta">
+      <span>模式 {retrievalMode || "unknown"}</span>
+      <span>通道 {channels.length ? channels.join(" + ") : "无"}</span>
+      <span>改写 {rewriteCount}</span>
+      <span>预算 {budgetChars} 字符</span>
+      {fallbackCode ? <span>降级 {fallbackCode}</span> : null}
+    </div>}
+    {response ? (response.results.length ? <div className="knowledge-retrieval-results">
+      {response.results.map((result) => {
+        const citation = citations[result.citationId];
+        const rating = ratings[result.citationId];
+        return <article className="knowledge-result" key={result.citationId}>
+          <header className="knowledge-result-head">
+            <div className="knowledge-result-title"><strong title={result.title || result.path}>{result.title || result.path}</strong><small>{result.path} · {result.locator} · rev {shortKnowledgeRevision(result.revision)}</small></div>
+            <span className="knowledge-result-score">score {result.score.toFixed(3)}</span>
+          </header>
+          <div className="knowledge-result-signals"><span>lexical {result.lexicalRank > 0 ? `#${result.lexicalRank}` : "—"}</span><span>semantic {result.semanticRank === null ? "—" : `#${result.semanticRank}`}</span></div>
+          <pre className="knowledge-result-preview">{citation ? citation.text : result.preview}</pre>
+          {citation && <small className="settings-help">引用 revision {shortKnowledgeRevision(citation.revision)} · {citation.isCurrentRevision ? "仍是当前版本" : "已不是当前版本"}</small>}
+          <div className="knowledge-result-actions">
+            <button className="secondary-button" type="button" disabled={busy} onClick={() => void reveal(result.citationId)}><FileText size={14} />{citation ? "引用已展开" : "展开引用"}</button>
+            {KNOWLEDGE_FEEDBACK_OPTIONS.map((option) => <button className={`knowledge-feedback-button${rating === option.type ? " knowledge-feedback-button--active" : ""}`} key={option.type} type="button" aria-pressed={rating === option.type} disabled={busy} onClick={() => void rate(result.citationId, option.type)}>{option.label}</button>)}
+          </div>
+        </article>;
+      })}
+    </div> : <div className="knowledge-retrieval-empty"><FileText size={18} aria-hidden="true" /><span>没有命中任何切片。试试更短的关键词，或先为 Collection 添加来源。</span></div>) : <div className="knowledge-retrieval-empty"><Search size={18} aria-hidden="true" /><span>输入关键词检索本地知识，结果会显示引用来源、评分与反馈入口。</span></div>}
+    {error && <div className="settings-error" role="alert">{error}</div>}
+    <div className="knowledge-card-heading"><div><span className="knowledge-section-kicker">最近检索</span><h4>检索事件</h4></div><span className="knowledge-card-hint">只记录查询摘要，不保存原文</span></div>
+    {events.length ? <div className="knowledge-events">{events.map((event) => <div className="knowledge-event-row" key={event.id}><div><code>{event.queryHash}</code><small>{event.retrievalMode} · 候选 {event.resultCount} · 返回引用 {event.selectedCitationCount} · {event.latencyMs} ms</small></div><time dateTime={new Date(event.createdAtMs).toISOString()}>{new Date(event.createdAtMs).toLocaleString()}</time></div>)}</div> : <div className="knowledge-retrieval-empty"><Clock3 size={18} aria-hidden="true" /><span>还没有检索记录。</span></div>}
+  </section>;
+}
+
+const MEMORY_SCOPE_KINDS: Array<{ id: MemoryScopeKind; label: string }> = [
+  { id: "user", label: "用户" },
+  { id: "workspace", label: "工作区" },
+  { id: "project", label: "项目" },
+  { id: "thread", label: "当前会话" },
+];
+
+/// 规范 scope 串：`user`，其余为 `<kind>:<id>`。
+///
+/// 这个应用里一个工作区就是一个 `ProjectRecord`，所以工作区级与项目级共用同一个宿主 ID；会话级
+/// 用当前会话 ID，没有活动会话时该项直接禁用——绝不用一个猜出来的 ID 去查记忆。
+function memoryScopeValue(kind: MemoryScopeKind, workspaceId: string, threadId: string | null) {
+  if (kind === "user") return "user";
+  if (kind === "thread") return threadId ? `thread:${threadId}` : "";
+  return `${kind}:${workspaceId}`;
+}
+
+/// 记忆页：开关、写入策略、待审核候选，以及按作用域查看/删除生效记忆。
+///
+/// 删除与清空的确认令牌由宿主计算（记忆 ID 与规范 scope 串），前端只是把它回传，所以这里不可能
+/// 通过构造参数删除一条它没有看到的记忆。
+function MemoryPage({ activeThreadId }: { activeThreadId: string | null }) {
+  const [settings, setSettings] = useState<MemorySettings | null>(null);
+  const [workspaceId, setWorkspaceId] = useState("");
+  const [scopeKind, setScopeKind] = useState<MemoryScopeKind>("user");
+  const [memories, setMemories] = useState<MemoryRecord[]>([]);
+  const [candidates, setCandidates] = useState<MemoryCandidate[]>([]);
+  const [autoAccept, setAutoAccept] = useState(false);
+  const [ttl, setTtl] = useState("0");
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [pending, setPending] = useState<null | { kind: "memory" | "clear"; id: string; label: string }>(null);
+
+  const scope = memoryScopeValue(scopeKind, workspaceId, activeThreadId);
+
+  async function load() {
+    const [nextSettings, workspace, nextCandidates] = await Promise.all([
+      getMemorySettings(),
+      getWorkspaceState(),
+      listMemoryCandidates("pending", 50),
+    ]);
+    setSettings(nextSettings);
+    setAutoAccept(nextSettings.autoAcceptHighConfidence);
+    setTtl(String(nextSettings.defaultTtlDays));
+    setWorkspaceId(workspace.current.id);
+    setCandidates(nextCandidates);
+    const nextScope = memoryScopeValue(scopeKind, workspace.current.id, activeThreadId);
+    setMemories(nextScope ? (await listMemories(nextScope, "active", undefined, 50)).items : []);
+  }
+
+  useEffect(() => {
+    void load().catch((reason) => setError(formatKnowledgeError(reason)));
+  }, [scopeKind, activeThreadId]);
+
+  async function run(action: () => Promise<void>) {
+    setBusy(true);
+    setError("");
+    try {
+      await action();
+      await load();
+    } catch (reason) {
+      setError(formatKnowledgeError(reason));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function confirm() {
+    const target = pending;
+    if (!target) return;
+    setPending(null);
+    await run(async () => {
+      if (target.kind === "memory") {
+        await deleteMemory(target.id, target.id);
+      } else {
+        await clearMemories(target.id, target.id);
+      }
+    });
+  }
+
+  if (!settings) return <section className="settings-page knowledge-page"><div className="settings-page-header"><div><p className="settings-eyebrow">知识与规则</p><h3>记忆</h3></div></div><div className="settings-pending">正在加载记忆</div></section>;
+
+  return <section className="settings-page knowledge-page" aria-labelledby="memory-page-title">
+    <header className="knowledge-hero">
+      <div className="knowledge-hero-copy">
+        <div className="knowledge-title-line"><span className="knowledge-title-icon" aria-hidden="true"><Brain size={18} /></span><div><p className="settings-eyebrow">知识与规则</p><h3 id="memory-page-title">记忆</h3></div></div>
+        <p>记忆只保存结构化摘要，不保存完整会话正文。模型只能提出候选，接受、删除与清空都在这里由你决定。</p>
+      </div>
+      <label className="knowledge-enable-toggle"><input type="checkbox" checked={settings.enabled} disabled={busy} onChange={(event) => void run(async () => { setSettings(await setMemoryEnabled(event.target.checked)); })} /><span><strong>{settings.enabled ? "记忆已启用" : "记忆已停用"}</strong><small>{settings.enabled ? "注入前会经过敏感项过滤与预算裁剪" : "停用后不会注入任何记忆"}</small></span></label>
+    </header>
+
+    <section className="knowledge-settings-card" aria-labelledby="memory-settings-title">
+      <div className="knowledge-card-heading"><div><span className="knowledge-section-kicker">写入策略</span><h4 id="memory-settings-title">自动接受与默认 TTL</h4></div><span className="knowledge-card-hint">默认全部进审核队列</span></div>
+      <label className="knowledge-enable-toggle knowledge-enable-toggle--compact"><input type="checkbox" checked={autoAccept} disabled={busy} onChange={(event) => setAutoAccept(event.target.checked)} /><span><strong>高置信且非敏感的候选自动接受</strong><small>关闭时所有模型提案都要人工审核；敏感项与冲突永远需要审核</small></span></label>
+      <div className="knowledge-api-row">
+        <label className="knowledge-field"><span>默认 TTL（天，0 为不过期）</span><input type="number" min={0} max={3650} value={ttl} aria-label="默认 TTL 天数" disabled={busy} onChange={(event) => setTtl(event.target.value)} /></label>
+        <button className="secondary-button" type="button" disabled={busy} onClick={() => void run(async () => { setSettings(await setMemorySettings({ enabled: settings.enabled, autoAcceptHighConfidence: autoAccept, defaultTtlDays: Number(ttl) || 0 })); })}><Save size={14} />保存</button>
+      </div>
+    </section>
+
+    <section className="knowledge-settings-card" aria-labelledby="memory-review-title">
+      <div className="knowledge-card-heading"><div><span className="knowledge-section-kicker">审核队列</span><h4 id="memory-review-title">待审核候选</h4></div><span className="knowledge-count-badge">{candidates.length}</span></div>
+      {candidates.length ? <div className="knowledge-retrieval-results">
+        {candidates.map((candidate) => <article className="knowledge-result" key={candidate.id}>
+          <header className="knowledge-result-head">
+            <div className="knowledge-result-title"><strong>{candidate.operation} · {candidate.memoryType}</strong><small>{candidate.reason}</small></div>
+            <span className="knowledge-result-score">{candidate.scopeType}{candidate.scopeId ? `:${candidate.scopeId}` : ""} · conf {candidate.confidence.toFixed(2)}</span>
+          </header>
+          <pre className="knowledge-result-preview">{candidate.content}</pre>
+          <div className="knowledge-result-actions">
+            <button className="secondary-button" type="button" disabled={busy} onClick={() => void run(async () => { await reviewMemoryCandidate(candidate.id, "accept"); })}><Check size={14} />接受</button>
+            <button className="knowledge-feedback-button" type="button" disabled={busy} onClick={() => void run(async () => { await reviewMemoryCandidate(candidate.id, "reject"); })}>拒绝</button>
+          </div>
+        </article>)}
+      </div> : <div className="knowledge-retrieval-empty"><CheckCircle2 size={18} aria-hidden="true" /><span>没有待审核的候选。</span></div>}
+    </section>
+
+    <section className="knowledge-settings-card" aria-labelledby="memory-list-title">
+      <div className="knowledge-card-heading"><div><span className="knowledge-section-kicker">已存储</span><h4 id="memory-list-title">生效记忆</h4></div><span className="knowledge-card-hint">{scope || "该作用域不可用"}</span></div>
+      <div className="knowledge-graph-controls">
+        <label className="knowledge-field"><span>作用域</span><select className="knowledge-select" value={scopeKind} aria-label="记忆作用域" onChange={(event) => setScopeKind(event.target.value as MemoryScopeKind)}>{MEMORY_SCOPE_KINDS.map((kind) => <option key={kind.id} value={kind.id} disabled={kind.id === "thread" && !activeThreadId}>{kind.label}</option>)}</select></label>
+        <label className="knowledge-field"><span>操作</span><button className="secondary-button knowledge-danger-button" type="button" disabled={busy || !scope || memories.length === 0} onClick={() => setPending({ kind: "clear", id: scope, label: scope })}><Trash2 size={14} />清空该作用域</button></label>
+      </div>
+      {memories.length ? <div className="knowledge-events">
+        {memories.map((memory) => <div className="knowledge-event-row" key={memory.id}>
+          <div><code>{memory.memoryType} · rev {memory.revision}</code><small>{memory.content}</small><small>{memory.sensitivity}{memory.sourceType === "model" ? " · 模型提案" : ""}{memory.expiresAtMs ? ` · 到期 ${new Date(memory.expiresAtMs).toLocaleDateString()}` : " · 不过期"}</small></div>
+          <button className="knowledge-icon-button knowledge-icon-button--danger" type="button" title="删除记忆" aria-label={`删除记忆 ${memory.memoryType}`} disabled={busy} onClick={() => setPending({ kind: "memory", id: memory.id, label: memory.content })}><Trash2 size={15} /></button>
+        </div>)}
+      </div> : <div className="knowledge-retrieval-empty"><Brain size={18} aria-hidden="true" /><span>这个作用域下还没有生效记忆。</span></div>}
+    </section>
+
+    {error && <div className="settings-error" role="alert">{error}</div>}
+    {pending && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && setPending(null)} onKeyDown={(event) => { if (event.key !== "Escape") return; event.preventDefault(); event.stopPropagation(); setPending(null); }}>
+      <section className="delete-confirm-dialog" role="dialog" aria-modal="true" aria-labelledby="memory-delete-title">
+        <h4 id="memory-delete-title">{pending.kind === "clear" ? "清空该作用域的记忆" : "删除这条记忆"}</h4>
+        <p>{pending.kind === "clear" ? `将把作用域 ${pending.label} 下的全部记忆软删除，并逐条写入审计事件。` : `将软删除“${pending.label}”，审计行保留。`}</p>
+        <div className="delete-confirm-actions">
+          <button className="secondary-button" type="button" autoFocus disabled={busy} onClick={() => setPending(null)}>取消</button>
+          <button className="danger-button" type="button" disabled={busy} onClick={() => void confirm()}><Trash2 size={14} />确认</button>
+        </div>
+      </section>
+    </div>}
+  </section>;
+}
+
+const KNOWLEDGE_ENTITY_TYPES: Array<{ type: KnowledgeEntityType; label: string }> = [
+  { type: "concept", label: "概念" },
+  { type: "module", label: "模块" },
+  { type: "symbol", label: "符号" },
+  { type: "file", label: "文件" },
+  { type: "api", label: "接口" },
+  { type: "config", label: "配置" },
+  { type: "service", label: "服务" },
+  { type: "technology", label: "技术" },
+];
+
+/// 实体与事实的审核面板。
+///
+/// 这里是 `active` 事实的唯一来源：模型提出的读法一律是 `candidate`，只有「通过」会让它生效，
+/// 并且只能给本次新建（仍是 candidate）的实体指定宿主词表里的类型。「驳回」把候选标成 rejected
+/// 而不是删除，所以审核痕迹与来源绑定都保留。下方的关系查询是只读的，用来确认审核后的图长什么样。
+function KnowledgeGraphPanel({ collections, enabled }: { collections: KnowledgeCollection[]; enabled: boolean }) {
+  const [collectionId, setCollectionId] = useState("");
+  const [candidates, setCandidates] = useState<KnowledgeFactCandidateRecord[]>([]);
+  const [entities, setEntities] = useState<KnowledgeEntityRecord[]>([]);
+  const [entityType, setEntityType] = useState<KnowledgeEntityType>("concept");
+  const [name, setName] = useState("");
+  const [graph, setGraph] = useState<KnowledgeRelationQueryResult | null>(null);
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const activeCollectionId = collectionId || collections[0]?.id || "";
+
+  async function refresh(target: string) {
+    if (!target) {
+      setCandidates([]);
+      setEntities([]);
+      return;
+    }
+    const [nextCandidates, nextEntities] = await Promise.all([
+      listKnowledgeFacts(target, "candidate", 50),
+      listKnowledgeEntities(target, "active", 50),
+    ]);
+    setCandidates(nextCandidates);
+    setEntities(nextEntities);
+  }
+
+  useEffect(() => {
+    let disposed = false;
+    void refresh(activeCollectionId).catch((reason) => {
+      if (!disposed) setError(formatKnowledgeError(reason));
+    });
+    return () => { disposed = true; };
+  }, [activeCollectionId]);
+
+  async function review(factId: string, decision: "accept" | "reject") {
+    setBusy(true);
+    setError("");
+    try {
+      await reviewKnowledgeFact(factId, decision, decision === "accept" ? entityType : undefined);
+      await refresh(activeCollectionId);
+    } catch (reason) {
+      setError(formatKnowledgeError(reason));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function searchGraph(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const trimmed = name.trim();
+    if (!trimmed) return;
+    setBusy(true);
+    setError("");
+    try {
+      setGraph(await queryKnowledgeRelations(trimmed, 50));
+    } catch (reason) {
+      setError(formatKnowledgeError(reason));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return <section className="knowledge-settings-card" aria-labelledby="knowledge-graph-title">
+    <div className="knowledge-card-heading"><div><span className="knowledge-section-kicker">实体与事实</span><h4 id="knowledge-graph-title">关系审核</h4></div><span className="knowledge-card-hint">{entities.length} 个已生效实体 · {candidates.length} 条待审核</span></div>
+    <p className="settings-help">模型只能提出候选，而且必须引用本轮检索到的 citation。只有在这里通过的读法会成为 active 事实；来源被删除时事实转为 expired 而不是消失。</p>
+    {!enabled && <p className="settings-help">知识库已停用，无法审核。</p>}
+    {collections.length === 0 && <p className="settings-help">先创建一个 Collection 并添加来源。</p>}
+    {collections.length > 0 && <div className="knowledge-graph-controls">
+      <label className="knowledge-field"><span>Collection</span><select className="knowledge-select" value={activeCollectionId} aria-label="选择 Collection" onChange={(event) => setCollectionId(event.target.value)}>{collections.map((collection) => <option key={collection.id} value={collection.id}>{collection.name}</option>)}</select></label>
+      <label className="knowledge-field"><span>通过时使用的实体类型</span><select className="knowledge-select" value={entityType} aria-label="实体类型" onChange={(event) => setEntityType(event.target.value as KnowledgeEntityType)}>{KNOWLEDGE_ENTITY_TYPES.map((option) => <option key={option.type} value={option.type}>{option.label}</option>)}</select></label>
+    </div>}
+    {candidates.length ? <div className="knowledge-retrieval-results">
+      {candidates.map((candidate) => <article className="knowledge-result" key={candidate.fact.id}>
+        <header className="knowledge-result-head">
+          <div className="knowledge-result-title"><strong>{candidate.subjectName} <span className="knowledge-predicate">{candidate.fact.predicate}</span> {candidate.objectEntityName ?? candidate.fact.objectText ?? ""}</strong><small>{candidate.sourcePath ?? "来源已不可读"}{candidate.locator ? ` · ${candidate.locator}` : ""} · rev {shortKnowledgeRevision(candidate.fact.sourceRevisionId)}</small></div>
+          <span className="knowledge-result-score">conf {candidate.fact.confidence.toFixed(2)}</span>
+        </header>
+        <div className="knowledge-result-actions">
+          <button className="secondary-button" type="button" disabled={busy} onClick={() => void review(candidate.fact.id, "accept")}><Check size={14} />通过</button>
+          <button className="knowledge-feedback-button" type="button" disabled={busy} onClick={() => void review(candidate.fact.id, "reject")}>驳回</button>
+        </div>
+      </article>)}
+    </div> : <div className="knowledge-retrieval-empty"><CheckCircle2 size={18} aria-hidden="true" /><span>没有待审核的事实候选。</span></div>}
+    {error && <div className="settings-error" role="alert">{error}</div>}
+    <div className="knowledge-card-heading"><div><span className="knowledge-section-kicker">关系查询</span><h4>已生效关系</h4></div><span className="knowledge-card-hint">只读</span></div>
+    <form className="knowledge-retrieval-form knowledge-retrieval-form--pair" noValidate onSubmit={(event) => void searchGraph(event)}>
+      <label className="knowledge-retrieval-input"><span className="sr-only">实体名称</span><Search size={15} aria-hidden="true" /><input value={name} maxLength={256} placeholder="例如：MemoryService" aria-label="实体名称" onChange={(event) => setName(event.target.value)} /></label>
+      <button className="primary-button" type="submit" disabled={busy || !name.trim()}><Search size={14} />查询</button>
+    </form>
+    {graph ? (graph.subject ? (graph.relations.length ? <div className="knowledge-retrieval-results">
+      {graph.relations.map((relation) => <article className="knowledge-result" key={relation.factId}>
+        <header className="knowledge-result-head"><div className="knowledge-result-title"><strong>{relation.subjectName} <span className="knowledge-predicate">{relation.predicate}</span> {relation.objectEntityName ?? relation.objectText ?? ""}</strong><small>{relation.sourcePath ?? "来源已不可读"}{relation.locator ? ` · ${relation.locator}` : ""} · rev {shortKnowledgeRevision(relation.sourceRevisionId)}</small></div></header>
+      </article>)}
+    </div> : <div className="knowledge-retrieval-empty"><Library size={18} aria-hidden="true" /><span>{graph.subject.name} 已存在，但还没有已生效的关系。</span></div>) : <div className="knowledge-retrieval-empty"><Search size={18} aria-hidden="true" /><span>没有这个实体。模型提出的实体在通过审核前不参与查询。</span></div>) : <div className="knowledge-retrieval-empty"><Search size={18} aria-hidden="true" /><span>输入实体名称，查看已审核生效的关系。</span></div>}
   </section>;
 }
 
@@ -2121,11 +2563,11 @@ function AppearancePage({
       </div>
       <div className="appearance-theme-section appearance-background-section">
         <div className="appearance-section-heading"><div><p className="settings-eyebrow">会话背景</p><h4>背景图</h4></div><span className="appearance-current-theme">本机显示</span></div>
-        <div className="background-preview" aria-label="会话背景预览" style={{ backgroundImage: `linear-gradient(rgba(255,255,255,.55),rgba(255,255,255,.55)),url("${backgroundImage}")` }} />
+        <div className="background-preview" aria-label="会话背景预览" style={{ backgroundImage: `linear-gradient(rgba(255,255,255,${backgroundOpacity}),rgba(255,255,255,${backgroundOpacity})),url("${backgroundImage}")` }} />
         <label className="background-upload"><span>上传背景图</span><input type="file" accept="image/png,image/jpeg,image/webp,image/gif" onChange={(event) => { const file = event.target.files?.[0]; if (!file) return; if (file.size > 4 * 1024 * 1024) { event.currentTarget.value = ""; return; } const reader = new FileReader(); reader.onload = () => { if (typeof reader.result === "string") onBackgroundImageChange(reader.result); }; reader.readAsDataURL(file); event.currentTarget.value = ""; }} /></label>
         {backgroundImage.startsWith("data:image/") && <button type="button" className="background-reset" onClick={() => onBackgroundImageChange("/chat-background.png")}>恢复内置背景</button>}
         <label className="background-toggle"><input type="checkbox" checked={backgroundEnabled} onChange={(e) => onBackgroundEnabledChange(e.target.checked)} /> 显示会话背景图</label>
-        <label className="background-opacity">图片可见度 <input type="range" min="0.2" max="0.85" step="0.01" value={backgroundOpacity} disabled={!backgroundEnabled} onChange={(e) => onBackgroundOpacityChange(Number(e.target.value))} /><output>{Math.round(backgroundOpacity * 100)}%</output></label>
+        <label className="background-opacity">图片可见度 <input type="range" min="0.15" max="1" step="0.01" value={Number((1 - backgroundOpacity).toFixed(2))} disabled={!backgroundEnabled} onChange={(e) => onBackgroundOpacityChange(Number((1 - Number(e.target.value)).toFixed(2)))} /><output>{Math.round((1 - backgroundOpacity) * 100)}%</output></label>
         <small className="settings-page-description">使用内置预览图验证透明面板效果；关闭后恢复纯色工作区。</small>
       </div>
     </section>

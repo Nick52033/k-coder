@@ -59,7 +59,19 @@ import type {
   GoalView,
   MemorySettings,
   MemoryUpsertRequest,
-  MemoryView,
+  MemoryUpsertOutcome,
+  MemoryRecord,
+  MemoryPage,
+  MemoryScope,
+  MemoryStatus,
+  MemoryCandidate,
+  MemoryCandidateStatus,
+  MemoryCandidateDecision,
+  MemoryClearOutcome,
+  SetMemorySettingsRequest,
+  MaintenanceSettings,
+  MaintenanceReport,
+  SetMemoryMaintenanceSettingsRequest,
   MetricsSnapshot,
   PlanUpdateRequest,
   PlanView,
@@ -70,6 +82,10 @@ import type {
   WorkflowSkillReadinessView,
   LogQuery,
   LogQueryResult,
+  MobileCapability,
+  MobileDeviceView,
+  MobilePairingView,
+  MobileStatus,
   KnowledgeSettings,
   EmbeddingSettings,
   KnowledgeCollection,
@@ -82,6 +98,14 @@ import type {
   SetEmbeddingSettingsRequest,
   KnowledgeSearchResponse,
   KnowledgeCitation,
+  KnowledgeFeedbackType,
+  KnowledgeFeedbackRecord,
+  KnowledgeRetrievalEventRecord,
+  KnowledgeEntityType,
+  KnowledgeEntityRecord,
+  KnowledgeFactCandidateRecord,
+  KnowledgeFactRecord,
+  KnowledgeRelationQueryResult,
   ScheduledTaskView,
   UpsertScheduledTaskRequest,
 } from "../types/runtime";
@@ -320,13 +344,28 @@ export function setEmbeddingSettings(request: SetEmbeddingSettingsRequest) { ret
 export function setEmbeddingApiKey(apiKey: string) { return invoke<Record<string, unknown>>("set_embedding_api_key", { apiKey }); }
 export function deleteEmbeddingApiKey() { return invoke<Record<string, unknown>>("delete_embedding_api_key"); }
 export function testEmbeddingConnection() { return invoke<{ connected: boolean; latencyMs: number; httpStatus: number | null; model: string; vectorDimension: number; usage: Record<string, unknown> | null; traceId: string | null; errorCode: string | null }>("test_embedding_connection"); }
-export function searchKnowledge(query: string, limit = 6, threadId?: string, turnId?: string) { return invoke<KnowledgeSearchResponse>("search_knowledge", { query, limit, threadId, turnId }); }
+export function searchKnowledge(query: string, limit = 6, threadId?: string, turnId?: string, modelRewrite = false) { return invoke<KnowledgeSearchResponse>("search_knowledge", { query, limit, threadId, turnId, modelRewrite }); }
 export function readKnowledgeCitation(citationId: string, threadId: string, turnId: string, before = 0, after = 0) { return invoke<KnowledgeCitation>("read_knowledge_citation", { citationId, threadId, turnId, before, after }); }
+export function recordKnowledgeFeedback(citationId: string, feedbackType: KnowledgeFeedbackType, threadId: string, turnId: string) { return invoke<KnowledgeFeedbackRecord>("record_knowledge_feedback", { citationId, feedbackType, threadId, turnId }); }
+export function listKnowledgeRetrievalEvents(threadId: string, limit = 20) { return invoke<KnowledgeRetrievalEventRecord[]>("list_knowledge_retrieval_events", { threadId, limit }); }
+export function listKnowledgeEntities(collectionId: string, status: string = "active", limit?: number) { return invoke<KnowledgeEntityRecord[]>("list_knowledge_entities", { collectionId, status, limit }); }
+export function listKnowledgeFacts(collectionId: string, status: string = "candidate", limit?: number) { return invoke<KnowledgeFactCandidateRecord[]>("list_knowledge_facts", { collectionId, status, limit }); }
+export function reviewKnowledgeFact(factId: string, decision: "accept" | "reject", entityType?: KnowledgeEntityType) { return invoke<KnowledgeFactRecord>("review_knowledge_fact", { factId, decision, entityType }); }
+export function queryKnowledgeRelations(name: string, limit?: number) { return invoke<KnowledgeRelationQueryResult>("query_knowledge_relations", { name, limit }); }
 export function getMemorySettings() { return invoke<MemorySettings>("get_memory_settings"); }
+export function setMemorySettings(request: SetMemorySettingsRequest) { return invoke<MemorySettings>("set_memory_settings", { request }); }
 export function setMemoryEnabled(enabled: boolean) { return invoke<MemorySettings>("set_memory_enabled", { enabled }); }
-export function listMemories() { return invoke<MemoryView[]>("list_memories"); }
-export function upsertMemory(request: MemoryUpsertRequest) { return invoke<MemoryView>("upsert_memory", { request }); }
-export function deleteMemory(memoryId: string) { return invoke<MemoryView>("delete_memory", { memoryId }); }
+export function listMemories(scope: MemoryScope, status?: MemoryStatus, cursor?: string, limit?: number) { return invoke<MemoryPage>("list_memories", { scope, status, cursor, limit }); }
+export function upsertMemory(request: MemoryUpsertRequest) { return invoke<MemoryUpsertOutcome>("upsert_memory", { request }); }
+export function listMemoryCandidates(status?: MemoryCandidateStatus, limit?: number) { return invoke<MemoryCandidate[]>("list_memory_candidates", { status, limit }); }
+export function reviewMemoryCandidate(candidateId: string, decision: MemoryCandidateDecision) { return invoke<MemoryCandidate>("review_memory_candidate", { candidateId, decision }); }
+export function deleteMemory(memoryId: string, confirmationToken: string) { return invoke<MemoryRecord>("delete_memory", { memoryId, confirmationToken }); }
+export function clearMemories(scope: MemoryScope, confirmationToken: string) { return invoke<MemoryClearOutcome>("clear_memories", { scope, confirmationToken }); }
+export function getMemoryMaintenanceSettings() { return invoke<MaintenanceSettings>("get_memory_maintenance_settings"); }
+export function setMemoryMaintenanceSettings(request: SetMemoryMaintenanceSettingsRequest) { return invoke<MaintenanceSettings>("set_memory_maintenance_settings", { request }); }
+export function acceptMemoryMaintenanceDisclosure() { return invoke<MaintenanceSettings>("accept_memory_maintenance_disclosure"); }
+export function runMemoryMaintenance() { return invoke<MaintenanceReport>("run_memory_maintenance"); }
+export function cancelMemoryMaintenance() { return invoke<boolean>("cancel_memory_maintenance"); }
 export function getBrowserSettings() { return invoke<BrowserSettings>("get_browser_settings"); }
 export function saveBrowserSettings(settings: BrowserSettings) { return invoke<BrowserSettings>("save_browser_settings", { settings }); }
 export function listBrowserAudit() { return invoke<BrowserAuditEvent[]>("list_browser_audit"); }
@@ -528,6 +567,43 @@ export function subscribeToSubagentEvents(
   handler: (event: SubagentView) => void,
 ): Promise<UnlistenFn> {
   return listen<SubagentView>("subagent-event", ({ payload }) => handler(payload));
+}
+
+export function mobileStatus(): Promise<MobileStatus> {
+  return invoke<MobileStatus>("mobile_status");
+}
+
+export function startMobileGateway(
+  bindAddress: string | null,
+  port: number | null = null,
+): Promise<MobileStatus> {
+  return invoke<MobileStatus>("mobile_start", { bindAddress, port });
+}
+
+export function stopMobileGateway(): Promise<MobileStatus> {
+  return invoke<MobileStatus>("mobile_stop");
+}
+
+export function createMobilePairing(): Promise<MobilePairingView> {
+  return invoke<MobilePairingView>("mobile_create_pairing");
+}
+
+export function approveMobilePairing(pendingId: string): Promise<MobileDeviceView> {
+  return invoke<MobileDeviceView>("mobile_approve_pairing", { pendingId });
+}
+
+export function denyMobilePairing(pendingId: string): Promise<void> {
+  return invoke<void>("mobile_deny_pairing", { pendingId });
+}
+
+export function revokeMobileDevice(deviceId: string): Promise<MobileDeviceView> {
+  return invoke<MobileDeviceView>("mobile_revoke_device", { deviceId });
+}
+
+export function setMobileCapabilities(
+  capabilities: MobileCapability[],
+): Promise<MobileStatus> {
+  return invoke<MobileStatus>("mobile_set_capabilities", { capabilities });
 }
 
 export function errorMessage(error: unknown): string {

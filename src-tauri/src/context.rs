@@ -1,7 +1,11 @@
+pub mod assembler;
+pub mod task_summary;
+
 use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
 
+use crate::execution::redact;
 use crate::protocol::{MessageRole, ToolDefinition};
 use crate::providers::ProviderMessage;
 
@@ -262,11 +266,11 @@ pub fn compact(
         .iter()
         .filter_map(|message| match message {
             ProviderMessage::Text { role, text } => {
-                Some(format!("{:?}: {}", role, bound(text, 500)))
+                Some(format!("{:?}: {}", role, bound(&redact(text), 500)))
             }
             ProviderMessage::UserContent { text, images } => Some(format!(
                 "User: {} [{} image attachment(s)]",
-                bound(text, 500),
+                bound(&redact(text), 500),
                 images.len()
             )),
             ProviderMessage::ToolResult {
@@ -274,7 +278,10 @@ pub fn compact(
                 success,
                 output,
                 ..
-            } => Some(format!("tool {name} ({success}): {}", bound(output, 300))),
+            } => Some(format!(
+                "tool {name} ({success}): {}",
+                bound(&redact(output), 300)
+            )),
             _ => None,
         })
         .collect::<Vec<_>>()
@@ -443,7 +450,7 @@ fn important_tool_observations(messages: &[ProviderMessage]) -> Vec<String> {
                 return None;
             }
             Some(bound(
-                &format!("tool {name}: {}", high_signal.join(" | ")),
+                &redact(&format!("tool {name}: {}", high_signal.join(" | "))),
                 IMPORTANT_TOOL_OBSERVATION_BYTES,
             ))
         })
@@ -475,8 +482,18 @@ fn summarize_large_tool_result(message: &ProviderMessage) -> ProviderMessage {
     else {
         return message.clone();
     };
+    // Redaction runs before the size check, so a short tool result that happens to contain a
+    // credential is cleaned up as well. Compaction must not copy secrets into the persisted summary
+    // or into the post-compaction history, and tool results are not all produced by the redacting
+    // command runner.
+    let output = redact(output);
     if output.len() <= LARGE_TOOL_OUTPUT_BYTES {
-        return message.clone();
+        return ProviderMessage::ToolResult {
+            call_id: call_id.clone(),
+            name: name.clone(),
+            success: *success,
+            output,
+        };
     }
 
     let mut tail_start = output.len().saturating_sub(TOOL_OUTPUT_PREVIEW_BYTES);
@@ -491,7 +508,7 @@ fn summarize_large_tool_result(message: &ProviderMessage) -> ProviderMessage {
             "[Tool output summary: {} bytes, {} lines; middle omitted]\nFirst section:\n{}\nLast section:\n{}",
             output.len(),
             output.lines().count(),
-            bound(output, TOOL_OUTPUT_PREVIEW_BYTES),
+            bound(&output, TOOL_OUTPUT_PREVIEW_BYTES),
             &output[tail_start..],
         ),
     }
@@ -561,7 +578,10 @@ pub fn render_summary(summary: &CompactionSummary) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n");
-    format!(
+    // Final redaction on the rendered boundary: summaries restored from the fact log may predate
+    // the redacting constructor paths, and this is the last point before the text reaches a
+    // Provider.
+    redact(&format!(
         "[Compacted context v{}]\nSummary:\n{}\nCurrent user request:\n{}\nRecent user requests:\n{}\nUser constraints:\n{}\nImportant tool observations:\n{}\nRecent tool results:\n{}",
         summary.contract_version,
         summary.summary,
@@ -570,7 +590,7 @@ pub fn render_summary(summary: &CompactionSummary) -> String {
         summary.user_constraints.join("\n"),
         important_tool_observations,
         recent_tool_results
-    )
+    ))
 }
 
 pub(crate) fn user_message_text(message: &ProviderMessage) -> Option<String> {
@@ -1145,5 +1165,162 @@ mod tests {
                 ProviderMessage::Text { role: MessageRole::User, .. }
             ] if text == "Checking files"
         ));
+    }
+
+    // Design §10.1: "验证 Compaction 不复制图片、密钥或完整工具输出". These three tests are the
+    // verification, not a description of intent: each one builds the adversarial input and asserts on
+    // both the persisted summary and the rendered Provider text.
+
+    #[test]
+    fn compaction_summary_never_carries_image_payloads() {
+        let payload = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8AAAwAB/wD/";
+        let image = ProviderMessage::UserContent {
+            text: "分析这张图".into(),
+            images: vec![crate::providers::ProviderImage {
+                name: "example.png".into(),
+                data_url: payload.into(),
+            }],
+        };
+        let mut messages = vec![image.clone()];
+        messages.extend((0..10).map(|_| ProviderMessage::Text {
+            role: MessageRole::Assistant,
+            text: "work in progress ".repeat(100),
+        }));
+        let (summary, compacted) = compact_once(&messages, 2_000);
+        let rendered = render_summary(&summary);
+        // The summary records that an image existed, never the pixels.
+        assert!(rendered.contains("[1 image attachment(s)]"));
+        assert!(!rendered.contains("base64"));
+        assert!(!rendered.contains("iVBORw0KGgo"));
+        assert!(!summary.summary.contains("iVBORw0KGgo"));
+        // Pixels are retained as pixels in the history — one bounded upload batch, not summary text.
+        assert_eq!(
+            compacted
+                .iter()
+                .filter(|message| **message == image)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn compaction_redacts_credentials_before_they_reach_a_provider() {
+        let secret = "API_KEY=sk-live-abcdefghijklmnop";
+        let mut messages = vec![
+            ProviderMessage::Text {
+                role: MessageRole::User,
+                text: format!("配置 {secret}"),
+            },
+            ProviderMessage::ToolResult {
+                call_id: "1".into(),
+                name: "read_file".into(),
+                success: true,
+                output: format!("failed to load {secret}"),
+            },
+        ];
+        messages.extend((0..10).map(|_| ProviderMessage::Text {
+            role: MessageRole::Assistant,
+            text: "filler ".repeat(300),
+        }));
+        // The newest tool result is kept, so this also covers the post-compaction history path.
+        messages.push(ProviderMessage::ToolResult {
+            call_id: "2".into(),
+            name: "run_command".into(),
+            success: true,
+            output: format!("export {secret}"),
+        });
+
+        let (summary, compacted) = compact_once(&messages, 2_000);
+        let rendered = render_summary(&summary);
+        assert!(
+            !rendered.contains("sk-live"),
+            "rendered summary leaked: {rendered}"
+        );
+        assert!(
+            !summary.summary.contains("sk-live"),
+            "persisted summary leaked: {}",
+            summary.summary
+        );
+        assert!(summary.summary.contains("[REDACTED]"));
+        assert!(
+            summary
+                .important_tool_observations
+                .iter()
+                .all(|observation| !observation.contains("sk-live")),
+            "observations leaked: {:?}",
+            summary.important_tool_observations
+        );
+        for message in &summary.recent_tool_results {
+            assert!(
+                !format!("{message:?}").contains("sk-live"),
+                "retained tool result leaked: {message:?}"
+            );
+        }
+        let history = render_provider_history(Some(&summary), &compacted);
+        let history = history
+            .iter()
+            .map(|message| format!("{message:?}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!history.contains("sk-live"), "history leaked: {history}");
+    }
+
+    #[test]
+    fn compaction_does_not_copy_full_tool_output() {
+        let head = "HEAD-MARKER";
+        let middle = "MIDDLE-MARKER-UNIQUE";
+        let tail = "TAIL-MARKER";
+        let output = format!(
+            "{head}\n{}\n{middle}\n{}\n{tail}",
+            "x".repeat(100_000),
+            "y".repeat(100_000)
+        );
+        let mut messages = vec![ProviderMessage::Text {
+            role: MessageRole::User,
+            text: "运行测试".into(),
+        }];
+        messages.extend((0..10).map(|_| ProviderMessage::Text {
+            role: MessageRole::Assistant,
+            text: "filler ".repeat(300),
+        }));
+        messages.push(ProviderMessage::ToolResult {
+            call_id: "1".into(),
+            name: "run_command".into(),
+            success: true,
+            output,
+        });
+
+        let (summary, compacted) = compact_once(&messages, 2_000);
+        let rendered = render_summary(&summary);
+        assert!(
+            !rendered.contains(middle),
+            "the middle of a huge tool output must not be copied into the summary"
+        );
+        assert!(rendered.contains(head));
+        // The retained observation keeps the head and the tail, and nothing else.
+        let retained = summary
+            .recent_tool_results
+            .iter()
+            .chain(compacted.iter())
+            .filter_map(|message| match message {
+                ProviderMessage::ToolResult { output, .. } => Some(output.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(!retained.is_empty());
+        for output in &retained {
+            assert!(
+                output.len() <= 4 * 1_024,
+                "retained tool output must stay bounded, got {} bytes",
+                output.len()
+            );
+            assert!(!output.contains(middle));
+        }
+        assert!(retained.iter().any(|output| output.contains(tail)));
+        assert!(
+            rendered.len() < 20_000,
+            "rendered summary must stay small, got {} chars",
+            rendered.len()
+        );
     }
 }

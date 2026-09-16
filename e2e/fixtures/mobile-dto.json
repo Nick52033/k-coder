@@ -1,0 +1,46 @@
+{
+  "_comment": [
+    "手机网关 DTO 的线上形状（wire shape）唯一数据源。",
+    "Rust 侧由 src-tauri/tests/mobile_dto_contract.rs 读取本文件，构造对应 DTO 再序列化，",
+    "断言结果与本文件逐字段相等；前端侧由 e2e/mobile-settings.spec.ts 读取本文件作为桩数据。",
+    "因此任何字段改名、改大小写或改可空性都会先让 Rust 契约测试失败，",
+    "而 Playwright 用同一份数据重新校验前端读得对不对——两边不会再各自漂移。"
+  ],
+  "device": {
+    "id": "device-1",
+    "name": "Pixel 9",
+    "platform": "Android 15",
+    "createdAtMs": 1760000000000,
+    "lastSeenAtMs": 1760000500000,
+    "revoked": false
+  },  "pending": {
+    "id": "pending-1",
+    "deviceName": "iPhone 16",
+    "platform": "iOS 19",
+    "createdAtMs": 1760000600000,
+    "expiresAtMs": 1760000660000
+  },
+  "pairing": {
+    "challengeId": "challenge-1",
+    "code": "482913",
+    "uri": "https://192.168.1.20:8787/m/#c=challenge-1.s3cr3t",
+    "expiresAtMs": 1760000900000,
+    "tls": true,
+    "fingerprint": "7C:1B:9F:2E:44:A8:0D:63:5E:71:20:BB:C4:8A:36:19:EF:52:07:D3:6A:81:9C:44:2B:5F:70:18:AE:33:D9:06"
+  },
+  "status": {
+    "running": true,
+    "host": "192.168.1.20",
+    "port": 8787,
+    "scheme": "https",
+    "fingerprint": "7C:1B:9F:2E:44:A8:0D:63:5E:71:20:BB:C4:8A:36:19:EF:52:07:D3:6A:81:9C:44:2B:5F:70:18:AE:33:D9:06",
+    "lanAddresses": ["192.168.1.20"],
+    "preferredBindAddress": "192.168.1.20",
+    "preferredPort": 8787,
+    "connections": 1,
+    "capabilities": ["chat", "approval", "interrupt"],
+    "pairing": null,
+    "pendingPairings": [],
+    "devices": []
+  }
+}

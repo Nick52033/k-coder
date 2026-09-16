@@ -10,23 +10,26 @@ use uuid::Uuid;
 use crate::advanced::{
     BrowserArtifact, BrowserAuditEvent, BrowserSettings, CancelWorkflowRunRequest,
     CreateGoalRequest, DocumentContent, EvaluationReport, GoalTransitionRequest, GoalView,
-    MemorySettings, MemoryUpsertRequest, MemoryView, MetricsSnapshot, PlanUpdateRequest, PlanView,
-    RepositorySearchIndex, SearchResult, WorkflowDefinitionView, WorkflowRunState, WorkflowRunView,
-    WorkflowSkillReadinessView, extract_document, extract_document_data_url,
-    run_recorded_evaluation,
+    MetricsSnapshot, PlanUpdateRequest, PlanView, RepositorySearchIndex, SearchResult,
+    WorkflowDefinitionView, WorkflowRunState, WorkflowRunView, WorkflowSkillReadinessView,
+    extract_document, extract_document_data_url, run_recorded_evaluation,
 };
 use crate::agent::mailbox::{MailboxTurn, MailboxTurnKind, QueuedTurnSteerError};
+use crate::agent::query_rewrite::ModelQueryRewriter;
 use crate::agent::thread_operation::ThreadOperationGuard;
 use crate::agent::{
     AgentRuntime, EventPublisher, RunTurnRequest, RuntimeInstructionProvider, SoftTurnLimits,
     TurnOutcome, build_user_message,
 };
 use crate::app_state::{AppState, AppStateError};
+use crate::context::assembler::{ContextAssembler, memory_fragments};
+use crate::entities::{DEFAULT_RELATION_LIMIT, EntityError, FactDecision, RelationQueryResult};
 use crate::execution::{
     CommandSessionView, OutputPage, PtyOutputPage, PtySessionView, StartCommandRequest,
     StartPtyRequest,
 };
 use crate::extensions::{ExtensionOverview, McpConfigView, SaveUserRuleRequest, UserRulesView};
+use crate::knowledge::retrieval::{RewriteHints, SearchOptions};
 use crate::knowledge::{
     AddSourceRequest, EmbeddingConnectionTest, EmbeddingSettings, KNOWLEDGE_PROGRESS_EVENT_NAME,
     KnowledgeCollection, KnowledgeError, KnowledgeIndexJob, KnowledgeIndexMetrics,
@@ -34,12 +37,23 @@ use crate::knowledge::{
     KnowledgeSource, SetEmbeddingSettingsRequest, UpsertCollectionRequest,
 };
 use crate::logging::{LogQuery, LogQueryResult};
+use crate::memory::{
+    CandidateDecision, CandidateOutcome, DreamReport, DreamStatus, MAX_MAINTENANCE_INPUT_MEMORIES,
+    MaintenanceOutcome, MaintenanceReport, MaintenanceSettings, MaintenanceTrigger,
+    MemoryClearOutcome, MemoryError, MemoryPage, MemoryScope, MemoryScopeKind, MemorySettings,
+    MemoryStatus, MemoryUpsertOutcome, bound_failure, build_maintenance_prompt, parse_proposals,
+    run_offline_maintenance,
+};
 use crate::multi_agent::{
     CreateSubagentRequest, MultiAgentCoordinator, MultiAgentError, SubagentEventPublisher,
     SubagentExecutionContext, SubagentView, delegation_tools,
 };
 use crate::ocr::{self, OcrResult};
 use crate::persistence::ProjectRecord;
+use crate::policy::AllowRegisteredTools;
+use crate::protocol::memory::{
+    SetMemoryMaintenanceSettingsRequest, SetMemorySettingsRequest, UpsertMemoryRequest,
+};
 use crate::protocol::{
     AgentEvent, AgentEventEnvelope, AgentMode, ApprovalMode, ApprovalResolution, ChangeSet,
     ImageAttachment, MessageRole, PROTOCOL_VERSION, PatchPreview, PluginOverview,
@@ -51,7 +65,15 @@ use crate::providers::{
     ProviderConfigView, ProviderEvent, ProviderMessage, ProviderRequest, SaveProviderConfigRequest,
 };
 use crate::scheduled_tasks::{ScheduledTaskError, ScheduledTaskView, UpsertScheduledTaskRequest};
+use crate::storage::knowledge_entity_repository::{
+    KnowledgeEntityRecord, KnowledgeFactCandidateRecord, KnowledgeFactRecord,
+    KnowledgeFeedbackRecord, KnowledgeRetrievalEventRecord,
+};
+use crate::storage::memory_repository::{
+    CANDIDATE_STATUS_PENDING, MemoryCandidateRecord, MemoryRecord,
+};
 use crate::storage::{StoredEvent, StoredEventKind, ThreadRepository, ThreadSummary};
+use crate::tools::ToolRegistry;
 use crate::workbench::{
     self, AttachmentContent, FileEntry, FilePreview, GitBranchView, GitStatusView,
     SaveWorkspaceFileRequest, WorkspaceState,
@@ -74,6 +96,7 @@ fn ordinary_turn_soft_limits(has_active_goal: bool) -> Option<SoftTurnLimits> {
     (!has_active_goal).then(SoftTurnLimits::default)
 }
 
+pub(crate) mod mobile;
 pub(crate) mod threads;
 
 async fn emit_mailbox_changed(app: &AppHandle, state: &AppState, thread_id: &str) {
@@ -307,14 +330,14 @@ fn retry_mode(events: &[StoredEvent]) -> AgentMode {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CommandError {
-    code: &'static str,
-    message: String,
+    pub(crate) code: &'static str,
+    pub(crate) message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     details: Option<serde_json::Value>,
 }
 
 impl CommandError {
-    fn new(code: &'static str, error: impl std::fmt::Display) -> Self {
+    pub(crate) fn new(code: &'static str, error: impl std::fmt::Display) -> Self {
         Self {
             code,
             message: error.to_string(),
@@ -327,7 +350,7 @@ impl CommandError {
         self
     }
 
-    fn internal(error: impl std::fmt::Display) -> Self {
+    pub(crate) fn internal(error: impl std::fmt::Display) -> Self {
         Self::new("internal_error", error)
     }
 }
@@ -344,7 +367,11 @@ struct TauriEventPublisher {
 
 impl EventPublisher for TauriEventPublisher {
     fn publish(&self, event: AgentEventEnvelope) {
-        let _ = self.app.emit(AGENT_EVENT_NAME, event);
+        let _ = self.app.emit(AGENT_EVENT_NAME, event.clone());
+        // 同一领域事件同时扇出给已订阅的移动端连接。桌面和手机看到的是同一份事实。
+        if let Some(service) = self.app.try_state::<crate::mobile::MobileService>() {
+            service.publish_event(&event);
+        }
     }
 }
 
@@ -573,6 +600,8 @@ fn live_runtime_instruction_provider(
 ) -> Arc<dyn RuntimeInstructionProvider> {
     let advanced = state.advanced();
     let extensions = state.extension_service();
+    let memory = state.memory();
+    let logger = state.logger();
     Arc::new(move || {
         let workflow_active = advanced
             .workflows
@@ -602,10 +631,21 @@ fn live_runtime_instruction_provider(
             }
             advanced_instructions.push_str(&workflow_skills);
         }
-        let memory_instructions = advanced
+        let legacy_memory_instructions = advanced
             .memory
             .context()
             .map_err(|error| format!("memory: {error}"))?;
+        // Design §5.1: Task 2 memories reach the request only through the assembler, which orders
+        // them by tier, withholds secret-bearing rows, budgets them and records every injection. The
+        // legacy store keeps its own 16 KiB budget and its own `enabled` gate, so it stays a separate
+        // block instead of being folded into the assembly budget.
+        let mut memory_instructions = legacy_memory_instructions;
+        if let Some(assembled) = assemble_memory_context(&memory, &logger, &thread_id) {
+            if !memory_instructions.trim().is_empty() {
+                memory_instructions.push_str("\n\n");
+            }
+            memory_instructions.push_str(&assembled);
+        }
         Ok(build_system_prompt(
             workspace_root.as_deref(),
             &extension_instructions,
@@ -615,6 +655,82 @@ fn live_runtime_instruction_provider(
             &tool_names,
         ))
     })
+}
+
+/// Builds the `<memory>` payload for Task 2 memories, or `None` when there is nothing to inject.
+///
+/// `enabled` is the Task 3 gate: it controls automatic capture and context injection while
+/// user-mediated viewing, editing, review and deletion stay available (design §12.4).
+///
+/// Scope coverage is deliberately conservative. `user` and `thread` are the two scopes the host can
+/// derive without inventing an identity: the runtime has a thread id but no project id, and design
+/// §7.1 requires host-generated scope ids. Project and workspace memories are therefore stored and
+/// managed but not yet auto-injected; that needs a host project identity, which is not part of Task 3.
+fn assemble_memory_context(
+    memory: &crate::memory::MemoryService,
+    logger: &crate::logging::StructuredLogger,
+    thread_id: &str,
+) -> Option<String> {
+    let settings = match memory.settings() {
+        Ok(settings) => settings,
+        Err(error) => {
+            let _ = logger.log(
+                "error",
+                "memory_context_settings_failed",
+                serde_json::json!({ "threadId": thread_id, "code": error.code() }),
+            );
+            return None;
+        }
+    };
+    if !settings.enabled {
+        return None;
+    }
+    let scopes = [
+        MemoryScope::user(),
+        MemoryScope::new(MemoryScopeKind::Thread, Some(thread_id.to_owned())),
+    ];
+    let mut records = Vec::<MemoryRecord>::new();
+    for scope in scopes {
+        match memory.list(
+            &scope,
+            MemoryStatus::Active,
+            None,
+            Some(crate::storage::memory_repository::MAX_MEMORY_PAGE_SIZE),
+        ) {
+            Ok(page) => records.extend(page.items),
+            Err(error) => {
+                // A failed scope read must not fail the turn; it is reported and the remaining
+                // scopes are still considered.
+                let _ = logger.log(
+                    "error",
+                    "memory_context_scope_failed",
+                    serde_json::json!({
+                        "threadId": thread_id,
+                        "scope": scope.canonical(),
+                        "code": error.code(),
+                    }),
+                );
+            }
+        }
+    }
+    let fragments = memory_fragments(&records, crate::storage::now_ms());
+    if fragments.is_empty() {
+        return None;
+    }
+    let assembled = ContextAssembler::default().assemble(fragments);
+    if assembled.is_empty() {
+        return None;
+    }
+    // Design §5.1: every injection records memoryId, revision, scope and whether it was trimmed.
+    let _ = logger.log(
+        "info",
+        "memory_context_injected",
+        serde_json::json!({
+            "threadId": thread_id,
+            "audit": assembled.audit_summary(),
+        }),
+    );
+    Some(assembled.render())
 }
 
 async fn turn_tokens(state: &AppState, thread_id: &str, turn_id: &str) -> u64 {
@@ -999,6 +1115,14 @@ fn knowledge_command_error(error: KnowledgeError) -> CommandError {
     CommandError::new(error.code(), error)
 }
 
+fn memory_command_error(error: MemoryError) -> CommandError {
+    CommandError::new(error.code(), error)
+}
+
+fn entities_command_error(error: EntityError) -> CommandError {
+    CommandError::new(error.code(), error)
+}
+
 #[tauri::command]
 pub fn get_knowledge_settings(state: State<'_, AppState>) -> CommandResult<KnowledgeSettings> {
     state
@@ -1200,18 +1324,158 @@ pub async fn search_knowledge(
     limit: Option<usize>,
     thread_id: Option<String>,
     turn_id: Option<String>,
+    model_rewrite: Option<bool>,
 ) -> CommandResult<KnowledgeSearchResponse> {
+    let workspace = state.workspace_root();
+    let mut options = SearchOptions {
+        hints: RewriteHints {
+            // The command layer only knows the workspace, so the project name is the one host hint it
+            // can supply honestly. Callers that hold thread context (the agent runtime) fill in the
+            // current file and the recent entities through the same struct.
+            project_name: workspace
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_owned),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    // The model rewrite is optional and only runs when the caller asks for it, so a knowledge search
+    // never spends a provider call the user did not request. Without a configured provider the
+    // deterministic rewrite is used, exactly as if the flag had not been set.
+    if model_rewrite.unwrap_or(false) {
+        if let Ok((provider, model, _)) = state.build_provider_for(None) {
+            options.rewriter = Some(Arc::new(ModelQueryRewriter::new(
+                provider,
+                model,
+                ReasoningEffort::Off,
+            )));
+        }
+    }
     state
         .knowledge()
-        .search(
-            &state.workspace_root(),
+        .search_with_options(
+            &workspace,
             thread_id.as_deref().unwrap_or("settings"),
             turn_id.as_deref().unwrap_or("settings"),
             &query,
             limit.unwrap_or(6),
+            &options,
         )
         .await
         .map_err(knowledge_command_error)
+}
+
+/// Records a user rating for a citation this turn already returned.
+///
+/// A rating is only accepted for a citation the given turn actually received, and it is persisted
+/// against the chunk *and* revision it rated so the ranking signal survives a restart.
+#[tauri::command(rename_all = "camelCase")]
+pub fn record_knowledge_feedback(
+    state: State<'_, AppState>,
+    citation_id: String,
+    feedback_type: String,
+    thread_id: String,
+    turn_id: String,
+) -> CommandResult<KnowledgeFeedbackRecord> {
+    state
+        .knowledge()
+        .record_feedback(&thread_id, &turn_id, &citation_id, &feedback_type)
+        .map_err(knowledge_command_error)
+}
+
+/// Retrieval telemetry for one thread, newest first. Only opaque query digests are stored.
+#[tauri::command(rename_all = "camelCase")]
+pub fn list_knowledge_retrieval_events(
+    state: State<'_, AppState>,
+    thread_id: String,
+    limit: Option<u32>,
+) -> CommandResult<Vec<KnowledgeRetrievalEventRecord>> {
+    state
+        .knowledge()
+        .list_retrieval_events(&thread_id, limit.unwrap_or(20))
+        .map_err(knowledge_command_error)
+}
+
+/// `active` entities of one collection. Entities are created by proposals, never by this surface.
+#[tauri::command(rename_all = "camelCase")]
+pub fn list_knowledge_entities(
+    state: State<'_, AppState>,
+    collection_id: String,
+    status: Option<String>,
+    limit: Option<u32>,
+) -> CommandResult<Vec<KnowledgeEntityRecord>> {
+    state
+        .entities()
+        .list_entities(&collection_id, status.as_deref().unwrap_or("active"), limit)
+        .map_err(entities_command_error)
+}
+
+/// Facts of one collection. `status = "candidate"` is the review queue.
+#[tauri::command(rename_all = "camelCase")]
+pub fn list_knowledge_facts(
+    state: State<'_, AppState>,
+    collection_id: String,
+    status: Option<String>,
+    limit: Option<u32>,
+) -> CommandResult<Vec<KnowledgeFactCandidateRecord>> {
+    state
+        .entities()
+        .list_facts(
+            &collection_id,
+            status.as_deref().unwrap_or("candidate"),
+            limit,
+        )
+        .map_err(entities_command_error)
+}
+
+/// Applies or discards one pending fact candidate.
+///
+/// `entityType` is only honoured for entities that are still candidates, i.e. the ones this
+/// proposal created; it is validated against the host-owned vocabulary, never trusted as free text.
+#[tauri::command(rename_all = "camelCase")]
+pub fn review_knowledge_fact(
+    state: State<'_, AppState>,
+    fact_id: String,
+    decision: String,
+    entity_type: Option<String>,
+) -> CommandResult<KnowledgeFactRecord> {
+    let decision = FactDecision::parse(&decision).map_err(entities_command_error)?;
+    state
+        .entities()
+        .review_fact(&fact_id, decision, entity_type.as_deref())
+        .map_err(entities_command_error)
+}
+
+/// Replays the fixed retrieval eval set and returns the recorded baseline.
+///
+/// This is the "固定评测集" of design §11 Phase E: it indexes a synthetic corpus in a temporary
+/// workspace, replays the fixture queries through the real service and reports Recall@k, MRR,
+/// citation correctness, degradation rate, availability and latency. It never touches the user's
+/// workspace or knowledge index.
+#[tauri::command]
+pub async fn run_knowledge_retrieval_evaluation()
+-> CommandResult<crate::knowledge::evaluation::RetrievalBaselineReport> {
+    crate::knowledge::evaluation::run_retrieval_baseline()
+        .await
+        .map_err(|message| CommandError::new("KC_EVALUATION_FAILED", message))
+}
+
+/// Read-only relation query: `active` facts about one entity name in the current workspace.
+#[tauri::command(rename_all = "camelCase")]
+pub fn query_knowledge_relations(
+    state: State<'_, AppState>,
+    name: String,
+    limit: Option<u32>,
+) -> CommandResult<RelationQueryResult> {
+    state
+        .entities()
+        .relations(
+            &state.workspace_root(),
+            &name,
+            limit.unwrap_or(DEFAULT_RELATION_LIMIT) as usize,
+        )
+        .map_err(entities_command_error)
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -1237,60 +1501,522 @@ pub fn read_knowledge_citation(
 
 #[tauri::command]
 pub fn get_memory_settings(state: State<'_, AppState>) -> CommandResult<MemorySettings> {
-    state
-        .advanced()
-        .memory
-        .settings()
-        .map_err(|error| CommandError::new("memory", error))
+    state.memory().settings().map_err(memory_command_error)
 }
 
+/// Updates the whole settings row. `enabled` also mirrors into the legacy Phase 9 store so the
+/// `recall_memory` tool keeps honouring the user's choice during the migration window.
+#[tauri::command(rename_all = "camelCase")]
+pub fn set_memory_settings(
+    state: State<'_, AppState>,
+    request: SetMemorySettingsRequest,
+) -> CommandResult<MemorySettings> {
+    let settings = state
+        .memory()
+        .set_settings(
+            request.enabled,
+            request.auto_accept_high_confidence,
+            request.default_ttl_days,
+        )
+        .map_err(memory_command_error)?;
+    if let Err(error) = state.advanced().memory.set_enabled(settings.enabled) {
+        return Err(CommandError::new("memory", error));
+    }
+    Ok(settings)
+}
+
+/// Kept for the existing settings surface: toggles only the enable flag.
 #[tauri::command(rename_all = "camelCase")]
 pub fn set_memory_enabled(
     state: State<'_, AppState>,
     enabled: bool,
 ) -> CommandResult<MemorySettings> {
-    state
-        .advanced()
-        .memory
-        .set_enabled(enabled)
-        .map_err(|error| CommandError::new("memory", error))
+    let current = state.memory().settings().map_err(memory_command_error)?;
+    let settings = state
+        .memory()
+        .set_settings(
+            enabled,
+            current.auto_accept_high_confidence,
+            current.default_ttl_days,
+        )
+        .map_err(memory_command_error)?;
+    if let Err(error) = state.advanced().memory.set_enabled(settings.enabled) {
+        return Err(CommandError::new("memory", error));
+    }
+    Ok(settings)
 }
 
-#[tauri::command]
-pub fn list_memories(state: State<'_, AppState>) -> CommandResult<Vec<MemoryView>> {
+#[tauri::command(rename_all = "camelCase")]
+pub fn list_memories(
+    state: State<'_, AppState>,
+    scope: String,
+    status: Option<String>,
+    cursor: Option<String>,
+    limit: Option<u32>,
+) -> CommandResult<MemoryPage> {
+    let scope = MemoryScope::parse(&scope).map_err(memory_command_error)?;
+    let status = match status.as_deref() {
+        Some(status) => MemoryStatus::parse(status).map_err(memory_command_error)?,
+        None => MemoryStatus::Active,
+    };
     state
-        .advanced()
-        .memory
-        .list()
-        .map_err(|error| CommandError::new("memory", error))
+        .memory()
+        .list(&scope, status, cursor.as_deref(), limit)
+        .map_err(memory_command_error)
 }
 
 #[tauri::command]
 pub fn upsert_memory(
     state: State<'_, AppState>,
-    request: MemoryUpsertRequest,
-) -> CommandResult<MemoryView> {
-    state
-        .advanced()
-        .memory
-        .upsert(request)
-        .map_err(|error| CommandError::new("memory", error))
+    request: UpsertMemoryRequest,
+) -> CommandResult<MemoryUpsertOutcome> {
+    let command = request.into_command().map_err(memory_command_error)?;
+    state.memory().upsert(command).map_err(memory_command_error)
 }
 
 #[tauri::command(rename_all = "camelCase")]
-pub fn delete_memory(state: State<'_, AppState>, memory_id: String) -> CommandResult<MemoryView> {
+pub fn list_memory_candidates(
+    state: State<'_, AppState>,
+    status: Option<String>,
+    limit: Option<u32>,
+) -> CommandResult<Vec<MemoryCandidateRecord>> {
+    let status = status.unwrap_or_else(|| CANDIDATE_STATUS_PENDING.to_owned());
     state
-        .advanced()
-        .memory
-        .delete(&memory_id)
-        .map_err(|error| CommandError::new("memory", error))
+        .memory()
+        .list_candidates(&status, limit)
+        .map_err(memory_command_error)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub fn review_memory_candidate(
+    state: State<'_, AppState>,
+    candidate_id: String,
+    decision: String,
+) -> CommandResult<MemoryCandidateRecord> {
+    let decision = CandidateDecision::parse(&decision).map_err(memory_command_error)?;
+    state
+        .memory()
+        .review_candidate(&candidate_id, decision)
+        .map_err(memory_command_error)
+}
+
+/// Soft-deletes one memory. `confirmationToken` must equal `memoryId`, matching the knowledge
+/// source and collection deletion contract.
+#[tauri::command(rename_all = "camelCase")]
+pub fn delete_memory(
+    state: State<'_, AppState>,
+    memory_id: String,
+    confirmation_token: String,
+) -> CommandResult<MemoryRecord> {
+    state
+        .memory()
+        .delete(&memory_id, &confirmation_token)
+        .map_err(memory_command_error)
+}
+
+/// Clears every active memory in one scope. `confirmationToken` must equal the canonical scope
+/// string, which the UI shows verbatim in the confirmation dialog.
+#[tauri::command(rename_all = "camelCase")]
+pub fn clear_memories(
+    state: State<'_, AppState>,
+    scope: String,
+    confirmation_token: String,
+) -> CommandResult<MemoryClearOutcome> {
+    let scope = MemoryScope::parse(&scope).map_err(memory_command_error)?;
+    state
+        .memory()
+        .clear(&scope, &confirmation_token)
+        .map_err(memory_command_error)
+}
+
+/// Title of the dedicated background thread a Dream Turn writes to.
+const DREAM_THREAD_TITLE: &str = "记忆维护";
+
+/// Reads the newest assistant text from a finished background Turn.
+///
+/// `TurnOutcome` carries state and timing, not the reply, so the maintenance pass reads the thread it
+/// just wrote. Only `Text` blocks count: a `Context` block is host-authored scaffolding, and an image
+/// block can never be a proposal payload.
+async fn last_assistant_text(state: &AppState, thread_id: &str) -> Option<String> {
+    let detail = state.repository().read_thread(thread_id).await.ok()?;
+    let message = detail
+        .messages
+        .iter()
+        .rev()
+        .find(|message| message.role == MessageRole::Assistant)?;
+    let text = message
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            crate::protocol::ContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    (!text.trim().is_empty()).then_some(text)
+}
+
+/// Runs the Dream half of a maintenance pass.
+///
+/// Dream is a Turn like any other: it reuses the single `AgentRuntime`, so it inherits the same
+/// provider plumbing, event stream, cancellation and audit trail instead of growing a second agent
+/// loop. Two things are deliberately taken away — the tool registry is empty and the budget is the
+/// maintenance budget — so a model that asks to read a file gets a denial, not a workspace.
+async fn run_dream_turn(
+    state: &AppState,
+    publisher: Arc<dyn EventPublisher>,
+    cancellation: &CancellationToken,
+    now_ms: u64,
+) -> DreamReport {
+    let service = state.memory_maintenance();
+    let settings = match service.settings() {
+        Ok(settings) => settings,
+        Err(error) => return DreamReport::failed(error),
+    };
+    if !settings.dream_runnable() {
+        return DreamReport::skipped();
+    }
+    let memories = match state
+        .memory()
+        .maintenance_input(MAX_MAINTENANCE_INPUT_MEMORIES as u32)
+    {
+        Ok(memories) => memories,
+        Err(error) => return DreamReport::failed(error),
+    };
+    // No Provider means no Dream. That is not a failure: the offline half already ran, and the design
+    // keeps maintenance useful on a machine that has never configured a model.
+    let (provider, model, context_limit) = match state.build_provider() {
+        Ok(configured) => configured,
+        Err(error) => {
+            let _ = state.logger().log(
+                "info",
+                "memory_dream_skipped",
+                serde_json::json!({"reason": "provider_unavailable", "error": error.to_string()}),
+            );
+            return DreamReport::skipped();
+        }
+    };
+    let workspace = state.workspace_root();
+    let thread = match state
+        .repository()
+        .create_thread_in_workspace(&workspace)
+        .await
+    {
+        Ok(thread) => thread,
+        Err(error) => return DreamReport::failed(error),
+    };
+    let _ = state
+        .repository()
+        .rename_thread(&thread.id, DREAM_THREAD_TITLE.to_owned())
+        .await;
+    // Remembered so the UI can open the run's transcript, and so a later pass can find it again.
+    let _ = service.set_thread_id(&thread.id);
+
+    let turn_id = Uuid::new_v4().to_string();
+    let (turn_cancellation, control) = match state
+        .begin_turn_with_id_in_workspace(&thread.id, &turn_id, &workspace)
+        .await
+    {
+        Ok(pair) => pair,
+        Err(error) => return DreamReport::failed(error),
+    };
+    // Cancelling the maintenance run has to cancel the Turn it started; aborting the bridge when the
+    // Turn ends keeps no listener behind.
+    let lease_token = cancellation.clone();
+    let turn_token = turn_cancellation.clone();
+    let bridge = tokio::spawn(async move {
+        lease_token.cancelled().await;
+        turn_token.cancel();
+    });
+
+    // An empty registry with `AllowRegisteredTools` is the "no tools at all" shape: nothing is
+    // registered, so every tool call is denied by construction rather than by a denylist.
+    let tools = match ToolRegistry::new_with_policy(vec![], Arc::new(AllowRegisteredTools)) {
+        Ok(tools) => tools,
+        Err(error) => {
+            bridge.abort();
+            state.finish_turn(&thread.id).await;
+            return DreamReport::failed(error);
+        }
+    };
+    let prompt = build_maintenance_prompt(&memories, &[], now_ms);
+    let runtime = AgentRuntime::with_tools_and_approvals(
+        state.runtime_repository(),
+        tools,
+        workspace,
+        state.approvals(),
+    )
+    .with_context_limit(context_limit)
+    .with_token_budget(settings.token_budget)
+    .with_logger(state.logger());
+    let result = runtime
+        .run_turn_with_attachments_id_and_control(
+            provider,
+            model,
+            RunTurnRequest {
+                thread_id: thread.id.clone(),
+                input: prompt,
+                agent_mode: None,
+            },
+            Vec::new(),
+            turn_id.clone(),
+            turn_cancellation,
+            control,
+            publisher,
+        )
+        .await;
+    bridge.abort();
+    state.finish_turn(&thread.id).await;
+
+    if cancellation.is_cancelled() {
+        return DreamReport::cancelled();
+    }
+    if let Err(error) = result {
+        return DreamReport::failed(error);
+    }
+    let Some(raw) = last_assistant_text(state, &thread.id).await else {
+        return DreamReport::failed("the maintenance turn produced no text to parse");
+    };
+    // The host owns the scope: the model never names one. A background pass has no thread context, so
+    // user scope is the only honest choice.
+    let host_scope = MemoryScope::user();
+    let drafts = match parse_proposals(&raw, &host_scope, &turn_id) {
+        Ok(drafts) => drafts,
+        Err(error) => return DreamReport::failed(error),
+    };
+    let mut report = DreamReport {
+        status: DreamStatus::Completed,
+        proposals: drafts.len(),
+        ..DreamReport::skipped()
+    };
+    for draft in drafts {
+        match state.memory().record_candidate(draft) {
+            Ok(CandidateOutcome::AutoAccepted { .. }) => report.accepted += 1,
+            Ok(CandidateOutcome::Pending { .. }) => report.pending += 1,
+            // A draft identical to an existing memory is dropped silently; it is not a decision the
+            // user needs to see.
+            Ok(CandidateOutcome::Deduplicated { .. }) => {}
+            Err(error) => report.error = Some(bound_failure(&error.to_string())),
+        }
+    }
+    report
+}
+
+/// Runs one maintenance pass: the deterministic offline steps, then the optional Dream Turn.
+///
+/// The offline half needs no Provider, which is what makes the design's "no local model" path work.
+/// It also runs first, so Dream reads a projection that is already consistent. The whole pass holds a
+/// single-instance lease, so a scheduled run and a manual run can never overlap.
+pub(crate) async fn run_memory_maintenance_with_publisher(
+    state: &AppState,
+    publisher: Arc<dyn EventPublisher>,
+    trigger: MaintenanceTrigger,
+) -> Result<MaintenanceReport, CommandError> {
+    let service = state.memory_maintenance();
+    let started_at_ms = crate::storage::now_ms();
+    let lease = service
+        .gate()
+        .try_begin(started_at_ms)
+        .map_err(memory_command_error)?;
+    service
+        .record_run_started(started_at_ms)
+        .map_err(memory_command_error)?;
+    let _ = state.logger().log(
+        "info",
+        "memory_maintenance_started",
+        serde_json::json!({"trigger": trigger.as_str(), "startedAtMs": started_at_ms}),
+    );
+
+    let offline = match run_offline_maintenance(&state.memory(), started_at_ms) {
+        Ok(offline) => offline,
+        Err(error) => {
+            let completed_at_ms = crate::storage::now_ms();
+            let _ = service.record_run_finished(MaintenanceOutcome::Failed, completed_at_ms);
+            return Err(memory_command_error(error));
+        }
+    };
+
+    let dream = if lease.cancellation().is_cancelled() {
+        DreamReport::cancelled()
+    } else {
+        run_dream_turn(state, publisher, &lease.cancellation(), started_at_ms).await
+    };
+    let outcome = if lease.cancellation().is_cancelled() {
+        MaintenanceOutcome::Cancelled
+    } else if dream.status == DreamStatus::Failed {
+        MaintenanceOutcome::Failed
+    } else {
+        MaintenanceOutcome::Completed
+    };
+    let completed_at_ms = crate::storage::now_ms();
+    service
+        .record_run_finished(outcome, completed_at_ms)
+        .map_err(memory_command_error)?;
+    let report = MaintenanceReport {
+        trigger,
+        outcome,
+        offline,
+        dream,
+        started_at_ms,
+        completed_at_ms,
+    };
+    let _ = state.logger().log(
+        "info",
+        "memory_maintenance_finished",
+        serde_json::json!({
+            "trigger": trigger.as_str(),
+            "outcome": outcome.as_str(),
+            "expired": report.offline.expired_ids.len(),
+            "merged": report.offline.merged_groups.len(),
+            "dream": report.dream.status,
+            "proposals": report.dream.proposals,
+            "accepted": report.dream.accepted,
+            "pending": report.dream.pending,
+            "durationMs": completed_at_ms.saturating_sub(started_at_ms),
+        }),
+    );
+    Ok(report)
+}
+
+/// Applies a maintenance settings update. Split out of the command so the disclosure rule is
+/// testable without an `AppHandle`.
+pub(crate) fn apply_memory_maintenance_settings(
+    state: &AppState,
+    request: SetMemoryMaintenanceSettingsRequest,
+) -> Result<MaintenanceSettings, CommandError> {
+    state
+        .memory_maintenance()
+        .set_settings(
+            request.enabled,
+            request.dream_enabled,
+            request.remote_disclosure_accepted,
+            request.token_budget,
+            request.idle_after_ms,
+        )
+        .map_err(memory_command_error)
+}
+
+/// Records the remote-disclosure acknowledgement without changing any other switch.
+///
+/// The UI shows the disclosure first and records it here, so a later visit to the settings page can
+/// enable Dream without re-reading the notice — but never without the acknowledgement existing.
+pub(crate) fn record_memory_maintenance_disclosure(
+    state: &AppState,
+) -> Result<MaintenanceSettings, CommandError> {
+    let service = state.memory_maintenance();
+    let current = service.settings().map_err(memory_command_error)?;
+    service
+        .set_settings(
+            current.enabled,
+            current.dream_enabled,
+            true,
+            current.token_budget,
+            current.idle_after_ms,
+        )
+        .map_err(memory_command_error)
+}
+
+#[tauri::command]
+pub async fn get_memory_maintenance_settings(
+    state: State<'_, AppState>,
+) -> CommandResult<MaintenanceSettings> {
+    state
+        .memory_maintenance()
+        .settings()
+        .map_err(memory_command_error)
+}
+
+/// Updates the whole maintenance settings row.
+///
+/// The disclosure acknowledgement travels in the same payload as the switch that needs it, and the
+/// domain service re-checks the pair: a request payload is never treated as an authorization source.
+#[tauri::command(rename_all = "camelCase")]
+pub fn set_memory_maintenance_settings(
+    state: State<'_, AppState>,
+    request: SetMemoryMaintenanceSettingsRequest,
+) -> CommandResult<MaintenanceSettings> {
+    apply_memory_maintenance_settings(state.inner(), request)
+}
+
+#[tauri::command]
+pub fn accept_memory_maintenance_disclosure(
+    state: State<'_, AppState>,
+) -> CommandResult<MaintenanceSettings> {
+    record_memory_maintenance_disclosure(state.inner())
+}
+
+/// Runs a maintenance pass now, regardless of the interval and idle gates.
+#[tauri::command]
+pub async fn run_memory_maintenance(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> CommandResult<MaintenanceReport> {
+    let publisher: Arc<dyn EventPublisher> = Arc::new(TauriEventPublisher { app: app.clone() });
+    run_memory_maintenance_with_publisher(state.inner(), publisher, MaintenanceTrigger::Manual)
+        .await
+}
+
+/// Cancels the in-flight run. Returns false when nothing was running.
+#[tauri::command]
+pub fn cancel_memory_maintenance(state: State<'_, AppState>) -> CommandResult<bool> {
+    Ok(state.memory_maintenance().cancel())
+}
+
+/// How often the maintenance scheduler re-checks its two gates.
+const MEMORY_MAINTENANCE_POLL_SECS: u64 = 5;
+
+/// Starts the background scheduler that decides when an automatic maintenance run may happen.
+///
+/// Polling rather than a timer, because both inputs are observed state: "has the interval elapsed"
+/// lives in the persisted settings row, and "is the app idle" lives in `AppState` alongside turn
+/// admission. A timer would have to be rebuilt on every settings change and could drift out of step
+/// with the runtime. The first tick is delayed, so a freshly started app never runs maintenance
+/// before its own setup has finished.
+pub fn spawn_memory_maintenance_scheduler(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(MEMORY_MAINTENANCE_POLL_SECS)).await;
+            let (trigger, publisher) = {
+                let state = app.state::<AppState>();
+                let state = state.inner();
+                let service = state.memory_maintenance();
+                let settings = match service.settings() {
+                    Ok(settings) => settings,
+                    // A bad settings row must not spin the loop or spam the log: the manual command
+                    // and the settings surface are what the user can act on.
+                    Err(_) => continue,
+                };
+                let idle_since_ms = state.memory_maintenance_idle_since_ms().await;
+                let now_ms = crate::storage::now_ms();
+                let Some(trigger) = service.automatic_trigger(&settings, now_ms, idle_since_ms)
+                else {
+                    continue;
+                };
+                let publisher: Arc<dyn EventPublisher> =
+                    Arc::new(TauriEventPublisher { app: app.clone() });
+                (trigger, publisher)
+            };
+            // A run in flight makes the lease claim fail; that is the expected way two ticks cannot
+            // overlap, so the error is not worth logging.
+            let state_handle = app.state::<AppState>();
+            if let Err(error) =
+                run_memory_maintenance_with_publisher(state_handle.inner(), publisher, trigger)
+                    .await
+            {
+                let _ = app.state::<AppState>().logger().log(
+                    "error",
+                    "memory_maintenance_failed",
+                    serde_json::json!({"trigger": trigger.as_str(), "error": error.message}),
+                );
+            }
+        }
+    });
 }
 
 #[tauri::command]
 pub async fn get_browser_settings(state: State<'_, AppState>) -> CommandResult<BrowserSettings> {
     Ok(state.advanced().browser.settings().await)
 }
-
 #[tauri::command]
 pub async fn save_browser_settings(
     state: State<'_, AppState>,
@@ -1864,12 +2590,22 @@ pub async fn turn_start(
     attachments: Vec<ImageAttachment>,
     workflow_id: Option<String>,
 ) -> CommandResult<TurnHandle> {
-    preflight_requested_or_active_workflow(
-        state.inner(),
-        &request.thread_id,
-        workflow_id.as_deref(),
-    )
-    .await?;
+    enqueue_message_turn(app, state.inner(), request, attachments, workflow_id).await
+}
+
+/// 把一个用户消息 Turn 放进 Thread mailbox 并等待它真正开始。
+///
+/// 这是桌面命令和移动网关共用的唯一入口：两条链路都走同一个 mailbox，
+/// 不允许移动端另起一套 Turn 启动逻辑。
+pub(crate) async fn enqueue_message_turn(
+    app: AppHandle,
+    state: &AppState,
+    request: RunTurnRequest,
+    attachments: Vec<ImageAttachment>,
+    workflow_id: Option<String>,
+) -> CommandResult<TurnHandle> {
+    preflight_requested_or_active_workflow(state, &request.thread_id, workflow_id.as_deref())
+        .await?;
     let turn_id = Uuid::new_v4().to_string();
     let thread_id = request.thread_id.clone();
     let (signal, started) = oneshot::channel();
@@ -1890,7 +2626,7 @@ pub async fn turn_start(
             started: Some(signal),
         })
         .await;
-    emit_mailbox_changed(&app, state.inner(), &thread_id).await;
+    emit_mailbox_changed(&app, state, &thread_id).await;
 
     if !should_start {
         return Ok(handle);
@@ -2165,7 +2901,7 @@ pub async fn turn_steer_queued(
     })
 }
 
-async fn prepare_steer_message(
+pub(crate) async fn prepare_steer_message(
     app: &AppHandle,
     state: &AppState,
     input: &str,
@@ -3181,19 +3917,26 @@ mod tests {
 
     use super::{
         CRAFT_MODE_INSTRUCTIONS, CommandError, PROJECT_FREE_TOOL_NAMES, PreparedTurnTools,
-        SubagentPublishers, TurnStartPublisher, build_system_prompt, execute_retry,
-        extract_local_document, ordinary_turn_soft_limits, plugin_command_error,
-        preflight_requested_or_active_workflow, require_project_thread_for_subagent,
+        SubagentPublishers, TurnStartPublisher, apply_memory_maintenance_settings,
+        assemble_memory_context, build_system_prompt, execute_retry, extract_local_document,
+        ordinary_turn_soft_limits, plugin_command_error, preflight_requested_or_active_workflow,
+        record_memory_maintenance_disclosure, require_project_thread_for_subagent,
         require_project_thread_for_workflow, require_queued_workflow_steerable, retry_mode,
-        tools_for_mode, tools_without_project, validate_workflow_turn_context,
+        run_memory_maintenance_with_publisher, tools_for_mode, tools_without_project,
+        validate_workflow_turn_context,
     };
     use crate::agent::mailbox::{MailboxTurn, MailboxTurnKind};
     use crate::agent::{AgentRuntime, EventPublisher, RunTurnRequest};
     use crate::app_state::AppState;
+    use crate::logging::StructuredLogger;
+    use crate::memory::{
+        DreamStatus, MaintenanceOutcome, MaintenanceTrigger, MemoryScope, MemoryScopeKind,
+    };
     use crate::multi_agent::{
         MultiAgentCoordinator, NoopSubagentPublisher, SubagentExecutionContext,
     };
     use crate::policy::ApprovalManager;
+    use crate::protocol::memory::SetMemoryMaintenanceSettingsRequest;
     use crate::protocol::{
         AgentEvent, AgentEventEnvelope, AgentMode, ApprovalMode, PROTOCOL_VERSION, ReasoningEffort,
     };
@@ -3903,5 +4646,303 @@ mod tests {
         )];
 
         assert_eq!(retry_mode(&events), AgentMode::Craft);
+    }
+
+    #[test]
+    fn memory_context_injection_is_gated_ordered_and_budgeted() {
+        use crate::memory::{MemoryService, MemoryType, UpsertMemoryCommand};
+        use crate::persistence::ProjectionDb;
+
+        let data = tempfile::tempdir().unwrap();
+        let logger = StructuredLogger::new(data.path()).unwrap();
+        let memory = MemoryService::new(ProjectionDb::memory().unwrap(), true);
+
+        memory
+            .upsert(UpsertMemoryCommand {
+                memory_id: None,
+                content: "必须用 pnpm 安装依赖".into(),
+                memory_type: MemoryType::Constraint,
+                scope: MemoryScope::user(),
+                expires_at_ms: None,
+            })
+            .unwrap();
+        memory
+            .upsert(UpsertMemoryCommand {
+                memory_id: None,
+                content: "当前任务正在迁移 schema".into(),
+                memory_type: MemoryType::WorkState,
+                scope: MemoryScope::new(MemoryScopeKind::Thread, Some("thread-1".to_owned())),
+                expires_at_ms: None,
+            })
+            .unwrap();
+
+        let rendered =
+            assemble_memory_context(&memory, &logger, "thread-1").expect("memory context");
+        // Constraint memory outranks work state, and both carry their tier tag and scope.
+        let constraint = rendered
+            .find("[constraint_memory]")
+            .expect("constraint tier");
+        let work_state = rendered
+            .find("[work_state_memory]")
+            .expect("work state tier");
+        assert!(constraint < work_state, "unexpected order: {rendered}");
+        assert!(rendered.contains("必须用 pnpm 安装依赖"));
+
+        // Another thread must not see this thread's work state.
+        let other = assemble_memory_context(&memory, &logger, "thread-2").expect("user scope only");
+        assert!(other.contains("必须用 pnpm 安装依赖"));
+        assert!(!other.contains("当前任务正在迁移 schema"));
+
+        // The `enabled` gate is what `set_memory_enabled` flips: disabled means no injection at all.
+        memory.set_settings(false, false, 0).unwrap();
+        assert!(assemble_memory_context(&memory, &logger, "thread-1").is_none());
+
+        // With no memories at all there is nothing to inject, so no empty `<memory>` block appears.
+        let empty = MemoryService::new(ProjectionDb::memory().unwrap(), true);
+        assert!(assemble_memory_context(&empty, &logger, "thread-1").is_none());
+    }
+
+    #[test]
+    fn memory_context_never_injects_secret_bearing_rows() {
+        use crate::memory::{MemoryService, MemoryType, UpsertMemoryCommand};
+        use crate::persistence::ProjectionDb;
+        use crate::storage::memory_repository::{MemoryEventKind, MemoryRepository, MemoryWrite};
+
+        let data = tempfile::tempdir().unwrap();
+        let logger = StructuredLogger::new(data.path()).unwrap();
+        let db = ProjectionDb::memory().unwrap();
+        let memory = MemoryService::new(db.clone(), true);
+
+        // First line of defence: the write path refuses credential-shaped content outright, so it
+        // never reaches the projection in the first place.
+        assert_eq!(
+            memory
+                .upsert(UpsertMemoryCommand {
+                    memory_id: None,
+                    content: "部署脚本读取 API_KEY=sk-live-abcdefghijklmnop".into(),
+                    memory_type: MemoryType::Fact,
+                    scope: MemoryScope::user(),
+                    expires_at_ms: None,
+                })
+                .unwrap_err()
+                .code(),
+            "MEM_SECRET_REJECTED"
+        );
+
+        // Second line of defence: a row that predates that rule, or that arrives from a foreign
+        // projection, is still stopped at the injection boundary.
+        MemoryRepository::new(db.clone())
+            .append(MemoryEventKind::MemoryUpserted(MemoryWrite {
+                id: "mem-legacy-secret".into(),
+                scope_type: "user".into(),
+                scope_id: None,
+                memory_type: "fact".into(),
+                normalized_key: "legacy-secret".into(),
+                content: "部署脚本读取 API_KEY=sk-live-abcdefghijklmnop".into(),
+                source_type: "user".into(),
+                source_ref: None,
+                confidence: 1.0,
+                sensitivity: "normal".into(),
+                status: "active".into(),
+                revision: 1,
+                expires_at_ms: None,
+                created_at_ms: crate::storage::now_ms(),
+            }))
+            .unwrap();
+        memory
+            .upsert(UpsertMemoryCommand {
+                memory_id: None,
+                content: "优先使用 pnpm 安装依赖".into(),
+                memory_type: MemoryType::Fact,
+                scope: MemoryScope::user(),
+                expires_at_ms: None,
+            })
+            .unwrap();
+
+        let rendered = assemble_memory_context(&memory, &logger, "thread-1").expect("context");
+        assert!(!rendered.contains("sk-live"), "leaked: {rendered}");
+        assert!(rendered.contains("优先使用 pnpm 安装依赖"));
+        assert!(!rendered.contains("mem-legacy-secret"));
+    }
+
+    /// An over-TTL row written straight into the projection, so the offline sweep has something real
+    /// to expire. `upsert` refuses a past `expiresAtMs`, which is the correct user-facing rule but
+    /// makes it useless for setting up this fixture.
+    fn append_over_ttl_memory(state: &AppState, id: &str) {
+        use crate::memory::{DEFAULT_WORK_STATE_TTL_DAYS, MemoryType};
+        use crate::storage::memory_repository::{MemoryEventKind, MemoryRepository, MemoryWrite};
+
+        let created_at_ms = crate::storage::now_ms()
+            .saturating_sub((DEFAULT_WORK_STATE_TTL_DAYS as u64 + 1) * 24 * 60 * 60 * 1_000);
+        MemoryRepository::new(state.repository().projection())
+            .append(MemoryEventKind::MemoryUpserted(MemoryWrite {
+                id: id.into(),
+                scope_type: "user".into(),
+                scope_id: None,
+                memory_type: MemoryType::WorkState.as_str().into(),
+                normalized_key: format!("stale-{id}"),
+                content: "旧的临时工作状态".into(),
+                source_type: "user".into(),
+                source_ref: None,
+                confidence: 1.0,
+                sensitivity: "normal".into(),
+                status: "active".into(),
+                revision: 1,
+                expires_at_ms: None,
+                created_at_ms,
+            }))
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_maintenance_run_sweeps_offline_and_skips_dream_without_a_provider() {
+        let data = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let state = AppState::with_workspace_and_credentials(
+            data.path(),
+            workspace.path(),
+            Arc::new(TestCredentials::default()),
+        )
+        .unwrap();
+        append_over_ttl_memory(&state, "mem-stale");
+
+        // No Provider is configured in this fixture, so Dream must be skipped rather than failed:
+        // the deterministic half is the whole point of running maintenance on a bare installation.
+        let report = run_memory_maintenance_with_publisher(
+            &state,
+            Arc::new(RecordingPublisher::default()),
+            MaintenanceTrigger::Manual,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.outcome, MaintenanceOutcome::Completed);
+        assert_eq!(report.dream.status, DreamStatus::Skipped);
+        assert_eq!(report.dream.proposals, 0);
+        assert_eq!(report.offline.expired_ids, vec!["mem-stale".to_owned()]);
+        assert_eq!(
+            state.memory().get("mem-stale").unwrap().unwrap().status,
+            "expired",
+            "expiry is a status change, not a delete"
+        );
+
+        // The interval clock and the last outcome are what the scheduler reads on the next tick.
+        let settings = state.memory_maintenance().settings().unwrap();
+        assert_eq!(settings.last_outcome, MaintenanceOutcome::Completed);
+        assert!(settings.last_run_at_ms.is_some());
+        assert_eq!(settings.running_since_ms, None);
+        assert!(!state.memory_maintenance().is_running());
+    }
+
+    #[tokio::test]
+    async fn a_second_maintenance_run_cannot_start_while_one_is_in_flight() {
+        let data = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let state = AppState::with_workspace_and_credentials(
+            data.path(),
+            workspace.path(),
+            Arc::new(TestCredentials::default()),
+        )
+        .unwrap();
+
+        let lease = state
+            .memory_maintenance()
+            .gate()
+            .try_begin(crate::storage::now_ms())
+            .unwrap();
+        let error = run_memory_maintenance_with_publisher(
+            &state,
+            Arc::new(RecordingPublisher::default()),
+            MaintenanceTrigger::Scheduled,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, "MEM_MAINTENANCE_RUNNING");
+
+        // The lease is what releases the gate, so a dropped lease must not leave it stuck.
+        drop(lease);
+        assert!(!state.memory_maintenance().is_running());
+        assert!(
+            run_memory_maintenance_with_publisher(
+                &state,
+                Arc::new(RecordingPublisher::default()),
+                MaintenanceTrigger::Manual,
+            )
+            .await
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn dream_cannot_be_enabled_without_recording_the_remote_disclosure() {
+        let data = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let state = AppState::with_workspace_and_credentials(
+            data.path(),
+            workspace.path(),
+            Arc::new(TestCredentials::default()),
+        )
+        .unwrap();
+
+        let request =
+            |dream_enabled: bool, acknowledged: bool| SetMemoryMaintenanceSettingsRequest {
+                enabled: true,
+                dream_enabled,
+                remote_disclosure_accepted: acknowledged,
+                token_budget: crate::memory::DEFAULT_DREAM_TOKEN_BUDGET,
+                idle_after_ms: crate::memory::DEFAULT_IDLE_AFTER_MS,
+            };
+
+        // A payload is never an authorization source: switching Dream on without the acknowledgement
+        // is rejected even though the request itself claims the user consented.
+        let error = apply_memory_maintenance_settings(&state, request(true, false)).unwrap_err();
+        assert_eq!(error.code, "MEM_DREAM_DISCLOSURE_REQUIRED");
+        assert!(!state.memory_maintenance().settings().unwrap().enabled);
+
+        let accepted = apply_memory_maintenance_settings(&state, request(true, true)).unwrap();
+        assert!(accepted.dream_runnable());
+
+        // Out-of-range budgets are rejected instead of being clamped, so the UI cannot silently
+        // persist a value the scheduler would then never honour.
+        let mut too_small = request(true, true);
+        too_small.token_budget = 1;
+        assert_eq!(
+            apply_memory_maintenance_settings(&state, too_small)
+                .unwrap_err()
+                .code,
+            "MEM_INVALID_ARGUMENT"
+        );
+
+        // The standalone acknowledgement keeps every other switch as it was.
+        let toggled = apply_memory_maintenance_settings(&state, request(false, true)).unwrap();
+        assert!(!toggled.dream_enabled);
+        let acknowledged = record_memory_maintenance_disclosure(&state).unwrap();
+        assert!(acknowledged.remote_disclosure_accepted);
+        assert!(
+            !acknowledged.dream_enabled,
+            "the acknowledgement toggles nothing else"
+        );
+        assert!(acknowledged.enabled);
+    }
+
+    #[test]
+    fn cancelling_an_idle_maintenance_run_reports_that_nothing_was_running() {
+        let data = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let state = AppState::with_workspace_and_credentials(
+            data.path(),
+            workspace.path(),
+            Arc::new(TestCredentials::default()),
+        )
+        .unwrap();
+
+        assert!(!state.memory_maintenance().cancel());
+        let lease = state
+            .memory_maintenance()
+            .gate()
+            .try_begin(crate::storage::now_ms())
+            .unwrap();
+        assert!(state.memory_maintenance().cancel());
+        assert!(lease.cancellation().is_cancelled());
     }
 }

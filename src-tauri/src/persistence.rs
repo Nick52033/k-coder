@@ -8,7 +8,7 @@ use crate::protocol::{
 };
 use crate::storage::{StoredEvent, StoredEventKind, ThreadSummary, TurnSnapshot};
 
-pub const DATABASE_SCHEMA_VERSION: u32 = 9;
+pub const DATABASE_SCHEMA_VERSION: u32 = 11;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -1164,6 +1164,139 @@ fn migrate(connection: &Connection) -> Result<(), rusqlite::Error> {
              COMMIT;",
         )?;
     }
+    if version < 10 {
+        // Knowledge and memory extension tables. Existing knowledge_collections /
+        // knowledge_sources / knowledge_revisions / knowledge_chunks / knowledge_chunk_embeddings
+        // stay untouched, so lexical and semantic retrieval keep working while the structured
+        // knowledge and memory projections are added.
+        //
+        // Unlike the earlier inline `BEGIN; ... COMMIT;` batches this block runs in a checked
+        // transaction: a failing statement rolls the whole block back on the same connection and
+        // never records version 10.
+        let transaction = connection.unchecked_transaction()?;
+        transaction.execute_batch(
+            "CREATE TABLE memories(
+               id TEXT PRIMARY KEY,
+               scope_type TEXT NOT NULL,
+               scope_id TEXT,
+               memory_type TEXT NOT NULL,
+               normalized_key TEXT NOT NULL,
+               content TEXT NOT NULL,
+               source_type TEXT NOT NULL,
+               source_ref TEXT,
+               confidence REAL NOT NULL CHECK(confidence >= 0 AND confidence <= 1),
+               sensitivity TEXT NOT NULL DEFAULT 'normal',
+               status TEXT NOT NULL DEFAULT 'active',
+               revision INTEGER NOT NULL DEFAULT 1,
+               expires_at_ms INTEGER,
+               created_at_ms INTEGER NOT NULL,
+               updated_at_ms INTEGER NOT NULL,
+               UNIQUE(scope_type,scope_id,normalized_key,revision));
+             CREATE INDEX memories_scope_status ON memories(scope_type,scope_id,status);
+             CREATE INDEX memories_normalized_key ON memories(normalized_key);
+             CREATE INDEX memories_created_at ON memories(created_at_ms);
+             CREATE TABLE memory_candidates(
+               id TEXT PRIMARY KEY,
+               operation TEXT NOT NULL,
+               target_memory_id TEXT,
+               scope_type TEXT NOT NULL,
+               scope_id TEXT,
+               memory_type TEXT NOT NULL,
+               content TEXT NOT NULL,
+               normalized_key TEXT NOT NULL,
+               reason TEXT NOT NULL,
+               confidence REAL NOT NULL CHECK(confidence >= 0 AND confidence <= 1),
+               requires_review INTEGER NOT NULL,
+               status TEXT NOT NULL DEFAULT 'pending',
+               source_turn_id TEXT,
+               created_at_ms INTEGER NOT NULL,
+               reviewed_at_ms INTEGER);
+             CREATE INDEX memory_candidates_scope_status
+               ON memory_candidates(scope_type,scope_id,status);
+             CREATE INDEX memory_candidates_normalized_key ON memory_candidates(normalized_key);
+             CREATE INDEX memory_candidates_created_at ON memory_candidates(created_at_ms);
+             CREATE TABLE knowledge_entities(
+               id TEXT PRIMARY KEY,
+               collection_id TEXT NOT NULL,
+               entity_type TEXT NOT NULL,
+               name TEXT NOT NULL,
+               normalized_name TEXT NOT NULL,
+               description TEXT,
+               confidence REAL NOT NULL CHECK(confidence >= 0 AND confidence <= 1),
+               status TEXT NOT NULL DEFAULT 'active',
+               created_at_ms INTEGER NOT NULL,
+               updated_at_ms INTEGER NOT NULL);
+             CREATE INDEX knowledge_entities_collection
+               ON knowledge_entities(collection_id,status);
+             CREATE INDEX knowledge_entities_normalized_name
+               ON knowledge_entities(normalized_name);
+             CREATE INDEX knowledge_entities_created_at ON knowledge_entities(created_at_ms);
+             CREATE TABLE knowledge_facts(
+               id TEXT PRIMARY KEY,
+               subject_entity_id TEXT NOT NULL,
+               predicate TEXT NOT NULL,
+               object_entity_id TEXT,
+               object_text TEXT,
+               source_chunk_id TEXT NOT NULL,
+               source_revision_id TEXT NOT NULL,
+               confidence REAL NOT NULL CHECK(confidence >= 0 AND confidence <= 1),
+               valid_from_ms INTEGER,
+               valid_to_ms INTEGER,
+               status TEXT NOT NULL DEFAULT 'candidate',
+               created_at_ms INTEGER NOT NULL,
+               updated_at_ms INTEGER NOT NULL,
+               CHECK (object_entity_id IS NOT NULL OR object_text IS NOT NULL));
+             CREATE INDEX knowledge_facts_source_chunk
+               ON knowledge_facts(source_chunk_id);
+             CREATE INDEX knowledge_facts_subject
+               ON knowledge_facts(subject_entity_id,predicate,status);
+             CREATE INDEX knowledge_facts_created_at ON knowledge_facts(created_at_ms);
+             CREATE TABLE knowledge_retrieval_events(
+               id TEXT PRIMARY KEY,
+               thread_id TEXT NOT NULL,
+               turn_id TEXT NOT NULL,
+               query_hash TEXT NOT NULL,
+               retrieval_mode TEXT NOT NULL,
+               result_count INTEGER NOT NULL,
+               selected_citation_count INTEGER NOT NULL,
+               latency_ms INTEGER NOT NULL,
+               created_at_ms INTEGER NOT NULL);
+             CREATE INDEX knowledge_retrieval_events_thread_turn
+               ON knowledge_retrieval_events(thread_id,turn_id);
+             CREATE INDEX knowledge_retrieval_events_created_at
+               ON knowledge_retrieval_events(created_at_ms);
+             CREATE TABLE knowledge_feedback(
+               id TEXT PRIMARY KEY,
+               citation_id TEXT NOT NULL,
+               feedback_type TEXT NOT NULL,
+               created_at_ms INTEGER NOT NULL);
+             CREATE INDEX knowledge_feedback_citation ON knowledge_feedback(citation_id);
+             CREATE INDEX knowledge_feedback_created_at ON knowledge_feedback(created_at_ms);",
+        )?;
+        transaction.execute(
+            "INSERT INTO schema_migrations(version,applied_at) VALUES(10,datetime('now'))",
+            [],
+        )?;
+        transaction.commit()?;
+    }
+    if version < 11 {
+        // Retrieval feedback must be attributable to the chunk it rated, otherwise the ranking
+        // signal in `knowledge::retrieval` has no long-lived source: the in-process citation map is
+        // dropped on restart. Both columns stay nullable so the v10 rows keep their meaning —
+        // `chunk_id IS NULL` simply reads as "source unknown" and never matches a chunk.
+        let transaction = connection.unchecked_transaction()?;
+        transaction.execute_batch(
+            "ALTER TABLE knowledge_feedback ADD COLUMN chunk_id TEXT;
+             ALTER TABLE knowledge_feedback ADD COLUMN source_revision_id TEXT;
+             CREATE INDEX knowledge_feedback_chunk
+               ON knowledge_feedback(chunk_id,feedback_type);",
+        )?;
+        transaction.execute(
+            "INSERT INTO schema_migrations(version,applied_at) VALUES(11,datetime('now'))",
+            [],
+        )?;
+        transaction.commit()?;
+    }
     Ok(())
 }
 
@@ -1300,6 +1433,372 @@ mod tests {
             )
             .unwrap();
         assert!(embedding_table_exists);
+    }
+
+    const EXTENSION_TABLES: [&str; 6] = [
+        "memories",
+        "memory_candidates",
+        "knowledge_entities",
+        "knowledge_facts",
+        "knowledge_retrieval_events",
+        "knowledge_feedback",
+    ];
+
+    fn sqlite_names(connection: &Connection, query: &str) -> Vec<String> {
+        connection
+            .prepare(query)
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn migration_creates_the_knowledge_and_memory_tables_without_touching_the_knowledge_index() {
+        let db = ProjectionDb::memory().unwrap();
+        let connection = db.connection.lock().unwrap();
+        let tables = sqlite_names(
+            &connection,
+            "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name",
+        );
+        for required in EXTENSION_TABLES {
+            assert!(
+                tables.iter().any(|table| table == required),
+                "schema v10 should create {required}"
+            );
+        }
+        // Lexical and semantic retrieval keep working because the existing projection survives.
+        for preserved in [
+            "knowledge_collections",
+            "knowledge_sources",
+            "knowledge_revisions",
+            "knowledge_chunks",
+            "knowledge_chunk_embeddings",
+            "knowledge_index_jobs",
+        ] {
+            assert!(
+                tables.iter().any(|table| table == preserved),
+                "schema v10 must keep {preserved}"
+            );
+        }
+    }
+
+    #[test]
+    fn migration_adds_the_scope_status_normalized_key_and_source_chunk_indexes() {
+        let db = ProjectionDb::memory().unwrap();
+        let connection = db.connection.lock().unwrap();
+        let indexes = sqlite_names(
+            &connection,
+            "SELECT name FROM sqlite_master WHERE type='index' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+        );
+        let expected: [(&str, &str, &[&str]); 7] = [
+            (
+                "memories_scope_status",
+                "memories",
+                &["scope_type", "scope_id", "status"],
+            ),
+            ("memories_normalized_key", "memories", &["normalized_key"]),
+            ("memories_created_at", "memories", &["created_at_ms"]),
+            (
+                "memory_candidates_scope_status",
+                "memory_candidates",
+                &["scope_type", "scope_id", "status"],
+            ),
+            (
+                "knowledge_facts_source_chunk",
+                "knowledge_facts",
+                &["source_chunk_id"],
+            ),
+            (
+                "knowledge_entities_normalized_name",
+                "knowledge_entities",
+                &["normalized_name"],
+            ),
+            (
+                "knowledge_retrieval_events_created_at",
+                "knowledge_retrieval_events",
+                &["created_at_ms"],
+            ),
+        ];
+        for (name, table, columns) in expected {
+            assert!(
+                indexes.iter().any(|index| index == name),
+                "missing index {name}"
+            );
+            let info = connection
+                .prepare(&format!("PRAGMA index_info({name})"))
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(2))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(info, columns, "index {name} should cover {columns:?}");
+            let indexed_table: String = connection
+                .query_row(
+                    "SELECT tbl_name FROM sqlite_master WHERE type='index' AND name=?1",
+                    [name],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(indexed_table, table);
+        }
+    }
+
+    #[test]
+    fn scope_status_normalized_key_and_source_chunk_lookups_avoid_full_scans() {
+        let db = ProjectionDb::memory().unwrap();
+        let connection = db.connection.lock().unwrap();
+        for (query, index) in [
+            (
+                "SELECT id FROM memories WHERE scope_type='user' AND status='active'",
+                "memories_scope_status",
+            ),
+            (
+                "SELECT id FROM memories WHERE normalized_key='use pnpm'",
+                "memories_normalized_key",
+            ),
+            (
+                "SELECT id FROM knowledge_facts WHERE source_chunk_id='chunk-1'",
+                "knowledge_facts_source_chunk",
+            ),
+        ] {
+            let plan = connection
+                .prepare(&format!("EXPLAIN QUERY PLAN {query}"))
+                .unwrap()
+                .query_map([], |row| row.get::<_, String>(3))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+                .join(" | ");
+            assert!(
+                plan.contains(index),
+                "expected the query planner to use {index}, got: {plan}"
+            );
+            assert!(
+                !plan.contains("SCAN memories") && !plan.contains("SCAN knowledge_facts"),
+                "expected an index lookup instead of a full scan, got: {plan}"
+            );
+        }
+    }
+
+    #[test]
+    fn repeated_migration_runs_are_idempotent() {
+        let connection = Connection::open_in_memory().unwrap();
+        migrate(&connection).unwrap();
+        migrate(&connection).unwrap();
+        let versions = sqlite_names(
+            &connection,
+            "SELECT CAST(version AS TEXT) FROM schema_migrations ORDER BY version",
+        );
+        let expected = (1..=DATABASE_SCHEMA_VERSION)
+            .map(|version| version.to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(versions, expected);
+        let extension_tables = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN
+                   ('memories','memory_candidates','knowledge_entities','knowledge_facts',
+                    'knowledge_retrieval_events','knowledge_feedback')",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        assert_eq!(extension_tables, EXTENSION_TABLES.len() as i64);
+    }
+
+    #[test]
+    fn a_failing_migration_block_rolls_back_without_recording_the_version() {
+        let connection = Connection::open_in_memory().unwrap();
+        // A pre-existing `memories` table makes the schema v10 block fail at its first statement,
+        // so the v11 block is never reached.
+        connection
+            .execute_batch("CREATE TABLE memories(id TEXT PRIMARY KEY);")
+            .unwrap();
+
+        assert!(migrate(&connection).is_err());
+
+        let recorded: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM schema_migrations WHERE version=10",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            recorded, 0,
+            "a rolled back block must not record its version"
+        );
+        let version: u32 = connection
+            .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            version, 9,
+            "the schema must stop at the last successfully applied version"
+        );
+        let leaked: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN
+                   ('memory_candidates','knowledge_entities','knowledge_facts',
+                    'knowledge_retrieval_events','knowledge_feedback')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            leaked, 0,
+            "a failing block must not leave partial tables behind"
+        );
+    }
+
+    #[test]
+    fn a_failing_feedback_migration_rolls_back_its_columns_and_index() {
+        let connection = Connection::open_in_memory().unwrap();
+        // An unrelated table already owns the index name the v11 block creates, so v10 applies
+        // cleanly and only the v11 block fails — which is what makes the column rollback visible.
+        connection
+            .execute_batch(
+                "CREATE TABLE scratch(id TEXT);
+                 CREATE INDEX knowledge_feedback_chunk ON scratch(id);",
+            )
+            .unwrap();
+
+        assert!(migrate(&connection).is_err());
+
+        let recorded: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM schema_migrations WHERE version=?1",
+                [DATABASE_SCHEMA_VERSION],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            recorded, 0,
+            "a rolled back block must not record its version"
+        );
+        let version: u32 = connection
+            .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(version, DATABASE_SCHEMA_VERSION - 1);
+        let columns = sqlite_names(
+            &connection,
+            "SELECT name FROM pragma_table_info('knowledge_feedback')",
+        );
+        assert!(
+            !columns.iter().any(|name| name == "chunk_id"),
+            "a rolled back block must not leave its columns behind, got: {columns:?}"
+        );
+        assert!(
+            !columns.iter().any(|name| name == "source_revision_id"),
+            "a rolled back block must not leave its columns behind, got: {columns:?}"
+        );
+    }
+
+    #[test]
+    fn migrating_an_existing_v10_database_binds_legacy_feedback_to_no_chunk() {
+        let connection = Connection::open_in_memory().unwrap();
+        migrate(&connection).unwrap();
+        // Rebuild the published v10 shape: drop the v11 index and columns, then seed a feedback row
+        // written before chunk attribution existed.
+        connection
+            .execute_batch(
+                "DROP INDEX knowledge_feedback_chunk;
+                 ALTER TABLE knowledge_feedback DROP COLUMN chunk_id;
+                 ALTER TABLE knowledge_feedback DROP COLUMN source_revision_id;
+                 DELETE FROM schema_migrations WHERE version=11;
+                 INSERT INTO knowledge_feedback(id,citation_id,feedback_type,created_at_ms)
+                   VALUES('feedback-legacy','citation-legacy','useful',5);",
+            )
+            .unwrap();
+
+        migrate(&connection).unwrap();
+
+        let version: u32 = connection
+            .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(version, DATABASE_SCHEMA_VERSION);
+        let legacy: (String, Option<String>) = connection
+            .query_row(
+                "SELECT feedback_type,chunk_id FROM knowledge_feedback WHERE id='feedback-legacy'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(legacy.0, "useful");
+        assert_eq!(
+            legacy.1, None,
+            "a pre-v11 feedback row must stay readable with an unknown source"
+        );
+    }
+
+    #[test]
+    fn migrating_an_existing_v9_database_adds_the_tables_without_touching_existing_rows() {
+        let connection = Connection::open_in_memory().unwrap();
+        migrate(&connection).unwrap();
+        // Roll the schema back to the published v9 shape and seed rows a real upgrade would meet.
+        // Dropping `knowledge_feedback` also drops the v11 index built on top of it.
+        connection
+            .execute_batch(
+                "DROP TABLE knowledge_feedback;
+                 DROP TABLE knowledge_retrieval_events;
+                 DROP TABLE knowledge_facts;
+                 DROP TABLE knowledge_entities;
+                 DROP TABLE memory_candidates;
+                 DROP TABLE memories;
+                 DELETE FROM schema_migrations WHERE version>=10;
+                 INSERT INTO sessions(id,title,created_at_ms,updated_at_ms,archived,event_count,workspace_path,in_project)
+                   VALUES('thread-legacy','Legacy thread',1,2,0,3,'D:\\work',1);
+                 INSERT INTO knowledge_collections(id,name,scope,scope_key,enabled,deleted,created_at_ms,updated_at_ms)
+                   VALUES('collection-legacy','Legacy docs','workspace','D:\\work',1,0,1,1);
+                 INSERT INTO knowledge_sources(id,collection_id,workspace_id,relative_path,size_bytes,modified_at_ms,state,created_at_ms,updated_at_ms)
+                   VALUES('source-legacy','collection-legacy','D:\\work','docs/guide.md',42,7,'ready',1,1);",
+            )
+            .unwrap();
+
+        migrate(&connection).unwrap();
+
+        let version: u32 = connection
+            .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(version, DATABASE_SCHEMA_VERSION);
+        let title: String = connection
+            .query_row(
+                "SELECT title FROM sessions WHERE id='thread-legacy'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(title, "Legacy thread");
+        let knowledge_rows: i64 = connection
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM knowledge_collections WHERE id='collection-legacy')
+                      + (SELECT COUNT(*) FROM knowledge_sources WHERE id='source-legacy')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            knowledge_rows, 2,
+            "the knowledge index must survive the upgrade"
+        );
+        let extension_tables: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN
+                   ('memories','memory_candidates','knowledge_entities','knowledge_facts',
+                    'knowledge_retrieval_events','knowledge_feedback')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(extension_tables, EXTENSION_TABLES.len() as i64);
     }
 
     #[test]

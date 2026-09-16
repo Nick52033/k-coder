@@ -113,6 +113,11 @@ test("knowledge page renders live index progress and metrics", async ({ page }) 
             return [source];
           case "get_knowledge_metrics":
             return { jobsQueued: 1, jobsCompleted: 2, jobsReused: 1, jobsFailed: 0, jobsCancelled: 0, chunksIndexed: 24, vectorsIndexed: 12, embeddingRequests: 3, embeddingRetries: 1, totalIndexDurationMs: 900, averageIndexDurationMs: 300, lastErrorCode: null, lastCompletedAtMs: 2 };
+          // 检索控制台与关系审核面板挂载时会各读一次；这里只需要让它们拿到空列表。
+          case "list_knowledge_retrieval_events":
+          case "list_knowledge_facts":
+          case "list_knowledge_entities":
+            return [];
           default:
             return null;
         }
