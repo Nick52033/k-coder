@@ -6692,10 +6692,14 @@ test("rate limit waiting and all child states are visible with only one wait cal
     bridge.__emitAgentEvent({ ...base, type: "tool_queued", call });
     bridge.__emitAgentEvent({ ...base, type: "tool_started", call });
   });
+  // task2 被本轮 wait_agent 引用，状态块挂在轮次内；task1 没有被任何委派调用引用（真实会话里它由
+  // 同一轮的 create_agent 创建），落在对话底部兜底块。两块合起来仍然保证"一次 wait 调用也能看到全部子任务状态"。
+  const roundSummary = page.getByRole("region", { name: "本轮子智能体状态" });
   const summary = page.getByRole("region", { name: "本会话子智能体状态" });
-  await expect(summary.locator("li")).toHaveCount(2);
+  await expect(roundSummary.locator("li")).toHaveCount(1);
+  await expect(roundSummary).toContainText("架构文档限流等待");
+  await expect(summary.locator("li")).toHaveCount(1);
   await expect(summary).toContainText("项目文档运行中");
-  await expect(summary).toContainText("架构文档限流等待");
   await expect(page.locator(".message--assistant").last().locator(".turn-timeline-tool")).toHaveCount(1);
   const chip = page.getByRole("button", { name: "查看子智能体 task2", exact: true });
   await expect(chip).toBeVisible();
@@ -6721,8 +6725,54 @@ test("rate limit waiting and all child states are visible with only one wait cal
     bridge.__emitTauriEvent("subagent-event", { schemaVersion: 1, id: "agent-2", parentAgentId: null, parentThreadId: "thread-1", threadId: "child-2", label: "架构文档", task: "检查文档", state: "failed", depth: 1, workspaceRoot: "D:\\code\\k-coder", capabilities: ["read_file"], tokenBudget: null, tokensUsed: 0, timeoutMs: 600000, createdAtMs: 2, updatedAtMs: 20, summary: null, error: "provider returned HTTP 429", turnCount: 1 });
   });
   await expect(page.locator(".turn-execution--live > summary > .turn-disclosure-title").last()).not.toContainText("限流等待");
-  await expect(summary).toContainText("架构文档失败");
+  await expect(roundSummary).toContainText("架构文档失败");
   await expect(drawer.locator(".agent-retry-wait")).toHaveCount(0);
+});
+
+
+test("keeps subagent status inside the round that delegated it", async ({ page }) => {
+  await page.addInitScript(() => {
+    localStorage.setItem("kcoder_e2e_subagents", JSON.stringify([{
+      schemaVersion: 1, id: "agent-round-one", parentAgentId: null, parentThreadId: "thread-1", threadId: "child-round-one",
+      label: "变更审查", task: "检查文档", state: "failed", depth: 1, workspaceRoot: "D:\\code\\k-coder",
+      capabilities: ["read_file"], tokenBudget: null, tokensUsed: 0, timeoutMs: 600000,
+      createdAtMs: 3, updatedAtMs: 9, summary: null, error: "provider unavailable", turnCount: 1,
+    }]));
+    localStorage.setItem("kcoder_e2e_thread_detail", JSON.stringify({
+      schemaVersion: 1,
+      summary: { schemaVersion: 1, id: "thread-1", title: "Phase 6 workbench", createdAtMs: 1, updatedAtMs: 5, archived: false, inProject: true, workspacePath: "D:\\code\\k-coder" },
+      messages: [
+        { schemaVersion: 1, id: "round-one-user", role: "user", content: [{ type: "text", text: "第一轮：请委派检查" }], createdAtMs: 1 },
+        { schemaVersion: 1, id: "round-one-answer", role: "assistant", content: [{ type: "text", text: "第一轮回复：已委派检查。" }], createdAtMs: 2 },
+        { schemaVersion: 1, id: "round-two-user", role: "user", content: [{ type: "text", text: "第二轮：本轮不用委派" }], createdAtMs: 3 },
+        { schemaVersion: 1, id: "round-two-answer", role: "assistant", content: [{ type: "text", text: "第二轮回复：本轮没有子任务。" }], createdAtMs: 4 },
+      ],
+      messageTurnIds: {},
+      turnUserMessageIds: { "turn-round-one": "round-one-user", "turn-round-two": "round-two-user" },
+      lastTurn: null,
+      toolActivities: [],
+      turnTimeline: [
+        { type: "tool", activity: { turnId: "turn-round-one", call: { id: "call-create-agent", name: "create_agent", arguments: { task: "检查文档", label: "变更审查" }, metadata: {} }, state: "completed", result: { success: true, output: JSON.stringify({ id: "agent-round-one" }), metadata: {} }, startedAtMs: 5, completedAtMs: 6 } },
+        { type: "text", id: "round-one-answer", turnId: "turn-round-one", text: "第一轮回复：已委派检查。" },
+        { type: "text", id: "round-two-answer", turnId: "turn-round-two", text: "第二轮回复：本轮没有子任务。" },
+      ],
+      approvals: [], userInputs: [], changes: [], todos: [], lastUsage: null,
+    }));
+  });
+  await page.goto("/");
+  await expect(page.getByRole("heading", { name: "Phase 6 workbench", exact: true })).toBeVisible();
+  const roundStatus = page.getByRole("region", { name: "本轮子智能体状态" });
+  await expect(roundStatus).toHaveCount(1);
+  await expect(roundStatus).toContainText("变更审查失败");
+  // 归属明确时不再有对话底部的兜底块。
+  await expect(page.getByRole("region", { name: "本会话子智能体状态" })).toHaveCount(0);
+  const listText = await page.locator(".message-list").innerText();
+  expect(listText.indexOf("第一轮回复：已委派检查。")).toBeLessThan(listText.indexOf("变更审查"));
+  expect(listText.indexOf("变更审查")).toBeLessThan(listText.indexOf("第二轮回复：本轮没有子任务。"));
+  // 轮次内的状态块仍然可点击进入右侧详情。
+  await roundStatus.getByRole("button").filter({ hasText: "变更审查" }).click();
+  const drawer = page.getByRole("complementary", { name: "子智能体", exact: true });
+  await expect(drawer.locator(".subagent-detail-title")).toContainText("变更审查");
 });
 
 
@@ -6745,6 +6795,7 @@ test("exhausted subagent budget disables resume in detail and list while ordinar
     }))));
   });
   await page.goto("/");
+  // 这些子任务由夹具直接创建、没有委派轮次，因此落在对话底部的兜底块里。
   const summary = page.getByRole("region", { name: "本会话子智能体状态" });
   await summary.getByRole("button").filter({ hasText: "测试范围分析" }).click();
   const drawer = page.getByRole("complementary", { name: "子智能体", exact: true });

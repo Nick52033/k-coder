@@ -1,17 +1,20 @@
 import { CircleCheck, CircleX, Clock3, LoaderCircle } from "lucide-react";
 import type { SubagentView } from "./types/runtime";
 import { RetryWaitingLabel } from "./components/RetryWaitingLabel";
+import { isLiveSubagentState } from "./lib/subagent";
 
-export function SubagentSummary({ agents, taskIndex, onFocus }: {
+export function SubagentSummary({ agents, taskIndex, onFocus, ariaLabel = "本会话子智能体状态" }: {
   agents: SubagentView[];
   taskIndex: Record<string, number>;
   onFocus: (id: string) => void;
+  /** 挂在所属轮次里时用轮次口径的无障碍名称，避免与兜底块重名。 */
+  ariaLabel?: string;
 }) {
   if (!agents.length) return null;
-  return <section className="subagent-summary" aria-label="本会话子智能体状态">
+  return <section className="subagent-summary" aria-label={ariaLabel}>
     <strong>子智能体状态 <span>{agents.length}</span></strong>
     <ul>{[...agents].sort((a, b) => (taskIndex[a.id] ?? 0) - (taskIndex[b.id] ?? 0)).map((agent) => {
-      const active = ["running", "queued", "blocked"].includes(agent.state);
+      const active = isLiveSubagentState(agent.state);
       const waiting = active && Boolean(agent.retryAtMs);
       const failed = ["failed", "timed_out"].includes(agent.state);
       const Icon = waiting ? Clock3 : active ? LoaderCircle : failed ? CircleX : CircleCheck;

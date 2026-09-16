@@ -27,6 +27,7 @@ import type {
   TurnTimelineItem,
 } from "../types/runtime";
 import { changeLineStats } from "../lib/diff";
+import { DELEGATION_TOOL_NAMES, subagentIdsOf } from "../lib/subagent";
 import { PlanProgress } from "./PlanProgress";
 import { RetryWaitingLabel } from "./RetryWaitingLabel";
 
@@ -1035,37 +1036,6 @@ function runningToolLabel(name: string) {
     write_file: "正在写入文件",
   };
   return labels[name] ?? `正在运行 ${name}`;
-}
-
-/** Delegation tools from `multi_agent`; waits may target multiple subagents. */
-const DELEGATION_TOOL_NAMES = new Set([
-  "create_agent",
-  "wait_agent",
-  "send_agent_message",
-  "resume_agent",
-  "close_agent",
-]);
-
-/**
- * Resolves the subagent a delegation tool acted on. Most tools carry `agentId` in
- * their arguments; `create_agent` only learns the id from its structured result.
- */
-function subagentIdsOf(activity: ToolActivity): string[] {
-  if (!DELEGATION_TOOL_NAMES.has(activity.call.name)) return [];
-  const args = activity.call.arguments ?? {};
-  if (activity.call.name === "wait_agent" && Array.isArray(args.agentIds)) {
-    return [...new Set(args.agentIds.filter((id): id is string => typeof id === "string" && !!id.trim()).map((id) => id.trim()))];
-  }
-  const argumentId = args.agentId;
-  if (typeof argumentId === "string" && argumentId.trim()) return [argumentId.trim()];
-  const output = activity.result?.output;
-  if (typeof output !== "string" || !output.trim()) return [];
-  try {
-    const parsed = JSON.parse(output) as { id?: unknown };
-    return typeof parsed.id === "string" && parsed.id.trim() ? [parsed.id.trim()] : [];
-  } catch {
-    return [];
-  }
 }
 
 function toolTarget(activity: ToolActivity) {

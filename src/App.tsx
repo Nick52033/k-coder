@@ -62,6 +62,7 @@ import { ContextProgress } from "./components/ContextProgress";
 import { ApprovalModeSelector } from "./components/ApprovalModeSelector";
 import { ReasoningSelector } from "./components/ReasoningSelector";
 import { SubagentSummary } from "./SubagentSummary";
+import { buildSubagentTurnIndex } from "./lib/subagent";
 import { ConversationTurnActivity, isVisibleConversationTimelineItem } from "./components/ConversationActivity";
 import { MarkdownContent } from "./components/MarkdownContent";
 import { ImagePreviewDialog } from "./components/ImagePreviewDialog";
@@ -518,6 +519,10 @@ function App() {
   useEffect(() => {
     setSubagentSelection(null);
   }, [activeThreadId]);
+  const threadSubagents = useMemo(
+    () => subagentList.filter((agent) => agent.parentThreadId === activeThreadId),
+    [subagentList, activeThreadId],
+  );
   const displayMessages = useMemo(
     () => reconcileConversationMessages(messages, turnTimeline),
     [messages, turnTimeline],
@@ -1204,6 +1209,42 @@ function App() {
     }
     return map;
   }, [turnTimeline]);
+  // 子智能体状态块跟随它所属的轮次：归属来自该轮次的委派工具调用（与对话内 task chip 同一份解析），
+  // 所以上一轮的结果不会再漂到对话底部。没有轮次归属的记录（从面板直接创建、或该轮次历史尚未分页加载）
+  // 继续由对话底部的兜底块承载。
+  const subagentTurnIndex = useMemo(() => buildSubagentTurnIndex(activitiesByTurn), [activitiesByTurn]);
+  const subagentsByTurn = useMemo(() => {
+    const map = new Map<string, SubagentView[]>();
+    for (const agent of threadSubagents) {
+      const turnId = subagentTurnIndex[agent.id];
+      if (!turnId) continue;
+      const list = map.get(turnId);
+      if (list) list.push(agent);
+      else map.set(turnId, [agent]);
+    }
+    return map;
+  }, [threadSubagents, subagentTurnIndex]);
+  const unownedSubagents = useMemo(
+    () => threadSubagents.filter((agent) => !subagentTurnIndex[agent.id]),
+    [threadSubagents, subagentTurnIndex],
+  );
+  // 同一轮次可能有多个可见片段（引导分段、重试尝试），状态块只挂在它碰到的第一个片段上。
+  const attachedSubagentTurns = new Set<string>();
+  function renderTurnSubagents(turnId: string | null | undefined) {
+    if (!turnId || attachedSubagentTurns.has(turnId)) return null;
+    const agents = subagentsByTurn.get(turnId);
+    if (!agents?.length) return null;
+    attachedSubagentTurns.add(turnId);
+    return (
+      <SubagentSummary
+        key={`turn-subagents-${turnId}`}
+        agents={agents}
+        taskIndex={subagentTaskIndex}
+        onFocus={focusSubagent}
+        ariaLabel="本轮子智能体状态"
+      />
+    );
+  }
   const steeredTurnProjection = useMemo(
     () => buildSteeredTurnSegments(displayMessages, turnTimeline, turnUserMessageIds),
     [displayMessages, turnTimeline, turnUserMessageIds],
@@ -1328,7 +1369,7 @@ function App() {
   const steeredTurnSegmentsByTurnId = steeredTurnProjection.segmentsByTurnId;
   const steeredTurnIds = steeredTurnProjection.turnIds;
   const hasConversationContent = displayMessages.length > 0
-    || subagentList.some((agent) => agent.parentThreadId === activeThreadId)
+    || threadSubagents.length > 0
     || orphanTurnIds.length > 0
     || Boolean(plan?.steps.length)
     || Boolean(pendingApproval)
@@ -1336,26 +1377,29 @@ function App() {
 
   function renderOrphanTurn(turnId: string) {
     return (
-      <article className="message message--assistant message--activity-only" key={`activity-${turnId}`}>
-        <div className="message-body">
-          <div className="message-role">k-Coder</div>
-          <ConversationTurnActivity
-            activities={activitiesByTurn.get(turnId) ?? []}
-            timeline={timelineByTurn.get(turnId) ?? []}
-            changes={changes}
-            plan={turnId === planTurnId ? plan : null}
-            turnId={turnId}
-            streaming={turnId === currentThreadTurnId}
-            initialTextVisible={turnId === restoredCurrentTurnId}
-            activityStatus={turnId === activityStatus?.turnId ? activityStatus.status : null}
-            renderText={renderMessageText}
-            onRetry={retryable && lastTurn?.turnId === turnId ? () => void retryLastTurn() : undefined}
-            retryAtMs={activityStatus?.retryAtMs}
-            subagentTaskIndex={subagentTaskIndex}
-            onFocusSubagent={focusSubagent}
-          />
-        </div>
-      </article>
+      <Fragment key={`activity-${turnId}`}>
+        <article className="message message--assistant message--activity-only">
+          <div className="message-body">
+            <div className="message-role">k-Coder</div>
+            <ConversationTurnActivity
+              activities={activitiesByTurn.get(turnId) ?? []}
+              timeline={timelineByTurn.get(turnId) ?? []}
+              changes={changes}
+              plan={turnId === planTurnId ? plan : null}
+              turnId={turnId}
+              streaming={turnId === currentThreadTurnId}
+              initialTextVisible={turnId === restoredCurrentTurnId}
+              activityStatus={turnId === activityStatus?.turnId ? activityStatus.status : null}
+              renderText={renderMessageText}
+              onRetry={retryable && lastTurn?.turnId === turnId ? () => void retryLastTurn() : undefined}
+              retryAtMs={activityStatus?.retryAtMs}
+              subagentTaskIndex={subagentTaskIndex}
+              onFocusSubagent={focusSubagent}
+            />
+          </div>
+        </article>
+        {renderTurnSubagents(turnId)}
+      </Fragment>
     );
   }
 
@@ -1463,10 +1507,10 @@ function App() {
     }
 
     return (
+      <Fragment key={`steered-turn-${segment.turnId}-${segment.index}-${segment.ownerMessageId}`}>
       <article
         className={cn("message", "message--assistant", segmentStreaming && "message--streaming")}
         data-turn-id={segment.turnId}
-        key={`steered-turn-${segment.turnId}-${segment.index}-${segment.ownerMessageId}`}
       >
         <div className="message-body">
           <div className="message-role">k-Coder</div>
@@ -1501,6 +1545,8 @@ function App() {
           ) : null}
         </div>
       </article>
+      {segment.isLast ? renderTurnSubagents(segment.turnId) : null}
+      </Fragment>
     );
   }
 
@@ -1560,6 +1606,7 @@ function App() {
                 {renderMessageAttachments(assistantMessage, attemptAttachments)}
                 {attemptIsTerminalSegment && !attemptHasTerminalEvent && assistantMessage?.status === "failed" ? <div className="message-status message-status--error">生成失败</div> : null}
                 {attemptIsTerminalSegment && !attemptHasTerminalEvent && assistantMessage?.status === "cancelled" ? <div className="message-status">已停止</div> : null}
+                {attemptIsTerminalSegment ? renderTurnSubagents(turnId) : null}
               </section>
             );
           })}
@@ -2512,6 +2559,7 @@ function App() {
                       {!messageHasTerminalEvent && message.status === "cancelled" && <div className="message-status">已停止</div>}
                     </div>
                   </article>
+                  {message.role === "assistant" ? renderTurnSubagents(message.turnId) : null}
                   {steeredSegments.map(renderSteeredTurnSegment)}
                   {message.role === "user"
                     ? retryTurnGroupsByUserMessage.has(message.id)
@@ -2533,7 +2581,8 @@ function App() {
                 </article>
               ) : null}
 
-              <SubagentSummary agents={subagentList.filter((agent) => agent.parentThreadId === activeThreadId)}
+              {/* 没有轮次归属的子智能体（从面板直接创建、或所属轮次历史未加载）兜底显示在对话底部。 */}
+              <SubagentSummary agents={unownedSubagents}
                 taskIndex={subagentTaskIndex} onFocus={focusSubagent} />
 
               {/* 内嵌授权请求 */}
