@@ -440,6 +440,10 @@ export function saveMcpSecret(server: string, name: string, value: string) { ret
 export function deleteMcpSecret(server: string, name: string) { return invoke<ExtensionOverview>("delete_mcp_secret", { server, name }); }
 export function getWorkspaceState() { return invoke<WorkspaceState>("workspace_state"); }
 export function switchWorkspace(path: string, trusted: boolean) { return invoke<ProjectRecord>("switch_workspace", { path, trusted }); }
+/** 只登记项目（服务端事实），不切换活动工作区。 */
+export function registerProjectPaths(paths: string[]) { return invoke<ProjectRecord[]>("register_project_paths", { paths }); }
+/** 从项目清单移除；不删除会话与文件。 */
+export function removeProjectPath(path: string) { return invoke<void>("remove_project_path", { path }); }
 export function listWorkspaceDirectory(path = "") { return invoke<FileEntry[]>("list_workspace_directory", { path }); }
 export function searchWorkspaceFiles(query: string, limit = 50) { return invoke<FileEntry[]>("search_workspace_files", { query, limit }); }
 export function previewWorkspaceFile(path: string) { return invoke<FilePreview>("preview_workspace_file", { path }); }

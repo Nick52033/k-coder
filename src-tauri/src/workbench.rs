@@ -26,6 +26,33 @@ pub(crate) fn resolve_workspace_path(
     resolve(root, relative, allow_directory)
 }
 
+/// 工作区路径的归属键。
+///
+/// 用途是「判断两个路径是否指同一个工作区」，不是展示，因此刻意丢掉大小写与分隔符
+/// 差异，并剥掉 Windows 的 `\\?\` 扩展前缀——`Path::canonicalize` 会把它加回来，
+/// 但历史记录里的路径可能没有，两者必须归一到同一个键。
+///
+/// 与前端 `src/lib/path.ts` 的 `workspacePathKey` 同源。前端按运行时判断是否
+/// 大小写折叠（macOS/Linux 上路径大小写敏感），服务端按执行平台判断，两边在各自
+/// 平台上得到一致结果。
+pub fn workspace_path_key(path: &str) -> String {
+    let trimmed = path.trim();
+    let without_prefix = trimmed
+        .strip_prefix(r"\\?\UNC\")
+        .map(|rest| format!(r"\\{rest}"))
+        .or_else(|| trimmed.strip_prefix(r"\\?\").map(str::to_string))
+        .unwrap_or_else(|| trimmed.to_string());
+    let normalized = without_prefix
+        .replace('\\', "/")
+        .trim_end_matches('/')
+        .to_string();
+    if cfg!(windows) {
+        normalized.to_lowercase()
+    } else {
+        normalized
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum WorkbenchError {
     #[error("invalid workspace request: {0}")]

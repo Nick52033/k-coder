@@ -10,9 +10,12 @@
 use std::fs;
 use std::path::PathBuf;
 
+use k_coder_lib::mobile::view::{MobileProject, MobileThreadSummary};
 use k_coder_lib::mobile::{
     MobileCapability, MobileDeviceView, MobilePairingView, MobilePendingPairingView, MobileStatus,
 };
+use k_coder_lib::protocol::PROTOCOL_VERSION;
+use k_coder_lib::storage::ThreadSummary;
 use serde_json::{Value, json};
 
 /// 与前端 Playwright 桩数据共用的唯一数据源。
@@ -95,6 +98,79 @@ fn pairing_view_matches_the_frontend_fixture() {
         fingerprint: pairing["fingerprint"].as_str().map(str::to_string),
     };
     assert_eq!(serialized(&view), *pairing);
+}
+
+/// 手机端唯一能看到的项目结构。它必须**不**带路径——项目归属键是路径的折叠形式，
+/// 而绝对路径本身属于不该跨越设备边界的信息。
+#[test]
+fn project_matches_the_frontend_fixture() {
+    let fixture = fixture();
+    let project = &fixture["project"];
+    let view = MobileProject {
+        id: text(project, "id"),
+        name: text(project, "name"),
+        key: text(project, "key"),
+        last_opened_at_ms: number(project, "lastOpenedAtMs"),
+    };
+    assert_eq!(serialized(&view), *project);
+
+    let mut keys: Vec<&str> = project
+        .as_object()
+        .expect("project 必须是对象")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    let mut expected = vec!["id", "key", "lastOpenedAtMs", "name"];
+    expected.sort_unstable();
+    assert_eq!(keys, expected, "项目视图不得新增字段，尤其不得暴露 path");
+}
+
+/// 归属键是「路径折叠」而不是路径本身：大小写与分隔符都已归一，
+/// 因此手机端拿到的 `key` 无法反推出真实绝对路径。
+#[test]
+fn project_key_is_not_a_path() {
+    let fixture = fixture();
+    let key = text(&fixture["project"], "key");
+    assert!(!key.contains('\\'), "归属键不得保留反斜杠：{key}");
+    assert!(
+        !key.contains(r"\\?\"),
+        "归属键不得保留 Windows 扩展前缀：{key}"
+    );
+    assert_eq!(key, key.to_lowercase(), "归属键必须已折叠大小写：{key}");
+    assert!(!key.ends_with('/'), "归属键不得以分隔符结尾：{key}");
+}
+
+/// 会话摘要携带归属键，`None` 表示独立会话。这里钉住可空性，
+/// 避免某天有人把它改成必填后手机端把所有会话误归到同一个项目。
+#[test]
+fn thread_summary_carries_an_optional_project_key() {
+    let fixture = fixture();
+    let project_key = text(&fixture["project"], "key");
+    let summary = ThreadSummary {
+        schema_version: PROTOCOL_VERSION,
+        id: "thread-1".to_string(),
+        title: "会话".to_string(),
+        created_at_ms: 1760000700000,
+        updated_at_ms: 1760000800000,
+        archived: false,
+        in_project: true,
+        workspace_path: None,
+    };
+
+    let attached =
+        MobileThreadSummary::from_summary(&summary, Some(project_key.clone()), None, 0, 0);
+    let value = serialized(&attached);
+    assert_eq!(value["projectKey"], json!(project_key));
+    assert!(value["projectKey"].is_string());
+
+    let standalone = MobileThreadSummary::from_summary(&summary, None, None, 0, 0);
+    let value = serialized(&standalone);
+    assert_eq!(value["projectKey"], Value::Null);
+    assert!(
+        value.get("projectKey").is_some(),
+        "字段必须始终存在，只是可为 null"
+    );
 }
 
 #[test]

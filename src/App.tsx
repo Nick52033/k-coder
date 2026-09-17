@@ -44,7 +44,7 @@ import {
   Target,
 } from "lucide-react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { extractLocalDocument, getRuntimeStatus, getWorkspaceState, switchWorkspace, subscribeToAgentEvents, subscribeToMailboxEvents, subscribeToSubagentEvents, listSubagents, getExtensionOverview, searchWorkspaceFiles } from "./api/runtime";
+import { extractLocalDocument, getRuntimeStatus, getWorkspaceState, registerProjectPaths as registerProjectPathsOnServer, removeProjectPath, switchWorkspace, subscribeToAgentEvents, subscribeToMailboxEvents, subscribeToSubagentEvents, listSubagents, getExtensionOverview, searchWorkspaceFiles } from "./api/runtime";
 import { useWorkbenchStore } from "./stores/workbenchStore";
 import { workflowProgressPlan } from "./lib/workflowProgress";
 import {
@@ -391,7 +391,12 @@ function App() {
   );
   const [backgroundEnabled, setBackgroundEnabled] = useState(() => localStorage.getItem("kcoder_background_enabled") !== "false");
   const [backgroundImage, setBackgroundImage] = useState(() => localStorage.getItem("kcoder_background_image") || "/chat-background.png");
-  const [backgroundOpacity, setBackgroundOpacity] = useState(() => Number(localStorage.getItem("kcoder_background_opacity") ?? "0.32"));
+  const [backgroundOpacity, setBackgroundOpacity] = useState(() => {
+    const stored = Number(localStorage.getItem("kcoder_background_opacity") ?? "0.18");
+    if (!Number.isFinite(stored)) return 0.18;
+    // 旧版本把该值当作“白纱厚度”，遗留值可高达 0.85，会把背景图整块盖住。
+    return Math.min(Math.max(stored, 0), 0.6);
+  });
   const [systemPrefersDark, setSystemPrefersDark] = useState(() =>
     typeof window !== "undefined" && window.matchMedia?.("(prefers-color-scheme: dark)").matches === true,
   );
@@ -751,9 +756,24 @@ function App() {
     ));
   };
 
+  // 把项目登记到服务端。
+  //
+  // `knownProjectPaths` 是浏览器本地状态，只服务桌面端自己的分组渲染；项目归属
+  // 的服务端事实由 `projects` 表承载，手机端读的就是它。这里必须写服务端，否则
+  // 「添加了项目但还没在项目下建会话」的状态在手机端不可见——那正是手机端只显示
+  // k-coder 一个分组的原因。
+  // 失败只记录不抛出：登记失败不该阻断用户已经完成的添加动作，且服务端会留下日志。
+  const persistProjectPaths = (paths: string[]) => {
+    if (!paths.length) return;
+    void registerProjectPathsOnServer(paths).catch((reason: unknown) => {
+      console.error("登记项目到服务端失败:", reason);
+    });
+  };
+
   const registerProjectPaths = (paths: string[]) => {
     setKnownProjectPaths((current) => mergeWorkspacePaths(current, paths));
     restoreProjectGroups(paths);
+    persistProjectPaths(paths);
   };
 
   const ensureProjectWorkspace = async (projectPath: string) => {
@@ -1055,6 +1075,11 @@ function App() {
         );
         try { localStorage.setItem("kcoder_pinned_projects", JSON.stringify([...next])); } catch { /* noop */ }
         return next;
+      });
+      // 服务端同样要移除，否则手机端会继续把这个项目显示成一个空分组，
+      // 与桌面端看到的列表不一致。
+      void removeProjectPath(projectPath).catch((reason: unknown) => {
+        console.error("从服务端移除项目失败:", reason);
       });
     }
     setProjectMenuOpen(null);

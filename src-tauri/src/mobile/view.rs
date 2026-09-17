@@ -26,6 +26,25 @@ pub const MAX_TOOL_EXCERPT_CHARS: usize = 512;
 /// 单条消息文本在手机上保留的最大字符数。
 pub const MAX_MESSAGE_CHARS: usize = 8_000;
 
+/// 手机端可见的项目。
+///
+/// 只下发展示所需的最小信息：项目 ID、显示名、归属键与最近打开时间。
+/// **绝不包含 `path`**——工作区绝对路径与手机无关，且属于不该跨越设备边界的信息。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MobileProject {
+    /// `projects` 表主键。
+    pub id: String,
+    /// 项目显示名（通常是目录名）。
+    pub name: String,
+    /// 项目归属键。会话用它指回项目，手机端也用它在重读之间保持分组展开态。
+    ///
+    /// 与桌面端 `workspacePathKey` 同源：取路径并统一大小写与分隔符，因此
+    /// 手机端不需要、也拿不到真实路径。
+    pub key: String,
+    pub last_opened_at_ms: u64,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MobileThreadSummary {
@@ -38,11 +57,18 @@ pub struct MobileThreadSummary {
     pub active_turn_id: Option<String>,
     pub pending_approvals: u32,
     pub pending_user_inputs: u32,
+    /// 会话所属项目的归属键，`None` 表示独立会话（`in_project = false`）。
+    ///
+    /// 桌面端的分组依赖 `sessions.workspace_path`，但它对「已注册但尚无绑定会话」
+    /// 的项目和 `workspace_path` 仍为 NULL 的历史会话都不足以自洽；这里由服务端统一
+    /// 解析后下发，手机端只做分组渲染，不再自行推断归属。
+    pub project_key: Option<String>,
 }
 
 impl MobileThreadSummary {
     pub fn from_summary(
         summary: &ThreadSummary,
+        project_key: Option<String>,
         active_turn_id: Option<String>,
         pending_approvals: u32,
         pending_user_inputs: u32,
@@ -57,6 +83,7 @@ impl MobileThreadSummary {
             active_turn_id,
             pending_approvals,
             pending_user_inputs,
+            project_key,
         }
     }
 }
@@ -620,14 +647,42 @@ mod tests {
             in_project: true,
             workspace_path: Some("D:\\code\\k-coder".to_string()),
         };
-        let projected =
-            MobileThreadSummary::from_summary(&summary, Some("turn-9".to_string()), 1, 2);
+        let projected = MobileThreadSummary::from_summary(
+            &summary,
+            Some("d:/code/k-coder".to_string()),
+            Some("turn-9".to_string()),
+            1,
+            2,
+        );
         assert!(projected.running);
         assert_eq!(projected.pending_approvals, 1);
+        assert_eq!(projected.project_key.as_deref(), Some("d:/code/k-coder"));
         let encoded = serde_json::to_string(&projected).unwrap();
         assert!(
             !encoded.contains("D:\\\\code"),
             "workspace absolute path must not reach the phone: {encoded}"
         );
+    }
+
+    /// 项目键是路径的归一化形式，不是路径本身。手机端拿它分组即可，
+    /// 不需要（也不应该）知道工作区在磁盘上的位置。
+    #[test]
+    fn project_key_is_not_the_workspace_path() {
+        let project = MobileProject {
+            id: "p1".to_string(),
+            name: "k-coder".to_string(),
+            key: crate::workbench::workspace_path_key(r"D:\code\Nick\k-coder"),
+            last_opened_at_ms: 7,
+        };
+
+        let encoded = serde_json::to_string(&project).unwrap();
+        assert!(
+            !encoded.contains(r"D:\\"),
+            "key 不得携带盘符路径: {encoded}"
+        );
+        assert!(!encoded.contains("Nick"), "key 不得携带父目录名: {encoded}");
+        let decoded: serde_json::Value = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded["name"], "k-coder");
+        assert!(decoded.get("path").is_none(), "项目视图不得下发 path 字段");
     }
 }

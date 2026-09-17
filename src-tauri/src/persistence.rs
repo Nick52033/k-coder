@@ -719,6 +719,31 @@ impl ProjectionDb {
             .collect::<Result<Vec<_>, _>>()?)
     }
 
+    /// 从项目清单移除。只影响项目登记，**不触碰任何会话或文件**。
+    ///
+    /// 匹配用路径的归属键（大小写/分隔符折叠），因为登记时写入的是
+    /// `canonicalize` 后的路径，而调用方传进来的可能是不带 `\\?\` 前缀的写法。
+    /// 返回被删除的行数，0 表示该项目本来就不在清单里（幂等，不算错误）。
+    pub fn delete_project(&self, path: &str) -> Result<usize, ProjectionError> {
+        let key = crate::workbench::workspace_path_key(path);
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| ProjectionError::Poisoned)?;
+        let candidates: Vec<String> = connection
+            .prepare("SELECT path FROM projects")?
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut removed = 0usize;
+        for candidate in candidates {
+            if crate::workbench::workspace_path_key(&candidate) == key {
+                removed +=
+                    connection.execute("DELETE FROM projects WHERE path=?1", [&candidate])?;
+            }
+        }
+        Ok(removed)
+    }
+
     pub fn usage_summary(&self) -> Result<UsageSummary, ProjectionError> {
         const AGGREGATE_COLUMNS: &str = "COALESCE(SUM(input_tokens),0),
              COALESCE(SUM(output_tokens),0),
@@ -1338,6 +1363,33 @@ mod tests {
 
         assert_eq!(restored.context_usage, None);
         assert_eq!(restored.last_usage.unwrap().total_tokens, 12);
+    }
+
+    #[test]
+    fn delete_project_matches_by_normalized_key_and_is_idempotent() {
+        let db = ProjectionDb::memory().unwrap();
+        let record = |id: &str, path: &str| ProjectRecord {
+            id: id.to_string(),
+            name: id.to_string(),
+            path: path.to_string(),
+            trusted: true,
+            last_opened_at_ms: 1,
+        };
+        // 同一个目录的两种写法（大小写 + 尾分隔符）都应被同一次删除命中。
+        db.upsert_project(&record("a", r"D:\code\App")).unwrap();
+        db.upsert_project(&record("b", "d:/code/app/")).unwrap();
+        db.upsert_project(&record("c", r"D:\code\other")).unwrap();
+
+        let removed = db.delete_project(r"\\?\D:\Code\APP").unwrap();
+
+        assert_eq!(removed, 2, "同一归属键的多行必须一次全部删除");
+        let remaining = db.list_projects().unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].id, "c");
+
+        // 幂等：再删一次不该报错，也不该影响其他项目。
+        assert_eq!(db.delete_project(r"D:\code\APP").unwrap(), 0);
+        assert_eq!(db.list_projects().unwrap().len(), 1);
     }
 
     #[test]

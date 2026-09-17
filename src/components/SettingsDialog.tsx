@@ -2563,11 +2563,11 @@ function AppearancePage({
       </div>
       <div className="appearance-theme-section appearance-background-section">
         <div className="appearance-section-heading"><div><p className="settings-eyebrow">会话背景</p><h4>背景图</h4></div><span className="appearance-current-theme">本机显示</span></div>
-        <div className="background-preview" aria-label="会话背景预览" style={{ backgroundImage: `linear-gradient(rgba(255,255,255,${backgroundOpacity}),rgba(255,255,255,${backgroundOpacity})),url("${backgroundImage}")` }} />
+        <div className="background-preview" aria-label="会话背景预览" style={{ backgroundImage: `linear-gradient(color-mix(in srgb, var(--color-surface) ${backgroundOpacity * 100}%, transparent), color-mix(in srgb, var(--color-surface) ${backgroundOpacity * 100}%, transparent)),url("${backgroundImage}")` }} />
         <label className="background-upload"><span>上传背景图</span><input type="file" accept="image/png,image/jpeg,image/webp,image/gif" onChange={(event) => { const file = event.target.files?.[0]; if (!file) return; if (file.size > 4 * 1024 * 1024) { event.currentTarget.value = ""; return; } const reader = new FileReader(); reader.onload = () => { if (typeof reader.result === "string") onBackgroundImageChange(reader.result); }; reader.readAsDataURL(file); event.currentTarget.value = ""; }} /></label>
         {backgroundImage.startsWith("data:image/") && <button type="button" className="background-reset" onClick={() => onBackgroundImageChange("/chat-background.png")}>恢复内置背景</button>}
         <label className="background-toggle"><input type="checkbox" checked={backgroundEnabled} onChange={(e) => onBackgroundEnabledChange(e.target.checked)} /> 显示会话背景图</label>
-        <label className="background-opacity">图片可见度 <input type="range" min="0.15" max="1" step="0.01" value={Number((1 - backgroundOpacity).toFixed(2))} disabled={!backgroundEnabled} onChange={(e) => onBackgroundOpacityChange(Number((1 - Number(e.target.value)).toFixed(2)))} /><output>{Math.round((1 - backgroundOpacity) * 100)}%</output></label>
+        <label className="background-opacity">图片可见度 <input type="range" min="0.4" max="1" step="0.01" value={Number((1 - backgroundOpacity).toFixed(2))} disabled={!backgroundEnabled} onChange={(e) => onBackgroundOpacityChange(Number((1 - Number(e.target.value)).toFixed(2)))} /><output>{Math.round((1 - backgroundOpacity) * 100)}%</output></label>
         <small className="settings-page-description">使用内置预览图验证透明面板效果；关闭后恢复纯色工作区。</small>
       </div>
     </section>

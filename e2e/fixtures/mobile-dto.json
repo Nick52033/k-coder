@@ -13,7 +13,14 @@
     "createdAtMs": 1760000000000,
     "lastSeenAtMs": 1760000500000,
     "revoked": false
-  },  "pending": {
+  },
+  "project": {
+    "id": "proj-1",
+    "name": "paypro-platform-be",
+    "key": "d:/code/nick/paypro-platform-be",
+    "lastOpenedAtMs": 1760000700000
+  },
+  "pending": {
     "id": "pending-1",
     "deviceName": "iPhone 16",
     "platform": "iOS 19",

@@ -6,6 +6,7 @@
 //! - [`auth`]：配对挑战、设备登记、访问令牌与撤销；
 //! - [`events`]：按 thread 订阅、投递序号、有界队列与补发，以及下发前的载荷脱敏；
 //! - [`view`]：会话历史的移动端安全投影；
+//! - [`projects`]：项目清单与会话归属的服务端解析；
 //! - [`rpc`]：方法分发，全部调用现有应用服务；
 //! - [`server`]：HTTP/WebSocket 传输、来源校验与限流；
 //! - [`tls`]：本机自签证书与指纹。
@@ -17,6 +18,7 @@ pub mod auth;
 pub mod capability;
 pub mod events;
 pub mod host;
+pub mod projects;
 pub mod protocol;
 pub mod rpc;
 pub mod server;

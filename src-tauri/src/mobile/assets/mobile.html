@@ -129,6 +129,29 @@
     padding: 12px 14px; margin-bottom: 8px; }
   .thread .thread-title { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .thread .thread-meta { color: var(--muted); font-size: 12px; margin-top: 2px; }
+  /* 项目分组内的会话收进同一张卡片靠分隔线区分层级。
+     注意必须用 `border-bottom-width` 而不是 `border-width` 简写：简写会把上边框也从
+     0 改成 1px，而 `.thread` 本来没有上边框，多出来的 1px 会改变卡片的实际高度。
+     `--composer-h` 由 `composer.offsetHeight` 取整写入，正文区底距按它计算，
+     于是这 1px 会让「正文让出的空间」与「输入区真实高度」之差越过既有断言的阈值。 */
+  .project-body .thread { border-radius: 0; border-bottom-width: 1px; border-top-width: 0; margin-bottom: 0; }
+  .project-body .thread:last-child { border-bottom-width: 0; }
+
+  .project { margin-bottom: 10px; }
+  .project-head { display: flex; align-items: center; gap: 8px; padding: 4px 2px 6px; }
+  .project-toggle { display: flex; align-items: center; gap: 7px; flex: 1; min-width: 0;
+    background: none; border: 0; padding: 0; text-align: left; color: inherit;
+    font: inherit; font-weight: 600; }
+  .project-toggle .chevron { display: inline-block; transition: transform .15s;
+    color: var(--muted); flex: none; }
+  .project-toggle[aria-expanded="true"] .chevron { transform: rotate(90deg); }
+  .project-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .project-count { font-size: 12px; color: var(--muted); background: var(--surface-alt);
+    border-radius: 999px; padding: 1px 8px; flex: none; }
+  .project-fold { font-size: 12px; color: var(--muted); flex: none; }
+  .project-body { background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--radius); overflow: hidden; }
+  .project-empty { color: var(--muted); font-size: 13px; padding: 12px 14px; }
 
   /* ---- 对话 ---- */
   .chatbar {
@@ -301,6 +324,9 @@
     pending: new Map(),
     view: "threads",
     threads: [],
+    projects: [],
+    /** 已折叠的项目键。默认全部展开：手机上项目数量少，折叠反而多一步。 */
+    collapsedProjects: new Set(),
     activeThreadId: null,
     activeTurnId: null,
     subscribed: new Map(),
@@ -1081,48 +1107,150 @@
 
   // ---- 渲染：会话与对话 ----
 
+  /// 会话按项目分组后的展示结构。
+  ///
+  /// 分组依据是服务端下发的 `projectKey`，手机端不再自行推断归属——归属事实留在
+  /// 服务端，这里只负责渲染。独立会话（`projectKey` 为空）单独归到最后。
+  function groupThreads() {
+    const groups = [];
+    const byKey = new Map();
+    const standalone = [];
+    state.projects.forEach((project) => {
+      const group = { key: project.key, name: project.name, threads: [], known: true };
+      byKey.set(project.key, group);
+      groups.push(group);
+    });
+    state.threads.forEach((thread) => {
+      const key = thread.projectKey;
+      if (!key) {
+        standalone.push(thread);
+        return;
+      }
+      let group = byKey.get(key);
+      if (!group) {
+        // 会话指向一个已从项目列表移除的项目：照常显示，但用键的末段当名字，
+        // 免得整条会话因为项目被删而在手机上凭空消失。
+        const name = (key.split("/").filter(Boolean).pop()) || key;
+        group = { key: key, name: name + "（已移除）", threads: [], known: false };
+        byKey.set(key, group);
+        groups.push(group);
+      }
+      group.threads.push(thread);
+    });
+    return { groups: groups, standalone: standalone };
+  }
+
+  function threadButton(thread) {
+    const button = document.createElement("button");
+    button.className = "thread";
+    const main = document.createElement("div");
+    main.className = "grow";
+    const title = document.createElement("div");
+    title.className = "thread-title";
+    title.textContent = thread.title || "(无标题)";
+    const meta = document.createElement("div");
+    meta.className = "thread-meta";
+    meta.textContent = new Date(thread.updatedAtMs).toLocaleString();
+    main.appendChild(title);
+    main.appendChild(meta);
+    const pills = document.createElement("div");
+    pills.className = "row";
+    if (thread.running) {
+      const pill = document.createElement("span");
+      pill.className = "pill running";
+      pill.textContent = "运行中";
+      pills.appendChild(pill);
+    }
+    if (thread.pendingApprovals > 0) {
+      const pill = document.createElement("span");
+      pill.className = "pill approval";
+      pill.textContent = "待审批 " + thread.pendingApprovals;
+      pills.appendChild(pill);
+    }
+    button.appendChild(main);
+    button.appendChild(pills);
+    button.addEventListener("click", () => openThread(thread.id, false));
+    return button;
+  }
+
+  function projectGroup(group) {
+    const expanded = !state.collapsedProjects.has(group.key);
+    const wrapper = document.createElement("div");
+    wrapper.className = "project";
+
+    const head = document.createElement("div");
+    head.className = "project-head";
+    const toggle = document.createElement("button");
+    toggle.className = "project-toggle";
+    toggle.setAttribute("aria-expanded", expanded ? "true" : "false");
+    const chevron = document.createElement("span");
+    chevron.className = "chevron";
+    chevron.textContent = "▶";
+    const name = document.createElement("span");
+    name.className = "project-name";
+    name.textContent = group.name;
+    toggle.appendChild(chevron);
+    toggle.appendChild(name);
+    toggle.addEventListener("click", () => {
+      if (state.collapsedProjects.has(group.key)) state.collapsedProjects.delete(group.key);
+      else state.collapsedProjects.add(group.key);
+      renderThreads();
+    });
+    const count = document.createElement("span");
+    count.className = "project-count";
+    count.textContent = String(group.threads.length);
+    head.appendChild(toggle);
+    head.appendChild(count);
+    wrapper.appendChild(head);
+
+    if (!expanded) {
+      const fold = document.createElement("div");
+      fold.className = "project-fold";
+      fold.style.padding = "0 2px";
+      fold.textContent = "已折叠";
+      wrapper.appendChild(fold);
+      return wrapper;
+    }
+
+    const body = document.createElement("div");
+    body.className = "project-body";
+    if (!group.threads.length) {
+      const empty = document.createElement("div");
+      empty.className = "project-empty";
+      // 这句话是这次修复的核心：项目存在但还没有会话，本身就是有效信息，
+      // 而不是"这个项目不存在"。
+      empty.textContent = "还没有会话";
+      body.appendChild(empty);
+    } else {
+      group.threads.forEach((thread) => body.appendChild(threadButton(thread)));
+    }
+    wrapper.appendChild(body);
+    return wrapper;
+  }
+
   function renderThreads() {
     const list = el("threadList");
     list.textContent = "";
-    if (!state.threads.length) {
+    const grouped = groupThreads();
+    const hasProjects = grouped.groups.length > 0;
+    if (!hasProjects && !grouped.standalone.length) {
       const empty = document.createElement("div");
       empty.className = "card muted";
-      empty.textContent = "还没有会话。请先在电脑端创建会话。";
+      // 网关未授权或尚未打开过任何项目时给一句能指路的话，而不是让人以为手机坏了。
+      empty.textContent = "还没有项目。请先在电脑端打开或添加项目。";
       list.appendChild(empty);
       return;
     }
-    state.threads.forEach((thread) => {
-      const button = document.createElement("button");
-      button.className = "thread";
-      const main = document.createElement("div");
-      main.className = "grow";
-      const title = document.createElement("div");
-      title.className = "thread-title";
-      title.textContent = thread.title || "(无标题)";
-      const meta = document.createElement("div");
-      meta.className = "thread-meta";
-      meta.textContent = new Date(thread.updatedAtMs).toLocaleString();
-      main.appendChild(title);
-      main.appendChild(meta);
-      const pills = document.createElement("div");
-      pills.className = "row";
-      if (thread.running) {
-        const pill = document.createElement("span");
-        pill.className = "pill running";
-        pill.textContent = "运行中";
-        pills.appendChild(pill);
-      }
-      if (thread.pendingApprovals > 0) {
-        const pill = document.createElement("span");
-        pill.className = "pill approval";
-        pill.textContent = "待审批 " + thread.pendingApprovals;
-        pills.appendChild(pill);
-      }
-      button.appendChild(main);
-      button.appendChild(pills);
-      button.addEventListener("click", () => openThread(thread.id, false));
-      list.appendChild(button);
-    });
+    grouped.groups.forEach((group) => list.appendChild(projectGroup(group)));
+    if (grouped.standalone.length) {
+      // 独立会话不属于任何项目，单独一段，避免被误读成某个项目的会话。
+      list.appendChild(projectGroup({
+        key: "\u0000standalone",
+        name: "独立会话",
+        threads: grouped.standalone,
+        known: true,
+      }));
+    }
   }
 
   function renderChatMeta() {
@@ -1308,11 +1436,27 @@
   async function refreshThreads() {
     if (!state.ready) return;
     try {
-      const result = await call("thread/list", {});
-      state.threads = result.threads || [];
+      // 两个请求并发：项目清单变化很慢，但它决定分组骨架，缺了它会话会先按
+      // 未知归属渲染一次再跳变。缺任一个都不影响另一个的展示。
+      const [projects, threads] = await Promise.all([
+        call("project/list", {}),
+        call("thread/list", {}),
+      ]);
+      state.projects = projects.projects || [];
+      state.threads = threads.threads || [];
       renderThreads();
     } catch (error) {
-      notify(describeError(error));
+      // 项目清单是分组骨架，但它不该决定会话能不能看：单独降级重取一次会话，
+      // 让「项目列表读不到」表现为分组缺失，而不是整个列表白屏。
+      try {
+        const threads = await call("thread/list", {});
+        state.projects = [];
+        state.threads = threads.threads || [];
+        renderThreads();
+        notify("项目列表读取失败，已按独立会话展示");
+      } catch (fallbackError) {
+        notify(describeError(error || fallbackError));
+      }
     }
   }
 

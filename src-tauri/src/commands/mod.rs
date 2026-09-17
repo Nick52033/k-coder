@@ -621,6 +621,14 @@ fn live_runtime_instruction_provider(
         let mut advanced_instructions = advanced
             .runtime_instructions(&thread_id)
             .map_err(|error| format!("advanced runtime: {error}"))?;
+        if tool_names.iter().any(|name| name == "update_plan") {
+            advanced_instructions.push_str(
+                &advanced
+                    .plans
+                    .runtime_instructions(&thread_id)
+                    .map_err(|error| format!("plan state: {error}"))?,
+            );
+        }
         let workflow_skills = advanced
             .workflows
             .runtime_skill_instructions(&thread_id, &extensions)
@@ -2376,6 +2384,41 @@ pub async fn delete_mcp_secret(
 #[tauri::command]
 pub fn workspace_state(state: State<'_, AppState>) -> CommandResult<WorkspaceState> {
     workbench::workspace_state(&state.repository().projection(), &state.workspace_root())
+        .map_err(|error| CommandError::new("workspace", error))
+}
+
+/// 把一个目录登记进项目清单，**不**切换活动工作区。
+///
+/// 与 `switch_workspace` 的分工：那个命令同时做「登记」和「切过去」，多选添加项目时
+/// 只有第一个需要切过去。此前其余项目只写进桌面端的 `localStorage`，服务端不知道它们
+/// 存在——手机端因此只能看到"已经有会话挂着"的项目。这个命令把登记这件事本身
+/// 变成服务端事实。
+#[tauri::command(rename_all = "camelCase")]
+pub fn register_project_paths(
+    state: State<'_, AppState>,
+    paths: Vec<String>,
+) -> CommandResult<Vec<ProjectRecord>> {
+    let projection = state.repository().projection();
+    let mut registered = Vec::with_capacity(paths.len());
+    for path in &paths {
+        let project = workbench::register_project(&projection, std::path::Path::new(path), true)
+            .map_err(|error| CommandError::new("workspace", error))?;
+        registered.push(project);
+    }
+    Ok(registered)
+}
+
+/// 从项目清单移除一个项目。**不删除任何会话或文件**。
+///
+/// 已绑定该工作区的会话仍然保留各自的归属，因此手机端会继续把它们显示在一个
+/// 标注「已移除」的分组里，而不是让它们凭空消失。
+#[tauri::command(rename_all = "camelCase")]
+pub fn remove_project_path(state: State<'_, AppState>, path: String) -> CommandResult<()> {
+    state
+        .repository()
+        .projection()
+        .delete_project(&path)
+        .map(|_removed| ())
         .map_err(|error| CommandError::new("workspace", error))
 }
 
@@ -4202,6 +4245,45 @@ mod tests {
         assert!(
             !build_system_prompt(None, "", "", "", "", &[]).contains("<delegation_scheduling>")
         );
+    }
+
+    #[test]
+    fn live_plan_guidance_refreshes_progress_only_when_tool_is_available() {
+        let data = tempfile::tempdir().unwrap();
+        let state =
+            AppState::with_credentials(data.path(), Arc::new(TestCredentials::default())).unwrap();
+        let compiler = |names| {
+            super::live_runtime_instruction_provider(
+                &state,
+                "plan-thread".into(),
+                "实现功能".into(),
+                None,
+                String::new(),
+                names,
+            )
+        };
+        let enabled = compiler(vec!["update_plan".into()]);
+        assert!(enabled.compile().unwrap().contains("[执行计划同步]"));
+        assert!(!enabled.compile().unwrap().contains("\"revision\""));
+        for (revision, status) in ["in_progress", "completed"].into_iter().enumerate() {
+            state
+                .advanced()
+                .plans
+                .update(
+                    serde_json::from_value(serde_json::json!({
+                        "threadId": "plan-thread",
+                        "steps": [{ "step": "实现功能", "status": status }],
+                    }))
+                    .unwrap(),
+                )
+                .unwrap();
+            let prompt = enabled.compile().unwrap();
+            assert!(prompt.contains(&format!("\"revision\":{}", revision + 1)));
+            assert!(prompt.contains(&format!("\"status\":\"{status}\"")));
+        }
+        let disabled = compiler(vec!["read_file".into()]).compile().unwrap();
+        assert!(!disabled.contains("[执行计划同步]"));
+        assert!(!disabled.contains("\"revision\""));
     }
 
     #[tokio::test]

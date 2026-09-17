@@ -24,7 +24,7 @@ use super::protocol::{
     EVENT_PROTOCOL_VERSION, MOBILE_PROTOCOL_VERSION, MobileError, MobileErrorKind, RpcRequest,
     RpcResponse,
 };
-use super::view;
+use super::{projects, view};
 
 /// 幂等缓存与待处理请求索引的容量上限。
 pub const MAX_TRACKED_REQUESTS: usize = 256;
@@ -400,6 +400,7 @@ async fn handle(
 
     match method {
         "ping" => Ok(Some(json!({ "serverTimeMs": now_ms() }))),
+        "project/list" => handle_project_list(ctx, &device_id).await.map(Some),
         "thread/list" => handle_thread_list(ctx, &device_id).await.map(Some),
         "thread/read" => handle_thread_read(ctx, &params).await.map(Some),
         "thread/subscribe" => handle_thread_subscribe(ctx, connection_id, &params)
@@ -538,8 +539,39 @@ async fn handle_auth_refresh(
     }))
 }
 
+/// 项目清单。手机端据此渲染项目分组，包括**尚无会话**的项目——这正是此前手机端
+/// 只能看到 k-coder 一个分组的原因（归属事实只存在于会话表里）。
+///
+/// 与 `thread/list` 分开发方法而不是揉进同一个响应：项目的生命周期比会话慢得多，
+/// 手机端只需要在进入列表页时拉一次，之后刷新会话就能保持分组不跳动。
+async fn handle_project_list(ctx: &GatewayContext, device_id: &str) -> Result<Value, MobileError> {
+    let state = ctx.app_state()?;
+    let active = state.workspace_root();
+    let attribution = projects::resolve(state, active.to_str())
+        .await
+        .map_err(|error| MobileError::internal(error.to_string()))?;
+    ctx.registry.touch(device_id);
+    Ok(json!({
+        "projects": attribution
+            .projects
+            .iter()
+            .map(|project| view::MobileProject {
+                id: project.id.clone(),
+                name: project.name.clone(),
+                key: project.key.clone(),
+                last_opened_at_ms: project.last_opened_at_ms,
+            })
+            .collect::<Vec<_>>(),
+    }))
+}
+
 async fn handle_thread_list(ctx: &GatewayContext, device_id: &str) -> Result<Value, MobileError> {
     let state = ctx.app_state()?;
+    let active = state.workspace_root();
+    let attribution = projects::resolve(state, active.to_str())
+        .await
+        .map_err(|error| MobileError::internal(error.to_string()))?;
+
     let threads = state
         .list_conversation_threads("")
         .await
@@ -549,6 +581,7 @@ async fn handle_thread_list(ctx: &GatewayContext, device_id: &str) -> Result<Val
         let active_turn_id = state.active_turn_id(&summary.id).await;
         projected.push(view::MobileThreadSummary::from_summary(
             &summary,
+            attribution.project_key_of(&summary.id),
             active_turn_id,
             ctx.pending.pending_approval_count(&summary.id),
             ctx.pending.pending_user_input_count(&summary.id),

@@ -64,8 +64,8 @@ impl MobileCapability {
 /// 方法到所需能力的映射。
 pub fn required_capability(method: &str) -> Option<MobileCapability> {
     match method {
-        "thread/list" | "thread/read" | "thread/subscribe" | "thread/unsubscribe"
-        | "turn/start" | "turn/steer" => Some(MobileCapability::Chat),
+        "project/list" | "thread/list" | "thread/read" | "thread/subscribe"
+        | "thread/unsubscribe" | "turn/start" | "turn/steer" => Some(MobileCapability::Chat),
         "turn/interrupt" => Some(MobileCapability::Interrupt),
         "approval/respond" | "tool/requestUserInput/respond" => Some(MobileCapability::Approval),
         "file/list" | "file/read" => Some(MobileCapability::FileRead),

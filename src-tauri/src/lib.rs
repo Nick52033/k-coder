@@ -281,6 +281,8 @@ pub fn run() {
             commands::threads::usage_summary,
             commands::workspace_state,
             commands::switch_workspace,
+            commands::register_project_paths,
+            commands::remove_project_path,
             commands::list_workspace_directory,
             commands::search_workspace_files,
             commands::preview_workspace_file,

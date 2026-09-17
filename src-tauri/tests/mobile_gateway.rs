@@ -610,6 +610,50 @@ async fn thread_methods_fail_closed_without_application_state() {
     assert_eq!(response["error"]["data"]["retryable"], json!(true));
 }
 
+/// `project/list` 是这次修复新增的方法，它必须和 `thread/list` 一样受 Chat 能力门控，
+/// 并且在拿不到应用状态时同样安全失败，而不是回一个空项目列表假装正常。
+#[tokio::test]
+async fn project_list_is_gated_and_fails_closed() {
+    let harness = Harness::start().await;
+    let (device_id, device_secret) = register_device(&harness, "Pixel");
+    let mut client = harness.connect().await;
+
+    // 未握手前调用 `project/list` 与其它业务方法一样被拒。
+    let unauthorized = call(&mut client, 1, "project/list", json!({})).await;
+    assert_eq!(error_kind(&unauthorized), "unauthorized");
+
+    authenticate(&mut client, &device_id, &device_secret).await;
+
+    // 能力门控与 `thread/list` 一致（两者都由 Chat 覆盖）。
+    harness
+        .context
+        .policy
+        .set_granted([k_coder_lib::mobile::MobileCapability::Approval]);
+    let denied = call(&mut client, 2, "project/list", json!({})).await;
+    assert_eq!(
+        error_kind(&denied),
+        "unsupported_capability",
+        "实际回包：{denied}"
+    );
+    // 结构化细节挂在 `data.details` 下（`MobileErrorData.details`），
+    // 客户端据此知道该补授哪个能力，而不是只看到一句「不支持」。
+    assert_eq!(
+        denied["error"]["data"]["details"]["capability"],
+        json!("chat"),
+        "实际回包：{denied}"
+    );
+    assert_eq!(denied["error"]["data"]["retryable"], json!(false));
+
+    harness
+        .context
+        .policy
+        .set_granted([k_coder_lib::mobile::MobileCapability::Chat]);
+    // 桩宿主没有 AppState：方法与 `thread/list` 走同一条结构化内部错误路径。
+    let response = call(&mut client, 3, "project/list", json!({})).await;
+    assert_eq!(error_kind(&response), "internal_error");
+    assert_eq!(response["error"]["data"]["retryable"], json!(true));
+}
+
 #[tokio::test]
 async fn events_are_not_delivered_without_a_subscription() {
     let harness = Harness::start().await;

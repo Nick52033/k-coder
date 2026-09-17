@@ -33,3 +33,8 @@ scripts/deploy.config.json
 
 # 本地 UI 取证产物（截图、metrics、一次性调试脚本），结论沉淀在 docs/
 .tmp-ui/
+
+# TypeScript 增量构建产物（`tsc -b` 由 vite.config.ts / tsconfig.*.json 生成，不是源码）
+*.tsbuildinfo
+vite.config.js
+vite.config.d.ts

@@ -613,29 +613,41 @@ button {
 }
 
 .workbench--background { background: transparent; }
+.workbench--background {
+  /* 背景模式下把次要文字压深，用来换取更透明的面板（即更清楚的背景图）。
+     这样既能让背景透出来，又不会牺牲正文可读性。 */
+  --color-ink-muted: #3f4a44;
+  --color-ink-subtle: #46514b;
+  --color-ink-faint: #6b756f;
+}
 .workbench--background::before {
   content: ""; position: absolute; inset: 0; z-index: 0; pointer-events: none;
-  background: linear-gradient(color-mix(in srgb, var(--color-surface) calc(var(--background-opacity, .32) * 100%), transparent), color-mix(in srgb, var(--color-surface) calc(var(--background-opacity, .32) * 100%), transparent)), var(--background-image, url('/chat-background.png')) center / cover no-repeat;
+  background: linear-gradient(color-mix(in srgb, var(--color-surface) calc(var(--background-opacity, .18) * 100%), transparent), color-mix(in srgb, var(--color-surface) calc(var(--background-opacity, .18) * 100%), transparent)), var(--background-image, url('/chat-background.png')) center / cover no-repeat;
+  /* 轻度提饱和/提对比，抵消上层半透明面板对背景图的稀释。 */
+  backdrop-filter: saturate(1.22) contrast(1.08);
 }
 .workbench--background > :is(.titlebar, .sidebar, .conversation) { position: relative; z-index: 1; }
 .workbench--background > :is(.workbench-panel, .subagent-drawer) { z-index: 1; }
+/* 面板不透明度是背景可见度的决定性变量：
+     最终可见对比 ≈ 图片对比 × (1 - 白纱) × (1 - 面板不透明度)
+   这里比原设计更透明，配合明暗结构明确的背景图，让背景真正透出来。 */
 .workbench--background .conversation {
-  background: color-mix(in srgb, var(--color-surface) 60%, transparent);
+  background: color-mix(in srgb, var(--color-surface) 62%, transparent);
   /* Diffuse image details behind prose without blurring the content itself. */
-  backdrop-filter: blur(9px);
+  backdrop-filter: blur(8px) saturate(1.16);
 }
 .workbench--background .message-area { background: transparent; }
 .workbench--background .sidebar {
-  background: color-mix(in srgb, var(--color-surface-raised) 74%, transparent);
-  backdrop-filter: blur(7px);
+  background: color-mix(in srgb, var(--color-surface-raised) 70%, transparent);
+  backdrop-filter: blur(8px) saturate(1.16);
 }
 .workbench--background .composer {
   background: color-mix(in srgb, var(--color-surface-raised) 64%, transparent);
-  backdrop-filter: blur(10px);
+  backdrop-filter: blur(12px) saturate(1.14);
 }
 .workbench--background .titlebar {
-  background: color-mix(in srgb, var(--color-surface-chrome) 74%, transparent);
-  backdrop-filter: blur(10px);
+  background: color-mix(in srgb, var(--color-surface-chrome) 66%, transparent);
+  backdrop-filter: blur(9px) saturate(1.14);
 }
 
 /* 设置等弹窗在背景模式下也透出背景图，而不是整块盖住 */
@@ -4175,7 +4187,7 @@ button {
   border: 1px solid var(--color-border);
   border-radius: 10px;
   background-color: var(--color-surface-panel);
-  background-image: linear-gradient(rgba(255,255,255,.55),rgba(255,255,255,.55)),url('/chat-background.png');
+  /* 图片与遮罩由组件内联样式提供，避免这里写死内置图导致自定义背景预览失真。 */
   background-position: center;
   background-size: 100% 100%, contain;
   background-repeat: no-repeat;

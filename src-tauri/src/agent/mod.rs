@@ -56,6 +56,10 @@ const MAX_TOOL_OUTPUT_BYTES: usize = 128 * 1024;
 const MAX_IDENTICAL_TOOL_CALLS: usize = 2;
 const SUBSTANTIAL_READ_OVERLAP_PERCENT: usize = 80;
 const MAX_RECOVERABLE_REDUNDANT_READ_BATCHES: usize = 2;
+// A compacted summary keeps read provenance but may omit most of the source body. Allow a
+// bounded number of provider batches to refill that body before the normal duplicate guard is
+// restored. The limit is per path/revision and is never reopened by another compaction.
+const MAX_POST_COMPACTION_REHYDRATION_BATCHES: usize = 8;
 const MAX_READ_RECOVERY_INSTRUCTIONS: usize = 4;
 const PROGRESS_CHECK_WINDOW: usize = 5;
 const MAX_NO_PROGRESS_WINDOWS: usize = 3;
@@ -176,9 +180,10 @@ struct ReadRevisionCoverage {
     redundant_batches: usize,
     last_redundant_batch: Option<usize>,
     recovery_delivered_batch: Option<usize>,
-    post_recovery_retry_count: usize,
     rehydration_available: bool,
     rehydrated_batch: Option<usize>,
+    rehydration_batches: usize,
+    last_rehydration_batch: Option<usize>,
 }
 
 #[derive(Debug, Default)]
@@ -258,19 +263,35 @@ impl ReadObservationTracker {
         if overlap_percent >= SUBSTANTIAL_READ_OVERLAP_PERCENT {
             let observation = (path, revision, start_line, end_line, overlap_percent);
 
-            if coverage.rehydration_available || coverage.rehydrated_batch == Some(provider_batch) {
-                coverage.rehydration_available = false;
-                coverage.rehydrated_batch = Some(provider_batch);
-                coverage.redundant_batches = 0;
-                coverage.last_redundant_batch = None;
-                coverage.recovery_delivered_batch = None;
-                return Some(ReadObservationDecision::RehydratedAfterCompaction {
-                    path: observation.0,
-                    revision: observation.1,
-                    start_line: observation.2,
-                    end_line: observation.3,
-                    overlap_percent: observation.4,
-                });
+            if coverage.rehydration_available {
+                let is_new_rehydration_batch =
+                    coverage.last_rehydration_batch != Some(provider_batch);
+                if is_new_rehydration_batch {
+                    if coverage.rehydration_batches >= MAX_POST_COMPACTION_REHYDRATION_BATCHES {
+                        coverage.rehydration_available = false;
+                    } else {
+                        coverage.rehydration_batches =
+                            coverage.rehydration_batches.saturating_add(1);
+                        coverage.last_rehydration_batch = Some(provider_batch);
+                        coverage.rehydrated_batch.get_or_insert(provider_batch);
+                        // A real body was returned for this batch, so a previous recovery cycle
+                        // cannot make the refill itself look like a duplicate read loop.
+                        coverage.redundant_batches = 0;
+                        coverage.last_redundant_batch = None;
+                        coverage.recovery_delivered_batch = None;
+                    }
+                }
+                if coverage.rehydration_available
+                    || coverage.last_rehydration_batch == Some(provider_batch)
+                {
+                    return Some(ReadObservationDecision::RehydratedAfterCompaction {
+                        path: observation.0.clone(),
+                        revision: observation.1.clone(),
+                        start_line,
+                        end_line,
+                        overlap_percent,
+                    });
+                }
             }
 
             if coverage.last_redundant_batch != Some(provider_batch) {
@@ -278,22 +299,7 @@ impl ReadObservationTracker {
                 coverage.last_redundant_batch = Some(provider_batch);
             }
             return Some(
-                if coverage.recovery_delivered_batch == Some(provider_batch)
-                    && coverage.post_recovery_retry_count == 0
-                {
-                    // Give the Provider one bounded grace response after the
-                    // correction was delivered. Compaction can make a model
-                    // repeat a tiny prefix before it consumes the instruction.
-                    coverage.post_recovery_retry_count = 1;
-                    coverage.recovery_delivered_batch = None;
-                    ReadObservationDecision::RecoveryRequired {
-                        path: observation.0,
-                        revision: observation.1,
-                        start_line: observation.2,
-                        end_line: observation.3,
-                        overlap_percent: observation.4,
-                    }
-                } else if coverage.recovery_delivered_batch == Some(provider_batch) {
+                if coverage.recovery_delivered_batch == Some(provider_batch) {
                     ReadObservationDecision::RepeatedLoop {
                         path: observation.0,
                         revision: observation.1,
@@ -324,7 +330,6 @@ impl ReadObservationTracker {
         coverage.redundant_batches = 0;
         coverage.last_redundant_batch = None;
         coverage.recovery_delivered_batch = None;
-        coverage.post_recovery_retry_count = 0;
         coverage.intervals.push((start_line, end_line));
         coverage
             .intervals
@@ -335,8 +340,12 @@ impl ReadObservationTracker {
 
     fn mark_compacted(&mut self) {
         for coverage in self.coverage.values_mut() {
-            if coverage.rehydrated_batch.is_none() {
+            if coverage.rehydrated_batch.is_none() && coverage.rehydration_batches == 0 {
                 coverage.rehydration_available = true;
+            } else if coverage.rehydrated_batch.is_some() {
+                // Rehydration is a lifetime allowance for this observation domain. A later
+                // compaction cannot reopen it after the first refill window was consumed.
+                coverage.rehydration_available = false;
             }
         }
     }
@@ -4502,7 +4511,7 @@ mod tests {
     }
 
     #[test]
-    fn semantic_read_tracker_rehydrates_only_one_post_compaction_batch() {
+    fn semantic_read_tracker_does_not_reopen_rehydration_on_second_compaction() {
         let mut tracker = ReadObservationTracker::default();
         assert_eq!(
             tracker.observe(
@@ -4535,6 +4544,91 @@ mod tests {
                 2
             ),
             Some(ReadObservationDecision::AlreadyCovered { .. })
+        ));
+    }
+
+    #[test]
+    fn semantic_read_tracker_refills_multiple_ranges_after_compaction() {
+        let mut tracker = ReadObservationTracker::default();
+        assert_eq!(
+            tracker.observe(
+                &versioned_read_result("src/file.rs", "revision-a", 1, 405),
+                0
+            ),
+            Some(ReadObservationDecision::NewCoverage)
+        );
+
+        tracker.mark_compacted();
+        for (batch, (start_line, end_line)) in [
+            (1, (1, 40)),
+            (2, (400, 405)),
+            (3, (330, 399)),
+            (4, (275, 329)),
+            (5, (200, 274)),
+        ] {
+            assert!(matches!(
+                tracker.observe(
+                    &versioned_read_result("src/file.rs", "revision-a", start_line, end_line),
+                    batch
+                ),
+                Some(ReadObservationDecision::RehydratedAfterCompaction {
+                    overlap_percent: 100,
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn semantic_read_tracker_bounds_rehydration_batches_and_restores_recovery() {
+        let mut tracker = ReadObservationTracker::default();
+        let read = versioned_read_result("src/file.rs", "revision-a", 1, 405);
+        assert_eq!(
+            tracker.observe(&read, 0),
+            Some(ReadObservationDecision::NewCoverage)
+        );
+        tracker.mark_compacted();
+
+        for batch in 1..=MAX_POST_COMPACTION_REHYDRATION_BATCHES {
+            // Multiple reads in the last allowed batch must still return bodies.
+            for start_line in [1, 200] {
+                assert!(matches!(
+                    tracker.observe(
+                        &versioned_read_result("src/file.rs", "revision-a", start_line, 405),
+                        batch,
+                    ),
+                    Some(ReadObservationDecision::RehydratedAfterCompaction { .. })
+                ));
+            }
+        }
+        let exhausted_batch = MAX_POST_COMPACTION_REHYDRATION_BATCHES + 1;
+        assert!(matches!(
+            tracker.observe(&read, exhausted_batch),
+            Some(ReadObservationDecision::AlreadyCovered { .. })
+        ));
+        tracker.mark_compacted();
+        assert!(matches!(
+            tracker.observe(&read, exhausted_batch + 1),
+            Some(ReadObservationDecision::RecoveryRequired { .. })
+        ));
+        tracker.mark_recovery_delivered(
+            &ReadRevisionKey::new("src/file.rs", "revision-a"),
+            exhausted_batch + 2,
+        );
+        assert!(matches!(
+            tracker.observe(&read, exhausted_batch + 2),
+            Some(ReadObservationDecision::RepeatedLoop { .. })
+        ));
+
+        let changed = versioned_read_result("src/file.rs", "revision-b", 1, 405);
+        assert_eq!(
+            tracker.observe(&changed, exhausted_batch + 3),
+            Some(ReadObservationDecision::NewCoverage)
+        );
+        tracker.mark_compacted();
+        assert!(matches!(
+            tracker.observe(&changed, exhausted_batch + 4),
+            Some(ReadObservationDecision::RehydratedAfterCompaction { .. })
         ));
     }
 
@@ -6686,7 +6780,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn compact_and_continue_rehydrates_one_read_batch_without_reopening_the_lifetime_limit() {
+    async fn compact_and_continue_rehydrates_multiple_read_batches_without_reopening_the_lifetime_limit()
+     {
         let (directory, repository, runtime, thread_id) = runtime_fixture().await;
         let contents = (1..=2_000)
             .map(|line| format!("line {line:04} carries context {}", "x".repeat(12)))
@@ -6802,13 +6897,25 @@ mod tests {
         );
         assert_eq!(rehydrated.metadata["contentSuppressed"], false);
         assert_eq!(rehydrated.metadata["rehydratedAfterCompaction"], true);
+        let second_rehydrated = &results["read-after-rehydration"];
+        assert!(second_rehydrated.success);
+        assert!(
+            second_rehydrated
+                .output
+                .contains("line 0004 carries context")
+        );
         assert_eq!(
-            results["read-after-rehydration"].metadata["observationStatus"],
+            second_rehydrated.metadata["observationStatus"],
+            "read_observation_rehydrated_after_compaction"
+        );
+        assert_eq!(second_rehydrated.metadata["contentSuppressed"], false);
+        assert_eq!(
+            results["read-after-second-compaction"].metadata["observationStatus"],
             "read_observation_already_covered"
         );
         assert_eq!(
-            results["read-after-second-compaction"].metadata["observationStatus"],
-            "read_observation_recovery_required"
+            results["read-after-second-compaction"].metadata["contentSuppressed"],
+            true
         );
     }
 
