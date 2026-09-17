@@ -12,6 +12,22 @@ export type ThemeId =
 
 export type ResolvedThemeId = Exclude<ThemeId, "system">;
 
+/**
+ * 深色色调（所有中性面都比文字暗）。用于需要「按明暗分流」的样式：
+ * 例如会话背景图是浅色雾绿展示图，浅色色调要压深次要文字，深色色调则必须压暗图片本身。
+ */
+export const DARK_RESOLVED_THEMES: readonly ResolvedThemeId[] = [
+  "dark",
+  "crt-green",
+  "ember",
+  "synthwave",
+  "terminal",
+];
+
+export function isDarkResolvedTheme(theme: ResolvedThemeId): boolean {
+  return DARK_RESOLVED_THEMES.includes(theme);
+}
+
 export interface ThemeOption {
   id: ThemeId;
   label: string;

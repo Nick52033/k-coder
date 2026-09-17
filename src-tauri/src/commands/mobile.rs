@@ -86,6 +86,17 @@ pub async fn mobile_revoke_device<R: Runtime>(
         .map_err(|error| CommandError::new("mobile", error))
 }
 
+/// 删除设备记录。删除活跃设备等同于「撤销 + 遗忘」，同样立即失效其访问令牌。
+#[tauri::command(rename_all = "camelCase")]
+pub async fn mobile_remove_device<R: Runtime>(
+    app: AppHandle<R>,
+    device_id: String,
+) -> CommandResult<()> {
+    service(&app)?
+        .remove_device(&device_id)
+        .map_err(|error| CommandError::new("mobile", error))
+}
+
 #[tauri::command(rename_all = "camelCase")]
 pub async fn mobile_set_capabilities<R: Runtime>(
     app: AppHandle<R>,
@@ -166,6 +177,7 @@ mod tests {
                 mobile_approve_pairing,
                 mobile_deny_pairing,
                 mobile_revoke_device,
+                mobile_remove_device,
                 mobile_set_capabilities
             ])
             .build(mock_context(noop_assets()))
@@ -466,14 +478,76 @@ mod tests {
         assert_eq!(deny.code, "mobile");
         assert!(deny.message.starts_with("not_found: "));
 
-        let revoke = mobile_revoke_device(handle, "device-does-not-exist".to_string())
+        let revoke = mobile_revoke_device(handle.clone(), "device-does-not-exist".to_string())
             .await
             .expect_err("revoking an unknown device must fail");
         assert_eq!(revoke.code, "mobile");
         assert!(revoke.message.starts_with("not_found: "));
 
+        let remove = mobile_remove_device(handle, "device-does-not-exist".to_string())
+            .await
+            .expect_err("removing an unknown device must fail");
+        assert_eq!(remove.code, "mobile");
+        assert!(remove.message.starts_with("not_found: "));
+
         let encoded = format!("{} {}", revoke.code, revoke.message);
         assert!(!encoded.contains("secret"));
         assert!(!encoded.contains("refresh"));
+    }
+
+    /// 「删除」必须同时做到三件事：从状态快照里消失、访问令牌立即失效、重开登记表不复活。
+    ///
+    /// 只做其中一件都会留下可被利用的缺口：只改内存则重启后设备复活；只删记录不清令牌
+    /// 则旧令牌在下一次 `resolve` 之前仍然指向一台「曾经合法」的设备。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn removing_a_device_drops_it_from_status_and_invalidates_its_tokens() {
+        let (app, directory) = app_with_service();
+        let handle = app.handle().clone();
+        let service = app.state::<MobileService<MockRuntime>>();
+        let (record, _credentials) = service
+            .context()
+            .registry
+            .register_device("Pixel", Some("android".to_string()))
+            .expect("device registration must succeed");
+        let (token, _) = service.context().tokens.issue(&record.id);
+
+        let before = mobile_status(handle.clone())
+            .await
+            .expect("status must succeed");
+        assert_eq!(before.devices.len(), 1);
+        assert_eq!(before.devices[0].id, record.id);
+
+        mobile_remove_device(handle.clone(), record.id.clone())
+            .await
+            .expect("removing a known device must succeed");
+
+        let after = mobile_status(handle.clone())
+            .await
+            .expect("status must succeed");
+        assert!(
+            after.devices.is_empty(),
+            "the removed device must leave the settings list"
+        );
+
+        assert!(
+            service
+                .context()
+                .tokens
+                .resolve(&token, &service.context().registry)
+                .is_err(),
+            "the access token must stop resolving once the device is gone"
+        );
+
+        // 落盘状态同样不能把它带回来。
+        let reloaded =
+            crate::mobile::auth::DeviceRegistry::load(directory.path()).expect("reload must work");
+        assert!(reloaded.devices().is_empty());
+
+        // 重复删除走 not_found，不静默成功。
+        let error = mobile_remove_device(handle, record.id)
+            .await
+            .expect_err("removing an unknown device must fail");
+        assert_eq!(error.code, "mobile");
+        assert!(error.message.starts_with("not_found: "));
     }
 }

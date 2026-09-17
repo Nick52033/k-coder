@@ -1,0 +1,33 @@
+{
+  "result": "PASS",
+  "checks": [
+    {
+      "name": "complete",
+      "state": "completed",
+      "providerRequests": 8,
+      "reads": 6,
+      "compactions": 0
+    },
+    {
+      "name": "compaction",
+      "state": "completed",
+      "providerRequests": 13,
+      "reads": 12,
+      "compactions": 12
+    },
+    {
+      "name": "no-progress",
+      "state": "failed",
+      "providerRequests": 20,
+      "reads": 20,
+      "compactions": 6
+    },
+    {
+      "name": "no-progress-compaction",
+      "state": "failed",
+      "providerRequests": 20,
+      "reads": 20,
+      "compactions": 19
+    }
+  ]
+}

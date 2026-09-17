@@ -3,7 +3,7 @@
 //! 安全约定：
 //! - 配对挑战 10 分钟有效、单次使用，失败次数有上限，一旦用掉或锁死就不再可用。
 //! - 设备密钥与刷新令牌只以 SHA-256 摘要形式落盘，明文只在配对批准时下发一次。
-//! - 访问令牌只存在于内存，进程重启即失效；撤销设备会立刻清掉该设备的全部访问令牌。
+//! - 访问令牌只存在于内存，进程重启即失效；撤销或删除设备都会立刻清掉该设备的全部访问令牌。
 //! - 二维码 URI 只携带挑战 ID 与挑战密钥，不携带设备密钥、访问令牌或工作区路径。
 
 use std::collections::HashMap;
@@ -342,6 +342,24 @@ impl DeviceRegistry {
         record.revoked = true;
         self.persist(&state)?;
         Ok(true)
+    }
+
+    /// 从登记表里彻底删除设备记录。
+    ///
+    /// 与 [`Self::revoke`] 的区别是**是否留下记录**：撤销把 `revoked` 置位，设备继续出现在
+    /// 设置页供审计；删除让这条记录连同它的密钥摘要一起消失，设置页不再展示。
+    ///
+    /// 删除活跃设备在效果上强于撤销——记录没了，`authenticate` 会以「unknown device」拒绝，
+    /// 而不是「device was revoked」。因此调用方必须先清掉该设备的内存访问令牌，
+    /// 否则令牌在下次 `resolve` 时才会因登记表查不到而失效。
+    pub fn remove(&self, device_id: &str) -> Result<(), MobileError> {
+        let mut state = self.state.write().expect("mobile state lock poisoned");
+        let before = state.devices.len();
+        state.devices.retain(|device| device.id != device_id);
+        if state.devices.len() == before {
+            return Err(MobileError::not_found("unknown device"));
+        }
+        self.persist(&state)
     }
 }
 
@@ -937,6 +955,43 @@ mod tests {
             .resolve(&token, &registry)
             .expect_err("revoked token must fail");
         assert_eq!(error.kind(), "unauthorized");
+    }
+
+    /// 删除必须同时清掉内存记录与落盘记录：只改内存的话，重启后设备会「复活」。
+    #[test]
+    fn removed_device_disappears_from_registry_and_state_file() {
+        let directory = TempDir::new().unwrap();
+        let registry = DeviceRegistry::load(directory.path()).unwrap();
+        let (record, credentials) = registry.register_device("Pixel", None).unwrap();
+        let state_path = directory.path().join("mobile/state.json");
+        assert!(
+            fs::read_to_string(&state_path)
+                .unwrap()
+                .contains(&record.id)
+        );
+
+        registry.remove(&record.id).unwrap();
+        assert!(registry.devices().is_empty());
+        assert!(registry.device(&record.id).is_none());
+        assert!(
+            !fs::read_to_string(&state_path)
+                .unwrap()
+                .contains(&record.id)
+        );
+
+        // 删除后凭据不再可用，且重开登记表不会把它读回来。
+        let error = registry
+            .authenticate(&record.id, &credentials.device_secret)
+            .expect_err("a removed device must not authenticate");
+        assert_eq!(error.kind(), "unauthorized");
+        let reloaded = DeviceRegistry::load(directory.path()).unwrap();
+        assert!(reloaded.devices().is_empty());
+
+        // 重复删除与删除不存在的 ID 一样走 not_found，不能静默成功。
+        let error = registry
+            .remove(&record.id)
+            .expect_err("removing a missing device must fail");
+        assert_eq!(error.kind(), "not_found");
     }
 
     #[test]

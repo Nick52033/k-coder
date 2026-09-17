@@ -111,6 +111,7 @@ test("mobile settings page drives gateway, pairing and device control", async ({
     let callbackId = 1;
     const state = JSON.parse(JSON.stringify(fixture.status)) as StatusFixture;
     const calls: Array<{ command: string; args?: Record<string, unknown> }> = [];
+    let removeAttempts = 0;
     (window as unknown as { __mobileCalls: unknown }).__mobileCalls = calls;
 
     const record = (command: string, args?: Record<string, unknown>) => {
@@ -207,6 +208,15 @@ test("mobile settings page drives gateway, pairing and device control", async ({
           );
           return state.devices.find((device) => device.id === deviceId) ?? null;
         }
+        if (command === "mobile_remove_device") {
+          const deviceId = args?.deviceId as string;
+          // 第一次刻意失败：删除的失败分支（记录没被删掉时界面必须说明原因，而不是静默吞掉）
+          // 在真实后端上要造一个「记录刚好消失」的竞态才能触发，桩里直接回一个结构化错误。
+          removeAttempts += 1;
+          if (removeAttempts === 1) throw new Error("not_found: unknown device");
+          state.devices = state.devices.filter((device) => device.id !== deviceId);
+          return null;
+        }
         if (command === "mobile_set_capabilities") {
           state.capabilities = (args?.capabilities as Capability[]) ?? [];
           return state;
@@ -289,6 +299,47 @@ test("mobile settings page drives gateway, pairing and device control", async ({
       ),
     )
     .toBe(true);
+
+  // 删除需要二次确认：取消不动数据，确认后设备从列表消失，在用计数随之回落。
+  const removeTarget = settings.locator(".mobile-settings__device").filter({ hasText: "Pixel 9" });
+  await removeTarget.getByRole("button", { name: "删除" }).click();
+  const confirmDialog = settings.getByRole("alertdialog", { name: "删除设备" });
+  await expect(confirmDialog).toBeVisible();
+  await expect(confirmDialog).toContainText("Pixel 9");
+  await page.screenshot({ path: testInfo.outputPath("mobile-settings-delete-confirm.png") });
+  await confirmDialog.getByRole("button", { name: "取消" }).click();
+  await expect(confirmDialog).toHaveCount(0);
+  await expect(removeTarget).toBeVisible();
+  expect(
+    await page.evaluate(
+      () =>
+        (
+          window as unknown as { __mobileCalls: Array<{ command: string }> }
+        ).__mobileCalls.some((call) => call.command === "mobile_remove_device"),
+    ),
+  ).toBe(false);
+
+  // 删除失败必须说清楚原因，且记录不能被抹掉（第一次调用由桩返回 not_found）。
+  await removeTarget.getByRole("button", { name: "删除" }).click();
+  await confirmDialog.getByRole("button", { name: "删除" }).click();
+  await expect(settings.getByRole("alert")).toContainText("not_found: unknown device");
+  await expect(removeTarget).toBeVisible();
+  await expect(removeTarget).toContainText("已撤销");
+
+  await removeTarget.getByRole("button", { name: "删除" }).click();
+  await confirmDialog.getByRole("button", { name: "删除" }).click();
+  await expect(settings.locator(".mobile-settings__device").filter({ hasText: "Pixel 9" })).toHaveCount(0);
+  await expect(settings.getByText("1 台在用")).toBeVisible();
+  await expect
+    .poll(() =>
+      page.evaluate(
+        () =>
+          (
+            window as unknown as { __mobileCalls: Array<{ command: string; args?: Record<string, unknown> }> }
+          ).__mobileCalls.find((call) => call.command === "mobile_remove_device")?.args,
+      ),
+    )
+    .toEqual({ deviceId: DEVICE.id });
 
   // 重新生成一次性挑战。
   await settings.getByRole("button", { name: "重新生成" }).click();

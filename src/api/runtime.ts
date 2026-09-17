@@ -604,6 +604,10 @@ export function revokeMobileDevice(deviceId: string): Promise<MobileDeviceView> 
   return invoke<MobileDeviceView>("mobile_revoke_device", { deviceId });
 }
 
+export function removeMobileDevice(deviceId: string): Promise<void> {
+  return invoke<void>("mobile_remove_device", { deviceId });
+}
+
 export function setMobileCapabilities(
   capabilities: MobileCapability[],
 ): Promise<MobileStatus> {

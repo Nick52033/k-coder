@@ -417,6 +417,62 @@
   font-size: var(--font-size-xs);
 }
 
+/* ---------- 删除确认 ---------- */
+
+/* 显式高于设置弹窗自身的 backdrop（`z-index: 50`），避免依赖 DOM 顺序。 */
+.mobile-settings__confirm-backdrop {
+  position: fixed;
+  z-index: 100;
+  inset: 0;
+  display: grid;
+  padding: 20px;
+  place-items: center;
+  background: rgba(0, 0, 0, 0.38);
+}
+
+.mobile-settings__confirm {
+  display: flex;
+  width: min(400px, 100%);
+  padding: 20px 22px 22px;
+  flex-direction: column;
+  gap: 14px;
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-md);
+  background: var(--color-surface);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.18);
+}
+
+.mobile-settings__confirm h4 {
+  margin: 0;
+  color: var(--color-ink);
+  font-size: var(--font-size-lg);
+  font-weight: 600;
+}
+
+.mobile-settings__confirm p {
+  margin: 0;
+  color: var(--color-ink-muted);
+  font-size: var(--font-size-sm);
+  line-height: 1.6;
+}
+
+.mobile-settings__confirm-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.mobile-settings__danger.is-solid {
+  border-color: var(--color-error-solid);
+  color: var(--color-on-error);
+  background: var(--color-error-solid);
+}
+
+.mobile-settings__danger.is-solid:hover:not(:disabled) {
+  border-color: var(--color-error);
+  background: var(--color-error);
+}
+
 /* ---------- 能力清单 ---------- */
 
 .mobile-settings__capabilities {

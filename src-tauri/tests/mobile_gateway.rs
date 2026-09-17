@@ -597,6 +597,61 @@ async fn revoked_device_loses_access_immediately() {
     assert_eq!(error_kind(&response), "unauthorized");
 }
 
+/// 删除设备比撤销更彻底：记录本身消失，所以已建立的连接下一条请求必须被拒，
+/// 不能留下「记录没了、会话还能说话」的窗口。
+///
+/// 顺序与 `MobileService::remove_device` 保持一致（先清令牌、再删记录）。
+#[tokio::test]
+async fn removed_device_loses_access_immediately() {
+    let harness = Harness::start().await;
+    let (device_id, device_secret) = register_device(&harness, "Pixel");
+    let mut client = harness.connect().await;
+    authenticate(&mut client, &device_id, &device_secret).await;
+    assert!(
+        call(&mut client, 2, "ping", json!({}))
+            .await
+            .get("error")
+            .is_none()
+    );
+
+    harness.context.tokens.revoke_device(&device_id);
+    harness
+        .context
+        .registry
+        .remove(&device_id)
+        .expect("remove succeeds");
+    assert!(
+        harness.context.registry.device(&device_id).is_none(),
+        "the record must be gone from the registry"
+    );
+
+    let response = call(&mut client, 3, "ping", json!({})).await;
+    assert_eq!(error_kind(&response), "unauthorized");
+
+    // 重新握手同样失败：登记表里已经没有这条记录了。
+    let mut second = harness.connect().await;
+    let response = call(
+        &mut second,
+        1,
+        "initialize",
+        json!({
+            "protocolVersion": MOBILE_PROTOCOL_VERSION,
+            "deviceId": device_id,
+            "deviceSecret": device_secret,
+        }),
+    )
+    .await;
+    assert_eq!(error_kind(&response), "unauthorized");
+
+    // 重复删除走 `not_found`，不静默成功。
+    let error = harness
+        .context
+        .registry
+        .remove(&device_id)
+        .expect_err("removing a missing device must fail");
+    assert_eq!(error.kind(), "not_found");
+}
+
 #[tokio::test]
 async fn thread_methods_fail_closed_without_application_state() {
     // 网关不复制应用状态：拿不到 AppState 时返回结构化内部错误，而不是 panic 或假成功。

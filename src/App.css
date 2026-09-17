@@ -613,9 +613,12 @@ button {
 }
 
 .workbench--background { background: transparent; }
-.workbench--background {
-  /* 背景模式下把次要文字压深，用来换取更透明的面板（即更清楚的背景图）。
-     这样既能让背景透出来，又不会牺牲正文可读性。 */
+/* 背景模式下把次要文字压深，用来换取更透明的面板（即更清楚的背景图）。
+   这样既能让背景透出来，又不会牺牲正文可读性。
+   ⚠ 这三档是「浅色色调专用」：它们比任何深色面都暗（#3f4a44 在 #1e1e2e 上只有约 1.4:1），
+   而且色相偏绿。深色色调下沿用会出现「看不清 + 发绿」的次要文字，
+   所以必须按 [data-tone] 分流（见下方深色色调的分支）。 */
+[data-tone="light"] .workbench--background {
   --color-ink-muted: #3f4a44;
   --color-ink-subtle: #46514b;
   --color-ink-faint: #6b756f;
@@ -660,6 +663,42 @@ button {
   background: color-mix(in srgb, var(--color-surface-panel) 46%, transparent);
 }
 .workbench--background .settings-content { background: transparent; }
+
+/* ── 深色色调：背景图必须先被压暗，面板才能保持接近不透明 ──
+   内置背景图是给浅色色调设计的展示图（整体亮度约 130~250 的雾绿），
+   在深色色调下它比所有中性面都亮，直接沿用浅色色调的不透明度会让正文坐在
+   约 50% 灰的底上：次要文字跌到 3:1 以下，而且整屏被雾绿染色。
+   深色色调不能靠「压深墨色」解决（深色面上压深等于抹掉文字），
+   所以反过来处理：① 给图片压一层中性黑纱并降饱和（把绿拉回中性）；
+   ② 面板抬到接近不透明，让 --color-ink-* 设计令牌继续成立。 */
+[data-tone="dark"] .workbench--background::before {
+  background:
+    linear-gradient(rgba(0, 0, 0, 0.45), rgba(0, 0, 0, 0.45)),
+    linear-gradient(color-mix(in srgb, var(--color-surface) calc(var(--background-opacity, .18) * 100%), transparent), color-mix(in srgb, var(--color-surface) calc(var(--background-opacity, .18) * 100%), transparent)),
+    var(--background-image, url('/chat-background.png')) center / cover no-repeat;
+  /* 降饱和抵消浅色背景图在深色面上的绿色偏色。 */
+  filter: saturate(0.55) brightness(0.96);
+}
+[data-tone="dark"] .workbench--background .conversation {
+  background: color-mix(in srgb, var(--color-surface) 88%, transparent);
+}
+[data-tone="dark"] .workbench--background .sidebar {
+  background: color-mix(in srgb, var(--color-surface-raised) 92%, transparent);
+}
+[data-tone="dark"] .workbench--background .composer {
+  background: color-mix(in srgb, var(--color-surface-raised) 90%, transparent);
+}
+[data-tone="dark"] .workbench--background .titlebar {
+  background: color-mix(in srgb, var(--color-surface-chrome) 90%, transparent);
+}
+[data-tone="dark"] .workbench--background .settings-dialog {
+  background: color-mix(in srgb, var(--color-surface) 92%, transparent);
+}
+[data-tone="dark"] .workbench--background .settings-navigation {
+  background: color-mix(in srgb, var(--color-surface-panel) 68%, transparent);
+}
+/* 弹窗遮罩：深色面 + 浅色背景图下 24% 黑挡不住背景，按 40%~60% 门槛抬到 50%。 */
+[data-tone="dark"] .workbench--background .modal-backdrop { background: rgba(0, 0, 0, 0.5); }
 
 /* 打开工作台：对话区让出第三列，工作台成为右侧面板（不再是覆盖浮层） */
 .workbench--panel-open {
@@ -4182,15 +4221,31 @@ button {
 }
 
 .background-preview {
+  position: relative;
   height: clamp(240px, 40vh, 420px);
   margin: 12px 0;
   border: 1px solid var(--color-border);
   border-radius: 10px;
   background-color: var(--color-surface-panel);
-  /* 图片与遮罩由组件内联样式提供，避免这里写死内置图导致自定义背景预览失真。 */
+  /* 图片由组件内联样式提供，避免这里写死内置图导致自定义背景预览失真。 */
   background-position: center;
-  background-size: 100% 100%, contain;
+  background-size: contain;
   background-repeat: no-repeat;
+}
+/* 预览必须与工作区同源合成：同样的纱 +（深色色调下）同样的黑纱与降饱和，
+   否则预览会比真实界面更亮、也更绿，调参时看到的是假象。 */
+.background-preview::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  background: linear-gradient(color-mix(in srgb, var(--color-surface) calc(var(--background-opacity, .18) * 100%), transparent), color-mix(in srgb, var(--color-surface) calc(var(--background-opacity, .18) * 100%), transparent));
+  pointer-events: none;
+}
+[data-tone="dark"] .background-preview::after {
+  background:
+    linear-gradient(rgba(0, 0, 0, 0.45), rgba(0, 0, 0, 0.45)),
+    linear-gradient(color-mix(in srgb, var(--color-surface) calc(var(--background-opacity, .18) * 100%), transparent), color-mix(in srgb, var(--color-surface) calc(var(--background-opacity, .18) * 100%), transparent));
 }
 .background-toggle, .background-opacity { display:flex; align-items:center; gap:10px; font-size: var(--font-size-sm); margin: 10px 0; }
 .background-upload { display:inline-flex; align-items:center; gap:8px; margin: 4px 0 8px; padding: 7px 10px; border: 1px solid var(--color-border); border-radius: 7px; color: var(--color-brand); cursor:pointer; font-size: var(--font-size-sm); }

@@ -39,6 +39,10 @@ mod input;
 pub(crate) mod instructions;
 pub mod mailbox;
 mod provider_history;
+mod read_observation;
+#[cfg(test)]
+use read_observation::ReadObservationDecision;
+use read_observation::{ReadObservationTracker, read_observation_result};
 pub mod query_rewrite;
 pub mod thread_operation;
 pub(crate) use input::build_user_message;
@@ -54,13 +58,6 @@ const MAX_REASONING_SUMMARY_BYTES: usize = 64 * 1024;
 const MAX_PROVIDER_CONTEXT_BYTES: usize = 512 * 1024;
 const MAX_TOOL_OUTPUT_BYTES: usize = 128 * 1024;
 const MAX_IDENTICAL_TOOL_CALLS: usize = 2;
-const SUBSTANTIAL_READ_OVERLAP_PERCENT: usize = 80;
-const MAX_RECOVERABLE_REDUNDANT_READ_BATCHES: usize = 2;
-// A compacted summary keeps read provenance but may omit most of the source body. Allow a
-// bounded number of provider batches to refill that body before the normal duplicate guard is
-// restored. The limit is per path/revision and is never reopened by another compaction.
-const MAX_POST_COMPACTION_REHYDRATION_BATCHES: usize = 8;
-const MAX_READ_RECOVERY_INSTRUCTIONS: usize = 4;
 const PROGRESS_CHECK_WINDOW: usize = 5;
 const MAX_NO_PROGRESS_WINDOWS: usize = 3;
 const MAX_PROTOCOL_RETRIES: usize = 5;
@@ -155,400 +152,6 @@ enum TurnContinuationDecision {
     Stop,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct ReadRevisionKey {
-    path: String,
-    revision: String,
-}
-
-impl ReadRevisionKey {
-    fn new(path: &str, revision: &str) -> Self {
-        Self {
-            path: if cfg!(windows) {
-                path.to_lowercase()
-            } else {
-                path.to_string()
-            },
-            revision: revision.to_string(),
-        }
-    }
-}
-
-#[derive(Debug, Default)]
-struct ReadRevisionCoverage {
-    intervals: Vec<(usize, usize)>,
-    redundant_batches: usize,
-    last_redundant_batch: Option<usize>,
-    recovery_delivered_batch: Option<usize>,
-    rehydration_available: bool,
-    rehydrated_batch: Option<usize>,
-    rehydration_batches: usize,
-    last_rehydration_batch: Option<usize>,
-}
-
-#[derive(Debug, Default)]
-struct ReadObservationTracker {
-    coverage: HashMap<ReadRevisionKey, ReadRevisionCoverage>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum ReadObservationDecision {
-    NewCoverage,
-    RehydratedAfterCompaction {
-        path: String,
-        revision: String,
-        start_line: usize,
-        end_line: usize,
-        overlap_percent: usize,
-    },
-    AlreadyCovered {
-        path: String,
-        revision: String,
-        start_line: usize,
-        end_line: usize,
-        overlap_percent: usize,
-    },
-    RecoveryRequired {
-        path: String,
-        revision: String,
-        start_line: usize,
-        end_line: usize,
-        overlap_percent: usize,
-    },
-    RepeatedLoop {
-        path: String,
-        revision: String,
-        start_line: usize,
-        end_line: usize,
-        overlap_percent: usize,
-    },
-}
-
-impl ReadObservationTracker {
-    fn observe(
-        &mut self,
-        result: &ToolResult,
-        provider_batch: usize,
-    ) -> Option<ReadObservationDecision> {
-        if !result.success {
-            return None;
-        }
-        let path = result.metadata.get("path")?.as_str()?.to_string();
-        let revision = result.metadata.get("fileRevision")?.as_str()?.to_string();
-        let start_line = usize::try_from(result.metadata.get("startLine")?.as_u64()?).ok()?;
-        let end_line = usize::try_from(result.metadata.get("endLine")?.as_u64()?).ok()?;
-        if start_line == 0 || end_line < start_line {
-            return None;
-        }
-
-        let key = ReadRevisionKey::new(&path, &revision);
-        self.coverage
-            .retain(|existing, _| existing.path != key.path || existing.revision == revision);
-        let coverage = self.coverage.entry(key).or_default();
-        let requested_lines = end_line.saturating_sub(start_line).saturating_add(1);
-        let covered_lines = coverage
-            .intervals
-            .iter()
-            .map(|(covered_start, covered_end)| {
-                let overlap_start = start_line.max(*covered_start);
-                let overlap_end = end_line.min(*covered_end);
-                overlap_end
-                    .checked_sub(overlap_start)
-                    .map(|value| value.saturating_add(1))
-                    .unwrap_or(0)
-            })
-            .sum::<usize>();
-        let overlap_percent = covered_lines.saturating_mul(100) / requested_lines.max(1);
-
-        if overlap_percent >= SUBSTANTIAL_READ_OVERLAP_PERCENT {
-            let observation = (path, revision, start_line, end_line, overlap_percent);
-
-            if coverage.rehydration_available {
-                let is_new_rehydration_batch =
-                    coverage.last_rehydration_batch != Some(provider_batch);
-                if is_new_rehydration_batch {
-                    if coverage.rehydration_batches >= MAX_POST_COMPACTION_REHYDRATION_BATCHES {
-                        coverage.rehydration_available = false;
-                    } else {
-                        coverage.rehydration_batches =
-                            coverage.rehydration_batches.saturating_add(1);
-                        coverage.last_rehydration_batch = Some(provider_batch);
-                        coverage.rehydrated_batch.get_or_insert(provider_batch);
-                        // A real body was returned for this batch, so a previous recovery cycle
-                        // cannot make the refill itself look like a duplicate read loop.
-                        coverage.redundant_batches = 0;
-                        coverage.last_redundant_batch = None;
-                        coverage.recovery_delivered_batch = None;
-                    }
-                }
-                if coverage.rehydration_available
-                    || coverage.last_rehydration_batch == Some(provider_batch)
-                {
-                    return Some(ReadObservationDecision::RehydratedAfterCompaction {
-                        path: observation.0.clone(),
-                        revision: observation.1.clone(),
-                        start_line,
-                        end_line,
-                        overlap_percent,
-                    });
-                }
-            }
-
-            if coverage.last_redundant_batch != Some(provider_batch) {
-                coverage.redundant_batches = coverage.redundant_batches.saturating_add(1);
-                coverage.last_redundant_batch = Some(provider_batch);
-            }
-            return Some(
-                if coverage.recovery_delivered_batch == Some(provider_batch) {
-                    ReadObservationDecision::RepeatedLoop {
-                        path: observation.0,
-                        revision: observation.1,
-                        start_line: observation.2,
-                        end_line: observation.3,
-                        overlap_percent: observation.4,
-                    }
-                } else if coverage.redundant_batches >= MAX_RECOVERABLE_REDUNDANT_READ_BATCHES {
-                    ReadObservationDecision::RecoveryRequired {
-                        path: observation.0,
-                        revision: observation.1,
-                        start_line: observation.2,
-                        end_line: observation.3,
-                        overlap_percent: observation.4,
-                    }
-                } else {
-                    ReadObservationDecision::AlreadyCovered {
-                        path: observation.0,
-                        revision: observation.1,
-                        start_line: observation.2,
-                        end_line: observation.3,
-                        overlap_percent: observation.4,
-                    }
-                },
-            );
-        }
-
-        coverage.redundant_batches = 0;
-        coverage.last_redundant_batch = None;
-        coverage.recovery_delivered_batch = None;
-        coverage.intervals.push((start_line, end_line));
-        coverage
-            .intervals
-            .sort_unstable_by_key(|interval| interval.0);
-        coverage.intervals = merge_line_intervals(&coverage.intervals);
-        Some(ReadObservationDecision::NewCoverage)
-    }
-
-    fn mark_compacted(&mut self) {
-        for coverage in self.coverage.values_mut() {
-            if coverage.rehydrated_batch.is_none() && coverage.rehydration_batches == 0 {
-                coverage.rehydration_available = true;
-            } else if coverage.rehydrated_batch.is_some() {
-                // Rehydration is a lifetime allowance for this observation domain. A later
-                // compaction cannot reopen it after the first refill window was consumed.
-                coverage.rehydration_available = false;
-            }
-        }
-    }
-
-    fn mark_recovery_delivered(&mut self, key: &ReadRevisionKey, provider_batch: usize) {
-        if let Some(coverage) = self.coverage.get_mut(key) {
-            coverage.recovery_delivered_batch = Some(provider_batch);
-        }
-    }
-
-    fn begin_workflow_node(&mut self) {
-        self.coverage.clear();
-    }
-}
-
-#[derive(Debug)]
-struct PendingReadRecoveryInstruction {
-    key: ReadRevisionKey,
-    text: String,
-}
-
-#[derive(Debug)]
-struct ReadObservationOutcome {
-    result: ToolResult,
-    recovery_instruction: Option<PendingReadRecoveryInstruction>,
-    stop_reason: Option<String>,
-}
-
-fn begin_read_observation_scope_after_workflow_transition(
-    call: &ToolCall,
-    result: &ToolResult,
-    read_observations: &mut ReadObservationTracker,
-    pending_recovery_instructions: &mut Vec<PendingReadRecoveryInstruction>,
-) {
-    if call.name == COMPLETE_WORKFLOW_NODE_TOOL_NAME && result.success {
-        read_observations.begin_workflow_node();
-        pending_recovery_instructions.clear();
-    }
-}
-
-fn merge_line_intervals(intervals: &[(usize, usize)]) -> Vec<(usize, usize)> {
-    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(intervals.len());
-    for &(start, end) in intervals {
-        if let Some((_, previous_end)) = merged.last_mut()
-            && start <= previous_end.saturating_add(1)
-        {
-            *previous_end = (*previous_end).max(end);
-        } else {
-            merged.push((start, end));
-        }
-    }
-    merged
-}
-
-fn read_observation_result(
-    original: ToolResult,
-    decision: ReadObservationDecision,
-) -> ReadObservationOutcome {
-    let (
-        kind,
-        path,
-        revision,
-        start_line,
-        end_line,
-        overlap_percent,
-        recovery_required,
-        should_stop,
-    ) = match decision {
-        ReadObservationDecision::NewCoverage => {
-            return ReadObservationOutcome {
-                result: original,
-                recovery_instruction: None,
-                stop_reason: None,
-            };
-        }
-        ReadObservationDecision::RehydratedAfterCompaction {
-            path: _,
-            revision: _,
-            start_line: _,
-            end_line: _,
-            overlap_percent,
-        } => {
-            let mut result = original;
-            if !result.metadata.is_object() {
-                result.metadata = json!({});
-            }
-            result.metadata["observationStatus"] =
-                Value::String("read_observation_rehydrated_after_compaction".to_string());
-            result.metadata["overlapPercent"] = Value::from(overlap_percent as u64);
-            result.metadata["contentSuppressed"] = Value::Bool(false);
-            result.metadata["recoveryRequired"] = Value::Bool(false);
-            result.metadata["rehydratedAfterCompaction"] = Value::Bool(true);
-            result.metadata["turnContinues"] = Value::Bool(true);
-            return ReadObservationOutcome {
-                result,
-                recovery_instruction: None,
-                stop_reason: None,
-            };
-        }
-        ReadObservationDecision::AlreadyCovered {
-            path,
-            revision,
-            start_line,
-            end_line,
-            overlap_percent,
-        } => (
-            "read_observation_already_covered",
-            path,
-            revision,
-            start_line,
-            end_line,
-            overlap_percent,
-            false,
-            false,
-        ),
-        ReadObservationDecision::RecoveryRequired {
-            path,
-            revision,
-            start_line,
-            end_line,
-            overlap_percent,
-        } => (
-            "read_observation_recovery_required",
-            path,
-            revision,
-            start_line,
-            end_line,
-            overlap_percent,
-            true,
-            false,
-        ),
-        ReadObservationDecision::RepeatedLoop {
-            path,
-            revision,
-            start_line,
-            end_line,
-            overlap_percent,
-        } => (
-            "repeated_observation_loop",
-            path,
-            revision,
-            start_line,
-            end_line,
-            overlap_percent,
-            false,
-            true,
-        ),
-    };
-    let message = if should_stop {
-        format!(
-            "repeated_observation_loop: 模型在文件未变化时仍反复读取 {path} 的第 {start_line}-{end_line} 行。k-Coder 已停止本轮以避免继续空转；请重试并要求直接使用已有观察。"
-        )
-    } else if recovery_required {
-        format!(
-            "Host recovery: file {path} is unchanged and {overlap_percent}% of lines {start_line}-{end_line} were already returned. No duplicate content was returned. The next provider request will receive a system correction; do not read this revision through read_file, shell commands, or repository search again. Reuse the existing observation, continue with a genuinely unresolved fact, perform the requested edit or validation, or finish the task."
-        )
-    } else {
-        format!(
-            "File {path} is unchanged and {overlap_percent}% of lines {start_line}-{end_line} were already returned. The duplicate content was suppressed; use the existing observation, read a non-overlapping range for a specific unresolved fact, or finish the task."
-        )
-    };
-    let mut metadata = original.metadata;
-    if !metadata.is_object() {
-        metadata = json!({});
-    }
-    metadata["observationStatus"] = Value::String(kind.to_string());
-    metadata["overlapPercent"] = Value::from(overlap_percent as u64);
-    metadata["contentSuppressed"] = Value::Bool(true);
-    metadata["recoveryRequired"] = Value::Bool(recovery_required);
-    metadata["turnContinues"] = Value::Bool(!should_stop);
-    let output = json!({
-        "type": kind,
-        "path": path,
-        "fileRevision": revision,
-        "startLine": start_line,
-        "endLine": end_line,
-        "overlapPercent": overlap_percent,
-        "recoveryRequired": recovery_required,
-        "turnContinues": !should_stop,
-        "message": message,
-    })
-    .to_string();
-    let recovery_path =
-        serde_json::to_string(&path).unwrap_or_else(|_| "\"<invalid path>\"".into());
-    let recovery_revision =
-        serde_json::to_string(&revision).unwrap_or_else(|_| "\"<invalid revision>\"".into());
-    let recovery_instruction = recovery_required.then(|| PendingReadRecoveryInstruction {
-        key: ReadRevisionKey::new(&path, &revision),
-        text: format!(
-            "[Host-enforced read recovery]\nThe unchanged workspace file whose JSON-encoded path is {recovery_path} at JSON-encoded revision {recovery_revision} has already been observed for lines {start_line}-{end_line} ({overlap_percent}% overlap). The duplicate read returned no new evidence. Do not request read_file for an overlapping range of this revision and do not bypass this boundary with shell commands or repository search. Reuse the existing observation already present in the conversation or compacted context. Continue with a genuinely unresolved non-overlapping fact, make the requested change, run focused validation, or give the final answer."
-        ),
-    });
-    ReadObservationOutcome {
-        result: ToolResult {
-            success: !should_stop,
-            output,
-            metadata,
-        },
-        recovery_instruction,
-        stop_reason: should_stop.then_some(message),
-    }
-}
-
 /// 进展快照：用于检测任务是否有实质性进展
 #[derive(Clone, PartialEq, Eq)]
 struct ProgressSnapshot {
@@ -559,6 +162,7 @@ struct ProgressSnapshot {
 impl ProgressSnapshot {
     fn from_events(events: &[StoredEvent]) -> Self {
         let mut progress_fingerprints = HashSet::new();
+        let mut reads = ReadObservationTracker::default();
 
         for event in events {
             let mut hasher = DefaultHasher::new();
@@ -581,10 +185,13 @@ impl ProgressSnapshot {
                     name.hash(&mut hasher);
                     match name.as_str() {
                         "read_file" => {
+                            if reads.observe(result).is_some() {
+                                continue;
+                            }
+                            // Legacy or incomplete metadata has no reliable coverage range.
                             result.metadata.get("path").hash(&mut hasher);
                             result.metadata.get("fileRevision").hash(&mut hasher);
-                            result.metadata.get("startLine").hash(&mut hasher);
-                            result.metadata.get("endLine").hash(&mut hasher);
+                            result.output.hash(&mut hasher);
                         }
                         "list_directory" => {
                             result.metadata.get("path").hash(&mut hasher);
@@ -606,6 +213,7 @@ impl ProgressSnapshot {
             }
         }
 
+        progress_fingerprints.extend(reads.progress_fingerprints());
         Self {
             progress_fingerprints,
         }
@@ -1162,7 +770,6 @@ impl AgentRuntime {
         let mut last_call_signature = None::<String>;
         let mut identical_call_streak = 0usize;
         let mut read_observations = ReadObservationTracker::default();
-        let mut pending_read_recovery_instructions = Vec::<PendingReadRecoveryInstruction>::new();
         let token_budget = self.max_total_tokens;
         let mut soft_turn_segment = self
             .soft_turn_limits
@@ -1271,19 +878,10 @@ impl AgentRuntime {
                 last_snapshot = Some(current_snapshot);
             }
 
-            let mut request_runtime_instructions = self
+            let request_runtime_instructions = self
                 .runtime_instruction_provider
                 .compile()
                 .map_err(AgentRuntimeError::RuntimeInstructions)?;
-            let mut delivered_read_recovery_keys = Vec::new();
-            for instruction in pending_read_recovery_instructions.drain(..) {
-                if !request_runtime_instructions.trim().is_empty() {
-                    request_runtime_instructions.push_str("\n\n");
-                }
-                request_runtime_instructions.push_str(&instruction.text);
-                delivered_read_recovery_keys.push(instruction.key);
-            }
-
             let events = self.repository.load(&thread_id).await?;
             let last_context_usage = last_active_context_usage(&events);
             let provider_history = provider_history(events, self.supports_vision);
@@ -1357,7 +955,7 @@ impl AgentRuntime {
                         &publisher,
                     )
                     .await?;
-                    read_observations.mark_compacted();
+                    read_observations.reset_context();
                     history = compacted;
                 }
             }
@@ -1377,9 +975,6 @@ impl AgentRuntime {
                 messages: history,
                 tools: tool_definitions.clone(),
             };
-            for key in &delivered_read_recovery_keys {
-                read_observations.mark_recovery_delivered(key, iteration);
-            }
             publisher.publish(AgentEventEnvelope::new(AgentEvent::ActivityStatusChanged {
                 thread_id: thread_id.clone(),
                 turn_id: turn_id.clone(),
@@ -2234,23 +1829,9 @@ impl AgentRuntime {
                 }
 
                 if call.name == "read_file"
-                    && let Some(decision) = read_observations.observe(&result, iteration)
+                    && let Some(decision) = read_observations.observe(&result)
                 {
-                    let outcome = read_observation_result(result, decision);
-                    result = outcome.result;
-                    if let Some(instruction) = outcome.recovery_instruction
-                        && pending_read_recovery_instructions.len()
-                            < MAX_READ_RECOVERY_INSTRUCTIONS
-                        && !pending_read_recovery_instructions
-                            .iter()
-                            .any(|pending| pending.key == instruction.key)
-                    {
-                        pending_read_recovery_instructions.push(instruction);
-                    }
-                    if let Some(reason) = outcome.stop_reason {
-                        item_status = AgentItemStatus::Failed;
-                        stop_reason = Some(reason);
-                    }
+                    result = read_observation_result(result, decision);
                 } else if call.name == "read_file" && repeated_identical_call {
                     let reason = format!(
                         "repeated_tool_call: {} was requested with identical arguments more than {MAX_IDENTICAL_TOOL_CALLS} consecutive times without producing a versioned observation",
@@ -2261,12 +1842,9 @@ impl AgentRuntime {
                     stop_reason = Some(reason);
                 }
 
-                begin_read_observation_scope_after_workflow_transition(
-                    &call,
-                    &result,
-                    &mut read_observations,
-                    &mut pending_read_recovery_instructions,
-                );
+                if call.name == COMPLETE_WORKFLOW_NODE_TOOL_NAME && result.success {
+                    read_observations.reset_context();
+                }
 
                 if let Some(metrics) = &self.metrics {
                     metrics.tool(result.success);
@@ -3718,6 +3296,7 @@ fn bound_tool_result(mut result: ToolResult) -> ToolResult {
     if !result.metadata.is_object() {
         result.metadata = json!({});
     }
+    result.metadata["retainedOutputRanges"] = json!([[0, head_end], [tail_start, original_bytes]]);
     result.metadata["outputTruncated"] = Value::Bool(true);
     result.metadata["originalOutputBytes"] = Value::from(original_bytes as u64);
     result.metadata["omittedOutputBytes"] =
@@ -3797,6 +3376,9 @@ fn outcome(
 
 #[cfg(test)]
 mod tests {
+    mod read_observation_regressions {
+        include!("read_observation_tests.rs");
+    }
     use std::collections::VecDeque;
     use std::path::Path;
     use std::sync::Mutex;
@@ -4360,535 +3942,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn semantic_read_tracker_recovers_once_before_stopping_overlap_loops() {
-        let mut tracker = ReadObservationTracker::default();
-        assert_eq!(
-            tracker.observe(
-                &versioned_read_result("src/file.rs", "revision-a", 1, 400),
-                0
-            ),
-            Some(ReadObservationDecision::NewCoverage)
-        );
-        assert_eq!(
-            tracker.observe(
-                &versioned_read_result("src/file.rs", "revision-a", 401, 800),
-                0
-            ),
-            Some(ReadObservationDecision::NewCoverage)
-        );
-        assert!(matches!(
-            tracker.observe(
-                &versioned_read_result("src/file.rs", "revision-a", 2, 399),
-                1
-            ),
-            Some(ReadObservationDecision::AlreadyCovered {
-                overlap_percent: 100,
-                ..
-            })
-        ));
-        assert!(matches!(
-            tracker.observe(
-                &versioned_read_result("src/file.rs", "revision-a", 3, 398),
-                2
-            ),
-            Some(ReadObservationDecision::RecoveryRequired {
-                overlap_percent: 100,
-                ..
-            })
-        ));
-        assert!(matches!(
-            tracker.observe(
-                &versioned_read_result("src/file.rs", "revision-a", 4, 397),
-                2
-            ),
-            Some(ReadObservationDecision::RecoveryRequired {
-                overlap_percent: 100,
-                ..
-            })
-        ));
-        tracker.mark_recovery_delivered(&ReadRevisionKey::new("src/file.rs", "revision-a"), 3);
-        assert!(matches!(
-            tracker.observe(
-                &versioned_read_result("src/file.rs", "revision-a", 5, 396),
-                3
-            ),
-            Some(ReadObservationDecision::RepeatedLoop {
-                overlap_percent: 100,
-                ..
-            })
-        ));
-        assert_eq!(
-            tracker.observe(
-                &versioned_read_result("src/file.rs", "revision-b", 1, 400),
-                4
-            ),
-            Some(ReadObservationDecision::NewCoverage)
-        );
-    }
-
-    #[test]
-    fn read_recovery_delivery_only_hard_stops_the_corrected_provider_batch() {
-        let mut tracker = ReadObservationTracker::default();
-        let result = versioned_read_result("src/file.rs", "revision-a", 1, 40);
-        assert_eq!(
-            tracker.observe(&result, 0),
-            Some(ReadObservationDecision::NewCoverage)
-        );
-        assert!(matches!(
-            tracker.observe(&result, 1),
-            Some(ReadObservationDecision::AlreadyCovered { .. })
-        ));
-        assert!(matches!(
-            tracker.observe(&result, 2),
-            Some(ReadObservationDecision::RecoveryRequired { .. })
-        ));
-
-        let key = ReadRevisionKey::new("src/file.rs", "revision-a");
-        tracker.mark_recovery_delivered(&key, 3);
-        assert!(matches!(
-            tracker.observe(&result, 4),
-            Some(ReadObservationDecision::RecoveryRequired { .. })
-        ));
-
-        tracker.mark_recovery_delivered(&key, 5);
-        assert!(matches!(
-            tracker.observe(&result, 5),
-            Some(ReadObservationDecision::RepeatedLoop { .. })
-        ));
-    }
-
-    #[test]
-    fn successful_workflow_node_transition_starts_a_new_read_observation_scope() {
-        let mut tracker = ReadObservationTracker::default();
-        let read_result = versioned_read_result("src/file.rs", "revision-a", 1, 40);
-        assert_eq!(
-            tracker.observe(&read_result, 0),
-            Some(ReadObservationDecision::NewCoverage)
-        );
-        let mut pending = vec![PendingReadRecoveryInstruction {
-            key: ReadRevisionKey::new("src/file.rs", "revision-a"),
-            text: "stale correction".into(),
-        }];
-        let transition = ToolCall {
-            id: "complete-node".into(),
-            name: COMPLETE_WORKFLOW_NODE_TOOL_NAME.into(),
-            arguments: json!({}),
-            metadata: json!({}),
-        };
-
-        begin_read_observation_scope_after_workflow_transition(
-            &transition,
-            &ToolResult {
-                success: true,
-                output: "next node".into(),
-                metadata: json!({}),
-            },
-            &mut tracker,
-            &mut pending,
-        );
-
-        assert!(pending.is_empty());
-        assert_eq!(
-            tracker.observe(&read_result, 1),
-            Some(ReadObservationDecision::NewCoverage)
-        );
-
-        begin_read_observation_scope_after_workflow_transition(
-            &transition,
-            &ToolResult {
-                success: false,
-                output: "node rejected".into(),
-                metadata: json!({}),
-            },
-            &mut tracker,
-            &mut pending,
-        );
-        assert!(matches!(
-            tracker.observe(&read_result, 2),
-            Some(ReadObservationDecision::AlreadyCovered { .. })
-        ));
-    }
-
-    #[test]
-    fn semantic_read_tracker_does_not_reopen_rehydration_on_second_compaction() {
-        let mut tracker = ReadObservationTracker::default();
-        assert_eq!(
-            tracker.observe(
-                &versioned_read_result("src/file.rs", "revision-a", 1, 400),
-                0
-            ),
-            Some(ReadObservationDecision::NewCoverage)
-        );
-
-        tracker.mark_compacted();
-        assert!(matches!(
-            tracker.observe(
-                &versioned_read_result("src/file.rs", "revision-a", 2, 399),
-                1
-            ),
-            Some(ReadObservationDecision::RehydratedAfterCompaction { .. })
-        ));
-        assert!(matches!(
-            tracker.observe(
-                &versioned_read_result("src/file.rs", "revision-a", 3, 398),
-                1
-            ),
-            Some(ReadObservationDecision::RehydratedAfterCompaction { .. })
-        ));
-
-        tracker.mark_compacted();
-        assert!(matches!(
-            tracker.observe(
-                &versioned_read_result("src/file.rs", "revision-a", 4, 397),
-                2
-            ),
-            Some(ReadObservationDecision::AlreadyCovered { .. })
-        ));
-    }
-
-    #[test]
-    fn semantic_read_tracker_refills_multiple_ranges_after_compaction() {
-        let mut tracker = ReadObservationTracker::default();
-        assert_eq!(
-            tracker.observe(
-                &versioned_read_result("src/file.rs", "revision-a", 1, 405),
-                0
-            ),
-            Some(ReadObservationDecision::NewCoverage)
-        );
-
-        tracker.mark_compacted();
-        for (batch, (start_line, end_line)) in [
-            (1, (1, 40)),
-            (2, (400, 405)),
-            (3, (330, 399)),
-            (4, (275, 329)),
-            (5, (200, 274)),
-        ] {
-            assert!(matches!(
-                tracker.observe(
-                    &versioned_read_result("src/file.rs", "revision-a", start_line, end_line),
-                    batch
-                ),
-                Some(ReadObservationDecision::RehydratedAfterCompaction {
-                    overlap_percent: 100,
-                    ..
-                })
-            ));
-        }
-    }
-
-    #[test]
-    fn semantic_read_tracker_bounds_rehydration_batches_and_restores_recovery() {
-        let mut tracker = ReadObservationTracker::default();
-        let read = versioned_read_result("src/file.rs", "revision-a", 1, 405);
-        assert_eq!(
-            tracker.observe(&read, 0),
-            Some(ReadObservationDecision::NewCoverage)
-        );
-        tracker.mark_compacted();
-
-        for batch in 1..=MAX_POST_COMPACTION_REHYDRATION_BATCHES {
-            // Multiple reads in the last allowed batch must still return bodies.
-            for start_line in [1, 200] {
-                assert!(matches!(
-                    tracker.observe(
-                        &versioned_read_result("src/file.rs", "revision-a", start_line, 405),
-                        batch,
-                    ),
-                    Some(ReadObservationDecision::RehydratedAfterCompaction { .. })
-                ));
-            }
-        }
-        let exhausted_batch = MAX_POST_COMPACTION_REHYDRATION_BATCHES + 1;
-        assert!(matches!(
-            tracker.observe(&read, exhausted_batch),
-            Some(ReadObservationDecision::AlreadyCovered { .. })
-        ));
-        tracker.mark_compacted();
-        assert!(matches!(
-            tracker.observe(&read, exhausted_batch + 1),
-            Some(ReadObservationDecision::RecoveryRequired { .. })
-        ));
-        tracker.mark_recovery_delivered(
-            &ReadRevisionKey::new("src/file.rs", "revision-a"),
-            exhausted_batch + 2,
-        );
-        assert!(matches!(
-            tracker.observe(&read, exhausted_batch + 2),
-            Some(ReadObservationDecision::RepeatedLoop { .. })
-        ));
-
-        let changed = versioned_read_result("src/file.rs", "revision-b", 1, 405);
-        assert_eq!(
-            tracker.observe(&changed, exhausted_batch + 3),
-            Some(ReadObservationDecision::NewCoverage)
-        );
-        tracker.mark_compacted();
-        assert!(matches!(
-            tracker.observe(&changed, exhausted_batch + 4),
-            Some(ReadObservationDecision::RehydratedAfterCompaction { .. })
-        ));
-    }
-
-    #[tokio::test]
-    async fn exact_repeated_read_recovers_and_the_turn_can_complete() {
-        let (directory, repository, runtime, thread_id) = runtime_fixture().await;
-        std::fs::write(directory.path().join("loop.txt"), "line 1\nline 2\nline 3").unwrap();
-        let read_call = |id: &str| ProviderEvent::ToolCall {
-            call: ToolCall {
-                id: id.into(),
-                name: "read_file".into(),
-                arguments: json!({
-                    "path": "loop.txt",
-                    "startLine": 1,
-                    "lineCount": 3
-                }),
-                metadata: json!({}),
-            },
-        };
-        let provider = Arc::new(FakeProvider::script(vec![
-            vec![Ok(read_call("read-1")), Ok(ProviderEvent::Completed)],
-            vec![Ok(read_call("read-2")), Ok(ProviderEvent::Completed)],
-            vec![Ok(read_call("read-3")), Ok(ProviderEvent::Completed)],
-            vec![
-                Ok(ProviderEvent::TextDelta {
-                    delta: "已使用已有观察完成分析".into(),
-                }),
-                Ok(ProviderEvent::Completed),
-            ],
-        ]));
-
-        let outcome = runtime
-            .run_turn(
-                provider.clone(),
-                "fake".to_string(),
-                RunTurnRequest {
-                    thread_id: thread_id.clone(),
-                    input: "inspect the file once".to_string(),
-                    agent_mode: None,
-                },
-                CancellationToken::new(),
-                Arc::new(RecordingPublisher::default()),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(outcome.state, TurnState::Completed);
-        let requests = provider.requests();
-        assert_eq!(requests.len(), 4);
-        assert!(requests[3].messages.iter().any(|message| matches!(
-            message,
-            ProviderMessage::Text {
-                role: MessageRole::System,
-                text,
-            } if text.contains("[Host-enforced read recovery]")
-                && text.contains("loop.txt")
-                && text.contains("Do not request read_file")
-        )));
-
-        let events = repository.load(&thread_id).await.unwrap();
-        assert_eq!(
-            events
-                .iter()
-                .filter(|event| matches!(event.kind, StoredEventKind::UserMessage { .. }))
-                .count(),
-            1,
-            "runtime recovery must not be persisted as a fake user message"
-        );
-        let results = events
-            .into_iter()
-            .filter_map(|event| match event.kind {
-                StoredEventKind::ToolResult {
-                    call_id, result, ..
-                } => Some((call_id, result)),
-                _ => None,
-            })
-            .collect::<HashMap<_, _>>();
-        assert_eq!(
-            results["read-2"].metadata["observationStatus"],
-            "read_observation_already_covered"
-        );
-        assert_eq!(
-            results["read-3"].metadata["observationStatus"],
-            "read_observation_recovery_required"
-        );
-        assert!(results["read-3"].success);
-        assert_eq!(results["read-3"].metadata["contentSuppressed"], true);
-        assert_eq!(results["read-3"].metadata["recoveryRequired"], true);
-        assert_eq!(results["read-3"].metadata["turnContinues"], true);
-    }
-
-    #[tokio::test]
-    async fn stale_read_recovery_does_not_fail_after_an_intervening_provider_batch() {
-        let (directory, repository, runtime, thread_id) = runtime_fixture().await;
-        std::fs::write(directory.path().join("loop.txt"), "line 1\nline 2\nline 3").unwrap();
-        let read_call = |id: &str| ProviderEvent::ToolCall {
-            call: ToolCall {
-                id: id.into(),
-                name: "read_file".into(),
-                arguments: json!({
-                    "path": "loop.txt",
-                    "startLine": 1,
-                    "lineCount": 3
-                }),
-                metadata: json!({}),
-            },
-        };
-        let provider = Arc::new(FakeProvider::script(vec![
-            vec![Ok(read_call("read-1")), Ok(ProviderEvent::Completed)],
-            vec![Ok(read_call("read-2")), Ok(ProviderEvent::Completed)],
-            vec![Ok(read_call("read-3")), Ok(ProviderEvent::Completed)],
-            vec![
-                Ok(ProviderEvent::ToolCall {
-                    call: ToolCall {
-                        id: "list-after-correction".into(),
-                        name: "list_directory".into(),
-                        arguments: json!({ "path": "." }),
-                        metadata: json!({}),
-                    },
-                }),
-                Ok(ProviderEvent::Completed),
-            ],
-            vec![Ok(read_call("read-4")), Ok(ProviderEvent::Completed)],
-            vec![
-                Ok(ProviderEvent::TextDelta {
-                    delta: "completed after the fresh correction".into(),
-                }),
-                Ok(ProviderEvent::Completed),
-            ],
-        ]));
-
-        let outcome = runtime
-            .run_turn(
-                provider.clone(),
-                "fake".into(),
-                RunTurnRequest {
-                    thread_id: thread_id.clone(),
-                    input: "inspect without inheriting stale recovery state".into(),
-                    agent_mode: None,
-                },
-                CancellationToken::new(),
-                Arc::new(RecordingPublisher::default()),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(outcome.state, TurnState::Completed);
-        let requests = provider.requests();
-        assert_eq!(requests.len(), 6);
-        for request_index in [3, 5] {
-            assert!(
-                requests[request_index]
-                    .messages
-                    .iter()
-                    .any(|message| matches!(
-                        message,
-                        ProviderMessage::Text {
-                            role: MessageRole::System,
-                            text,
-                        } if text.contains("[Host-enforced read recovery]")
-                    ))
-            );
-        }
-        let results = repository
-            .load(&thread_id)
-            .await
-            .unwrap()
-            .into_iter()
-            .filter_map(|event| match event.kind {
-                StoredEventKind::ToolResult {
-                    call_id, result, ..
-                } => Some((call_id, result)),
-                _ => None,
-            })
-            .collect::<HashMap<_, _>>();
-        assert!(results["read-4"].success);
-        assert_eq!(
-            results["read-4"].metadata["observationStatus"],
-            "read_observation_recovery_required"
-        );
-    }
-
-    #[tokio::test]
-    async fn one_provider_batch_cannot_skip_from_recovery_to_hard_stop() {
-        let (directory, repository, runtime, thread_id) = runtime_fixture().await;
-        std::fs::write(directory.path().join("loop.txt"), "line 1\nline 2\nline 3").unwrap();
-        let read_call = |id: &str, start_line: usize, line_count: usize| ProviderEvent::ToolCall {
-            call: ToolCall {
-                id: id.into(),
-                name: "read_file".into(),
-                arguments: json!({
-                    "path": "loop.txt",
-                    "startLine": start_line,
-                    "lineCount": line_count
-                }),
-                metadata: json!({}),
-            },
-        };
-        let provider = Arc::new(FakeProvider::script(vec![
-            vec![Ok(read_call("read-1", 1, 3)), Ok(ProviderEvent::Completed)],
-            vec![Ok(read_call("read-2", 1, 3)), Ok(ProviderEvent::Completed)],
-            vec![
-                Ok(read_call("read-3", 1, 3)),
-                Ok(read_call("read-4", 2, 2)),
-                Ok(ProviderEvent::Completed),
-            ],
-            vec![
-                Ok(ProviderEvent::TextDelta {
-                    delta: "continued after receiving the correction".into(),
-                }),
-                Ok(ProviderEvent::Completed),
-            ],
-        ]));
-
-        let outcome = runtime
-            .run_turn(
-                provider.clone(),
-                "fake".into(),
-                RunTurnRequest {
-                    thread_id: thread_id.clone(),
-                    input: "inspect without looping".into(),
-                    agent_mode: None,
-                },
-                CancellationToken::new(),
-                Arc::new(RecordingPublisher::default()),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(outcome.state, TurnState::Completed);
-        let requests = provider.requests();
-        assert_eq!(requests.len(), 4);
-        assert!(requests[3].messages.iter().any(|message| matches!(
-            message,
-            ProviderMessage::Text {
-                role: MessageRole::System,
-                text,
-            } if text.matches("[Host-enforced read recovery]").count() == 1
-        )));
-        let results = repository
-            .load(&thread_id)
-            .await
-            .unwrap()
-            .into_iter()
-            .filter_map(|event| match event.kind {
-                StoredEventKind::ToolResult {
-                    call_id, result, ..
-                } => Some((call_id, result)),
-                _ => None,
-            })
-            .collect::<HashMap<_, _>>();
-        for call_id in ["read-3", "read-4"] {
-            assert!(results[call_id].success);
-            assert_eq!(
-                results[call_id].metadata["observationStatus"],
-                "read_observation_recovery_required"
-            );
-        }
-    }
-
     #[tokio::test]
     async fn repeated_failed_read_still_uses_the_generic_hard_stop() {
         let (_directory, repository, runtime, thread_id) = runtime_fixture().await;
@@ -4945,151 +3998,6 @@ mod tests {
         assert!(!results["read-2"].success);
         assert!(!results["read-3"].success);
         assert!(results["read-3"].output.contains("repeated_tool_call"));
-    }
-
-    #[tokio::test]
-    async fn recovery_still_stops_varied_overlapping_reads_after_one_correction() {
-        let (directory, repository, runtime, thread_id) = runtime_fixture().await;
-        let contents = (1..=500)
-            .map(|line| format!("line {line}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        std::fs::write(directory.path().join("loop.txt"), contents).unwrap();
-        let provider = Arc::new(FakeProvider::script(vec![
-            vec![
-                Ok(ProviderEvent::ToolCall {
-                    call: ToolCall {
-                        id: "read-1".into(),
-                        name: "read_file".into(),
-                        arguments: json!({
-                            "path": "loop.txt",
-                            "startLine": 1,
-                            "lineCount": 400
-                        }),
-                        metadata: json!({}),
-                    },
-                }),
-                Ok(ProviderEvent::Completed),
-            ],
-            vec![
-                Ok(ProviderEvent::ToolCall {
-                    call: ToolCall {
-                        id: "read-2".into(),
-                        name: "read_file".into(),
-                        arguments: json!({
-                            "path": "loop.txt",
-                            "startLine": 2,
-                            "lineCount": 399
-                        }),
-                        metadata: json!({}),
-                    },
-                }),
-                Ok(ProviderEvent::Completed),
-            ],
-            vec![
-                Ok(ProviderEvent::ToolCall {
-                    call: ToolCall {
-                        id: "list-between".into(),
-                        name: "list_directory".into(),
-                        arguments: json!({ "path": "." }),
-                        metadata: json!({}),
-                    },
-                }),
-                Ok(ProviderEvent::Completed),
-            ],
-            vec![
-                Ok(ProviderEvent::ToolCall {
-                    call: ToolCall {
-                        id: "read-3".into(),
-                        name: "read_file".into(),
-                        arguments: json!({
-                            "path": "loop.txt",
-                            "startLine": 3,
-                            "lineCount": 398
-                        }),
-                        metadata: json!({}),
-                    },
-                }),
-                Ok(ProviderEvent::Completed),
-            ],
-            vec![
-                Ok(ProviderEvent::ToolCall {
-                    call: ToolCall {
-                        id: "read-4".into(),
-                        name: "read_file".into(),
-                        arguments: json!({
-                            "path": "loop.txt",
-                            "startLine": 4,
-                            "lineCount": 397
-                        }),
-                        metadata: json!({}),
-                    },
-                }),
-                Ok(ProviderEvent::Completed),
-            ],
-        ]));
-
-        let outcome = runtime
-            .run_turn(
-                provider.clone(),
-                "fake".to_string(),
-                RunTurnRequest {
-                    thread_id: thread_id.clone(),
-                    input: "keep confirming the same file".to_string(),
-                    agent_mode: None,
-                },
-                CancellationToken::new(),
-                Arc::new(RecordingPublisher::default()),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(outcome.state, TurnState::Failed);
-        assert!(
-            outcome
-                .error
-                .as_deref()
-                .is_some_and(|error| error.contains("repeated_observation_loop")
-                    && error.contains("模型在文件未变化时仍反复读取"))
-        );
-        let requests = provider.requests();
-        assert_eq!(requests.len(), 5);
-        assert!(requests[4].messages.iter().any(|message| matches!(
-            message,
-            ProviderMessage::Text {
-                role: MessageRole::System,
-                text,
-            } if text.contains("[Host-enforced read recovery]")
-        )));
-        let results = repository
-            .load(&thread_id)
-            .await
-            .unwrap()
-            .into_iter()
-            .filter_map(|event| match event.kind {
-                StoredEventKind::ToolResult {
-                    call_id, result, ..
-                } => Some((call_id, result)),
-                _ => None,
-            })
-            .collect::<HashMap<_, _>>();
-        assert_eq!(results["read-2"].success, true);
-        assert_eq!(results["read-2"].metadata["contentSuppressed"], true);
-        assert_eq!(
-            results["read-2"].metadata["observationStatus"],
-            "read_observation_already_covered"
-        );
-        assert_eq!(results["read-3"].success, true);
-        assert_eq!(
-            results["read-3"].metadata["observationStatus"],
-            "read_observation_recovery_required"
-        );
-        assert_eq!(results["read-3"].metadata["recoveryRequired"], true);
-        assert_eq!(results["read-4"].success, false);
-        assert_eq!(
-            results["read-4"].metadata["observationStatus"],
-            "repeated_observation_loop"
-        );
     }
 
     #[tokio::test]
@@ -6776,146 +5684,6 @@ mod tests {
                         }
                     )
                 })
-        );
-    }
-
-    #[tokio::test]
-    async fn compact_and_continue_rehydrates_multiple_read_batches_without_reopening_the_lifetime_limit()
-     {
-        let (directory, repository, runtime, thread_id) = runtime_fixture().await;
-        let contents = (1..=2_000)
-            .map(|line| format!("line {line:04} carries context {}", "x".repeat(12)))
-            .collect::<Vec<_>>()
-            .join("\n");
-        std::fs::write(directory.path().join("context.txt"), contents).unwrap();
-        let read_call = |id: &str, start_line: usize, line_count: usize| ProviderEvent::ToolCall {
-            call: ToolCall {
-                id: id.into(),
-                name: "read_file".into(),
-                arguments: json!({
-                    "path": "context.txt",
-                    "startLine": start_line,
-                    "lineCount": line_count
-                }),
-                metadata: json!({}),
-            },
-        };
-        let provider = Arc::new(FakeProvider::script(vec![
-            vec![
-                Ok(read_call("read-before-compaction", 1, 2_000)),
-                Ok(ProviderEvent::Completed),
-            ],
-            vec![
-                Ok(read_call("read-already-covered", 2, 1_999)),
-                Ok(ProviderEvent::Completed),
-            ],
-            vec![
-                Ok(read_call("read-rehydrated", 3, 1_998)),
-                Ok(ProviderEvent::Completed),
-            ],
-            vec![
-                Ok(read_call("read-after-rehydration", 4, 1_997)),
-                Ok(ProviderEvent::Completed),
-            ],
-            vec![
-                Ok(read_call("read-after-second-compaction", 5, 1_996)),
-                Ok(ProviderEvent::Completed),
-            ],
-            vec![
-                Ok(ProviderEvent::TextDelta {
-                    delta: "used the rehydrated context".into(),
-                }),
-                Ok(ProviderEvent::Completed),
-            ],
-        ]));
-        let publisher = Arc::new(UserInputResolvingPublisher::new(
-            runtime.user_input_manager(),
-            TURN_COMPACT_AND_CONTINUE,
-        ));
-
-        let outcome = runtime
-            .with_context_limit(64_000)
-            .with_soft_turn_limits(SoftTurnLimits::new(2, u64::MAX, u64::MAX))
-            .run_turn(
-                provider.clone(),
-                "fake".into(),
-                RunTurnRequest {
-                    thread_id: thread_id.clone(),
-                    input: "read, compact, and continue".into(),
-                    agent_mode: None,
-                },
-                CancellationToken::new(),
-                publisher,
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(outcome.state, TurnState::Completed);
-        let events = repository.load(&thread_id).await.unwrap();
-        let continuation_requests = events
-            .iter()
-            .filter(|event| matches!(event.kind, StoredEventKind::UserInputRequested { .. }))
-            .count();
-        let initial_output_bytes = events
-            .iter()
-            .find_map(|event| match &event.kind {
-                StoredEventKind::ToolResult {
-                    call_id, result, ..
-                } if call_id == "read-before-compaction" => Some(result.output.len()),
-                _ => None,
-            })
-            .unwrap_or_default();
-        assert_eq!(provider.requests().len(), 6);
-        assert_eq!(continuation_requests, 2);
-        assert!(initial_output_bytes > 35_200);
-        assert!(events.iter().any(|event| matches!(
-            event.kind,
-            StoredEventKind::ContextCompacted {
-                automatic: true,
-                ..
-            }
-        )));
-        let results = events
-            .into_iter()
-            .filter_map(|event| match event.kind {
-                StoredEventKind::ToolResult {
-                    call_id, result, ..
-                } => Some((call_id, result)),
-                _ => None,
-            })
-            .collect::<HashMap<_, _>>();
-        assert_eq!(
-            results["read-already-covered"].metadata["observationStatus"],
-            "read_observation_already_covered"
-        );
-        let rehydrated = &results["read-rehydrated"];
-        assert!(rehydrated.success);
-        assert!(rehydrated.output.contains("line 0003 carries context"));
-        assert_eq!(
-            rehydrated.metadata["observationStatus"],
-            "read_observation_rehydrated_after_compaction"
-        );
-        assert_eq!(rehydrated.metadata["contentSuppressed"], false);
-        assert_eq!(rehydrated.metadata["rehydratedAfterCompaction"], true);
-        let second_rehydrated = &results["read-after-rehydration"];
-        assert!(second_rehydrated.success);
-        assert!(
-            second_rehydrated
-                .output
-                .contains("line 0004 carries context")
-        );
-        assert_eq!(
-            second_rehydrated.metadata["observationStatus"],
-            "read_observation_rehydrated_after_compaction"
-        );
-        assert_eq!(second_rehydrated.metadata["contentSuppressed"], false);
-        assert_eq!(
-            results["read-after-second-compaction"].metadata["observationStatus"],
-            "read_observation_already_covered"
-        );
-        assert_eq!(
-            results["read-after-second-compaction"].metadata["contentSuppressed"],
-            true
         );
     }
 

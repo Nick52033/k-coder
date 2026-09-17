@@ -404,6 +404,17 @@ impl<R: Runtime> MobileService<R> {
         Ok(MobileDeviceView::from(record))
     }
 
+    /// 删除设备：清掉访问令牌并从登记表移除，设备随即从设置页消失。
+    ///
+    /// 先清令牌再删记录。令牌清理只动内存、不会失败；反过来先删记录的话，一旦落盘失败
+    /// 就会留下「记录已消失、令牌还在」的中间态——那些令牌在 `TokenStore::resolve` 里因为
+    /// 查不到设备而被拒，行为上无害，但会让人误以为删除失败却已经掉线。当前顺序的最坏情况
+    /// 是设备被踢下线而记录仍在，用户重试即可，语义更容易解释。
+    pub fn remove_device(&self, device_id: &str) -> Result<(), MobileError> {
+        self.ctx.tokens.revoke_device(device_id);
+        self.ctx.registry.remove(device_id)
+    }
+
     /// 调整授予移动端的能力。首期只允许在已实现能力范围内变更。
     pub fn set_capabilities(&self, capabilities: Vec<MobileCapability>) {
         self.ctx.policy.set_granted(capabilities);

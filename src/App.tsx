@@ -108,7 +108,7 @@ import { WorkflowSelector } from "./components/WorkflowSelector";
 import { ScheduledTasksPage } from "./components/ScheduledTasksPage";
 import { findComposerTrigger, type ComposerTrigger } from "./lib/composerTrigger";
 import { workspacePathKey, workspacePathsEqual } from "./lib/path";
-import { THEME_STORAGE_KEY, parseThemePreference, resolveTheme, type ThemeId } from "./lib/theme";
+import { THEME_STORAGE_KEY, isDarkResolvedTheme, parseThemePreference, resolveTheme, type ThemeId } from "./lib/theme";
 import "./App.css";
 import "./enhanced-animations.css"; // UI 增强动画
 import "./components/ModeSelector.css";
@@ -732,6 +732,8 @@ function App() {
     document.documentElement.setAttribute("data-skin", "codebuddy");
     document.documentElement.setAttribute("data-theme", resolvedTheme);
     document.documentElement.setAttribute("data-theme-preference", themeMode);
+    // 明暗分流标记：背景图与墨色的处理方式在深浅色调下相反（见 App.css 的 .workbench--background）。
+    document.documentElement.setAttribute("data-tone", isDarkResolvedTheme(resolvedTheme) ? "dark" : "light");
   }, [resolvedTheme, themeMode]);
   useEffect(() => { localStorage.setItem("kcoder_background_enabled", String(backgroundEnabled)); }, [backgroundEnabled]);
   useEffect(() => { if (backgroundImage.startsWith("data:image/")) localStorage.setItem("kcoder_background_image", backgroundImage); else localStorage.removeItem("kcoder_background_image"); }, [backgroundImage]);

@@ -346,6 +346,7 @@ pub fn run() {
             commands::mobile::mobile_approve_pairing,
             commands::mobile::mobile_deny_pairing,
             commands::mobile::mobile_revoke_device,
+            commands::mobile::mobile_remove_device,
             commands::mobile::mobile_set_capabilities,
             commands::start_command,
             commands::command_status,

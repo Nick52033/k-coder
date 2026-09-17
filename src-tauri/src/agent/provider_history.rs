@@ -116,12 +116,21 @@ fn read_file_observation_header(name: &str, result: &ToolResult) -> Option<Strin
     if path.is_empty() || revision.is_empty() || start_line == 0 || end_line < start_line {
         return None;
     }
-    let provenance = serde_json::json!({
+    let mut provenance = serde_json::json!({
         "path": path,
         "fileRevision": revision,
         "startLine": start_line,
         "endLine": end_line,
     });
+    if result.success
+        && result.metadata["observationStatus"] == "read_observation_already_covered"
+        && result.metadata["contentSuppressed"] == false
+    {
+        provenance["notice"] = serde_json::Value::String(
+            "This content was already observed. The requested body is included below. Reuse established facts where possible; reread when context is missing or a specific unresolved detail requires it, otherwise proceed with the task or final answer."
+                .into(),
+        );
+    }
     Some(format!(
         "[read_file observation] {}",
         serde_json::to_string(&provenance).ok()?

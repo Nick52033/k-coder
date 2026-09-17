@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   AlertTriangle,
+  Ban,
   CheckCircle2,
   Copy,
   Link2,
@@ -23,6 +24,7 @@ import {
   denyMobilePairing,
   errorMessage,
   mobileStatus,
+  removeMobileDevice,
   revokeMobileDevice,
   setMobileCapabilities,
   startMobileGateway,
@@ -70,6 +72,8 @@ export function MobileSettingsPage() {
   const [port, setPort] = useState("");
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState("");
+  /** 待删除确认的设备。删除不可恢复，必须二次确认。 */
+  const [pendingRemoval, setPendingRemoval] = useState<MobileDeviceView | null>(null);
   const pollingRef = useRef<number | null>(null);
 
   const refresh = useCallback(async () => {
@@ -202,6 +206,17 @@ export function MobileSettingsPage() {
       toast.success(`已撤销「${device.name}」`);
       await refresh();
     });
+
+  // 确认弹窗先关再执行：失败时页面顶部的错误条必须可见，否则用户面对一个没有任何
+  // 解释的弹窗，只能靠猜。删除活跃设备等价于「撤销 + 遗忘」，服务端会一并清掉访问令牌。
+  const remove = (device: MobileDeviceView) => {
+    setPendingRemoval(null);
+    return run(`remove-${device.id}`, async () => {
+      await removeMobileDevice(device.id);
+      toast.success(`已删除「${device.name}」`);
+      await refresh();
+    });
+  };
 
   const toggleCapability = (capability: MobileCapability) =>
     run(`capability-${capability}`, async () => {
@@ -485,9 +500,18 @@ export function MobileSettingsPage() {
                       onClick={() => void revoke(device)}
                       disabled={busy !== null}
                     >
-                      <Trash2 size={13} aria-hidden /> 撤销
+                      <Ban size={13} aria-hidden /> 撤销
                     </button>
                   )}
+                  <button
+                    type="button"
+                    className="mobile-settings__danger"
+                    onClick={() => setPendingRemoval(device)}
+                    disabled={busy !== null}
+                    title="从列表中删除这台设备"
+                  >
+                    <Trash2 size={13} aria-hidden /> 删除
+                  </button>
                 </div>
               </div>
             ))}
@@ -495,6 +519,11 @@ export function MobileSettingsPage() {
         ) : (
           <p className="mobile-settings__hint">还没有配对过任何设备。</p>
         )}
+        {devices.length ? (
+          <p className="mobile-settings__hint">
+            撤销会保留这条记录并立即断开设备，方便日后核对；删除会把记录从列表里彻底移除。
+          </p>
+        ) : null}
       </section>
 
       <section className="mobile-settings__card">
@@ -544,6 +573,56 @@ export function MobileSettingsPage() {
           关闭「查看会话与发送消息」会让手机彻底无法使用。供应商配置、插件管理、MCP 配置、密钥管理和系统级设置不向手机开放。
         </p>
       </section>
+
+      {/* 用页面自己的 backdrop 而不是全局 `.modal-backdrop`：设置弹窗本身就是一个
+          `z-index: 50` 的 backdrop，同级叠放会随 DOM 顺序漂移，这里显式抬到 100。 */}
+      {pendingRemoval ? (
+        <div
+          className="mobile-settings__confirm-backdrop"
+          role="presentation"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget) setPendingRemoval(null);
+          }}
+        >
+          <div
+            className="mobile-settings__confirm"
+            role="alertdialog"
+            aria-modal="true"
+            aria-labelledby="mobile-remove-device-title"
+            onKeyDown={(event) => {
+              if (event.key !== "Escape") return;
+              event.preventDefault();
+              event.stopPropagation();
+              setPendingRemoval(null);
+            }}
+          >
+            <h4 id="mobile-remove-device-title">删除设备</h4>
+            <p>
+              确定要删除「{pendingRemoval.name}」吗？
+              {pendingRemoval.revoked
+                ? "删除后这条记录不再出现在列表里，且无法恢复。"
+                : "该设备会立即失去访问权限，需要重新配对才能接入。"}
+            </p>
+            <div className="mobile-settings__confirm-actions">
+              <button
+                type="button"
+                className="mobile-settings__ghost"
+                onClick={() => setPendingRemoval(null)}
+              >
+                取消
+              </button>
+              <button
+                type="button"
+                className="mobile-settings__danger is-solid"
+                onClick={() => void remove(pendingRemoval)}
+                disabled={busy !== null}
+              >
+                <Trash2 size={13} aria-hidden /> 删除
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
     </div>
   );
 }

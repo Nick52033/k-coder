@@ -20,11 +20,14 @@
         if (stored === "system") {
           resolved = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
         }
+        var tone = DARK_THEMES.indexOf(resolved) >= 0 ? "dark" : "light";
         var root = document.documentElement;
         root.setAttribute("data-skin", "codebuddy");
         root.setAttribute("data-theme", resolved);
         root.setAttribute("data-theme-preference", stored);
-        root.setAttribute("data-boot-tone", DARK_THEMES.indexOf(resolved) >= 0 ? "dark" : "light");
+        root.setAttribute("data-boot-tone", tone);
+        // 与 App.tsx 保持同一来源：样式按色调分流（浅色压深墨色 / 深色压暗背景图）。
+        root.setAttribute("data-tone", tone);
       })();
     </script>
     <style>
