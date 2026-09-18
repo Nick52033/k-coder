@@ -2794,6 +2794,7 @@ button {
 
 .turn-timeline-tool--running > svg { color: var(--color-brand); }
 .turn-timeline-tool--failed > svg { color: var(--color-error); }
+.turn-timeline-tool--no-matches > svg { color: var(--color-ink-muted); }
 .turn-timeline-tool--cancelled > svg { color: var(--color-ink-muted); opacity: 0.7; }
 .turn-timeline-tool--cancelled .turn-tool-duration { color: var(--color-ink-muted); }
 .turn-timeline-event--turn_failed > svg { color: var(--color-error); }

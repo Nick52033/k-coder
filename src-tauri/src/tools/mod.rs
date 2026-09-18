@@ -21,6 +21,8 @@ use crate::protocol::{
     ToolRisk,
 };
 
+mod command_diagnostics;
+
 const TOOL_PROGRESS_CHANNEL_CAPACITY: usize = 64;
 const TOOL_PROGRESS_BATCH_BYTES: usize = 16 * 1024;
 const TOOL_PROGRESS_READ_LIMIT: usize = 200;
@@ -1232,7 +1234,9 @@ impl ToolHandler for RunCommandTool {
         };
         ToolDefinition {
             name: "run_command".to_string(),
-            description: description.to_string(),
+            description: format!(
+                "{description} Commands are non-interactive (stdin is closed). For repository searches always give rg an explicit directory, such as '.', and prefer one search per call. Use single quotes for literal PowerShell regexes; backslash does not escape a double quote. Do not suppress stderr while diagnosing a failed search."
+            ),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -1265,7 +1269,7 @@ impl ToolHandler for RunCommandTool {
                 .shell_request(&arguments.command, arguments.cwd, arguments.timeout_ms);
         let session = self
             .runtime
-            .start(request)
+            .start_non_interactive(request)
             .await
             .map_err(|error| ToolError::Execution(error.to_string()))?;
         let id = session.id;
@@ -1334,18 +1338,40 @@ impl ToolHandler for RunCommandTool {
             CommandState::Exited { code } => Some(*code),
             _ => None,
         };
+        let result_kind = (shell == "powershell"
+            && !status.output_truncated
+            && !output.truncated_before_cursor
+            && output.next_cursor == status.next_cursor)
+            .then(|| command_result_kind(&arguments.command, exit_code, output_was_empty))
+            .flatten();
         if output_was_empty
-            && let Some(message) = empty_command_failure_message(&arguments.command, exit_code)
+            && let Some(message) = empty_command_failure_message(result_kind, exit_code)
         {
             text.push_str(&message);
         }
-        let recovery_hint = command_recovery_hint(
-            shell,
-            self.runtime.uses_windows_powershell_native_pipeline(),
-            &arguments.command,
-            &status.state,
-            output_was_empty,
-        );
+        let stderr = output
+            .chunks
+            .iter()
+            .filter(|chunk| matches!(chunk.stream, crate::execution::OutputStream::Stderr))
+            .map(|chunk| chunk.text.as_str())
+            .collect::<String>();
+        let recovery_hint = if shell == "powershell" && !success && powershell_parse_error(&stderr)
+        {
+            Some(
+                "PowerShell 命令语法错误：正则或含双引号的文本优先使用单引号包裹；PowerShell 不使用反斜杠转义双引号。请修正引号后重试。",
+            )
+        } else {
+            command_recovery_hint(
+                shell,
+                self.runtime.uses_windows_powershell_native_pipeline(),
+                &arguments.command,
+                &status.state,
+                output_was_empty,
+            )
+            .filter(|hint| {
+                *hint != POWERSHELL_RG_GLOB_RECOVERY_HINT || stderr.contains("(os error 123)")
+            })
+        };
         if let Some(hint) = recovery_hint {
             if !text.ends_with('\n') && !text.is_empty() {
                 text.push('\n');
@@ -1371,6 +1397,9 @@ impl ToolHandler for RunCommandTool {
             "nextCursor": output.next_cursor,
             "outputChunks": output_chunks
         });
+        if let Some(result_kind) = result_kind {
+            metadata["resultKind"] = Value::String(result_kind.to_string());
+        }
         if let Some(hint) = recovery_hint {
             metadata["recoveryHint"] = Value::String(hint.to_string());
         }
@@ -1386,9 +1415,33 @@ impl ToolHandler for RunCommandTool {
     }
 }
 
-fn empty_command_failure_message(command: &str, exit_code: Option<i32>) -> Option<String> {
+fn command_result_kind(
+    command: &str,
+    exit_code: Option<i32>,
+    output_is_empty: bool,
+) -> Option<&'static str> {
+    (output_is_empty
+        && exit_code == Some(1)
+        && command_diagnostics::is_unambiguous_rg_search(command))
+    .then_some("no_matches")
+}
+
+fn powershell_parse_error(output: &str) -> bool {
+    [
+        "TerminatorExpectedAtEndOfString",
+        "ParserError",
+        "字符串缺少终止符",
+    ]
+    .iter()
+    .any(|marker| output.contains(marker))
+}
+
+fn empty_command_failure_message(
+    result_kind: Option<&str>,
+    exit_code: Option<i32>,
+) -> Option<String> {
     let code = exit_code.filter(|code| *code != 0)?;
-    if code == 1 && contains_rg_command(command) {
+    if result_kind == Some("no_matches") {
         return Some("rg: no matches (exit code 1).".to_string());
     }
     Some(format!(
@@ -2130,6 +2183,104 @@ mod tests {
 
     #[cfg(windows)]
     #[tokio::test]
+    async fn run_command_search_diagnostics_preserve_errors_and_do_not_wait_for_input() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("sample.cs"),
+            "class UniqueMarker {}\n",
+        )
+        .unwrap();
+        let runtime = CommandRuntime::new_with_bundled_tools(
+            directory.path(),
+            Some(
+                crate::execution::BundledTools::new(
+                    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                        .join("../src/resources/tools/windows-x86_64"),
+                )
+                .unwrap(),
+            ),
+        )
+        .unwrap();
+        let tool = RunCommandTool { runtime };
+        let run = |command: &'static str| {
+            let tool = &tool;
+            let root = directory.path();
+            async move {
+                tool.execute(
+                    &context(root),
+                    json!({"command":command,"timeoutMs":10000}),
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap()
+            }
+        };
+        // This exact shape used to consume the open pipe for the entire 120s timeout.
+        let found = run("rg -n UniqueMarker --glob '*.cs' -l").await;
+        assert!(found.success, "{found:?}");
+        assert!(found.output.contains("sample.cs"));
+        for command in [
+            "rg -n AbsentMarker .",
+            "rg -n AbsentMarker . | Select-Object -First 20",
+        ] {
+            let absent = run(command).await;
+            assert!(!absent.success, "keep the original exit fact");
+            assert_eq!(absent.metadata["exitCode"], 1);
+            assert_eq!(absent.metadata["resultKind"], "no_matches");
+            assert!(absent.output.contains("no matches"));
+            assert!(
+                absent.metadata["outputChunks"]
+                    .as_array()
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        for command in [
+            "rg x missing.cs",
+            "rg x missing.cs 2>$null",
+            "rg --no-messages x missing.cs",
+            "rg x .; exit 1",
+            "Write-Output 'sample.cs ParserError'; rg AbsentMarker .",
+        ] {
+            let error = run(command).await;
+            assert!(!error.success, "{command}: {error:?}");
+            assert!(
+                error.metadata.get("resultKind").is_none(),
+                "{command}: {error:?}"
+            );
+            assert!(
+                !error.output.contains("rg: no matches"),
+                "{command}: {error:?}"
+            );
+            assert!(
+                error.metadata.get("recoveryHint").is_none(),
+                "{command}: {error:?}"
+            );
+        }
+        let syntax = run(r#"rg "not-closed ./sample*.cs"#).await;
+        assert!(!syntax.success);
+        assert!(syntax.metadata.get("resultKind").is_none());
+        if syntax.metadata["outputChunks"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+        {
+            // Some pwsh hosts emit no diagnostics for a -Command parse failure.
+            // Preserve that uncertainty instead of guessing from the wildcard.
+            assert_eq!(syntax.metadata["exitCode"], 1);
+            assert!(syntax.metadata.get("recoveryHint").is_none());
+            assert!(syntax.output.contains("exited with code 1"));
+        } else {
+            let hint = syntax.metadata["recoveryHint"]
+                .as_str()
+                .expect("PowerShell parser diagnostics should have a syntax hint");
+            assert!(hint.contains("语法错误"), "{syntax:?}");
+            assert!(!hint.contains("--glob"), "{syntax:?}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
     async fn run_command_explains_and_recovers_from_powershell_rg_path_globs() {
         let directory = tempfile::tempdir().unwrap();
         std::fs::create_dir(directory.path().join("assets")).unwrap();
@@ -2637,14 +2788,39 @@ mod tests {
     #[test]
     fn empty_command_failures_report_exit_codes_and_rg_no_matches() {
         assert_eq!(
-            empty_command_failure_message("rg -n missing .", Some(1)).as_deref(),
+            empty_command_failure_message(Some("no_matches"), Some(1)).as_deref(),
             Some("rg: no matches (exit code 1).")
         );
         assert_eq!(
-            empty_command_failure_message("cargo test", Some(101)).as_deref(),
+            empty_command_failure_message(None, Some(101)).as_deref(),
             Some("command produced no output and exited with code 101.")
         );
-        assert_eq!(empty_command_failure_message("cargo test", Some(0)), None);
+        assert_eq!(empty_command_failure_message(None, Some(0)), None);
+    }
+
+    #[test]
+    fn command_result_kind_marks_only_empty_rg_exit_one_as_no_matches() {
+        assert_eq!(
+            command_result_kind("rg -n missing .", Some(1), true),
+            Some("no_matches")
+        );
+        assert_eq!(
+            command_result_kind("rg -n missing .; Write-Output other", Some(1), false),
+            None
+        );
+        assert_eq!(command_result_kind("rg -n missing .", Some(2), true), None);
+        assert_eq!(command_result_kind("cargo test", Some(1), true), None);
+    }
+
+    #[test]
+    fn powershell_parser_markers_are_distinct_from_native_path_errors() {
+        assert!(powershell_parse_error("CategoryInfo: ParserError"));
+        assert!(powershell_parse_error(
+            "FullyQualifiedErrorId: TerminatorExpectedAtEndOfString"
+        ));
+        assert!(powershell_parse_error("字符串缺少终止符"));
+        assert!(!powershell_parse_error("rg: sample*.cs (os error 123)"));
+        assert!(!powershell_parse_error(""));
     }
 
     #[tokio::test]

@@ -99,3 +99,28 @@ tempfile = "3"
 tauri = { version = "2", features = ["test"] }
 tokio = { version = "1", features = ["test-util"] }
 tokio-tungstenite = "0.29"
+
+# ---------------------------------------------------------------------------
+# 构建体积控制
+#
+# 背景：dev 档默认 debug = 2（完整 DWARF），而本项目依赖图很大
+# （tauri / ort / chromiumoxide / rusqlite(bundled) / pdf-extract / image …），
+# 曾把 target/ 撑到 83 GB：debug/deps 19.8 GB、debug/incremental 33 GB、
+# debug/build 1.9 GB（每个依赖的 build script 都会带一份 .pdb）。
+#
+# 策略：
+#   - 本地 crate 用 debug = 1：保留行号表，断点与单步照常可用，砍掉完整 DWARF；
+#   - 第三方依赖 debug = false：极少需要单步进依赖源码，调试信息纯属浪费；
+#   - build-override（build script 与 proc-macro）同样关掉：它们只在构建期运行。
+#
+# 代价：依赖内部栈帧的 backtrace 会缺文件/行号（panic 消息本身不受影响）。
+# 若确实需要单步调试依赖源码，把对应 debug 临时改回 2 即可，重新编译一轮即可恢复。
+# ---------------------------------------------------------------------------
+[profile.dev]
+debug = 1
+
+[profile.dev.package."*"]
+debug = false
+
+[profile.dev.build-override]
+debug = false

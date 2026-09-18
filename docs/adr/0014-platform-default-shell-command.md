@@ -1,5 +1,15 @@
 # ADR 0014：`run_command` 使用平台默认 Shell
 
+## 2026-09-18 修订：非交互输入与保守命令诊断（P10-199）
+
+`run_command` 通过 `start_non_interactive` 启动进程，stdin 使用空设备，避免未指定搜索目录的 rg 等待宿主一直保持打开的管道。宿主 `start_command/write_stdin` 与 PTY 保留交互语义，工作目录、安全审批、取消、进程树和输出脱敏仍走同一执行链路。
+
+`ToolResult.metadata.resultKind = "no_matches"` 是可缺省的宿主诊断。仅 PowerShell 的简单 rg，或 rg 后接单一 `Select-Object -First/-Last N`，在完整输出为空且退出码 1 时提供；串联、动态语法、重定向、quiet/no-messages/pre 及输出丢失均不分类。保留 `success=false`、原始退出码和生命周期失败审计，展示层用中性的「未匹配」且不计入工具组「包含失败」。旧历史不猜测该类型，不改写审计。
+
+空输出的复杂命令仅报告退出码，不再由「文本包含 rg」推断无匹配。PowerShell 的 stderr 包含解析错误时优先提供引号恢复指引；路径通配符恢复提示必须同时有 stderr 中的真实 `os error 123`。前端优先展示超时/解析错误/stderr，再考虑恢复提示；有分流元数据但仅有 stdout 时只展示退出码与「已有部分输出」，避免拿成功段文件名或源代码中的 `ParserError` 字样当失败原因。缺分流数据的旧历史继续有界兼容。部分 pwsh 宿主的 `-Command` 解析失败不输出诊断，此时保留退出码与「无错误详情」，不猜测引号或通配符原因。
+
+回归覆盖：无搜索路径 rg 正常结束、宿主输入可写、未匹配与缺失路径/错误抑制/串联的区分、错误提示优先级、实时与刷新恢复展示，以及隔离 `pnpm tauri dev` 原生链路。
+
 - 状态：已接受；PowerShell 原生 `rg` 路径通配符诊断于 2026-08-16 由 `P10-109` 修订；Windows PowerShell 原生管道 CRLF 诊断于 2026-08-16 由 `P10-110` 修订
 - 日期：2026-08-05
 
@@ -15,7 +25,7 @@
 4. 策略在转换前评估原始脚本文本。只有单条、可静态拆分且属于已知只读或构建/测试类别的命令可以自动运行；管道、重定向、串联、换行、变量展开、命令替换、未知程序和写入/破坏性命令必须审批。模型参数中的权限声明不能改变该决策。
 5. 最终工具结果记录实际 shell 类型。前端直接显示新 `command` 文本；已持久化的旧 `program + args` 工具事件继续只读展示，避免历史会话失去命令详情。
 6. Windows x86_64 桌面包固定内置 ripgrep 15.2.0。官方发布归档和解压后的 `rg.exe` 都使用固定 SHA-256 校验，许可证随资源分发；Tauri 将内置工具目录传给 execution 层，`CommandRuntime` 与 `NativePtyRuntime` 分别把它置于子进程 `PATH` 首位。该目录由宿主决定，调用方提供的环境不能覆盖其优先级；应用不在 Tauri/Tokio 多线程运行期间修改全局 `PATH`。
-7. PowerShell 不替原生可执行程序展开 `dist/assets/CodeEditor-*.js` 这类路径通配符。模型契约和系统提示要求改用 `rg --glob 'CodeEditor-*.js' ... dist/assets`，或先由 `Get-ChildItem` 解析精确路径。失败命令命中“PowerShell + `rg` + 路径通配符”时，`ToolResult` 附加有界 `recoveryHint` 并把同一提示返回 Provider；运行时不得静默改写并重跑模型命令。
+7. PowerShell 不替原生可执行程序展开 `dist/assets/CodeEditor-*.js` 这类路径通配符。模型契约和系统提示要求改用 `rg --glob 'CodeEditor-*.js' ... dist/assets`，或先由 `Get-ChildItem` 解析精确路径。失败命令命中“PowerShell + `rg` + 路径通配符”，且 stderr 包含 `os error 123` 时，`ToolResult` 附加有界 `recoveryHint` 并把同一提示返回 Provider；运行时不得静默改写并重跑模型命令。
 8. Windows PowerShell（`powershell.exe`）会把原生命令管道的文本重新编码为 CRLF；因此 `rg --files ... | rg 'name\.js$'` 的下游 `$` 行尾锚点可能得到空结果，而 `pwsh` 不存在同一兼容问题。模型契约和系统提示要求下游使用 `rg --crlf` 或改用 `Select-String`。运行时只有在实际 Shell 为 `powershell.exe`、命令以退出码 1 结束、输出为空、存在真实 Shell 管道且下游 `rg` 使用未转义 `$` 锚点时才附加专用 `recoveryHint`；已有输出、`pwsh`、超时、取消、无锚点或已经传入 `--crlf` 的命令不得误提示，也不得静默改写和重跑。
 
 ## 影响

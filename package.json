@@ -9,7 +9,8 @@
     "test:e2e": "playwright test",
     "preview": "vite preview",
     "tauri": "tauri",
-    "build:deploy": "pnpm tauri build && powershell -NoProfile -ExecutionPolicy Bypass -File scripts/deploy.ps1"
+    "build:deploy": "pnpm tauri build && powershell -NoProfile -ExecutionPolicy Bypass -File scripts/deploy.ps1",
+    "clean:cache": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/clean-build-cache.ps1"
   },
   "dependencies": {
     "@monaco-editor/react": "^4.7.0",

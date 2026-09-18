@@ -59,7 +59,28 @@ if (Get-Process -Name "k-coder" -ErrorAction SilentlyContinue) {
 New-Item -ItemType Directory -Force -Path $Dest | Out-Null
 
 # 3. 增量镜像同步（robocopy 退出码 0-7 均成功，>=8 为错误）
-robocopy $source $Dest /MIR /NFL /NDL /NJH /NJS /NP
+#
+# 只同步运行时真正需要的产物。$source 是 cargo 的 target/release 目录，
+# 里面同时住着交付物（k-coder.exe + skills/ tools/ ocr/）和编译中间件；
+# 不加排除时 deps/ 与 build/ 会被整目录镜像过去，安装目录会从 ~90 MB 涨到 3 GB+。
+$excludeDirs = @("deps", "build", "incremental", ".fingerprint", "examples")
+$excludeFiles = @("k_coder.pdb", "k-coder.d")
+
+# /MIR 不会删除目标目录里被 /XD 排除掉的旧内容，历史遗留的中间件需要先手工清掉
+foreach ($name in $excludeDirs) {
+    $junk = Join-Path $Dest $name
+    if (Test-Path -LiteralPath $junk) {
+        Remove-Item -LiteralPath $junk -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+foreach ($name in $excludeFiles) {
+    $junk = Join-Path $Dest $name
+    if (Test-Path -LiteralPath $junk) {
+        Remove-Item -LiteralPath $junk -Force -ErrorAction SilentlyContinue
+    }
+}
+
+robocopy $source $Dest /MIR /NFL /NDL /NJH /NJS /NP /XD $excludeDirs /XF $excludeFiles
 if ($LASTEXITCODE -ge 8) {
     Write-Error "robocopy 失败，退出码: $LASTEXITCODE"
     exit $LASTEXITCODE

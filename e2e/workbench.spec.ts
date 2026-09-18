@@ -1,5 +1,110 @@
-import { expect, test } from "@playwright/test";
+import { expect, test, type Page } from "@playwright/test";
 import { readFileSync } from "node:fs";
+
+async function emitDisclosureEvents(page: Page, events: Record<string, unknown>[]) {
+  await page.evaluate((events) => {
+    const emit = (window as unknown as { __emitAgentEvent: (event: unknown) => void }).__emitAgentEvent;
+    for (const event of events) {
+      emit({ schemaVersion: 6, threadId: "thread-1", turnId: "turn-disclosure", phase: "executing", ...event });
+    }
+  }, events);
+}
+
+for (const toolName of ["read_file", "run_command"]) {
+  const call = (id: string) => ({
+    id, name: toolName,
+    arguments: toolName === "read_file" ? { path: `${id}.txt` } : { command: `echo ${id}` },
+    metadata: {},
+  });
+  const started = (id: string) => ({ type: "tool_started", call: call(id) });
+  const completed = (id: string, success = true) => ({
+    type: "tool_completed", callId: id, name: toolName,
+    result: { success, output: success ? "done" : "fixture failure", metadata: {} },
+  });
+
+  test(`tool group manual expansion survives appended ${toolName} operations and terminal states`, async ({ page }) => {
+    await page.emulateMedia({ reducedMotion: "reduce" });
+    await page.goto("/");
+    await expect(page.getByRole("heading", { name: "Phase 6 workbench" })).toBeVisible();
+    await emitDisclosureEvents(page, [{ type: "turn_started" }, started("disclosure-1"), completed("disclosure-1")]);
+    const group = page.locator(".turn-execution--live .turn-tool-group");
+    const summary = group.locator(":scope > summary");
+    await expect(group).not.toHaveAttribute("open", "");
+    await summary.click();
+    await expect(group).toHaveAttribute("open", "");
+
+    // A whole additional operation can arrive between two renders.
+    await emitDisclosureEvents(page, [started("disclosure-2"), completed("disclosure-2")]);
+    await expect(group.locator(".turn-timeline-tool")).toHaveCount(2);
+    await expect(group).toHaveAttribute("open", "");
+    await expect(summary.locator(".lucide-chevron-down")).toHaveCount(1);
+
+    await emitDisclosureEvents(page, [started("disclosure-3")]);
+    await expect(group).toHaveClass(/--running/);
+    await emitDisclosureEvents(page, [completed("disclosure-3", false)]);
+    await expect(summary).toContainText("包含失败");
+    await expect(group).toHaveAttribute("open", "");
+
+    // Keyboard activation is still handled by the native summary element.
+    await summary.focus();
+    await summary.press("Enter");
+    await expect(group).not.toHaveAttribute("open", "");
+    await summary.press("Space");
+    await expect(group).toHaveAttribute("open", "");
+    await emitDisclosureEvents(page, [
+      { type: "text_delta", itemId: "disclosure-progress", delta: "继续检查下一组。" },
+      started("disclosure-4"), completed("disclosure-4"),
+    ]);
+    const groups = page.locator(".turn-execution--live .turn-tool-group");
+    await expect(groups).toHaveCount(2);
+    await expect(groups.first()).toHaveAttribute("open", "");
+    await expect(groups.last()).not.toHaveAttribute("open", "");
+  });
+
+  test(`tool group manual collapse survives queued and running ${toolName} operations`, async ({ page }) => {
+    await page.emulateMedia({ reducedMotion: "reduce" });
+    await page.goto("/");
+    await expect(page.getByRole("heading", { name: "Phase 6 workbench" })).toBeVisible();
+    await emitDisclosureEvents(page, [{ type: "turn_started" }, started("disclosure-1")]);
+    const group = page.locator(".turn-execution--live .turn-tool-group");
+    await expect(group).toHaveAttribute("open", "");
+    await group.locator(":scope > summary").click();
+    await expect(group).not.toHaveAttribute("open", "");
+    await emitDisclosureEvents(page, [completed("disclosure-1"), { type: "tool_queued", call: call("disclosure-2") }]);
+    await expect(group).toHaveClass(/--pending/);
+    await expect(group).not.toHaveAttribute("open", "");
+    await emitDisclosureEvents(page, [started("disclosure-2")]);
+    await expect(group).toHaveClass(/--running/);
+    await expect(group).not.toHaveAttribute("open", "");
+    await emitDisclosureEvents(page, [completed("disclosure-2")]);
+    await expect(group).toHaveClass(/--completed/);
+    await expect(group).not.toHaveAttribute("open", "");
+    await expect(group.locator(":scope > summary .lucide-chevron-right")).toHaveCount(1);
+  });
+
+  test(`tool group untouched ${toolName} operations retain automatic disclosure`, async ({ page }) => {
+    await page.emulateMedia({ reducedMotion: "reduce" });
+    await page.goto("/");
+    await expect(page.getByRole("heading", { name: "Phase 6 workbench" })).toBeVisible();
+    await emitDisclosureEvents(page, [{ type: "turn_started" }, { type: "tool_queued", call: call("disclosure-1") }]);
+    const group = page.locator(".turn-execution--live .turn-tool-group");
+    await expect(group).toHaveAttribute("open", "");
+    await emitDisclosureEvents(page, [started("disclosure-1")]);
+    await expect(group).toHaveClass(/--running/);
+    await expect(group).toHaveAttribute("open", "");
+    await emitDisclosureEvents(page, [completed("disclosure-1")]);
+    await expect(group).not.toHaveAttribute("open", "");
+    await emitDisclosureEvents(page, [started("disclosure-2")]);
+    await expect(group).toHaveAttribute("open", "");
+    await group.locator(":scope > summary").click();
+    await expect(group).not.toHaveAttribute("open", "");
+    await group.locator(":scope > summary").click();
+    await expect(group).toHaveAttribute("open", "");
+    await emitDisclosureEvents(page, [completed("disclosure-2")]);
+    await expect(group).toHaveClass(/--completed/);
+    await expect(group).toHaveAttribute("open", "");
+  });
+}
 
 test.beforeEach(async ({ page }) => {
   await page.addInitScript(() => {
@@ -1109,6 +1214,56 @@ test.beforeEach(async ({ page }) => {
       },
     });
   });
+});
+
+test("command diagnostics distinguish no matches and errors in live and restored history", async ({ page }) => {
+  await page.emulateMedia({ reducedMotion: "reduce" });
+  await page.goto("/");
+  await expect(page.getByRole("heading", { name: "Phase 6 workbench" })).toBeVisible();
+  const fixtures = [
+    { id: "empty-search", command: "rg absent .", output: "rg: no matches (exit code 1).", metadata: { resultKind: "no_matches", exitCode: 1, outputChunks: [] }, label: "未匹配" },
+    { id: "parser", command: 'rg "unclosed *.cs', output: 'TerminatorExpectedAtEndOfString', metadata: { recoveryHint: "过时的通配符提示" }, label: "运行失败：PowerShell 字符串引号未闭合" },
+    { id: "stderr", command: "Get-ChildItem; rg x missing.cs", output: "sample.cs\nrg: missing.cs: IO error", metadata: { exitCode: 1, outputChunks: [{ stream: "stdout", cursor: 0, text: "sample.cs\n" }, { stream: "stderr", cursor: 1, text: "rg: missing.cs: IO error\n" }] }, label: "运行失败：rg: missing.cs: IO error" },
+    { id: "partial", command: "Get-ChildItem; rg absent .", output: "normal-output.cs ParserError", metadata: { exitCode: 1, outputChunks: [{ stream: "stdout", cursor: 0, text: "normal-output.cs ParserError\n" }] }, label: "运行失败：退出码 1（已有部分输出）" },
+    { id: "timeout", command: "Start-Sleep 50", output: "", metadata: { state: { state: "timed_out" }, exitCode: null, outputChunks: [] }, label: "运行超时" },
+    { id: "legacy", command: "rg missing .; exit 1", output: "rg: no matches (exit code 1).", metadata: {}, label: "运行失败：rg: no matches (exit code 1)." },
+  ];
+  const activities = fixtures.map(({ id, command, output, metadata }) => ({
+    turnId: "turn-disclosure", call: { id, name: "run_command", arguments: { command }, metadata: {} },
+    state: "failed", result: { success: false, output, metadata },
+  }));
+  const events = (activity: typeof activities[number]) => [
+    { type: "tool_started", call: activity.call },
+    { type: "tool_completed", callId: activity.call.id, name: "run_command", result: activity.result },
+  ];
+  await emitDisclosureEvents(page, [{ type: "turn_started" }, ...events(activities[0])]);
+  const liveGroup = page.locator(".turn-execution--live .turn-tool-group");
+  await expect(liveGroup).toHaveClass(/--completed/);
+  await liveGroup.locator(":scope > summary").click();
+  await expect(liveGroup.locator(".turn-timeline-tool--no-matches")).toContainText("未匹配");
+  await expect(liveGroup.locator(".turn-timeline-tool--failed")).toHaveCount(0);
+  await emitDisclosureEvents(page, activities.slice(1).flatMap(events));
+  const assertLabels = async () => {
+    const rows = page.locator(".message--assistant").last().locator(".turn-timeline-tool--command");
+    await expect(rows).toHaveCount(fixtures.length);
+    for (let i = 0; i < fixtures.length; i++) await expect(rows.nth(i).locator(".turn-tool-meta")).toHaveText(fixtures[i].label);
+    await expect(rows.first()).not.toHaveClass(/--failed/);
+    await expect(rows.nth(1)).toHaveClass(/--failed/);
+  };
+  await assertLabels();
+  await page.evaluate(detail => localStorage.setItem("kcoder_e2e_thread_detail", JSON.stringify(detail)), {
+    schemaVersion: 1,
+    summary: { schemaVersion: 1, id: "thread-1", title: "Phase 6 workbench", createdAtMs: 1, updatedAtMs: 3, archived: false },
+    messages: [{ schemaVersion: 1, id: "diagnostic-answer", role: "assistant", content: [{ type: "text", text: "检查完成" }], createdAtMs: 3 }],
+    messageTurnIds: { "diagnostic-answer": "turn-disclosure" },
+    lastTurn: { turnId: "turn-disclosure", state: "completed", error: null },
+    toolActivities: activities,
+    turnTimeline: [...activities.map(activity => ({ type: "tool", activity })), { type: "event", itemId: "done", turnId: "turn-disclosure", kind: "turn_completed", title: "Turn 已完成", detail: null }],
+    approvals: [], changes: [],
+  });
+  await page.reload();
+  await expect(page.getByRole("heading", { name: "Phase 6 workbench" })).toBeVisible();
+  await assertLabels();
 });
 
 test("keeps composer popover surfaces consistent and closes the mode menu outside", async ({ page }, testInfo) => {

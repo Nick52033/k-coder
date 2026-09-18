@@ -163,7 +163,7 @@ export const ConversationTurnActivity = memo(function ConversationTurnActivity({
             ) : entry.type === "tool_group" ? (
               <ToolActivityGroup
                 activities={entry.activities}
-                key={`tool-group-${entry.activities.map((activity) => activity.call.id).join("-")}`}
+                key={`tool-group-${entry.activities[0].call.id}`}
                 subagentTaskIndex={subagentTaskIndex}
                 onFocusSubagent={onFocusSubagent}
               />
@@ -557,15 +557,21 @@ function ToolActivityGroup({
           ? "等待执行"
           : "已完成";
   const active = state === "running" || state === "pending";
-  const [open, setOpen] = useState(false);
-  const expanded = active || open;
+  // Follow activity only until the user chooses; subsequent tools must not reset that choice.
+  const [userExpanded, setUserExpanded] = useState<boolean | null>(null);
+  const expanded = userExpanded ?? active;
   return (
     <details
       className={`turn-disclosure turn-tool-group turn-tool-group--${state}${allCommands ? " turn-tool-group--commands" : ""}${allCommands && count > 1 ? " turn-tool-group--multiple-commands" : ""}`}
-      open={active || undefined}
-      onToggle={(event) => setOpen(!active && event.currentTarget.open)}
+      open={expanded}
     >
-      <summary className="turn-tool-group-summary">
+      <summary
+        className="turn-tool-group-summary"
+        onClick={(event) => {
+          event.preventDefault();
+          setUserExpanded((previous) => !(previous ?? active));
+        }}
+      >
         <span className="turn-tool-group-marker" aria-hidden="true"><span /></span>
         <span className="turn-tool-group-copy">
           <span className="turn-disclosure-title">{title}</span>
@@ -627,11 +633,18 @@ function patchRetryTarget(activity: ToolActivity) {
 }
 
 function toolGroupState(activities: ToolActivity[]): ToolActivity["state"] {
-  if (activities.some((activity) => activity.state === "failed")) return "failed";
+  if (activities.some((activity) => activity.state === "failed" && !isNoMatchActivity(activity))) return "failed";
   if (activities.some((activity) => activity.state === "cancelled")) return "cancelled";
   if (activities.some((activity) => activity.state === "running")) return "running";
   if (activities.some((activity) => activity.state === "pending")) return "pending";
   return "completed";
+}
+
+function isNoMatchActivity(activity: ToolActivity) {
+  return activity.call.name === "run_command"
+    && activity.state === "failed"
+    && activity.result?.metadata?.exitCode === 1
+    && activity.result?.metadata?.resultKind === "no_matches";
 }
 
 
@@ -652,19 +665,25 @@ function ToolActivityRow({
   const isPending = activity.state === "pending";
   const isRunning = activity.state === "running";
   const failed = activity.state === "failed";
-  const target = isCommand ? command : failed ? "" : toolTarget(activity);
+  const noMatches = isNoMatchActivity(activity);
+  const visibleFailure = failed && !noMatches;
+  const target = isCommand ? command : visibleFailure ? "" : toolTarget(activity);
   const title = target || (isRunning ? runningToolLabel(activity.call.name) : toolLabel(activity.call.name));
   const meta = isCommand
-    ? failed
+    ? noMatches
+      ? "未匹配"
+      : visibleFailure
       ? commandFailureSummary(activity)
       : commandActivityStateLabel(activity.state)
-    : failed && activity.result?.output
+    : visibleFailure && activity.result?.output
       ? truncate(activity.result.output, 120)
       : activityStateLabel(activity);
   const subagentIds = subagentIdsOf(activity);
   return (
-    <div className={`turn-timeline-tool turn-timeline-tool--${activity.state}${isCommand ? " turn-timeline-tool--command" : ""}`}>
-      {activity.state === "completed" ? (
+    <div className={`turn-timeline-tool turn-timeline-tool--${noMatches ? "no-matches" : activity.state}${isCommand ? " turn-timeline-tool--command" : ""}`}>
+      {noMatches ? (
+        <CircleDot size={15} aria-hidden="true" />
+      ) : activity.state === "completed" ? (
         <CircleCheck size={15} aria-hidden="true" />
       ) : activity.state === "failed" ? (
         <CircleX size={15} aria-hidden="true" />
@@ -1130,9 +1149,32 @@ function commandActivityStateLabel(state: ToolActivity["state"]) {
 }
 
 function commandFailureSummary(activity: ToolActivity) {
-  const recoveryHint = activity.result?.metadata?.recoveryHint;
+  const metadata = activity.result?.metadata;
+  const state = metadata?.state as { state?: unknown } | undefined;
+  if (state?.state === "timed_out") return "运行超时";
+  if (state?.state === "cancelled") return "已取消";
+  const outputChunks = activity.result?.metadata?.outputChunks;
+  const stderr = Array.isArray(outputChunks)
+    ? outputChunks
+      .filter((chunk): chunk is { stream: string; text: string } => (
+        typeof chunk === "object" && chunk !== null
+        && (chunk as { stream?: unknown }).stream === "stderr"
+        && typeof (chunk as { text?: unknown }).text === "string"
+      ))
+      .map((chunk) => chunk.text).join("")
+    : activity.result?.output ?? "";
+  if (stderr.includes("TerminatorExpectedAtEndOfString")) return "运行失败：PowerShell 字符串引号未闭合";
+  if (stderr.includes("ParserError")) return "运行失败：PowerShell 命令语法错误";
+  const stderrLine = stderr.split(/\r?\n/).map((line) => line.trim()).find(Boolean);
+  if (Array.isArray(outputChunks) && stderrLine) return `运行失败：${truncate(stderrLine, 180)}`;
+  const recoveryHint = metadata?.recoveryHint;
   if (typeof recoveryHint === "string" && recoveryHint.trim()) {
     return `运行失败：${truncate(recoveryHint.replace(/\s+/g, " ").trim(), 180)}`;
+  }
+  // With stream metadata, stdout can belong to a successful earlier command.
+  if (Array.isArray(outputChunks) && typeof metadata?.exitCode === "number") {
+    const hasOutput = outputChunks.some((chunk) => typeof chunk?.text === "string" && chunk.text.trim());
+    return `运行失败：退出码 ${metadata.exitCode}${hasOutput ? "（已有部分输出）" : "（无错误详情）"}`;
   }
   const firstLine = activity.result?.output
     ?.split(/\r?\n/)

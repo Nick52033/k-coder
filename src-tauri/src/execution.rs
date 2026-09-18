@@ -576,6 +576,22 @@ impl CommandRuntime {
         &self,
         request: StartCommandRequest,
     ) -> Result<CommandSessionView, ExecutionError> {
+        self.start_with_stdin(request, true).await
+    }
+
+    /// Model tools cannot supply input; keep the host's interactive API separate.
+    pub(crate) async fn start_non_interactive(
+        &self,
+        request: StartCommandRequest,
+    ) -> Result<CommandSessionView, ExecutionError> {
+        self.start_with_stdin(request, false).await
+    }
+
+    async fn start_with_stdin(
+        &self,
+        request: StartCommandRequest,
+        interactive: bool,
+    ) -> Result<CommandSessionView, ExecutionError> {
         if request.program.trim().is_empty() {
             return Err(ExecutionError::Invalid("program must not be empty".into()));
         }
@@ -627,7 +643,11 @@ impl CommandRuntime {
             .envs(request.env.iter().filter(|(key, _)| {
                 !is_sensitive_key(key) && (bundled_path.is_none() || !is_path_key(key))
             }))
-            .stdin(Stdio::piped())
+            .stdin(if interactive {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
@@ -1658,6 +1678,61 @@ mod tests {
         assert_eq!(
             runtime.wait(&failed.id).await.unwrap().state,
             CommandState::Exited { code: 7 }
+        );
+    }
+
+    #[tokio::test]
+    async fn non_interactive_commands_receive_eof_without_a_stdin_writer() {
+        let workspace = tempfile::tempdir().unwrap();
+        let runtime = CommandRuntime::new(workspace.path()).unwrap();
+        #[cfg(windows)]
+        let request = request("cmd", &["/D", "/S", "/C", "more >nul & echo eof"], 10_000);
+        #[cfg(unix)]
+        let request = request("sh", &["-c", "cat >/dev/null; printf eof"], 10_000);
+        let session = runtime.start_non_interactive(request).await.unwrap();
+        let status = tokio::time::timeout(Duration::from_secs(12), runtime.wait(&session.id))
+            .await
+            .expect("non-interactive command should receive EOF")
+            .unwrap();
+        assert_eq!(status.state, CommandState::Exited { code: 0 });
+        let output = runtime
+            .read(&session.id, 0, 20)
+            .await
+            .unwrap()
+            .chunks
+            .into_iter()
+            .map(|chunk| chunk.text)
+            .collect::<String>();
+        assert!(output.contains("eof"), "output was {output:?}");
+    }
+
+    #[tokio::test]
+    async fn host_foreground_sessions_keep_the_explicit_stdin_api() {
+        let workspace = tempfile::tempdir().unwrap();
+        let runtime = CommandRuntime::new(workspace.path()).unwrap();
+        #[cfg(windows)]
+        let command = runtime.shell_request(
+            "$line = [Console]::ReadLine(); Write-Output $line",
+            ".".into(),
+            10_000,
+        );
+        #[cfg(unix)]
+        let command = shell("read line; printf '%s' \"$line\"", 10_000);
+        let session = runtime.start(command).await.unwrap();
+        runtime
+            .write_stdin(&session.id, "interactive-input\n")
+            .await
+            .unwrap();
+        assert_eq!(
+            runtime.wait(&session.id).await.unwrap().state,
+            CommandState::Exited { code: 0 }
+        );
+        let output = runtime.read(&session.id, 0, 20).await.unwrap();
+        assert!(
+            output
+                .chunks
+                .iter()
+                .any(|chunk| chunk.text.contains("interactive-input"))
         );
     }
 
