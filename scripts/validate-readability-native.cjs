@@ -246,12 +246,17 @@ const REPLY = Array.from(
         }
         if (background) {
           expect(metrics.backgroundClass).toBe(true);
-          expect(metrics.conversationBlur).toContain('blur(12px)');
-          expect(metrics.conversationAlpha).toBeGreaterThan(0.85);
-          expect(metrics.conversationAlpha).toBeLessThan(0.91);
+          // P10-201 基线：浅色色调会话区 52% / 侧栏 60%（沿用 P10-200），
+          // 深色色调在 P10-201 把会话区 82%→72%、侧栏 87%→78%、黑纱 32%→16%，
+          // 让背景图真正透出来（内置图上的结构量翻倍），正文/次要文字仍守 4.5:1。
+          // 详见 docs/深色模式背景可见度增强验证.md；改动这几个值必须同步该文档与 App.css。
+          const expected = theme === 'light'
+            ? { conversationAlpha: 0.52, sidebarAlpha: 0.6 }
+            : { conversationAlpha: 0.72, sidebarAlpha: 0.78 };
+          expect(metrics.conversationBlur).toContain('blur(8px)');
+          expect(metrics.conversationAlpha).toBeCloseTo(expected.conversationAlpha, 2);
           expect(metrics.sidebarBlur).toContain('blur(8px)');
-          expect(metrics.sidebarAlpha).toBeGreaterThan(0.89);
-          expect(metrics.sidebarAlpha).toBeLessThan(0.95);
+          expect(metrics.sidebarAlpha).toBeCloseTo(expected.sidebarAlpha, 2);
         } else {
           expect(metrics.backgroundClass).toBe(false);
         }

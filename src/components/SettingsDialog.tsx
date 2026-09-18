@@ -2563,8 +2563,8 @@ function AppearancePage({
       </div>
       <div className="appearance-theme-section appearance-background-section">
         <div className="appearance-section-heading"><div><p className="settings-eyebrow">会话背景</p><h4>背景图</h4></div><span className="appearance-current-theme">本机显示</span></div>
-        {/* 只放原图，纱与深色色调的黑纱交给 .background-preview::after，保证预览与工作区同源合成。 */}
-        <div className="background-preview" aria-label="会话背景预览" style={{ "--background-opacity": backgroundOpacity, backgroundImage: `url("${backgroundImage}")` } as CSSProperties} />
+        {/* 只传原图：图片层（含提饱和/提对比或降饱和）与纱、黑纱分别交给 .background-preview::before/::after，保证预览与工作区同源合成。 */}
+        <div className="background-preview" aria-label="会话背景预览" style={{ "--background-opacity": backgroundOpacity, "--background-image": `url("${backgroundImage}")` } as CSSProperties} />
         <label className="background-upload"><span>上传背景图</span><input type="file" accept="image/png,image/jpeg,image/webp,image/gif" onChange={(event) => { const file = event.target.files?.[0]; if (!file) return; if (file.size > 4 * 1024 * 1024) { event.currentTarget.value = ""; return; } const reader = new FileReader(); reader.onload = () => { if (typeof reader.result === "string") onBackgroundImageChange(reader.result); }; reader.readAsDataURL(file); event.currentTarget.value = ""; }} /></label>
         {backgroundImage.startsWith("data:image/") && <button type="button" className="background-reset" onClick={() => onBackgroundImageChange("/chat-background.png")}>恢复内置背景</button>}
         <label className="background-toggle"><input type="checkbox" checked={backgroundEnabled} onChange={(e) => onBackgroundEnabledChange(e.target.checked)} /> 显示会话背景图</label>

@@ -621,84 +621,106 @@ button {
 [data-tone="light"] .workbench--background {
   --color-ink-muted: #3f4a44;
   --color-ink-subtle: #46514b;
-  --color-ink-faint: #6b756f;
+  /* 本轮面板与白纱一起变薄后，内置背景图最暗像素（约 #617D77）会更多地透上来，
+     #6b756f 在最坏点上只剩 2.75:1。压深到 #5d675f 把最坏点拉回 3.3:1 以上，
+     且仍明显亮于 --color-ink-subtle，保持「正文 > 次要 > 元信息」的阶梯。 */
+  --color-ink-faint: #5d675f;
 }
 .workbench--background::before {
   content: ""; position: absolute; inset: 0; z-index: 0; pointer-events: none;
-  background: linear-gradient(color-mix(in srgb, var(--color-surface) calc(var(--background-opacity, .18) * 100%), transparent), color-mix(in srgb, var(--color-surface) calc(var(--background-opacity, .18) * 100%), transparent)), var(--background-image, url('/chat-background.png')) center / cover no-repeat;
-  /* 轻度提饱和/提对比，抵消上层半透明面板对背景图的稀释。 */
-  backdrop-filter: saturate(1.22) contrast(1.08);
+  background: linear-gradient(color-mix(in srgb, var(--color-surface) calc(var(--background-opacity, .10) * 100%), transparent), color-mix(in srgb, var(--color-surface) calc(var(--background-opacity, .10) * 100%), transparent)), var(--background-image, url('/chat-background.png')) center / cover no-repeat;
+  /* 提饱和/提对比，抵消上层半透明面板对背景图的稀释。
+     必须用 filter，不能用 backdrop-filter：backdrop-filter 过滤的是元素**身后**已经绘制的内容，
+     对 ::before 自己铺的图片层不起作用（旧写法等于空转），这是背景图一直偏淡的隐性原因之一。 */
+  filter: saturate(1.3) contrast(1.12);
 }
 .workbench--background > :is(.titlebar, .sidebar, .conversation) { position: relative; z-index: 1; }
 .workbench--background > :is(.workbench-panel, .subagent-drawer) { z-index: 1; }
 /* 面板不透明度是背景可见度的决定性变量：
      最终可见对比 ≈ 图片对比 × (1 - 白纱) × (1 - 面板不透明度)
-   这里比原设计更透明，配合明暗结构明确的背景图，让背景真正透出来。 */
+   这里比原设计更透明，配合明暗结构明确的背景图，让背景真正透出来。
+   ⚠ 本轮按用户「背景图再明显一点」的反馈，浅色色调面板统一再下调 8~10 个百分点
+   （会话区 62%→52%、侧栏 70%→60%、输入区 64%→54%、标题栏 66%→56%）；
+   底线仍是可读性：正文与次要文字在实测合成底色上都必须过门槛（见 docs/背景图可见度增强验证.md）。 */
 .workbench--background .conversation {
-  background: color-mix(in srgb, var(--color-surface) 62%, transparent);
+  background: color-mix(in srgb, var(--color-surface) 52%, transparent);
   /* Diffuse image details behind prose without blurring the content itself. */
   backdrop-filter: blur(8px) saturate(1.16);
 }
 .workbench--background .message-area { background: transparent; }
 .workbench--background .sidebar {
-  background: color-mix(in srgb, var(--color-surface-raised) 70%, transparent);
+  background: color-mix(in srgb, var(--color-surface-raised) 60%, transparent);
   backdrop-filter: blur(8px) saturate(1.16);
 }
 .workbench--background .composer {
-  background: color-mix(in srgb, var(--color-surface-raised) 64%, transparent);
+  background: color-mix(in srgb, var(--color-surface-raised) 54%, transparent);
   backdrop-filter: blur(12px) saturate(1.14);
 }
 .workbench--background .titlebar {
-  background: color-mix(in srgb, var(--color-surface-chrome) 66%, transparent);
+  background: color-mix(in srgb, var(--color-surface-chrome) 56%, transparent);
   backdrop-filter: blur(9px) saturate(1.14);
 }
 
 /* 设置等弹窗在背景模式下也透出背景图，而不是整块盖住 */
-.workbench--background .modal-backdrop { background: rgba(0, 0, 0, 0.24); }
+.workbench--background .modal-backdrop { background: rgba(0, 0, 0, 0.18); }
 .workbench--background .settings-dialog {
-  background: color-mix(in srgb, var(--color-surface) 72%, transparent);
+  background: color-mix(in srgb, var(--color-surface) 64%, transparent);
   backdrop-filter: blur(20px);
 }
 .workbench--background .settings-navigation {
-  background: color-mix(in srgb, var(--color-surface-panel) 46%, transparent);
+  background: color-mix(in srgb, var(--color-surface-panel) 38%, transparent);
 }
 .workbench--background .settings-content { background: transparent; }
 
-/* ── 深色色调：背景图必须先被压暗，面板才能保持接近不透明 ──
+/* ── 深色色调：先把背景图压暗/降饱和，再让面板带上可见的图 ──
    内置背景图是给浅色色调设计的展示图（整体亮度约 130~250 的雾绿），
    在深色色调下它比所有中性面都亮，直接沿用浅色色调的不透明度会让正文坐在
    约 50% 灰的底上：次要文字跌到 3:1 以下，而且整屏被雾绿染色。
    深色色调不能靠「压深墨色」解决（深色面上压深等于抹掉文字），
    所以反过来处理：① 给图片压一层中性黑纱并降饱和（把绿拉回中性）；
-   ② 面板抬到接近不透明，让 --color-ink-* 设计令牌继续成立。 */
+   ② 面板保持较高不透明度，让 --color-ink-* 设计令牌继续成立；
+   ③ 但「高到看不见图」就违背了这个功能本身，所以面板只抬到刚好守住门槛的位置。
+   ⚠ 深色色调的可见度由三层衰减连乘决定：`(1 − 黑纱) × (1 − 白纱) × (1 − 面板不透明度)`。
+   P10-194 把面板抬到 88%~92%（保住正文 4.5:1）、P10-200 又下调到 82%/87%/85%/85% 并把黑纱收到 32%，
+   但用户仍反馈「深色下背景图不够明显」——实测图像结构只透出约 5 个 CIE L* 单位
+   （浅色色调同位置为 17 个单位），上屏就是一层平色而不是一张图。
+   本轮按「先放图、再守底线」重新配平：黑纱 32%→16%，并只下调两块最大的面
+   （会话区 82%→72%、侧栏 87%→78%），给图片加一点对比度
+   ——`contrast()` 对这张「亮端本来就接近白」的图表现为亮端裁剪、暗端压深，
+   所以结构变明显的同时暗部反而更好读；提饱和同步放宽到 0.68 让图有色彩层次。
+   输入区/标题栏（85%）与设置弹窗（88%）**刻意不动**：它们承载整屏最密的文字，
+   再往下调换来的可见度收益有限，却要先啃掉这两块的可读余量。
+   代价落在最坏点上：纯白自定义图的元信息一档从 4.14 降到 3.12（仍高于 3:1 门槛），
+   正文 ≥6.32、次要（muted）≥4.59 都守住 4.5:1；内置图上的结构量翻倍
+   （会话区 p5~p95 跨度 4.87→9.90 L*），实测见 docs/深色模式背景可见度增强验证.md。 */
 [data-tone="dark"] .workbench--background::before {
   background:
-    linear-gradient(rgba(0, 0, 0, 0.45), rgba(0, 0, 0, 0.45)),
-    linear-gradient(color-mix(in srgb, var(--color-surface) calc(var(--background-opacity, .18) * 100%), transparent), color-mix(in srgb, var(--color-surface) calc(var(--background-opacity, .18) * 100%), transparent)),
+    linear-gradient(rgba(0, 0, 0, 0.16), rgba(0, 0, 0, 0.16)),
+    linear-gradient(color-mix(in srgb, var(--color-surface) calc(var(--background-opacity, .10) * 100%), transparent), color-mix(in srgb, var(--color-surface) calc(var(--background-opacity, .10) * 100%), transparent)),
     var(--background-image, url('/chat-background.png')) center / cover no-repeat;
-  /* 降饱和抵消浅色背景图在深色面上的绿色偏色。 */
-  filter: saturate(0.55) brightness(0.96);
+  /* 降饱和抵消浅色背景图在深色面上的绿色偏色；contrast 提结构（亮端裁剪、暗端压深）。 */
+  filter: saturate(0.68) brightness(0.98) contrast(1.08);
 }
 [data-tone="dark"] .workbench--background .conversation {
-  background: color-mix(in srgb, var(--color-surface) 88%, transparent);
+  background: color-mix(in srgb, var(--color-surface) 72%, transparent);
 }
 [data-tone="dark"] .workbench--background .sidebar {
-  background: color-mix(in srgb, var(--color-surface-raised) 92%, transparent);
+  background: color-mix(in srgb, var(--color-surface-raised) 78%, transparent);
 }
 [data-tone="dark"] .workbench--background .composer {
-  background: color-mix(in srgb, var(--color-surface-raised) 90%, transparent);
+  background: color-mix(in srgb, var(--color-surface-raised) 85%, transparent);
 }
 [data-tone="dark"] .workbench--background .titlebar {
-  background: color-mix(in srgb, var(--color-surface-chrome) 90%, transparent);
+  background: color-mix(in srgb, var(--color-surface-chrome) 85%, transparent);
 }
 [data-tone="dark"] .workbench--background .settings-dialog {
-  background: color-mix(in srgb, var(--color-surface) 92%, transparent);
+  background: color-mix(in srgb, var(--color-surface) 88%, transparent);
 }
 [data-tone="dark"] .workbench--background .settings-navigation {
-  background: color-mix(in srgb, var(--color-surface-panel) 68%, transparent);
+  background: color-mix(in srgb, var(--color-surface-panel) 60%, transparent);
 }
-/* 弹窗遮罩：深色面 + 浅色背景图下 24% 黑挡不住背景，按 40%~60% 门槛抬到 50%。 */
-[data-tone="dark"] .workbench--background .modal-backdrop { background: rgba(0, 0, 0, 0.5); }
+/* 弹窗遮罩：深色面 + 浅色背景图下 24% 黑挡不住背景，按 40%~60% 门槛取 42%（随黑纱下调同步收窄）。 */
+[data-tone="dark"] .workbench--background .modal-backdrop { background: rgba(0, 0, 0, 0.42); }
 
 /* 打开工作台：对话区让出第三列，工作台成为右侧面板（不再是覆盖浮层） */
 .workbench--panel-open {
@@ -4228,25 +4250,36 @@ button {
   border: 1px solid var(--color-border);
   border-radius: 10px;
   background-color: var(--color-surface-panel);
-  /* 图片由组件内联样式提供，避免这里写死内置图导致自定义背景预览失真。 */
-  background-position: center;
-  background-size: contain;
-  background-repeat: no-repeat;
+  /* 图片由组件内联的 --background-image 提供，避免这里写死内置图导致自定义背景预览失真。 */
 }
-/* 预览必须与工作区同源合成：同样的纱 +（深色色调下）同样的黑纱与降饱和，
-   否则预览会比真实界面更亮、也更绿，调参时看到的是假象。 */
+/* 图片单独成层，才能像工作区那样挂 filter；图片层与工作区一样提饱和/提对比
+   （深色色调换成降饱和），否则预览会比真实界面更平更淡，调参时看到的是假象。 */
+.background-preview::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  background: var(--background-image, url('/chat-background.png')) center / contain no-repeat;
+  filter: saturate(1.3) contrast(1.12);
+}
+[data-tone="dark"] .background-preview::before {
+  filter: saturate(0.68) brightness(0.98) contrast(1.08);
+}
+/* 预览必须与工作区同源合成：同样的纱 +（深色色调下）同样的黑纱，
+   否则预览会比真实界面更亮、也更绿，调参时看到的是假象。
+   黑纱比例必须与 [data-tone="dark"] .workbench--background::before 保持一致。 */
 .background-preview::after {
   content: "";
   position: absolute;
   inset: 0;
   border-radius: inherit;
-  background: linear-gradient(color-mix(in srgb, var(--color-surface) calc(var(--background-opacity, .18) * 100%), transparent), color-mix(in srgb, var(--color-surface) calc(var(--background-opacity, .18) * 100%), transparent));
+  background: linear-gradient(color-mix(in srgb, var(--color-surface) calc(var(--background-opacity, .10) * 100%), transparent), color-mix(in srgb, var(--color-surface) calc(var(--background-opacity, .10) * 100%), transparent));
   pointer-events: none;
 }
 [data-tone="dark"] .background-preview::after {
   background:
-    linear-gradient(rgba(0, 0, 0, 0.45), rgba(0, 0, 0, 0.45)),
-    linear-gradient(color-mix(in srgb, var(--color-surface) calc(var(--background-opacity, .18) * 100%), transparent), color-mix(in srgb, var(--color-surface) calc(var(--background-opacity, .18) * 100%), transparent));
+    linear-gradient(rgba(0, 0, 0, 0.16), rgba(0, 0, 0, 0.16)),
+    linear-gradient(color-mix(in srgb, var(--color-surface) calc(var(--background-opacity, .10) * 100%), transparent), color-mix(in srgb, var(--color-surface) calc(var(--background-opacity, .10) * 100%), transparent));
 }
 .background-toggle, .background-opacity { display:flex; align-items:center; gap:10px; font-size: var(--font-size-sm); margin: 10px 0; }
 .background-upload { display:inline-flex; align-items:center; gap:8px; margin: 4px 0 8px; padding: 7px 10px; border: 1px solid var(--color-border); border-radius: 7px; color: var(--color-brand); cursor:pointer; font-size: var(--font-size-sm); }

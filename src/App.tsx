@@ -392,8 +392,9 @@ function App() {
   const [backgroundEnabled, setBackgroundEnabled] = useState(() => localStorage.getItem("kcoder_background_enabled") !== "false");
   const [backgroundImage, setBackgroundImage] = useState(() => localStorage.getItem("kcoder_background_image") || "/chat-background.png");
   const [backgroundOpacity, setBackgroundOpacity] = useState(() => {
-    const stored = Number(localStorage.getItem("kcoder_background_opacity") ?? "0.18");
-    if (!Number.isFinite(stored)) return 0.18;
+    // 缺省白纱从 18% 收到 10%：配合更透明的面板，让内置背景图一上手就清晰可见。
+    const stored = Number(localStorage.getItem("kcoder_background_opacity") ?? "0.10");
+    if (!Number.isFinite(stored)) return 0.10;
     // 旧版本把该值当作“白纱厚度”，遗留值可高达 0.85，会把背景图整块盖住。
     return Math.min(Math.max(stored, 0), 0.6);
   });
