@@ -51,6 +51,7 @@ export const ConversationTurnActivity = memo(function ConversationTurnActivity({
   changes = [],
   plan,
   turnId,
+  workflowPlan = false,
   streaming = false,
   initialTextVisible = false,
   activityStatus = null,
@@ -66,6 +67,8 @@ export const ConversationTurnActivity = memo(function ConversationTurnActivity({
   changes?: ChangeSet[];
   plan: PlanView | null;
   turnId?: string;
+  /** 该计划是否由机器人工作流派生；机器人节点进度不参与普通计划的收尾核对。 */
+  workflowPlan?: boolean;
   streaming?: boolean;
   initialTextVisible?: boolean;
   activityStatus?: AgentActivityStatus | null;
@@ -93,6 +96,9 @@ export const ConversationTurnActivity = memo(function ConversationTurnActivity({
     (item): item is Extract<TurnTimelineItem, { type: "event" }> => item.type === "event" && isTerminalEvent(item.kind),
   );
   const processItems = processTimeline.filter((item) => item !== terminalEvent && isVisibleConversationTimelineItem(item));
+  const turnOutcome: TerminalEventKind | null = terminalEvent && isTerminalEvent(terminalEvent.kind)
+    ? terminalEvent.kind
+    : null;
   const groupedProcessTimeline = groupConsecutiveTimeline(processItems);
   const hasItems = Boolean(activities.length || processItems.length);
   const hasProcess = hasItems || Boolean(activityStatus) || terminalEvent?.kind === "turn_failed" || terminalEvent?.kind === "turn_cancelled";
@@ -239,13 +245,17 @@ export const ConversationTurnActivity = memo(function ConversationTurnActivity({
           changes={changes}
           plan={plan}
           turnId={turnId}
+          workflowPlan={workflowPlan}
+          turnOutcome={turnOutcome}
         />
       ) : null}
     </div>
   );
 });
 
-function isTerminalEvent(kind: TimelineEventKind) {
+type TerminalEventKind = "turn_completed" | "turn_failed" | "turn_cancelled";
+
+function isTerminalEvent(kind: TimelineEventKind): kind is TerminalEventKind {
   return kind === "turn_completed" || kind === "turn_failed" || kind === "turn_cancelled";
 }
 

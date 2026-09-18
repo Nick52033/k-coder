@@ -24,9 +24,23 @@ interface PlanProgressProps {
   changes: ChangeSet[];
   plan: PlanView;
   turnId?: string;
+  /**
+   * 计划是否由机器人工作流派生。机器人节点进度由 `complete_workflow_node` 驱动，
+   * 一个 Turn 正常结束并不代表工作流节点已全部完成，因此不参与收尾核对。
+   */
+  workflowPlan?: boolean;
+  /** 承载该计划的 Turn 的权威终态；`null` 表示尚无可用的终态事实。 */
+  turnOutcome?: "turn_completed" | "turn_failed" | "turn_cancelled" | null;
 }
 
-export function PlanProgress({ activeTurn, changes, plan, turnId }: PlanProgressProps) {
+export function PlanProgress({
+  activeTurn,
+  changes,
+  plan,
+  turnId,
+  workflowPlan = false,
+  turnOutcome = null,
+}: PlanProgressProps) {
   const triggerRef = useRef<HTMLButtonElement>(null);
   const popoverRef = useRef<HTMLDivElement>(null);
   const closeTimerRef = useRef<number | null>(null);
@@ -35,7 +49,8 @@ export function PlanProgress({ activeTurn, changes, plan, turnId }: PlanProgress
   const [pinned, setPinned] = useState(false);
   const [visible, setVisible] = useState(false);
   const popoverId = `plan-progress-${useId().replace(/:/g, "")}`;
-  const summary = useMemo(() => summarizePlan(plan), [plan]);
+  const unreconciled = isUnreconciledPlan(plan, { activeTurn, workflowPlan, turnOutcome });
+  const summary = useMemo(() => summarizePlan(plan, unreconciled), [plan, unreconciled]);
   const changeSummary = useMemo(
     () => summarizeChanges(changes, turnId),
     [changes, turnId],
@@ -191,14 +206,18 @@ export function PlanProgress({ activeTurn, changes, plan, turnId }: PlanProgress
         aria-controls={popoverId}
         aria-expanded={visible}
         aria-haspopup="dialog"
-        aria-label={progressAriaLabel(summary.current, summary.total, summary.completed, changeSummary)}
+        aria-label={progressAriaLabel(summary, changeSummary)}
         onBlur={scheduleHide}
         onClick={togglePinned}
         onFocus={showPopover}
         onPointerEnter={enterProgress}
         onPointerLeave={leaveProgress}
       >
-        <span className="plan-progress-position">第 {summary.current}/{summary.total} 步</span>
+        <span className="plan-progress-position">
+          {summary.state === "unreconciled"
+            ? `计划未收尾 · ${summary.completed}/${summary.total} 已完成`
+            : `第 ${summary.current}/${summary.total} 步`}
+        </span>
         {changeSummary.files > 0 ? (
           <>
             <span className="plan-progress-separator" aria-hidden="true">·</span>
@@ -224,6 +243,11 @@ export function PlanProgress({ activeTurn, changes, plan, turnId }: PlanProgress
           <strong>执行步骤</strong>
           <span>{summary.completed}/{summary.total} 已完成</span>
         </header>
+        {summary.state === "unreconciled" ? (
+          <p className="plan-progress-notice">
+            本轮已结束，计划仍停在「进行中」。模型未在收尾前同步步骤状态，这里的进度可能落后于正文结论。
+          </p>
+        ) : null}
         <ol className="plan-progress-steps">
           {plan.steps.map((step, index) => (
             <li
@@ -255,7 +279,7 @@ function PlanStateIcon({ status }: { status: PlanStepState }) {
   return <Circle size={16} aria-hidden="true" />;
 }
 
-function summarizePlan(plan: PlanView) {
+function summarizePlan(plan: PlanView, unreconciled: boolean) {
   const total = plan.steps.length;
   const activeIndex = plan.steps.findIndex((step) => step.status === "in_progress");
   const failedIndex = plan.steps.findIndex((step) => step.status === "failed");
@@ -271,14 +295,37 @@ function summarizePlan(plan: PlanView) {
   const settled = plan.steps.filter(
     (step) => step.status === "completed" || step.status === "skipped",
   ).length;
-  const state = failedIndex >= 0
-    ? "failed"
-    : total > 0 && settled === total
-      ? "completed"
-      : activeIndex >= 0
-        ? "active"
-        : "pending";
+  const state = unreconciled
+    ? "unreconciled"
+    : failedIndex >= 0
+      ? "failed"
+      : total > 0 && settled === total
+        ? "completed"
+        : activeIndex >= 0
+          ? "active"
+          : "pending";
   return { completed, current: currentIndex + 1, state, total };
+}
+
+/**
+ * 只暴露事实，不替模型收尾：承载该计划的普通 Turn 已经正常结束，计划里却仍留有
+ * 「进行中」步骤——这是正文宣称完成而快照没跟上时的可观测矛盾。
+ *
+ * 刻意不做的事：不把残留步骤改写成 completed（那会伪造未经验证的完成事实），
+ * 也不在失败、取消、仍进行中，或只有 pending 的普通计划上触发（这些情况下计划
+ * 停在中间是真实的）。机器人节点进度由 `complete_workflow_node` 驱动，同样排除。
+ */
+export function isUnreconciledPlan(
+  plan: PlanView,
+  options: {
+    activeTurn: boolean;
+    workflowPlan: boolean;
+    turnOutcome: "turn_completed" | "turn_failed" | "turn_cancelled" | null;
+  },
+) {
+  if (options.workflowPlan || options.activeTurn) return false;
+  if (options.turnOutcome !== "turn_completed") return false;
+  return plan.steps.some((step) => step.status === "in_progress");
 }
 
 function summarizeChanges(changes: ChangeSet[], turnId?: string) {
@@ -306,12 +353,12 @@ function planStatusLabel(status: PlanStepState) {
 }
 
 function progressAriaLabel(
-  current: number,
-  total: number,
-  completed: number,
+  summary: { completed: number; current: number; state: string; total: number },
   changes: { added: number; deleted: number; files: number },
 ) {
-  const planLabel = `执行计划：第 ${current}/${total} 步，${completed} 步已完成`;
+  const planLabel = summary.state === "unreconciled"
+    ? `执行计划未收尾：共 ${summary.total} 步，${summary.completed} 步已完成，本轮已结束但仍有进行中的步骤`
+    : `执行计划：第 ${summary.current}/${summary.total} 步，${summary.completed} 步已完成`;
   if (!changes.files) return planLabel;
   return `${planLabel}，${changes.files} 个文件已更新，新增 ${changes.added} 行，删除 ${changes.deleted} 行`;
 }

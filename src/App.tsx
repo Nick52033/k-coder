@@ -1385,6 +1385,8 @@ function App() {
   const retryTurnGroupsByUserMessage = derivedTurnData.retryTurnGroupsByUserMessage;
   const groupedRetryTurnIds = derivedTurnData.groupedRetryTurnIds;
   const planTurnId = derivedTurnData.planTurnId;
+  // 机器人节点进度由 complete_workflow_node 驱动，工作流计划不参与普通计划的收尾核对。
+  const workflowPlanActive = Boolean(workflowRun);
   const orphanTurnIds = derivedTurnData.orphanTurnIds;
   const orphanTurnsByUserMessage = derivedTurnData.orphanTurnsByUserMessage;
   const unanchoredOrphanTurnIds = derivedTurnData.unanchoredOrphanTurnIds;
@@ -1413,6 +1415,7 @@ function App() {
               timeline={timelineByTurn.get(turnId) ?? []}
               changes={changes}
               plan={turnId === planTurnId ? plan : null}
+              workflowPlan={workflowPlanActive}
               turnId={turnId}
               streaming={turnId === currentThreadTurnId}
               initialTextVisible={turnId === restoredCurrentTurnId}
@@ -1546,6 +1549,7 @@ function App() {
             timeline={segment.timeline}
             changes={changes}
             plan={segmentPlan}
+            workflowPlan={workflowPlanActive}
             turnId={segment.turnId}
             streaming={segmentStreaming}
             initialTextVisible={segment.turnId === restoredCurrentTurnId}
@@ -1614,6 +1618,7 @@ function App() {
                   timeline={attemptTimeline}
                   changes={changes}
                   plan={attemptPlan}
+                  workflowPlan={workflowPlanActive}
                   turnId={turnId}
                   streaming={attemptIsTerminalSegment && turnId === currentThreadTurnId}
                   initialTextVisible={turnId === restoredCurrentTurnId}
@@ -2556,6 +2561,7 @@ function App() {
                           timeline={messageTimeline}
                           changes={changes}
                           plan={messagePlan}
+                          workflowPlan={workflowPlanActive}
                           turnId={message.turnId}
                           streaming={message.status === "streaming"}
                           initialTextVisible={message.turnId === restoredCurrentTurnId}

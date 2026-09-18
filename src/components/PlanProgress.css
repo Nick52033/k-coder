@@ -44,6 +44,15 @@
   border-color: color-mix(in srgb, var(--color-error) 72%, var(--color-border));
 }
 
+.plan-progress--unreconciled .plan-progress-trigger {
+  border-color: color-mix(in srgb, var(--color-warning) 68%, var(--color-border));
+  background: color-mix(in srgb, var(--color-warning) 6%, var(--color-surface-raised));
+}
+
+.plan-progress--unreconciled .plan-progress-position {
+  color: var(--color-warning);
+}
+
 .plan-progress-position {
   flex: 0 0 auto;
   color: var(--color-ink);
@@ -122,6 +131,16 @@
   color: var(--color-ink-subtle);
   font-size: var(--font-size-xs);
   white-space: nowrap;
+}
+
+.plan-progress-notice {
+  margin: 0;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--color-border);
+  background: color-mix(in srgb, var(--color-warning) 9%, var(--color-surface-raised));
+  color: var(--color-ink);
+  font-size: var(--font-size-xs);
+  line-height: 1.45;
 }
 
 .plan-progress-steps {

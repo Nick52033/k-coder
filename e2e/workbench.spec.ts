@@ -1702,8 +1702,8 @@ test("supports the primary workbench inspection flow", async ({ page }, testInfo
   await expect(page.locator(".turn-event-step--provider_context")).toHaveCount(0);
   await expect(page.locator(".turn-event-step--usage")).toHaveCount(0);
   const planProgress = page.locator(".plan-progress").first();
-  const planProgressTrigger = planProgress.getByRole("button", { name: /执行计划：第 2\/2 步/ });
-  await expect(planProgressTrigger).toContainText("第 2/2 步");
+  const planProgressTrigger = planProgress.getByRole("button", { name: /执行计划未收尾：共 2 步/ });
+  await expect(planProgressTrigger).toContainText("计划未收尾 · 1/2 已完成");
   await expect(planProgressTrigger).toContainText("1 个文件已更新");
   await expect(planProgressTrigger).toContainText("+1");
   await expect(planProgressTrigger).toContainText("-1");
@@ -6881,11 +6881,39 @@ test("robot progress follows authoritative nodes across failure retry and reload
   await expect(control).toContainText("3 / 8");
 });
 
+test("robot node progress stays authoritative after a turn completes", async ({ page }) => {
+  await page.addInitScript(() => {
+    if (localStorage.getItem("kcoder_e2e_workflow_run")) return;
+    const nodes = ["requirements-analysis", "interface-architecture-design", "html-prototype", "backend-development", "frontend-development", "comprehensive-testing", "build-release", "code-review-delivery"];
+    localStorage.setItem("kcoder_e2e_plan", JSON.stringify({ schemaVersion: 1, threadId: "thread-1", revision: 1, updatedAtMs: 1, steps: nodes.map((id, index) => ({ id, step: `旧计划 ${index + 1}`, status: index === 0 ? "in_progress" : "pending" })) }));
+    localStorage.setItem("kcoder_e2e_workflow_run", JSON.stringify({ schemaVersion: 1, definitionVersion: 2, id: "reconcile-run", threadId: "thread-1", workflowId: "fullstack-delivery", objective: "收尾核对边界", state: "active", currentNodeId: nodes[1], currentNodeIndex: 1, nodeCount: 8, completedNodes: [{ nodeId: nodes[0], summary: "需求已确认", evidence: ["docs"], completedAtMs: 2 }], createdAtMs: 1, updatedAtMs: 2, revision: 2 }));
+  });
+  await page.goto("/");
+  const progress = page.locator(".plan-progress-trigger");
+  await expect(progress).toContainText("第 2/8 步");
+  await page.evaluate(() => {
+    const emit = (window as unknown as { __emitAgentEvent: (event: unknown) => void }).__emitAgentEvent;
+    const base = { schemaVersion: 1, threadId: "thread-1", turnId: "robot-reconcile" };
+    emit({ ...base, phase: "executing", type: "turn_started" });
+    emit({
+      ...base,
+      type: "turn_completed",
+      phase: "completed",
+      message: { schemaVersion: 1, id: "robot-reconcile-done", role: "assistant", content: [{ type: "text", text: "本轮节点已完成。" }], createdAtMs: 4 },
+      usage: null,
+    });
+  });
+  // 一个 Turn 正常结束不代表工作流节点已全部完成：机器人进度按节点事实显示，不标记为未收尾。
+  await expect(progress).toContainText("第 2/8 步");
+  await expect(progress).not.toContainText("计划未收尾");
+});
+
 test("ordinary conversation keeps its independent plan progress", async ({ page }) => {
   await page.goto("/");
   const progress = page.locator(".plan-progress-trigger");
   await expect(progress).toHaveCount(1);
-  await expect(progress).toContainText("第 2/2 步");
+  // Turn 已经正常结束，计划却仍停在「进行中」：如实暴露未收尾，而不是继续显示误导性的进行中步数。
+  await expect(progress).toContainText("计划未收尾 · 1/2 已完成");
   await expect(progress).toContainText("1 个文件已更新");
   await page.evaluate(() => {
     (window as unknown as { __emitAgentEvent: (event: unknown) => void }).__emitAgentEvent({
@@ -6898,10 +6926,11 @@ test("ordinary conversation keeps its independent plan progress", async ({ page 
   await expect(progress).toHaveCount(1);
   await progress.click();
   const details = page.getByRole("dialog", { name: "执行计划详情" });
+  await expect(details).toContainText("模型未在收尾前同步步骤状态");
   await expect(details.locator(".plan-progress-step--completed")).toContainText("检查工作区");
   await expect(details.locator(".plan-progress-step--in_progress")).toContainText("验证实现");
   await page.reload();
-  await expect(progress).toContainText("第 2/2 步");
+  await expect(progress).toContainText("计划未收尾 · 1/2 已完成");
 });
 
 test("previews markdown data, remote, workspace and browser artifact images safely", async ({ page }) => {
