@@ -148,7 +148,7 @@ const REPLY = Array.from(
     expect(geometry.position).toBe('sticky');
     result.scrollToBottom = geometry;
 
-    await area.screenshot({ path: 'docs/回到底部按钮-原生.png' });
+    await area.screenshot({ path: 'docs/sys/回到底部按钮-原生.png' });
 
     // 点击后恢复跟随并立即回到最新内容，按钮随滚动状态自动隐藏。
     await button.click();
@@ -249,7 +249,7 @@ const REPLY = Array.from(
           // P10-201 基线：浅色色调会话区 52% / 侧栏 60%（沿用 P10-200），
           // 深色色调在 P10-201 把会话区 82%→72%、侧栏 87%→78%、黑纱 32%→16%，
           // 让背景图真正透出来（内置图上的结构量翻倍），正文/次要文字仍守 4.5:1。
-          // 详见 docs/深色模式背景可见度增强验证.md；改动这几个值必须同步该文档与 App.css。
+          // 基线的推导过程见路线图 P10-201（对应验证文档已按用户要求从仓库移除）；改动这几个值必须同步 App.css。
           const expected = theme === 'light'
             ? { conversationAlpha: 0.52, sidebarAlpha: 0.6 }
             : { conversationAlpha: 0.72, sidebarAlpha: 0.78 };
@@ -273,12 +273,12 @@ const REPLY = Array.from(
     await page.reload();
     await ready();
     await expect(page.locator('.message-list')).toHaveCount(1);
-    await page.screenshot({ path: 'docs/阅读层级-原生-浅色.png' });
+    await page.screenshot({ path: 'docs/sys/阅读层级-原生-浅色.png' });
     await page.evaluate(() => localStorage.setItem('kcoder_theme', 'dark'));
     await page.reload();
     await ready();
     await expect(page.locator('.message-list')).toHaveCount(1);
-    await page.screenshot({ path: 'docs/阅读层级-原生-深色.png' });
+    await page.screenshot({ path: 'docs/sys/阅读层级-原生-深色.png' });
 
     writeFileSync(
       'src-tauri/target/readability-native-result.json',

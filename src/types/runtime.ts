@@ -326,6 +326,8 @@ export interface ContextCompactionSummary {
   userConstraints: string[];
   recentUserMessages?: string[];
   currentUserRequest?: string;
+  userClarifications?: string[];
+  recentAssistantProgress?: string[];
   importantToolObservations?: string[];
   recentToolResults: unknown[];
   compactedMessageCount: number;
@@ -1068,7 +1070,8 @@ export interface UserInputRequest {
   kind: UserInputRequestKind;
   questions: UserInputQuestion[];
   createdAtMs: number;
-  expiresAtMs: number;
+  /** null 表示持续等待用户回答；数值仅用于兼容旧历史。 */
+  expiresAtMs: number | null;
 }
 
 export type UserInputAction = "answered" | "skipped" | "cancelled";

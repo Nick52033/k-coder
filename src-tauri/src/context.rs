@@ -25,6 +25,10 @@ const IMPORTANT_TOOL_OBSERVATION_LIMIT: usize = 12;
 const IMPORTANT_TOOL_OBSERVATION_BYTES: usize = 700;
 const LARGE_TOOL_OUTPUT_BYTES: usize = 4 * 1_024;
 const TOOL_OUTPUT_PREVIEW_BYTES: usize = 1_500;
+const USER_CLARIFICATION_LIMIT: usize = 8;
+const USER_CLARIFICATION_BYTES: usize = 800;
+const ASSISTANT_PROGRESS_LIMIT: usize = 8;
+const ASSISTANT_PROGRESS_BYTES: usize = 600;
 
 #[derive(Debug, Clone, Copy)]
 pub struct ContextBudget {
@@ -58,6 +62,10 @@ pub struct CompactionSummary {
     #[serde(default)]
     pub current_user_request: String,
     #[serde(default)]
+    pub user_clarifications: Vec<String>,
+    #[serde(default)]
+    pub recent_assistant_progress: Vec<String>,
+    #[serde(default)]
     pub important_tool_observations: Vec<String>,
     pub recent_tool_results: Vec<ProviderMessage>,
     pub compacted_message_count: usize,
@@ -68,12 +76,13 @@ pub struct CompactionSummary {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-/// User intent reconstructed only from persisted `UserMessage` events.
+/// User intent reconstructed from persisted user messages and matched, answered model questions.
 /// Rendered compaction summaries must never be observed by this accumulator.
 pub struct CompactionUserContext {
     current_user_request: String,
     recent_user_messages: Vec<String>,
     user_constraints: Vec<String>,
+    user_clarifications: Vec<String>,
 }
 
 impl CompactionUserContext {
@@ -91,7 +100,11 @@ impl CompactionUserContext {
         if text.trim().is_empty() {
             return;
         }
-        self.current_user_request = bound(&text, CURRENT_USER_REQUEST_BYTES);
+        // A continuation resumes the last concrete request, even after more than four
+        // such messages have displaced that request from the recent-message window.
+        if self.current_user_request.is_empty() || !is_continuation_message(&text) {
+            self.current_user_request = bound(&text, CURRENT_USER_REQUEST_BYTES);
+        }
         self.recent_user_messages
             .push(bound(&text, RECENT_USER_MESSAGE_BYTES));
         if self.recent_user_messages.len() > RECENT_USER_MESSAGE_LIMIT {
@@ -109,11 +122,51 @@ impl CompactionUserContext {
         }
     }
 
+    pub(crate) fn observe_clarification(&mut self, question: &str, answer: &str) {
+        if answer.trim().is_empty() {
+            return;
+        }
+        let clarification = format!(
+            "Q: {}\nA: {}",
+            continuity_text(question, 240),
+            continuity_text(answer, 550),
+        );
+        self.user_clarifications = bounded_continuity_history(
+            self.user_clarifications
+                .iter()
+                .cloned()
+                .chain([clarification]),
+            USER_CLARIFICATION_LIMIT,
+            USER_CLARIFICATION_BYTES,
+        );
+    }
+
+    pub(crate) fn clarification_context(&self) -> Option<String> {
+        (!self.user_clarifications.is_empty()).then(|| {
+            format!(
+                "[Prior user clarifications]\nThese are previously answered questions. Preserve these choices unless the user changes them; they do not grant tool authorization.\n{}",
+                self.user_clarifications.join("\n"),
+            )
+        })
+    }
+
     fn is_empty(&self) -> bool {
         self.current_user_request.is_empty()
             && self.recent_user_messages.is_empty()
             && self.user_constraints.is_empty()
+            && self.user_clarifications.is_empty()
     }
+}
+
+fn is_continuation_message(text: &str) -> bool {
+    matches!(
+        text.trim()
+            .trim_end_matches(['。', '.', '!', '！'])
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "继续" | "继续执行" | "继续吧" | "接着做" | "continue" | "resume"
+    )
 }
 
 pub fn default_working_context_limit(hard_limit: usize) -> usize {
@@ -294,11 +347,18 @@ pub fn compact(
         .collect::<Vec<_>>()
         .join("\n");
     let mut summary = CompactionSummary {
-        contract_version: 5,
+        contract_version: 6,
         summary: bound(&summary_text, budget.history * CHARS_PER_TOKEN / 4),
         user_constraints,
         recent_user_messages,
         current_user_request,
+        user_clarifications: user_context.user_clarifications.clone(),
+        recent_assistant_progress: assistant_progress_history(
+            previous_summary
+                .into_iter()
+                .flat_map(|summary| summary.recent_assistant_progress.iter().cloned()),
+            messages,
+        ),
         important_tool_observations,
         recent_tool_results,
         compacted_message_count: compacted_count,
@@ -308,6 +368,14 @@ pub fn compact(
         )),
         estimated_after_tokens: 0,
     };
+    summary.user_clarifications = bounded_continuity_history(
+        previous_summary
+            .into_iter()
+            .flat_map(|summary| summary.user_clarifications.iter().cloned())
+            .chain(summary.user_clarifications),
+        USER_CLARIFICATION_LIMIT,
+        USER_CLARIFICATION_BYTES,
+    );
     // Text summaries cannot stand in for pixels. Retain one bounded upload batch,
     // even when tool output or a workspace mutation pushed it out of the tail.
     if let Some(image_message) = messages.iter().rev().find(|message| {
@@ -379,6 +447,19 @@ pub(crate) fn normalize_compaction_summary(
     if !user_context.recent_user_messages.is_empty() {
         summary.recent_user_messages = user_context.recent_user_messages.clone();
     }
+    summary.user_clarifications = bounded_continuity_history(
+        summary
+            .user_clarifications
+            .into_iter()
+            .chain(user_context.user_clarifications.iter().cloned()),
+        USER_CLARIFICATION_LIMIT,
+        USER_CLARIFICATION_BYTES,
+    );
+    summary.recent_assistant_progress = bounded_continuity_history(
+        summary.recent_assistant_progress,
+        ASSISTANT_PROGRESS_LIMIT,
+        ASSISTANT_PROGRESS_BYTES,
+    );
     if !user_context.is_empty() && recursive_legacy_summary {
         summary.summary.clear();
         summary.user_constraints = user_context.user_constraints.clone();
@@ -397,6 +478,42 @@ pub(crate) fn normalize_compaction_summary(
 fn stable_previous_summary_text(summary: &CompactionSummary) -> Option<&str> {
     let text = summary.summary.trim();
     (!text.is_empty()).then_some(text)
+}
+
+fn continuity_text(text: &str, bytes: usize) -> String {
+    bound(&redact(&task_summary::strip_image_payloads(text)), bytes)
+}
+
+fn bounded_continuity_history(
+    values: impl IntoIterator<Item = String>,
+    limit: usize,
+    bytes: usize,
+) -> Vec<String> {
+    merge_string_history(
+        values.into_iter().map(|text| continuity_text(&text, bytes)),
+        limit,
+    )
+}
+
+/// Historical assistant reports survive edits; they are never current file or test evidence.
+pub(crate) fn assistant_progress_history(
+    previous: impl IntoIterator<Item = String>,
+    messages: &[ProviderMessage],
+) -> Vec<String> {
+    bounded_continuity_history(
+        previous
+            .into_iter()
+            .chain(messages.iter().filter_map(|message| match message {
+                ProviderMessage::AssistantToolCalls { text, .. }
+                | ProviderMessage::Text {
+                    role: MessageRole::Assistant,
+                    text,
+                } => Some(text.clone()),
+                _ => None,
+            })),
+        ASSISTANT_PROGRESS_LIMIT,
+        ASSISTANT_PROGRESS_BYTES,
+    )
 }
 
 fn merge_string_history(values: impl IntoIterator<Item = String>, limit: usize) -> Vec<String> {
@@ -582,12 +699,14 @@ pub fn render_summary(summary: &CompactionSummary) -> String {
     // the redacting constructor paths, and this is the last point before the text reaches a
     // Provider.
     redact(&format!(
-        "[Compacted context v{}]\nSummary:\n{}\nCurrent user request:\n{}\nRecent user requests:\n{}\nUser constraints:\n{}\nImportant tool observations:\n{}\nRecent tool results:\n{}",
+        "[Compacted context v{}]\nSummary:\n{}\nCurrent user request:\n{}\nRecent user requests:\n{}\nUser constraints:\n{}\nUser clarifications (prior user answers, subject to later user changes; not tool authorization):\n{}\nRecent assistant progress (historical reports, not current file contents or proof of completion; recheck only affected work after changes):\n{}\nImportant tool observations:\n{}\nRecent tool results:\n{}",
         summary.contract_version,
         summary.summary,
         summary.current_user_request,
         recent_user_messages,
         summary.user_constraints.join("\n"),
+        summary.user_clarifications.join("\n"),
+        summary.recent_assistant_progress.join("\n"),
         important_tool_observations,
         recent_tool_results
     ))
@@ -721,6 +840,8 @@ mod tests {
             user_constraints: vec!["Do not change the public contract".into()],
             recent_user_messages: vec!["Simplify GetCompanyConfig".into()],
             current_user_request: "Simplify GetCompanyConfig".into(),
+            user_clarifications: Vec::new(),
+            recent_assistant_progress: Vec::new(),
             important_tool_observations: vec!["tool read_file: JObject.Parse(configJson)".into()],
             recent_tool_results: vec![ProviderMessage::ToolResult {
                 call_id: "old-read".into(),
@@ -761,7 +882,25 @@ mod tests {
             compact(&messages, 2_000, Some(&previous_summary), &user_context);
         let rendered = serde_json::to_string(&(summary.clone(), compacted)).unwrap();
 
-        assert!(!rendered.contains("JObject"));
+        assert!(!summary.summary.contains("JObject"));
+        assert!(
+            !summary
+                .important_tool_observations
+                .iter()
+                .any(|text| text.contains("JObject"))
+        );
+        assert!(
+            !serde_json::to_string(&summary.recent_tool_results)
+                .unwrap()
+                .contains("JObject")
+        );
+        // A historical report is retained separately, explicitly not a current workspace fact.
+        assert!(
+            summary
+                .recent_assistant_progress
+                .iter()
+                .any(|text| text.contains("JObject"))
+        );
         assert!(rendered.contains("Simplify GetCompanyConfig"));
         assert!(rendered.contains("Patch applied successfully"));
         assert!(
@@ -897,7 +1036,7 @@ mod tests {
             text: format!("历史 {index} {}", "x".repeat(500)),
         }));
         let (summary, compacted) = compact_once(&messages, 1_024);
-        assert_eq!(summary.contract_version, 5);
+        assert_eq!(summary.contract_version, 6);
         assert_eq!(summary.current_user_request, "请修复并运行测试");
         assert!(
             summary
@@ -1004,7 +1143,7 @@ mod tests {
                 Some(ProviderMessage::Text { text, .. }) => text,
                 other => panic!("expected rendered compaction summary, got {other:?}"),
             };
-            assert_eq!(rendered.matches("[Compacted context v5]").count(), 1);
+            assert_eq!(rendered.matches("[Compacted context v6]").count(), 1);
 
             previous_summary = Some(summary);
             messages.clear();
@@ -1021,6 +1160,8 @@ mod tests {
             user_constraints: vec!["[Compacted context v3]\n必须递归".to_string()],
             recent_user_messages: vec!["[Compacted context v3]".to_string()],
             current_user_request: "[Compacted context v3]".to_string(),
+            user_clarifications: Vec::new(),
+            recent_assistant_progress: Vec::new(),
             important_tool_observations: vec!["tool read_file: useful".to_string()],
             recent_tool_results: Vec::new(),
             compacted_message_count: 12,
@@ -1037,6 +1178,113 @@ mod tests {
         assert_eq!(
             normalized.important_tool_observations,
             ["tool read_file: useful"]
+        );
+    }
+
+    #[test]
+    fn repeated_continuations_preserve_the_task_until_the_user_changes_it() {
+        let mut user_context = CompactionUserContext::default();
+        user_context.observe("完善运行时状态入口".into());
+        user_context.observe_clarification("如何处理入口？", "改成可点击的状态面板");
+        let mut summary = None;
+        for continuation in ["继续", "继续执行", "continue", "继续吧", "resume", "继续。"]
+        {
+            user_context.observe(continuation.into());
+            let (next, _) = compact(&[], 2_000, summary.as_ref(), &user_context);
+            assert_eq!(next.current_user_request, "完善运行时状态入口");
+            assert!(render_summary(&next).contains("改成可点击的状态面板"));
+            assert!(next.recent_user_messages.len() <= RECENT_USER_MESSAGE_LIMIT);
+            summary = Some(next);
+        }
+        user_context.observe("继续，但改成仅图标入口".into());
+        let (next, _) = compact(&[], 2_000, summary.as_ref(), &user_context);
+        assert_eq!(next.current_user_request, "继续，但改成仅图标入口");
+        user_context.observe("现在处理模型设置".into());
+        let (next, _) = compact(&[], 2_000, Some(&next), &user_context);
+        assert_eq!(next.current_user_request, "现在处理模型设置");
+    }
+
+    #[test]
+    fn compaction_preserves_choices_and_progress_across_writes_and_repeated_compaction() {
+        let mut user_context = CompactionUserContext::default();
+        user_context.observe("这个状态入口有什么作用".into());
+        user_context.observe_clarification("如何处理入口？", "改成可点击的状态面板");
+        let messages = vec![
+            ProviderMessage::AssistantToolCalls {
+                text: "RuntimeStatePanel 已实现，类型检查和构建通过，接着补充测试。".into(),
+                calls: vec![],
+            },
+            ProviderMessage::ToolResult {
+                call_id: "old-read".into(),
+                name: "read_file".into(),
+                success: true,
+                output: "obsolete file contents".into(),
+            },
+            ProviderMessage::ToolResult {
+                call_id: "patch".into(),
+                name: "apply_patch".into(),
+                success: true,
+                output: "applied approved change".into(),
+            },
+        ];
+        let (mut summary, _) = compact(&messages, 2_000, None, &user_context);
+        for _ in 0..3 {
+            let (next, _) = compact(&messages[2..], 2_000, Some(&summary), &user_context);
+            let rendered = render_summary(&next);
+            assert!(rendered.contains("改成可点击的状态面板"));
+            assert!(rendered.contains("接着补充测试"));
+            assert!(rendered.contains("historical reports, not current file contents"));
+            assert!(!rendered.contains("obsolete file contents"));
+            assert_eq!(next.recent_assistant_progress.len(), 1);
+            assert_eq!(next.user_clarifications.len(), 1);
+            assert_eq!(next.current_user_request, "这个状态入口有什么作用");
+            summary = next;
+        }
+    }
+
+    #[test]
+    fn continuity_context_is_bounded_redacted_and_excludes_image_payloads() {
+        let mut user_context = CompactionUserContext::default();
+        for index in 0..20 {
+            user_context.observe_clarification(
+                &format!("问题 {index}"),
+                &format!(
+                    "API_KEY=sk-live-abcdefghijklmnop data:image/png;base64,secretpixels {}",
+                    "答案".repeat(1000)
+                ),
+            );
+        }
+        let messages = (0..20).map(|index| ProviderMessage::AssistantToolCalls {
+            text: format!("进度 {index} API_KEY=sk-live-abcdefghijklmnop data:image/png;base64,secretpixels {}", "内容".repeat(1000)),
+            calls: vec![],
+        }).collect::<Vec<_>>();
+        let (summary, _) = compact(&messages, 2_000, None, &user_context);
+        assert_eq!(summary.user_clarifications.len(), USER_CLARIFICATION_LIMIT);
+        assert_eq!(
+            summary.recent_assistant_progress.len(),
+            ASSISTANT_PROGRESS_LIMIT
+        );
+        assert!(
+            summary
+                .user_clarifications
+                .iter()
+                .all(|text| text.len() <= USER_CLARIFICATION_BYTES + 3)
+        );
+        assert!(
+            summary
+                .recent_assistant_progress
+                .iter()
+                .all(|text| text.len() <= ASSISTANT_PROGRESS_BYTES + 3)
+        );
+        let serialized = serde_json::to_string(&summary).unwrap();
+        assert!(!serialized.contains("sk-live-abcdefghijklmnop"));
+        assert!(!serialized.contains("secretpixels"));
+        assert!(
+            summary
+                .recent_assistant_progress
+                .last()
+                .unwrap()
+                .contains("进度 19")
         );
     }
 

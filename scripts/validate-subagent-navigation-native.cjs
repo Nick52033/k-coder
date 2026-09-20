@@ -77,7 +77,7 @@ const path = require('node:path');
     await expect(drawer.locator('.subagent-detail-title')).toContainText(childTitle);
     await expect(drawer.getByRole('article').getByText('子任务导航验证完成', { exact: true })).toBeVisible();
     await expect(page.getByRole('heading', { name: parentTitle, exact: true })).toBeVisible();
-    await page.screenshot({ path: path.resolve('docs/subagent-navigation-native.png') });
+    await page.screenshot({ path: path.resolve('docs/sys/subagent-navigation-native.png') });
     console.log(JSON.stringify({ result: 'PASS', checks: ['real list/search IPC', 'child history retained', 'reload selects parent', 'project list/count/search', 'conversation list/search', 'parent opens child details'] }));
   } finally {
     await page?.evaluate(async () => {

@@ -150,7 +150,7 @@ pub fn sanitize(value: &str) -> String {
 }
 
 /// Collapses `data:image/...;base64,...` runs so pixel data cannot ride along inside a text summary.
-fn strip_image_payloads(value: &str) -> String {
+pub(super) fn strip_image_payloads(value: &str) -> String {
     let mut result = String::with_capacity(value.len());
     let mut rest = value;
     while let Some(index) = rest.find("data:") {

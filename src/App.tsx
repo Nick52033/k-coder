@@ -57,6 +57,7 @@ import { SettingsDialog, type SettingsSection } from "./components/SettingsDialo
 import { LogViewerDialog } from "./components/LogViewerDialog";
 import { WorkbenchPanel } from "./components/WorkbenchPanel";
 import { AgentActivityPanel } from "./components/AgentActivityPanel";
+import { RuntimeStatePanel } from "./components/RuntimeStatePanel";
 import { ModelSelector } from "./components/ModelSelector";
 import { ContextProgress } from "./components/ContextProgress";
 import { ApprovalModeSelector } from "./components/ApprovalModeSelector";
@@ -1214,6 +1215,29 @@ function App() {
   const activeModelContextWindow = providerConfig?.models.find(
     (model) => model.id === providerConfig.model,
   )?.contextWindow ?? null;
+  // 标题栏运行时面板展示当前会话的 Turn 摘要：忙时给实时阶段，空闲时给最近一次的终态与错误。
+  const runtimeTurnSummary = useMemo<{ label: string; detail: string } | null>(() => {
+    const busyTurnId = currentThreadTurnId ?? restoredCurrentTurnId;
+    if (busyTurnId) {
+      const statusLabel = activityStatus && activityStatus.turnId === busyTurnId
+        ? {
+          rate_limited: "限流等待",
+          thinking: "思考中",
+          responding: "生成回复中",
+          running_tool: "处理工具结果中",
+          awaiting_approval: "等待确认",
+          finalizing: "整理结果中",
+        }[activityStatus.status]
+        : null;
+      const cancelling = Boolean(activeThreadId && cancellingTurns[activeThreadId] === busyTurnId);
+      return {
+        label: cancelling ? "取消中" : statusLabel ?? "响应中",
+        detail: "",
+      };
+    }
+    if (!lastTurn) return null;
+    return { label: stateLabel(lastTurn.state), detail: lastTurn.error ?? "" };
+  }, [activeThreadId, activityStatus, cancellingTurns, currentThreadTurnId, lastTurn, restoredCurrentTurnId]);
   const toolActivities = useMemo(
     () => turnTimeline.flatMap((item) => item.type === "tool" ? [item.activity] : []),
     [turnTimeline],
@@ -2140,10 +2164,12 @@ function App() {
           <strong>k-Coder</strong>
         </div>
         <div className="titlebar-actions">
-          <span className={cn("runtime-state", runtimeError && "runtime-state--error")}>
-            {runtimeError ? <CircleAlert size={14} /> : <Activity size={14} />}
-            <span className="runtime-state-label">{runtimeError ? "运行时不可用" : runtime ? "运行时就绪" : "正在连接"}</span>
-          </span>
+          <RuntimeStatePanel
+            runtime={runtime}
+            runtimeError={runtimeError}
+            model={providerConfig?.model ?? null}
+            turn={runtimeTurnSummary}
+          />
           <div className="titlebar-segmented" role="group" aria-label="面板切换">
             <button
               className={cn("segmented-button", workbenchOpen && "segmented-button--active")}
@@ -3297,8 +3323,11 @@ function toolActivityDetail(activity: {
   if (activity.call.name === "read_file" && typeof args.path === "string") {
     const startLine = typeof args.startLine === "number" ? args.startLine : null;
     const lineCount = typeof args.lineCount === "number" ? args.lineCount : null;
+    const endLine = typeof args.endLine === "number" ? args.endLine : null;
     const range = startLine !== null
-      ? lineCount !== null && lineCount > 1 ? ` L${startLine}-${startLine + lineCount - 1}` : ` L${startLine}`
+      ? endLine !== null && endLine >= startLine
+        ? ` L${startLine}-${endLine}`
+        : lineCount !== null && lineCount > 1 ? ` L${startLine}-${startLine + lineCount - 1}` : ` L${startLine}`
       : "";
     return `读取 ${args.path}${range}`;
   }

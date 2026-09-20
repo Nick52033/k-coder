@@ -51,7 +51,7 @@ const path = require('node:path');
     await summary.getByRole('button').filter({ hasText: '架构文档验证' }).click();
     await expect(page.locator('.agent-retry-wait')).toContainText('限流等待');
     if (calls.length !== 1) throw new Error(`Cooldown bypass: ${calls.length} HTTP calls`);
-    await page.screenshot({ path: path.resolve('docs/quota-native-waiting.png') });
+    await page.screenshot({ path: path.resolve('docs/sys/quota-native-waiting.png') });
     await expect(summary).toContainText('已完成', { timeout: 35000 });
     await expect(summary.getByRole('button').filter({ hasText: '项目文档验证' })).toContainText('已完成', { timeout: 35000 });
     await expect(summary.getByRole('button').filter({ hasText: '架构文档验证' })).toContainText('已完成', { timeout: 35000 });

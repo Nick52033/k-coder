@@ -1084,7 +1084,9 @@ function toolTarget(activity: ToolActivity) {
     const metadata = activity.result?.metadata ?? {};
     const startLine = positiveInteger(metadata.startLine) ?? positiveInteger(args.startLine);
     const requestedLineCount = positiveInteger(args.lineCount);
+    const requestedEndLine = positiveInteger(args.endLine);
     const endLine = positiveInteger(metadata.endLine)
+      ?? requestedEndLine
       ?? (startLine !== null && requestedLineCount !== null
         ? startLine + requestedLineCount - 1
         : null);
@@ -1150,6 +1152,10 @@ function commandActivityStateLabel(state: ToolActivity["state"]) {
 
 function commandFailureSummary(activity: ToolActivity) {
   const metadata = activity.result?.metadata;
+  if (metadata?.resultKind === "invalid_command" && metadata.executed === false
+    && typeof metadata.recoveryHint === "string") {
+    return `未执行：${truncate(metadata.recoveryHint.replace(/\s+/g, " ").trim(), 180)}`;
+  }
   const state = metadata?.state as { state?: unknown } | undefined;
   if (state?.state === "timed_out") return "运行超时";
   if (state?.state === "cancelled") return "已取消";

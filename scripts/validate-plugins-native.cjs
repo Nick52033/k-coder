@@ -101,8 +101,8 @@ const fs = require('node:fs');
     await page.getByRole('button', { name: '设置', exact: true }).click();
     await page.getByRole('button', { name: '插件管理', exact: true }).click();
     await expect(page.getByRole('checkbox', { checked: true })).toHaveCount(7);
-    await page.screenshot({ path: 'docs/插件适配原生验证.png' });
-    fs.writeFileSync('docs/插件适配原生结果.json', JSON.stringify({ overview: refreshed, toolCalls: calls.map(c => c.name), turnState: history.lastTurn.state, providerRequests: requests.length }, null, 2));
+    await page.screenshot({ path: 'docs/sys/插件适配原生验证.png' });
+    fs.writeFileSync('docs/sys/插件适配原生结果.json', JSON.stringify({ overview: refreshed, toolCalls: calls.map(c => c.name), turnState: history.lastTurn.state, providerRequests: requests.length }, null, 2));
     console.log('PASS: seven plugins enabled, seven Skills read through AgentRuntime, plan update, native browser interaction/screenshot, refresh persistence.');
   } finally {
     await browser?.close();

@@ -104,7 +104,7 @@ const fs = require('node:fs');
     await page.reload();
     await expect(page.getByText('本地验证完成：超过十分钟后自动继续，无需确认。', { exact: true }))
       .toBeVisible({ timeout: 30000 });
-    await page.screenshot({ path: path.resolve('docs/turn-flow-native.png') });
+    await page.screenshot({ path: path.resolve('docs/sys/turn-flow-native.png') });
     console.log(JSON.stringify({ result: 'PASS', threadId, providerCalls: calls.length,
       elapsedMs: calls[1] - calls[0], continuationRequests: detail.userInputs.length, refreshed: true }));
   } finally {

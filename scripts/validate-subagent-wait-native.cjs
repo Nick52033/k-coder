@@ -133,7 +133,7 @@ const assert = require('node:assert/strict');
     await expect(drawer.locator('.subagent-detail-meta')).toContainText('子任务耗时');
     await expect(drawer.locator('.subagent-message--assistant')).toContainText('fast child finished');
     checks.push('history reload, wait duration, all target chips and matching task details');
-    await page.screenshot({ path: path.resolve('docs/subagent-wait-native.png') });
+    await page.screenshot({ path: path.resolve('docs/sys/subagent-wait-native.png') });
     console.log(JSON.stringify({ result: 'PASS', parentId, checks }));
   } finally {
     for (const response of children.values()) if (!response.writableEnded) reply(response, 'fixture cleanup');

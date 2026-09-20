@@ -4138,6 +4138,46 @@ mod tests {
     }
 
     #[test]
+    fn bundled_webapp_testing_skill_ships_a_bounded_read_only_harness() {
+        // Keep in sync with `MAX_WORKFLOW_SKILL_BODY_BYTES` in advanced/workflow.rs.
+        const MAX_INJECTED_SKILL_BODY_BYTES: usize = 16 * 1024;
+        let builtin = Path::new(env!("CARGO_MANIFEST_DIR")).join("../src/resources/skills");
+        let data = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+
+        let skills = discover_skills(
+            Some(&builtin),
+            data.path(),
+            workspace.path(),
+            &ProjectionDb::memory().unwrap(),
+        )
+        .unwrap();
+        let skill = skills
+            .iter()
+            .find(|skill| skill.metadata.name == "webapp-testing")
+            .expect("bundled webapp-testing Skill");
+
+        assert_eq!(skill.scope, "builtin");
+        assert!(skill.robot_pack);
+        assert!(skill.enabled);
+        assert_eq!(skill.metadata.category, SkillCategory::Testing);
+        assert_eq!(skill.metadata.risk, ToolRisk::External);
+        assert!(skill.body.len() <= MAX_INJECTED_SKILL_BODY_BYTES);
+        assert!(skill.body.contains("playwright install chromium"));
+        assert!(
+            skill
+                .body
+                .contains("Never claim coverage that could not be executed")
+        );
+
+        let harness = skill.resource_root.path.join("scripts/with_server.py");
+        let bytes = std::fs::read(&harness).expect("bundled with_server.py harness");
+        assert!(bytes.len() < MAX_SKILL_RESOURCE_FILE_BYTES);
+        let text = String::from_utf8(bytes).expect("harness must stay UTF-8 text");
+        assert!(text.contains("def main("));
+    }
+
+    #[test]
     fn rejects_skill_metadata_that_exceeds_bounded_description() {
         let content = format!(
             "---\nname: review\ndescription: {}\ntriggers: [review]\nrisk: read\n---\nInstructions",

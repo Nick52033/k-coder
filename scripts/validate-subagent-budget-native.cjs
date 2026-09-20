@@ -106,7 +106,7 @@ const assert = require('node:assert/strict');
     await expect(drawer.getByRole('button', { name: '恢复', exact: true })).toBeDisabled();
     await expect(drawer.getByRole('alert')).toContainText('Token 预算已耗尽');
     await expect(drawer.getByRole('alert')).toContainText('64,398 / 8,000 tokens');
-    await page.screenshot({ path: path.resolve('docs/subagent-budget-native.png') });
+    await page.screenshot({ path: path.resolve('docs/sys/subagent-budget-native.png') });
     await drawer.getByRole('button', { name: '返回列表' }).click();
     await expect(drawer.locator('.subagent-row').filter({ hasText: '预算耗尽子任务' }).getByRole('button', { name: '恢复', exact: true })).toBeDisabled();
     console.log(JSON.stringify({ result: 'PASS', parentId, checks: [

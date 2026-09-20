@@ -60,8 +60,8 @@ const { writeFileSync } = require('node:fs');
           }
           await expect(page.locator('.composer textarea')).toHaveValue('卡片之间留出空隙，输入草稿在调整窗口后保留。');
           results.push({ background, ...metrics });
-          if (viewport === 1400) await page.screenshot({ path: `docs/卡片布局-${theme}-${background ? '背景' : '纯色'}.png` });
-          if (viewport === 376 && theme === 'light' && !background) await page.screenshot({ path: 'docs/卡片布局-窄屏.png' });
+          if (viewport === 1400) await page.screenshot({ path: `docs/sys/卡片布局-${theme}-${background ? '背景' : '纯色'}.png` });
+          if (viewport === 376 && theme === 'light' && !background) await page.screenshot({ path: 'docs/sys/卡片布局-窄屏.png' });
         }
       }
     }

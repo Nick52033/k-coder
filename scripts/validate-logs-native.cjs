@@ -35,7 +35,7 @@ const path = require('node:path');
     await expect(dialog.locator('.log-source').filter({ hasText: threads[0] })).toContainText('日志来源验证 A');
     await expect(dialog.locator('.log-source').filter({ hasText: threads[1] })).toContainText('日志来源验证 B');
     expect(await dialog.locator('.log-time').allTextContents()).not.toContain('Invalid Date');
-    await page.screenshot({ path: 'docs/本地运行日志原生验证.png' });
+    await page.screenshot({ path: 'docs/sys/本地运行日志原生验证.png' });
     const root = path.join(process.env.APPDATA, 'com.kcoder.validation.logs/runtime-data/logs');
     for (let n = 1; n <= 3; n++) fs.writeFileSync(path.join(root, `runtime.jsonl.${n}`), JSON.stringify({ timestampMs: n, level: n === 1 ? 'warn' : 'info', event: 'old_rotation', fields: {} }) + '\n');
     await dialog.getByRole('button', { name: '刷新', exact: true }).click();

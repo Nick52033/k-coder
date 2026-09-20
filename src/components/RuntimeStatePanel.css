@@ -1,0 +1,204 @@
+/* 标题栏运行时状态：触发器保持与旧标签一致的紧凑尺寸，展开的悬浮面板沿用
+   composer-popover-surface 统一表面样式。 */
+.runtime-state-panel {
+  position: relative;
+  display: inline-flex;
+  flex: 0 0 auto;
+}
+
+.runtime-state-trigger {
+  display: inline-flex;
+  height: 32px;
+  padding: 0 7px 0 8px;
+  align-items: center;
+  gap: 5px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  color: var(--color-brand-light);
+  background: transparent;
+  font: inherit;
+  font-size: var(--font-size-base);
+  cursor: pointer;
+  transition: color var(--transition-fast), background-color var(--transition-fast), border-color var(--transition-fast);
+}
+
+.runtime-state-trigger:hover,
+.runtime-state-trigger[aria-expanded="true"] {
+  border-color: var(--color-border);
+  background: var(--color-surface-hover);
+}
+
+.runtime-state-trigger--error {
+  color: var(--color-error);
+}
+
+.runtime-state-trigger--error:hover,
+.runtime-state-trigger--error[aria-expanded="true"] {
+  border-color: var(--color-error);
+  background: var(--color-error-bg);
+}
+
+.runtime-state-chevron {
+  flex-shrink: 0;
+  transition: transform var(--transition-fast);
+}
+
+.runtime-state-trigger[aria-expanded="true"] .runtime-state-chevron {
+  transform: rotate(180deg);
+}
+
+.runtime-state-popover {
+  padding: 14px;
+  display: grid;
+  gap: 12px;
+}
+
+.runtime-state-popover-heading {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 9px;
+}
+
+.runtime-state-popover-heading > div {
+  display: grid;
+  min-width: 0;
+  gap: 1px;
+}
+
+.runtime-state-popover-heading strong {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.runtime-state-popover-heading span {
+  font-size: 12px;
+  color: var(--color-ink-muted);
+}
+
+.runtime-state-popover-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--color-brand);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--color-brand) 18%, transparent);
+  flex-shrink: 0;
+}
+
+.runtime-state-trigger--error ~ * .runtime-state-popover-dot,
+.runtime-state-popover-error .runtime-state-popover-dot {
+  background: var(--color-error);
+}
+
+.runtime-state-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px 12px;
+  margin: 0;
+}
+
+.runtime-state-grid > div {
+  min-width: 0;
+}
+
+.runtime-state-grid dt {
+  font-size: 11px;
+  color: var(--color-ink-faint);
+}
+
+.runtime-state-grid dd {
+  margin: 2px 0 0;
+  font-size: 12.5px;
+  color: var(--color-ink);
+  overflow-wrap: anywhere;
+}
+
+.runtime-state-turn-detail,
+.runtime-state-error pre {
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.runtime-state-turn-detail {
+  margin: 0;
+  padding: 8px 10px;
+  border-radius: var(--radius-sm);
+  background: var(--color-surface-hover);
+  color: var(--color-ink-muted);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.runtime-state-error {
+  display: grid;
+  gap: 6px;
+}
+
+.runtime-state-error strong {
+  font-size: 11px;
+  color: var(--color-error);
+}
+
+.runtime-state-error pre {
+  max-height: 140px;
+  margin: 0;
+  padding: 8px 10px;
+  overflow: auto;
+  border: 1px solid var(--color-error);
+  border-radius: var(--radius-sm);
+  background: var(--color-error-bg);
+  color: var(--color-error-text);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11.5px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.runtime-state-capabilities {
+  display: grid;
+  gap: 8px;
+  border-top: 1px solid var(--color-border);
+  padding-top: 10px;
+}
+
+.runtime-state-capabilities-heading {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.runtime-state-capabilities-heading strong {
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.runtime-state-capabilities-heading span {
+  font-size: 11px;
+  color: var(--color-ink-faint);
+}
+
+.runtime-state-capabilities ul {
+  display: flex;
+  margin: 0;
+  padding: 0;
+  flex-wrap: wrap;
+  gap: 5px;
+  list-style: none;
+}
+
+.runtime-state-capabilities li {
+  padding: 3px 8px;
+  border: 1px solid var(--color-border);
+  border-radius: 999px;
+  background: var(--color-surface-hover);
+  color: var(--color-ink-muted);
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.runtime-state-capabilities-empty {
+  margin: 0;
+  font-size: 12px;
+  color: var(--color-ink-faint);
+}

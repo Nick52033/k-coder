@@ -2627,6 +2627,8 @@ mod tests {
                         user_constraints: Vec::new(),
                         recent_user_messages: Vec::new(),
                         current_user_request: "继续当前任务".to_string(),
+                        user_clarifications: Vec::new(),
+                        recent_assistant_progress: Vec::new(),
                         important_tool_observations: Vec::new(),
                         recent_tool_results: Vec::new(),
                         compacted_message_count: 12,
@@ -3207,7 +3209,7 @@ mod tests {
                 options: vec!["稳妥".into(), "快速".into()],
             }],
             created_at_ms: now_ms(),
-            expires_at_ms: now_ms() + 60_000,
+            expires_at_ms: None,
         };
         for (index, kind) in [
             StoredEventKind::UserMessage {

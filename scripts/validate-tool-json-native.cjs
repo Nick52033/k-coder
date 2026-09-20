@@ -64,7 +64,7 @@ const path = require('node:path');
     expect(attempt).toBe(2);
     expect(calls[0].request.messages).toEqual(calls[1].request.messages);
     for (const q of questions) await page.getByRole('button', { name: q.options[0], exact: true }).click();
-    await page.screenshot({ path: path.resolve('docs/工具JSON恢复原生验证.png') });
+    await page.screenshot({ path: path.resolve('docs/sys/工具JSON恢复原生验证.png') });
     await page.getByRole('button', { name: '提交回答', exact: true }).click();
     await expect.poll(() => page.evaluate(id => window.toolJsonValidation.api.readThreadHistory(id).then(h => h.lastTurn?.state), threadId)).toBe('completed');
     expect(attempt).toBe(3);

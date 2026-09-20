@@ -1,8 +1,0 @@
-{
-  "artifactImport": true,
-  "presentationJsxImport": true,
-  "workbookExport": true,
-  "workbookRender": true,
-  "presentationExport": true,
-  "presentationRender": true
-}

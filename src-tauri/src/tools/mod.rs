@@ -981,7 +981,7 @@ impl ToolHandler for ReadFileTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "read_file".to_string(),
-            description: "Read a bounded text range from one existing regular file inside the current workspace. The path must be an exact workspace-relative file path: directories, guessed names, and wildcard patterns are rejected. Use list_directory or search_repository first. Prefer startLine/lineCount for code inspection. When either line-range field is present, the line range takes precedence and offset/limit are ignored; otherwise offset/limit remain available for byte-precise reads."
+            description: "Read a bounded text range from one existing regular file inside the current workspace. The path must be an exact workspace-relative file path: directories, guessed names, and wildcard patterns are rejected. Use list_directory or search_repository first. Prefer startLine/lineCount for code inspection; startLine/endLine is also accepted as an inclusive compatibility range. When a line-range field is present, the line range takes precedence and offset/limit are ignored; otherwise offset/limit remain available for byte-precise reads."
                 .to_string(),
             input_schema: json!({
                 "type": "object",
@@ -990,7 +990,8 @@ impl ToolHandler for ReadFileTool {
                     "offset": { "type": "integer", "minimum": 0, "description": "Zero-based byte offset. Ignored when startLine or lineCount is present." },
                     "limit": { "type": "integer", "minimum": 1, "maximum": MAX_READ_BYTES, "description": "Maximum bytes for a byte-range read. Ignored when startLine or lineCount is present." },
                     "startLine": { "type": "integer", "minimum": 1, "description": "One-based starting line. Takes precedence over offset/limit." },
-                    "lineCount": { "type": "integer", "minimum": 1, "maximum": MAX_READ_LINES, "description": "Maximum lines to return. Takes precedence over offset/limit." }
+                    "lineCount": { "type": "integer", "minimum": 1, "maximum": MAX_READ_LINES, "description": "Maximum lines to return. Takes precedence over offset/limit." },
+                    "endLine": { "type": "integer", "minimum": 1, "description": "One-based inclusive ending line for the compatibility startLine/endLine range. Takes precedence over lineCount when both are present." }
                 },
                 "required": ["path"],
                 "additionalProperties": false
@@ -1009,7 +1010,10 @@ impl ToolHandler for ReadFileTool {
         let byte_limit = optional_usize(&arguments, "limit")?;
         let requested_start_line = optional_usize(&arguments, "startLine")?;
         let requested_line_count = optional_usize(&arguments, "lineCount")?;
-        let uses_line_range = requested_start_line.is_some() || requested_line_count.is_some();
+        let requested_end_line = optional_usize(&arguments, "endLine")?;
+        let uses_line_range = requested_start_line.is_some()
+            || requested_line_count.is_some()
+            || requested_end_line.is_some();
         let workspace = Workspace::new(&context.workspace_root)?;
         let file = workspace.resolve_existing(path, WorkspaceEntryKind::File)?;
         let file_size = tokio::fs::metadata(&file)
@@ -1041,11 +1045,25 @@ impl ToolHandler for ReadFileTool {
                     "startLine must be within the decoded text (1..={total_lines})"
                 )));
             }
-            let line_count = requested_line_count.unwrap_or(DEFAULT_READ_LINES);
+            let line_count = if let Some(end_line) = requested_end_line {
+                if end_line < start_line {
+                    return Err(ToolError::InvalidArguments(
+                        "endLine must be greater than or equal to startLine".to_string(),
+                    ));
+                }
+                end_line.saturating_sub(start_line).saturating_add(1)
+            } else {
+                requested_line_count.unwrap_or(DEFAULT_READ_LINES)
+            };
+            if line_count > MAX_READ_LINES {
+                return Err(ToolError::InvalidArguments(format!(
+                    "the requested line range exceeds the {MAX_READ_LINES} line limit"
+                )));
+            }
             let start_index = start_line - 1;
             let end_index = start_index.saturating_add(line_count).min(total_lines);
             let requested_end = line_starts.get(end_index).copied().unwrap_or(text.len());
-            let output_limit = if requested_line_count.is_some() {
+            let output_limit = if requested_line_count.is_some() || requested_end_line.is_some() {
                 MAX_READ_BYTES
             } else {
                 DEFAULT_READ_BYTES
@@ -1235,7 +1253,7 @@ impl ToolHandler for RunCommandTool {
         ToolDefinition {
             name: "run_command".to_string(),
             description: format!(
-                "{description} Commands are non-interactive (stdin is closed). For repository searches always give rg an explicit directory, such as '.', and prefer one search per call. Use single quotes for literal PowerShell regexes; backslash does not escape a double quote. Do not suppress stderr while diagnosing a failed search."
+                "{description} Commands are non-interactive (stdin is closed). For repository searches always give rg an explicit directory, such as '.', and use one search per call. Select-Object -First/-Last/-Skip requires a numeric count, e.g. Select-Object -First 20. Known invalid PowerShell commands are rejected before execution with a correction hint; fix the command and call again. Use single quotes for literal PowerShell regexes; backslash does not escape a double quote. Do not suppress stderr while diagnosing a failed search."
             ),
             input_schema: json!({
                 "type": "object",
@@ -1264,6 +1282,25 @@ impl ToolHandler for RunCommandTool {
             ));
         }
         let shell = self.runtime.default_shell_name();
+        if cancellation.is_cancelled() {
+            return Err(ToolError::Cancelled);
+        }
+        if shell == "powershell"
+            && let Some(hint) = command_diagnostics::powershell_preflight_hint(&arguments.command)
+        {
+            // Preserve the proposed command and return it through the normal tool
+            // result loop. A corrected call must go through authorization again.
+            return Ok(ToolResult {
+                success: false,
+                output: format!("命令未执行：{hint}"),
+                metadata: json!({
+                    "shell": shell,
+                    "executed": false,
+                    "resultKind": "invalid_command",
+                    "recoveryHint": hint,
+                }),
+            });
+        }
         let request =
             self.runtime
                 .shell_request(&arguments.command, arguments.cwd, arguments.timeout_ms);
@@ -1935,6 +1972,12 @@ mod tests {
                 .is_err()
         );
         assert!(validator.validate(&json!({ "command": "   " })).is_err());
+        assert!(definition.description.contains("Select-Object -First 20"));
+        assert!(
+            definition
+                .description
+                .contains("fix the command and call again")
+        );
         if cfg!(windows) {
             assert!(definition.description.contains("PowerShell"));
             assert!(definition.description.contains("bundled ripgrep 15.2.0"));
@@ -2281,6 +2324,58 @@ mod tests {
 
     #[cfg(windows)]
     #[tokio::test]
+    async fn run_command_preflight_returns_repair_guidance_without_starting_a_process() {
+        let directory = tempfile::tempdir().unwrap();
+        let tool = RunCommandTool {
+            runtime: CommandRuntime::new(directory.path()).unwrap(),
+        };
+        for (command, hint) in [
+            (
+                "Set-Content marker.txt should-not-run | Select-Object -First",
+                command_diagnostics::SELECT_COUNT_HINT,
+            ),
+            (
+                "rg -n marker src/*.tsx src/**/*.css | Select-Object -First 10",
+                command_diagnostics::RG_PATH_GLOB_HINT,
+            ),
+            (
+                "rg -n first src; rg -n second src | Select-Object -First 20",
+                command_diagnostics::RG_BATCH_HINT,
+            ),
+        ] {
+            let result = tool
+                .execute(
+                    &context(directory.path()),
+                    json!({ "command": command }),
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+            assert!(!result.success);
+            assert_eq!(result.metadata["executed"], false);
+            assert_eq!(result.metadata["resultKind"], "invalid_command");
+            assert_eq!(result.metadata["recoveryHint"], hint);
+            assert!(result.metadata.get("sessionId").is_none());
+            assert!(result.metadata.get("exitCode").is_none());
+            assert!(result.output.contains(hint));
+        }
+        assert!(!directory.path().join("marker.txt").exists());
+
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        assert!(matches!(
+            tool.execute(
+                &context(directory.path()),
+                json!({ "command": "Select-Object -First" }),
+                cancellation,
+            )
+            .await,
+            Err(ToolError::Cancelled)
+        ));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
     async fn run_command_explains_and_recovers_from_powershell_rg_path_globs() {
         let directory = tempfile::tempdir().unwrap();
         std::fs::create_dir(directory.path().join("assets")).unwrap();
@@ -2311,12 +2406,13 @@ mod tests {
             .await
             .unwrap();
         assert!(!failed.success);
-        assert!(failed.output.contains("[提示]"));
-        assert!(failed.output.contains("rg --glob 'CodeEditor-*.js'"));
+        assert_eq!(failed.metadata["resultKind"], "invalid_command");
+        assert_eq!(failed.metadata["executed"], false);
+        assert!(failed.metadata.get("exitCode").is_none());
         assert!(
             failed.metadata["recoveryHint"]
                 .as_str()
-                .is_some_and(|hint| hint.contains("rg --glob"))
+                .is_some_and(|hint| hint.contains("--glob"))
         );
 
         let recovered = tool
@@ -2330,6 +2426,24 @@ mod tests {
         assert!(recovered.success);
         assert!(recovered.output.contains("workspace-glob-test"));
         assert!(recovered.metadata.get("recoveryHint").is_none());
+
+        // The screenshot's multi-extension query must search both root files and
+        // nested files after the model follows the repair guidance.
+        std::fs::create_dir(directory.path().join("assets/nested")).unwrap();
+        std::fs::write(directory.path().join("assets/App.tsx"), "Marker\n").unwrap();
+        std::fs::write(directory.path().join("assets/nested/App.css"), "Marker\n").unwrap();
+        let corrected = tool
+            .execute(
+                &context(directory.path()),
+                json!({ "command": "rg -n Marker assets --glob '*.tsx' --glob '*.css' | Select-Object -First 10" }),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(corrected.success, "{corrected:?}");
+        assert!(corrected.output.contains("App.tsx"));
+        assert!(corrected.output.contains("App.css"));
+        assert!(!corrected.output.contains("CodeEditor-test.js"));
     }
 
     #[tokio::test]
@@ -2721,6 +2835,33 @@ mod tests {
         assert_eq!(lines.metadata["endLine"], 3);
         assert_eq!(lines.metadata["linesReturned"], 2);
         assert_eq!(lines.metadata["totalLines"], 5);
+
+        let compatibility_lines = registry
+            .dispatch(
+                &context(workspace.path()),
+                "read_file",
+                json!({ "path": "lines.txt", "startLine": 2, "endLine": 3 }),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(compatibility_lines.output, lines.output);
+        assert_eq!(compatibility_lines.metadata["startLine"], 2);
+        assert_eq!(compatibility_lines.metadata["endLine"], 3);
+        assert_eq!(compatibility_lines.metadata["linesReturned"], 2);
+
+        let reversed = registry
+            .dispatch(
+                &context(workspace.path()),
+                "read_file",
+                json!({ "path": "lines.txt", "startLine": 3, "endLine": 2 }),
+                CancellationToken::new(),
+            )
+            .await;
+        let Err(ToolError::InvalidArguments(reversed)) = reversed else {
+            panic!("a reversed endLine range should be rejected");
+        };
+        assert!(reversed.contains("endLine must be greater than or equal to startLine"));
 
         let bytes = registry
             .dispatch(

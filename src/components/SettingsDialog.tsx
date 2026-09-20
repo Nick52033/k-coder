@@ -186,7 +186,7 @@ function editableModel(model?: Partial<ProviderModelConfig>): EditableProviderMo
     id: model?.id ?? "",
     displayName: model?.displayName ?? "",
     contextWindow: model?.contextWindow ?? 200_000,
-    maxOutputTokens: model?.maxOutputTokens,
+    maxOutputTokens: model?.maxOutputTokens ?? 65_536,
     supportsVision: model?.supportsVision ?? true,
     fallback: model?.fallback ?? false,
   };
@@ -1136,7 +1136,7 @@ function ProviderEditor({ providerItem, error, onSave }: ProviderEditorProps) {
                         step={1}
                         value={configuredModel.maxOutputTokens || ""}
                         onChange={(event) => updateModel(configuredModel.key, { maxOutputTokens: event.target.value ? Number(event.target.value) : undefined })}
-                        placeholder="16384"
+                        placeholder="65536"
                         aria-label={`最大输出 ${index + 1}`}
                       />
                       <span className="unit">tokens</span>

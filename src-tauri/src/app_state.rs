@@ -293,7 +293,7 @@ impl AppState {
             approvals: Arc::new(ApprovalManager::new(Duration::from_secs(5 * 60))),
             approval_mode: RwLock::new(approval_mode),
             reasoning_effort: RwLock::new(reasoning_effort),
-            user_inputs: Arc::new(UserInputManager::new(Duration::from_secs(10 * 60))),
+            user_inputs: Arc::new(UserInputManager::new()),
             command_runtime: RwLock::new(command_runtime),
             pty_runtime: RwLock::new(pty_runtime),
             bundled_tools,
@@ -3254,7 +3254,7 @@ mod tests {
                         options: vec!["继续".to_string(), "停止".to_string()],
                     }],
                     created_at_ms: 1,
-                    expires_at_ms: 2,
+                    expires_at_ms: Some(2),
                 },
             },
             StoredEventKind::ItemStarted {

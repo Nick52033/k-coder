@@ -7,3 +7,18 @@ Apache License, Version 2.0; see LICENSE-APACHE-2.0.
 The Skills are adapted for k-Coder's ExtensionService, workspace policy,
 bounded tools, and local-only persistence. Upstream executable helpers,
 credential files, and unavailable runtime integrations are not bundled.
+
+Single documented exception:
+
+  robot-pack/webapp-testing/scripts/with_server.py
+
+is not upstream code. It is a local k-Coder implementation written for this
+repository (standard library only, no third-party or copied sources) that starts
+short-lived local development servers, waits for them to answer, runs one
+verification command, and then stops the servers and their process trees.
+
+The host never executes it. It is a read-only Skill resource: the model may only
+obtain it through `skill_resource_read` and run it through `run_command`, where
+policy assessment, sandbox rules, command timeouts, approvals, and audit still
+apply. It installs nothing and contacts no remote host. Any other Python or
+Playwright dependency is a user-provided prerequisite and is not bundled.

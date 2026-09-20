@@ -1081,7 +1081,9 @@ pub struct UserInputRequest {
     pub kind: UserInputRequestKind,
     pub questions: Vec<UserInputQuestion>,
     pub created_at_ms: u64,
-    pub expires_at_ms: u64,
+    /// 新请求无到期时间；保留可选字段以读取旧版历史中的数值。
+    #[serde(default)]
+    pub expires_at_ms: Option<u64>,
 }
 
 /// 用户对单个问题的回答
@@ -1199,12 +1201,34 @@ mod tests {
         });
         let request: UserInputRequest = serde_json::from_value(legacy).unwrap();
         assert_eq!(request.kind, UserInputRequestKind::ModelQuestion);
+        assert_eq!(request.expires_at_ms, Some(2));
 
         let mut continuation = request;
         continuation.kind = UserInputRequestKind::TurnContinuation;
         assert_eq!(
             serde_json::to_value(continuation).unwrap()["kind"],
             "turn_continuation"
+        );
+    }
+
+    #[test]
+    fn user_input_without_expiry_round_trips_and_accepts_an_absent_field() {
+        let mut value = serde_json::json!({
+            "id": "input-1",
+            "threadId": "thread-1",
+            "turnId": "turn-1",
+            "toolCallId": "call-1",
+            "questions": [],
+            "createdAtMs": 1,
+            "expiresAtMs": null
+        });
+        let request: UserInputRequest = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(request.expires_at_ms, None);
+        assert!(serde_json::to_value(&request).unwrap()["expiresAtMs"].is_null());
+        value.as_object_mut().unwrap().remove("expiresAtMs");
+        assert_eq!(
+            serde_json::from_value::<UserInputRequest>(value).unwrap(),
+            request
         );
     }
 

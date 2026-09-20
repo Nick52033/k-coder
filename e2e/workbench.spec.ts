@@ -1227,6 +1227,8 @@ test("command diagnostics distinguish no matches and errors in live and restored
     { id: "partial", command: "Get-ChildItem; rg absent .", output: "normal-output.cs ParserError", metadata: { exitCode: 1, outputChunks: [{ stream: "stdout", cursor: 0, text: "normal-output.cs ParserError\n" }] }, label: "运行失败：退出码 1（已有部分输出）" },
     { id: "timeout", command: "Start-Sleep 50", output: "", metadata: { state: { state: "timed_out" }, exitCode: null, outputChunks: [] }, label: "运行超时" },
     { id: "legacy", command: "rg missing .; exit 1", output: "rg: no matches (exit code 1).", metadata: {}, label: "运行失败：rg: no matches (exit code 1)." },
+    { id: "preflight", command: "rg -n 'AgentActivityStatus' src/App.tsx | Select-Object -First", output: "命令未执行：Select-Object 的 -First 必须带行数。", metadata: { resultKind: "invalid_command", executed: false, recoveryHint: "Select-Object 的 -First 必须带行数。" }, label: "未执行：Select-Object 的 -First 必须带行数。" },
+    { id: "preflight-glob", command: "rg -n Marker src/*.tsx src/**/*.css", output: "命令未执行：请使用目录和 --glob。", metadata: { resultKind: "invalid_command", executed: false, recoveryHint: "请使用目录和 --glob。" }, label: "未执行：请使用目录和 --glob。" },
   ];
   const activities = fixtures.map(({ id, command, output, metadata }) => ({
     turnId: "turn-disclosure", call: { id, name: "run_command", arguments: { command }, metadata: {} },
@@ -1264,6 +1266,53 @@ test("command diagnostics distinguish no matches and errors in live and restored
   await page.reload();
   await expect(page.getByRole("heading", { name: "Phase 6 workbench" })).toBeVisible();
   await assertLabels();
+});
+
+test("surfaces runtime details from the titlebar state entry", async ({ page }, testInfo) => {
+  await page.goto("/");
+  if (testInfo.project.name === "narrow") await page.setViewportSize({ width: 420, height: 820 });
+
+  const trigger = page.getByRole("button", { name: "运行时状态" });
+  await expect(trigger).toContainText("运行时就绪");
+  const popover = page.locator(".runtime-state-popover");
+  await expect(popover).toBeHidden();
+
+  await trigger.click();
+  await expect(popover).toBeVisible();
+  await expect(popover).toHaveClass(/composer-popover-surface/);
+  await expect(trigger).toHaveAttribute("aria-expanded", "true");
+
+  const rows = popover.locator(".runtime-state-grid > div");
+  await expect(rows.filter({ hasText: "状态" })).toContainText("运行时就绪");
+  await expect(rows.filter({ hasText: "版本" })).toContainText("v0.10.0");
+  await expect(rows.filter({ hasText: "运行时长" })).toContainText("12 秒");
+  await expect(rows.filter({ hasText: "当前模型" })).toContainText("gpt-4.1");
+  await expect(rows.filter({ hasText: "当前 Turn" })).toContainText("空闲");
+
+  // 能力名称做了本地化，但 tooltip 仍保留稳定的后端标识。
+  const capability = popover.locator(".runtime-state-capabilities li").first();
+  await expect(capability).toHaveText("Skill");
+  await expect(capability).toHaveAttribute("title", "skills");
+  await expect(popover.locator(".runtime-state-error")).toHaveCount(0);
+
+  // 窄屏下面板会覆盖会话标题，点击标题栏其他控件同样属于面板外点击。
+  await page.getByRole("button", { name: "工作台" }).click();
+  await expect(popover).toBeHidden();
+
+  // Turn 进行中时标题应转为实时阶段，失败态应给出可读错误详情。
+  await trigger.click();
+  await emitDisclosureEvents(page, [{ type: "turn_started" }]);
+  await expect(popover.locator(".runtime-state-grid dd").nth(4)).toHaveText(/响应中|思考中/);
+  await emitDisclosureEvents(page, [
+    { type: "item_started", item: { schemaVersion: 1, id: "reasoning-1", turnId: "turn-disclosure", status: "completed", startedAtMs: 0 }, itemType: "reasoning" },
+    { type: "turn_failed", message: "沙箱拒绝写入" },
+  ]);
+  await expect(trigger).toContainText("运行时就绪");
+  await expect(popover.locator(".runtime-state-turn-detail")).toHaveText("沙箱拒绝写入");
+
+  await page.keyboard.press("Escape");
+  await expect(popover).toBeHidden();
+  await expect(trigger).toBeFocused();
 });
 
 test("keeps composer popover surfaces consistent and closes the mode menu outside", async ({ page }, testInfo) => {
@@ -4510,14 +4559,14 @@ test("queues concurrent approvals and drops an expired request", async ({ page }
       expiresAtMs: Date.now() + 300_000,
     });
     emit({ ...base, type: "turn_started", phase: "exploring" });
-    emit({ ...base, type: "approval_requested", phase: "awaiting_input", request: request("approval-1", "call-1", "docs/架构.md") });
-    emit({ ...base, type: "approval_requested", phase: "awaiting_input", request: request("approval-2", "call-2", "docs/开发路线图.md") });
+    emit({ ...base, type: "approval_requested", phase: "awaiting_input", request: request("approval-1", "call-1", "docs/sys/架构.md") });
+    emit({ ...base, type: "approval_requested", phase: "awaiting_input", request: request("approval-2", "call-2", "docs/sys/开发路线图.md") });
   });
 
   await expect(page.getByText("待确认 1 / 2", { exact: true })).toBeVisible();
-  await expect(page.locator(".approval-prompt")).toContainText("docs/架构.md");
+  await expect(page.locator(".approval-prompt")).toContainText("docs/sys/架构.md");
   await page.getByRole("button", { name: "运行", exact: true }).click();
-  await expect(page.locator(".approval-prompt")).toContainText("docs/开发路线图.md");
+  await expect(page.locator(".approval-prompt")).toContainText("docs/sys/开发路线图.md");
 
   await page.evaluate(() => {
     const host = window as unknown as {
@@ -5055,7 +5104,7 @@ test("restores a pending user question after reopening the thread", async ({ pag
           kind: "model_question",
           questions: [{ question: "Choose an approach", options: ["Conservative", "Fast"] }],
           createdAtMs: 1,
-          expiresAtMs: Date.now() + 300000,
+          expiresAtMs: null,
         },
         resolution: null,
       }],
@@ -5095,7 +5144,7 @@ test("restores a soft turn continuation gate with direct actions", async ({ page
           kind: "turn_continuation",
           questions: [{ question: continuationQuestion, options: ["continue", "compact_and_continue", "stop"] }],
           createdAtMs: 1,
-          expiresAtMs: Date.now() + 300000,
+          expiresAtMs: null,
         },
         resolution: null,
       }],
@@ -5757,6 +5806,7 @@ test("adds, edits, deletes, and saves structured provider models", async ({ page
   await page.getByLabel("模型 ID 3").fill("gpt-5.6-sol");
   await page.getByLabel("显示名称 3").fill("GPT-5.6 Sol");
   await page.getByLabel("上下文长度 3").fill("200000");
+  await expect(page.getByLabel("最大输出 3")).toHaveValue("65536");
   await expect(page.locator(".provider-model-card").nth(2).getByRole("checkbox", { name: "支持图片" })).toBeChecked();
   await page.getByLabel(/设为默认模型：GPT-5.6 Sol/).check();
 
@@ -5767,8 +5817,8 @@ test("adds, edits, deletes, and saves structured provider models", async ({ page
   await expect.poll(() => page.evaluate(() => (window as unknown as { __lastProviderRequest: { model: string } | null }).__lastProviderRequest?.model)).toBe("gpt-5.6-sol");
   const request = await page.evaluate(() => (window as unknown as { __lastProviderRequest: { models: unknown[] } }).__lastProviderRequest);
   expect(request.models).toEqual([
-    { id: "gpt-4.1", displayName: "GPT-4.1", contextWindow: 128000, maxOutputTokens: undefined, supportsVision: true, fallback: false },
-    { id: "gpt-5.6-sol", displayName: "GPT-5.6 Sol", contextWindow: 200000, maxOutputTokens: undefined, supportsVision: true, fallback: false },
+    { id: "gpt-4.1", displayName: "GPT-4.1", contextWindow: 128000, maxOutputTokens: 65536, supportsVision: true, fallback: false },
+    { id: "gpt-5.6-sol", displayName: "GPT-5.6 Sol", contextWindow: 200000, maxOutputTokens: 65536, supportsVision: true, fallback: false },
   ]);
 });
 

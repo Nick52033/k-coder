@@ -89,7 +89,7 @@ const assert = require('node:assert/strict');
     assert.equal(persisted.run.currentNodeIndex, 2);
     await trigger.click();
     await expect(details.locator('.plan-progress-step--completed')).toHaveCount(2);
-    await page.screenshot({ path: path.resolve('docs/workflow-progress-native.png') });
+    await page.screenshot({ path: path.resolve('docs/sys/workflow-progress-native.png') });
     if (fixtureError) throw fixtureError;
     assert.equal(stage, 5);
     console.log(JSON.stringify({ result: 'PASS', threadId, checks: ['real node transitions', 'failure at step 2', 'UI retry continues at step 3', 'single progress capsule', 'popover completed nodes', 'reload with stale persisted plan'] }));

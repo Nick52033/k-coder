@@ -212,7 +212,7 @@
 
 @media (max-width: 520px) {
   .titlebar .brand strong { display: none; }
-  .runtime-state-label {
+  .runtime-state-trigger .runtime-state-label {
     position: absolute;
     width: 1px;
     height: 1px;

@@ -150,7 +150,7 @@ pub struct MobileUserInput {
     pub questions: Vec<MobileQuestion>,
     pub resolved: bool,
     pub created_at_ms: u64,
-    pub expires_at_ms: u64,
+    pub expires_at_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -633,6 +633,34 @@ mod tests {
     fn diff_stats_ignore_file_headers() {
         let (insertions, deletions) = diff_stats("--- a\n+++ b\n+one\n+two\n-three\n context\n");
         assert_eq!((insertions, deletions), (2, 1));
+    }
+
+    #[test]
+    fn pending_user_input_projection_preserves_absent_and_legacy_expiry() {
+        for expiry in [None, Some(20)] {
+            let snapshot = UserInputSnapshot {
+                request: crate::protocol::UserInputRequest {
+                    id: "input-1".into(),
+                    thread_id: "thread-1".into(),
+                    turn_id: "turn-1".into(),
+                    tool_call_id: "call-1".into(),
+                    kind: crate::protocol::UserInputRequestKind::ModelQuestion,
+                    questions: vec![crate::protocol::UserInputQuestion {
+                        question: "Choose an approach".into(),
+                        options: vec!["Conservative".into(), "Fast".into()],
+                    }],
+                    created_at_ms: 1,
+                    expires_at_ms: expiry,
+                },
+                resolution: None,
+            };
+            let projected = project_user_input(&snapshot);
+            assert!(!projected.resolved);
+            assert_eq!(projected.expires_at_ms, expiry);
+            let value = serde_json::to_value(projected).unwrap();
+            assert_eq!(value["expiresAtMs"], serde_json::json!(expiry));
+            assert_eq!(value["questions"][0]["question"], "Choose an approach");
+        }
     }
 
     #[test]

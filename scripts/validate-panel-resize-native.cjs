@@ -44,7 +44,7 @@ const { createServer } = require('node:http');
     await expect.poll(() => width('.workbench-panel')).toBeCloseTo(initial.panel + 50, 0);
     await input.fill('拖动后网页可操作');
     const preferred = { sidebar: await width('.sidebar'), panel: await width('.workbench-panel') };
-    await page.screenshot({ path: 'docs/面板拖动原生验证.png' });
+    await page.screenshot({ path: 'docs/sys/面板拖动原生验证.png' });
     // Exercise native maximize/restore through the same controls as the user.
     const restoredWidth = await page.evaluate(() => innerWidth);
     await page.getByRole('button', { name: '最大化或还原窗口', exact: true }).click();

@@ -1392,18 +1392,6 @@ button {
   background: var(--color-error-solid);
 }
 
-.runtime-state {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  color: var(--color-brand-light);
-  font-size: var(--font-size-base);
-}
-
-.runtime-state--error {
-  color: var(--color-error);
-}
-
 .icon-button,
 .send-button {
   display: grid;

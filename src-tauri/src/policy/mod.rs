@@ -233,20 +233,15 @@ impl ApprovalManager {
     }
 }
 
-/// `request_user_input` 工具的等待管理器，语义与 `ApprovalManager` 类似，
-/// 区别是返回的是用户对问题的回答而非批准/拒绝。
-#[derive(Clone)]
+/// 等待用户回答或显式取消；用户暂未回答不等于取消，不设置时间上限。
+#[derive(Clone, Default)]
 pub struct UserInputManager {
     pending: Arc<Mutex<HashMap<String, oneshot::Sender<UserInputResolution>>>>,
-    timeout: Duration,
 }
 
 impl UserInputManager {
-    pub fn new(timeout: Duration) -> Self {
-        Self {
-            pending: Arc::new(Mutex::new(HashMap::new())),
-            timeout,
-        }
+    pub fn new() -> Self {
+        Self::default()
     }
 
     pub async fn register(
@@ -273,10 +268,6 @@ impl UserInputManager {
     ) -> Result<UserInputResolution, UserInputError> {
         let result = tokio::select! {
             _ = cancellation.cancelled() => Err(UserInputError::Cancelled),
-            _ = tokio::time::sleep(self.timeout) => Ok(UserInputResolution {
-                action: crate::protocol::UserInputAction::Cancelled,
-                answers: Vec::new(),
-            }),
             resolution = receiver => resolution.map_err(|_| UserInputError::Closed),
         };
         self.pending.lock().await.remove(request_id);
@@ -303,10 +294,6 @@ impl UserInputManager {
 
     pub async fn pending_count(&self) -> usize {
         self.pending.lock().await.len()
-    }
-
-    pub fn timeout_ms(&self) -> u64 {
-        self.timeout.as_millis().min(u64::MAX as u128) as u64
     }
 }
 
@@ -525,6 +512,100 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resolution.action, ApprovalAction::TimedOut);
+        assert_eq!(manager.pending_count().await, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn user_input_waits_past_a_day_and_accepts_a_late_answer_once() {
+        let manager = UserInputManager::new();
+        let receiver = manager.register("question").await.unwrap();
+        assert_eq!(
+            manager.register("question").await.unwrap_err(),
+            UserInputError::Duplicate("question".into())
+        );
+        let waiter = tokio::spawn({
+            let manager = manager.clone();
+            async move {
+                manager
+                    .wait("question", receiver, CancellationToken::new())
+                    .await
+            }
+        });
+        tokio::task::yield_now().await;
+        for elapsed in [Duration::from_secs(601), Duration::from_secs(86_400)] {
+            tokio::time::advance(elapsed).await;
+            tokio::task::yield_now().await;
+            assert!(
+                !waiter.is_finished(),
+                "unanswered questions must remain pending"
+            );
+            assert_eq!(manager.pending_count().await, 1);
+        }
+        let resolution = UserInputResolution {
+            action: crate::protocol::UserInputAction::Answered,
+            answers: vec![crate::protocol::UserInputAnswer {
+                question: "Choose an approach".into(),
+                answer: "Conservative".into(),
+            }],
+        };
+        manager
+            .resolve("question", resolution.clone())
+            .await
+            .unwrap();
+        assert_eq!(waiter.await.unwrap().unwrap(), resolution);
+        assert_eq!(manager.pending_count().await, 0);
+        assert_eq!(
+            manager.resolve("question", resolution).await.unwrap_err(),
+            UserInputError::NotFound("question".into())
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelling_an_indefinite_user_input_wait_removes_the_request() {
+        let manager = UserInputManager::new();
+        let receiver = manager.register("question").await.unwrap();
+        let cancellation = CancellationToken::new();
+        let waiter = tokio::spawn({
+            let manager = manager.clone();
+            let cancellation = cancellation.clone();
+            async move { manager.wait("question", receiver, cancellation).await }
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(86_400)).await;
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+        cancellation.cancel();
+        assert_eq!(
+            waiter.await.unwrap().unwrap_err(),
+            UserInputError::Cancelled
+        );
+        assert_eq!(manager.pending_count().await, 0);
+        assert!(matches!(
+            manager
+                .resolve(
+                    "question",
+                    UserInputResolution {
+                        action: crate::protocol::UserInputAction::Answered,
+                        answers: Vec::new(),
+                    }
+                )
+                .await,
+            Err(UserInputError::NotFound(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn discarding_a_user_input_request_closes_the_waiter() {
+        let manager = UserInputManager::new();
+        let receiver = manager.register("question").await.unwrap();
+        manager.discard("question").await;
+        assert_eq!(
+            manager
+                .wait("question", receiver, CancellationToken::new())
+                .await
+                .unwrap_err(),
+            UserInputError::Closed
+        );
         assert_eq!(manager.pending_count().await, 0);
     }
 }

@@ -339,9 +339,7 @@ impl AgentRuntime {
             workspace_root,
             approvals,
             approval_mode: ApprovalMode::Ask,
-            user_inputs: Arc::new(UserInputManager::new(std::time::Duration::from_secs(
-                10 * 60,
-            ))),
+            user_inputs: Arc::new(UserInputManager::new()),
             runtime_instruction_provider: Arc::new(|| Ok(String::new())),
             max_total_tokens: None,
             soft_turn_limits: None,
@@ -716,6 +714,15 @@ impl AgentRuntime {
         publisher: Arc<dyn EventPublisher>,
     ) -> Result<TurnOutcome, AgentRuntimeError> {
         let existing = self.repository.load(&thread_id).await?;
+        let previous_turn_interrupted = existing
+            .iter()
+            .rev()
+            .find_map(|event| match event.kind {
+                StoredEventKind::TurnFailed { .. } | StoredEventKind::TurnCancelled => Some(true),
+                StoredEventKind::TurnCompleted { .. } | StoredEventKind::TurnStarted => Some(false),
+                _ => None,
+            })
+            .unwrap_or(false);
         if existing
             .iter()
             .any(|event| matches!(event.kind, StoredEventKind::ThreadArchived))
@@ -878,10 +885,13 @@ impl AgentRuntime {
                 last_snapshot = Some(current_snapshot);
             }
 
-            let request_runtime_instructions = self
+            let mut request_runtime_instructions = self
                 .runtime_instruction_provider
                 .compile()
                 .map_err(AgentRuntimeError::RuntimeInstructions)?;
+            if previous_turn_interrupted {
+                request_runtime_instructions.push_str(instructions::INTERRUPTED_TASK);
+            }
             let events = self.repository.load(&thread_id).await?;
             let last_context_usage = last_active_context_usage(&events);
             let provider_history = provider_history(events, self.supports_vision);
@@ -1046,6 +1056,7 @@ impl AgentRuntime {
 
                         if let Some((delay, transient)) = retry_delay {
                             if error.rate_limit_delay().is_some() {
+                                self.record_rate_limit_retry(&thread_id, &turn_id, &error, delay, transient_retry_count + 1);
                                 publisher.publish(AgentEventEnvelope::new(AgentEvent::ProviderRetryWaiting {
                                     thread_id: thread_id.clone(), turn_id: turn_id.clone(),
                                     retry_at_ms: crate::providers::retry_at_ms(delay),
@@ -1470,6 +1481,7 @@ impl AgentRuntime {
                             };
                             if let Some((delay, transient)) = retry_delay {
                             if error.rate_limit_delay().is_some() {
+                                self.record_rate_limit_retry(&thread_id, &turn_id, &error, delay, transient_retry_count + 1);
                                 publisher.publish(AgentEventEnvelope::new(AgentEvent::ProviderRetryWaiting {
                                     thread_id: thread_id.clone(), turn_id: turn_id.clone(),
                                     retry_at_ms: crate::providers::retry_at_ms(delay),
@@ -2411,7 +2423,7 @@ impl AgentRuntime {
                 ],
             }],
             created_at_ms,
-            expires_at_ms: created_at_ms.saturating_add(self.user_inputs.timeout_ms()),
+            expires_at_ms: None,
         };
         let resolution = self
             .await_user_input(request, cancellation, publisher)
@@ -2524,7 +2536,7 @@ impl AgentRuntime {
                 })
                 .collect(),
             created_at_ms,
-            expires_at_ms: created_at_ms.saturating_add(self.user_inputs.timeout_ms()),
+            expires_at_ms: None,
         };
         let resolution = match self
             .await_user_input(request, cancellation, publisher)
@@ -3085,6 +3097,36 @@ impl AgentRuntime {
                 usage.input_tokens,
                 usage.output_tokens,
             );
+        }
+    }
+
+    fn record_rate_limit_retry(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        error: &ProviderError,
+        delay: Duration,
+        retry_number: usize,
+    ) {
+        if let Some(logger) = &self.logger {
+            // Provider adapters already strip their credential. Apply the shared
+            // secret-token filter too, and never log request bodies or headers.
+            let message: String = crate::execution::redact(&error.to_string())
+                .chars()
+                .take(1024)
+                .collect();
+            let _ = logger.log("info", "provider_rate_limited", json!({
+                "threadId": thread_id,
+                "turnId": turn_id,
+                "message": message,
+                "retryNumber": retry_number,
+                "retryDelayMs": delay.as_millis().min(u64::MAX as u128) as u64,
+                "delaySource": if matches!(error, ProviderError::RateLimited { retry_after: Some(_), .. }) {
+                    "retry_after"
+                } else {
+                    "default"
+                },
+            }));
         }
     }
 
@@ -5062,6 +5104,151 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unanswered_questions_and_continuations_wait_until_answered_or_interrupted() {
+        for continuation in [false, true] {
+            for interrupt in [false, true] {
+                let (_directory, repository, runtime, thread_id) = runtime_fixture().await;
+                let call = if continuation {
+                    ToolCall {
+                        id: "inspect-before-wait".into(),
+                        name: "list_directory".into(),
+                        arguments: json!({"path": "."}),
+                        metadata: json!({}),
+                    }
+                } else {
+                    ToolCall {
+                        id: "question-before-wait".into(),
+                        name: REQUEST_USER_INPUT_TOOL_NAME.into(),
+                        arguments: json!({"questions": [{
+                            "question": "Choose an approach",
+                            "options": ["Conservative", "Fast"]
+                        }]}),
+                        metadata: json!({}),
+                    }
+                };
+                let provider = Arc::new(FakeProvider::script(vec![
+                    vec![
+                        Ok(ProviderEvent::ToolCall { call }),
+                        Ok(ProviderEvent::Completed),
+                    ],
+                    vec![
+                        Ok(ProviderEvent::TextDelta {
+                            delta: "Continued after the answer".into(),
+                        }),
+                        Ok(ProviderEvent::Completed),
+                    ],
+                ]));
+                let runtime = if continuation {
+                    runtime.with_soft_turn_limits(SoftTurnLimits::new(1, u64::MAX, u64::MAX))
+                } else {
+                    runtime
+                };
+                let manager = runtime.user_input_manager();
+                let cancellation = CancellationToken::new();
+                let run = tokio::spawn({
+                    let provider = provider.clone();
+                    let thread_id = thread_id.clone();
+                    let cancellation = cancellation.clone();
+                    async move {
+                        runtime
+                            .run_turn(
+                                provider,
+                                "fake".into(),
+                                RunTurnRequest {
+                                    thread_id,
+                                    input: "Complete the task".into(),
+                                    agent_mode: None,
+                                },
+                                cancellation,
+                                Arc::new(RecordingPublisher::default()),
+                            )
+                            .await
+                    }
+                });
+                let request = tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        let detail = repository.read_thread(&thread_id).await.unwrap();
+                        if let Some(input) = detail.user_inputs.first() {
+                            break input.request.clone();
+                        }
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                })
+                .await
+                .expect("request should be persisted before waiting");
+                assert_eq!(request.expires_at_ms, None);
+                assert_eq!(
+                    request.kind,
+                    if continuation {
+                        UserInputRequestKind::TurnContinuation
+                    } else {
+                        UserInputRequestKind::ModelQuestion
+                    }
+                );
+                tokio::time::pause();
+                tokio::time::advance(Duration::from_secs(86_401)).await;
+                tokio::task::yield_now().await;
+                assert!(!run.is_finished());
+                assert_eq!(manager.pending_count().await, 1);
+                assert_eq!(provider.requests().len(), 1);
+                tokio::time::resume();
+                let waiting = repository.read_thread(&thread_id).await.unwrap();
+                assert!(waiting.user_inputs[0].resolution.is_none());
+                assert!(!matches!(
+                    waiting.last_turn.unwrap().state,
+                    TurnState::Completed | TurnState::Failed | TurnState::Cancelled
+                ));
+                if interrupt {
+                    cancellation.cancel();
+                } else {
+                    manager
+                        .resolve(
+                            &request.id,
+                            UserInputResolution {
+                                action: UserInputAction::Answered,
+                                answers: vec![crate::protocol::UserInputAnswer {
+                                    question: request.questions[0].question.clone(),
+                                    answer: if continuation {
+                                        TURN_CONTINUE
+                                    } else {
+                                        "Conservative"
+                                    }
+                                    .into(),
+                                }],
+                            },
+                        )
+                        .await
+                        .unwrap();
+                }
+                let outcome = tokio::time::timeout(Duration::from_secs(5), run)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    outcome.state,
+                    if interrupt {
+                        TurnState::Cancelled
+                    } else {
+                        TurnState::Completed
+                    }
+                );
+                assert_eq!(provider.requests().len(), if interrupt { 1 } else { 2 });
+                assert_eq!(manager.pending_count().await, 0);
+                let detail = repository.read_thread(&thread_id).await.unwrap();
+                assert_eq!(
+                    detail.user_inputs[0].resolution.as_ref().unwrap().action,
+                    if interrupt {
+                        UserInputAction::Cancelled
+                    } else {
+                        UserInputAction::Answered
+                    }
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn skipped_user_input_closes_item_as_failed() {
         let (_directory, repository, runtime, thread_id) = runtime_fixture().await;
         let call = ToolCall {
@@ -5689,7 +5876,9 @@ mod tests {
 
     #[tokio::test]
     async fn rate_limit_retry_is_visible_and_cancellation_prevents_replay() {
-        let (_directory, _repository, runtime, thread_id) = runtime_fixture().await;
+        let (directory, _repository, runtime, thread_id) = runtime_fixture().await;
+        let logger = StructuredLogger::new(directory.path()).unwrap();
+        let runtime = runtime.with_logger(logger.clone());
         let provider = Arc::new(PreStreamProvider::new(vec![Err(
             ProviderError::RateLimited {
                 message: "free tier".into(),
@@ -5745,6 +5934,85 @@ mod tests {
             TurnState::Cancelled
         );
         assert_eq!(provider.requests().len(), 1);
+        let logs = logger
+            .read_logs(crate::logging::LogQuery {
+                limit: None,
+                level: None,
+                event: Some("provider_rate_limited".into()),
+                after_timestamp_ms: None,
+            })
+            .unwrap();
+        assert_eq!(logs.records.len(), 1);
+        assert_eq!(logs.records[0].fields["retryDelayMs"], 60_000);
+        assert_eq!(logs.records[0].fields["delaySource"], "default");
+        assert_eq!(logs.records[0].fields["retryNumber"], 1);
+    }
+
+    #[tokio::test]
+    async fn recovered_rate_limits_keep_bounded_diagnostics_for_both_provider_paths() {
+        for wrapped in [false, true] {
+            let (directory, _repository, runtime, thread_id) = runtime_fixture().await;
+            let logger = StructuredLogger::new(directory.path()).unwrap();
+            let inner = Arc::new(PreStreamProvider::new(vec![
+                Err(ProviderError::RateLimited {
+                    message: format!(
+                        "fixture capacity reached sk-fixture-private {}",
+                        "长".repeat(2000)
+                    ),
+                    retry_after: Some(Duration::from_millis(1)),
+                }),
+                Ok(vec![
+                    Ok(ProviderEvent::TextDelta {
+                        delta: "recovered".into(),
+                    }),
+                    Ok(ProviderEvent::Completed),
+                ]),
+            ]));
+            let provider: Arc<dyn Provider> = if wrapped {
+                crate::providers::RateLimitRegistry::default().wrap("fixture", inner.clone())
+            } else {
+                inner.clone()
+            };
+            let outcome = runtime
+                .with_logger(logger.clone())
+                .run_turn(
+                    provider,
+                    "fixture".into(),
+                    RunTurnRequest {
+                        thread_id: thread_id.clone(),
+                        input: "private user prompt marker".into(),
+                        agent_mode: None,
+                    },
+                    CancellationToken::new(),
+                    Arc::new(RecordingPublisher::default()),
+                )
+                .await
+                .unwrap();
+            assert_eq!(outcome.state, TurnState::Completed);
+            assert_eq!(inner.requests().len(), 2);
+            let logs = logger
+                .read_logs(crate::logging::LogQuery {
+                    limit: None,
+                    level: None,
+                    event: Some("provider_rate_limited".into()),
+                    after_timestamp_ms: None,
+                })
+                .unwrap();
+            assert_eq!(logs.records.len(), 1);
+            let fields = &logs.records[0].fields;
+            assert_eq!(fields["threadId"], thread_id);
+            assert!(fields["turnId"].as_str().is_some_and(|id| !id.is_empty()));
+            assert_eq!(fields["retryNumber"], 1);
+            assert_eq!(fields["retryDelayMs"], 1);
+            assert_eq!(fields["delaySource"], "retry_after");
+            let message = fields["message"].as_str().unwrap();
+            assert!(message.contains("fixture capacity reached [REDACTED]"));
+            assert_eq!(message.chars().count(), 1024);
+            let persisted =
+                std::fs::read_to_string(directory.path().join("logs/runtime.jsonl")).unwrap();
+            assert!(!persisted.contains("sk-fixture-private"));
+            assert!(!persisted.contains("private user prompt marker"));
+        }
     }
 
     #[tokio::test]
@@ -5782,6 +6050,162 @@ mod tests {
             assert_eq!(
                 history.last_turn.unwrap().error.unwrap().code,
                 "rate_limited"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn quota_failure_continuation_and_retry_preserve_compacted_progress_and_saved_plan() {
+        for retry in [false, true] {
+            let (directory, repository, _, thread_id) = runtime_fixture().await;
+            let advanced = crate::advanced::AdvancedServices::new(directory.path()).unwrap();
+            let handlers = advanced
+                .tool_handlers(directory.path())
+                .0
+                .into_iter()
+                .filter(|handler| handler.definition().name == "update_plan")
+                .collect();
+            let tools = ToolRegistry::new(handlers).unwrap();
+            let make_runtime = || {
+                let plans = advanced.plans.clone();
+                let id = thread_id.clone();
+                AgentRuntime::with_tools(
+                    repository.clone(),
+                    tools.clone(),
+                    directory.path().to_path_buf(),
+                )
+                .with_runtime_instruction_provider(Arc::new(move || {
+                    plans.runtime_instructions(&id)
+                }))
+            };
+            let plan_call = |id: &str, complete: bool| ProviderEvent::ToolCall {
+                call: ToolCall {
+                    id: id.into(),
+                    name: "update_plan".into(),
+                    metadata: json!({}),
+                    arguments: json!({"steps": (1..=5).map(|i| json!({
+                    "id": i.to_string(), "step": format!("状态面板步骤 {i}"),
+                    "status": if complete { "completed" } else if i == 1 { "in_progress" } else { "pending" },
+                })).collect::<Vec<_>>()}),
+                },
+            };
+            let failed_provider = Arc::new(PreStreamProvider::new(vec![
+                Ok(vec![
+                    Ok(ProviderEvent::TextDelta {
+                        delta: "组件已实现，构建已通过，现在补充 e2e 回归。".into(),
+                    }),
+                    Ok(plan_call("initial-plan", false)),
+                    Ok(ProviderEvent::Completed),
+                ]),
+                Err(ProviderError::Http {
+                    status: 402,
+                    message: "You exceeded your current quota".into(),
+                }),
+            ]));
+            let runtime = make_runtime();
+            let outcome = runtime
+                .run_turn(
+                    failed_provider.clone(),
+                    "fixture".into(),
+                    RunTurnRequest {
+                        thread_id: thread_id.clone(),
+                        input: "实现可点击状态面板".into(),
+                        agent_mode: Some("craft".into()),
+                    },
+                    CancellationToken::new(),
+                    Arc::new(RecordingPublisher::default()),
+                )
+                .await
+                .unwrap();
+            assert_eq!(outcome.state, TurnState::Failed);
+            assert_eq!(failed_provider.requests().len(), 2); // No automatic quota retry.
+            runtime.compact_thread(&thread_id).await.unwrap();
+            drop(runtime);
+            let resumed_provider = Arc::new(PreStreamProvider::new(vec![
+                Ok(vec![
+                    Ok(plan_call("reconciled-plan", true)),
+                    Ok(ProviderEvent::Completed),
+                ]),
+                Ok(vec![
+                    Ok(ProviderEvent::TextDelta {
+                        delta: "剩余验证已完成。".into(),
+                    }),
+                    Ok(ProviderEvent::Completed),
+                ]),
+            ]));
+            let runtime = make_runtime();
+            let outcome = if retry {
+                runtime
+                    .retry_turn(
+                        resumed_provider.clone(),
+                        "fixture".into(),
+                        thread_id.clone(),
+                        AgentMode::Craft,
+                        CancellationToken::new(),
+                        Arc::new(RecordingPublisher::default()),
+                    )
+                    .await
+            } else {
+                runtime
+                    .run_turn(
+                        resumed_provider.clone(),
+                        "fixture".into(),
+                        RunTurnRequest {
+                            thread_id: thread_id.clone(),
+                            input: "继续".into(),
+                            agent_mode: Some("craft".into()),
+                        },
+                        CancellationToken::new(),
+                        Arc::new(RecordingPublisher::default()),
+                    )
+                    .await
+            }
+            .unwrap();
+            assert_eq!(outcome.state, TurnState::Completed);
+            let first = serde_json::to_string(&resumed_provider.requests()[0]).unwrap();
+            assert!(first.contains("<interrupted_task_continuation>"));
+            assert!(first.contains("实现可点击状态面板"));
+            assert!(first.contains("现在补充 e2e 回归"));
+            assert!(first.contains("状态面板步骤 5"));
+            assert!(first.contains("in_progress"));
+            assert!(
+                advanced
+                    .plans
+                    .get(&thread_id)
+                    .unwrap()
+                    .unwrap()
+                    .steps
+                    .iter()
+                    .all(|step| step.status == crate::advanced::PlanStepState::Completed)
+            );
+            let events = repository.load(&thread_id).await.unwrap();
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event.kind, StoredEventKind::UserMessage { .. }))
+                    .count(),
+                if retry { 1 } else { 2 }
+            );
+
+            let next = Arc::new(FakeProvider::text(&["新问题已回答"]));
+            runtime
+                .run_turn(
+                    next.clone(),
+                    "fixture".into(),
+                    RunTurnRequest {
+                        thread_id: thread_id.clone(),
+                        input: "现在回答另一问题".into(),
+                        agent_mode: None,
+                    },
+                    CancellationToken::new(),
+                    Arc::new(RecordingPublisher::default()),
+                )
+                .await
+                .unwrap();
+            assert!(
+                !serde_json::to_string(&next.requests()[0])
+                    .unwrap()
+                    .contains("<interrupted_task_continuation>")
             );
         }
     }
@@ -6699,6 +7123,8 @@ mod tests {
             user_constraints: Vec::new(),
             recent_user_messages: Vec::new(),
             current_user_request: String::new(),
+            user_clarifications: Vec::new(),
+            recent_assistant_progress: Vec::new(),
             important_tool_observations: Vec::new(),
             recent_tool_results: vec![ProviderMessage::ToolResult {
                 call_id: "orphaned-call".to_string(),
@@ -6738,6 +7164,8 @@ mod tests {
             user_constraints: vec!["[Compacted context v3]\n必须递归".to_string()],
             recent_user_messages: vec!["[Compacted context v3]".to_string()],
             current_user_request: "[Compacted context v3]".to_string(),
+            user_clarifications: Vec::new(),
+            recent_assistant_progress: Vec::new(),
             important_tool_observations: vec!["tool read_file: inspected settings".to_string()],
             recent_tool_results: Vec::new(),
             compacted_message_count: 20,

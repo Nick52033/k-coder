@@ -109,7 +109,7 @@ const path = require('node:path');
     await expect(page.getByText('最大输出参数已生效，完整文件写入验证通过。', { exact: true })).toBeVisible();
     await page.reload();
     await expect(page.getByText('最大输出参数已生效，完整文件写入验证通过。', { exact: true })).toBeVisible({ timeout: 20000 });
-    await page.screenshot({ path: path.resolve('docs/Chat输出上限原生验证.png') });
+    await page.screenshot({ path: path.resolve('docs/sys/Chat输出上限原生验证.png') });
     scenario = 'clamped';
     const clamped = await page.evaluate(async workspace => {
       const api = await import('/src/api/runtime.ts');
@@ -123,7 +123,7 @@ const path = require('node:path');
     assert.equal(fs.readFileSync(outputFile, 'utf8'), content);
     const facts = { threadId, workspace, outputFile, calls, fileBytes: Buffer.byteLength(content),
       defaultState: failed.state, recoveredState: 'completed', clampedState: clamped.state };
-    fs.writeFileSync(path.resolve('docs/Chat输出上限原生结果.json'), JSON.stringify(facts, null, 2));
+    fs.writeFileSync(path.resolve('docs/sys/Chat输出上限原生结果.json'), JSON.stringify(facts, null, 2));
     console.log('PASS: missing-limit truncation, 65355 on wire, fragmented complete write, explicit retry, refresh recovery, clamped-limit rejection.');
   } finally {
     await page?.evaluate(async () => {

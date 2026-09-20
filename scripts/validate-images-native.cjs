@@ -73,7 +73,7 @@ const path = require('node:path');
       await button.click();
       await expect(page.getByRole('dialog', { name, exact: true })).toBeVisible();
       await expect.poll(() => page.getByRole('dialog').locator('img').evaluate(img => img.naturalWidth)).toBe(640);
-      if (name === '本地结果') await page.screenshot({ path: 'docs/图片预览原生验证.png' });
+      if (name === '本地结果') await page.screenshot({ path: 'docs/sys/图片预览原生验证.png' });
       await page.keyboard.press('Escape');
     }
     await page.evaluate(async () => { const { api, thread } = window.imageValidation; await api.compactThread(thread.id); });

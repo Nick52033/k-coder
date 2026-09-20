@@ -1,5 +1,7 @@
 use crate::context::{self, CompactionSummary, CompactionUserContext};
-use crate::protocol::{TokenUsage, ToolResult};
+use std::collections::HashMap;
+
+use crate::protocol::{MessageRole, TokenUsage, ToolResult, UserInputAction, UserInputRequestKind};
 use crate::providers::ProviderMessage;
 use crate::storage::{StoredEvent, StoredEventKind};
 
@@ -14,7 +16,21 @@ pub(super) struct ProviderHistory {
 
 impl ProviderHistory {
     pub(super) fn request_messages(&self) -> Vec<ProviderMessage> {
-        context::render_provider_history(self.summary.as_ref(), &self.messages)
+        let mut messages = context::render_provider_history(self.summary.as_ref(), &self.messages);
+        if self.summary.is_none() {
+            if let Some(text) = self.user_context.clarification_context() {
+                // Keep durable answers visible even when interruption left the question's
+                // tool group incomplete. Insert outside tool groups to preserve pairing.
+                messages.insert(
+                    0,
+                    ProviderMessage::Text {
+                        role: MessageRole::User,
+                        text,
+                    },
+                );
+            }
+        }
+        messages
     }
 
     pub(super) fn messages(&self) -> &[ProviderMessage] {
@@ -35,6 +51,8 @@ pub(super) fn provider_history(events: Vec<StoredEvent>, supports_vision: bool) 
     let mut summary = None;
     let mut user_context = CompactionUserContext::default();
     let mut latest_image_message = None;
+    let mut questions = HashMap::new();
+    let mut assistant_progress = Vec::new();
     for event in events {
         let message = match event.kind {
             StoredEventKind::UserMessage { message } => {
@@ -70,19 +88,64 @@ pub(super) fn provider_history(events: Vec<StoredEvent>, supports_vision: bool) 
             StoredEventKind::ProviderContext { provider, item } => {
                 Some(ProviderMessage::ProviderContext { provider, item })
             }
+            StoredEventKind::UserInputRequested { request }
+                if request.kind == UserInputRequestKind::ModelQuestion
+                    && request.thread_id == event.thread_id
+                    && Some(&request.turn_id) == event.turn_id.as_ref() =>
+            {
+                questions.insert(request.id.clone(), request);
+                None
+            }
+            StoredEventKind::UserInputResolved {
+                request_id,
+                resolution,
+            } => {
+                if let Some(request) = questions.remove(&request_id) {
+                    if resolution.action == UserInputAction::Answered
+                        && request.thread_id == event.thread_id
+                        && Some(&request.turn_id) == event.turn_id.as_ref()
+                    {
+                        for answer in resolution.answers {
+                            if request
+                                .questions
+                                .iter()
+                                .any(|q| q.question == answer.question)
+                            {
+                                user_context
+                                    .observe_clarification(&answer.question, &answer.answer);
+                            }
+                        }
+                    }
+                }
+                None
+            }
             StoredEventKind::ContextCompacted {
-                summary: compacted, ..
+                summary: mut compacted,
+                ..
             } => {
                 history.clear();
                 if let Some(image_message) = &latest_image_message {
                     history.push(image_message.clone());
                 }
+                // Replay original assistant events to repair v5 snapshots that discarded all
+                // progress at the last workspace write. Never mine rendered summaries as facts.
+                compacted.recent_assistant_progress = context::assistant_progress_history(
+                    compacted
+                        .recent_assistant_progress
+                        .into_iter()
+                        .chain(assistant_progress.clone()),
+                    &[],
+                );
                 summary = Some(compacted);
                 None
             }
             _ => None,
         };
         if let Some(message) = message {
+            assistant_progress = context::assistant_progress_history(
+                assistant_progress,
+                std::slice::from_ref(&message),
+            );
             history.push(message);
         }
     }
@@ -148,6 +211,179 @@ pub(super) fn last_active_context_usage(events: &[StoredEvent]) -> Option<TokenU
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::{
+        UserInputAnswer, UserInputQuestion, UserInputRequest, UserInputResolution,
+    };
+
+    fn question_events(kind: UserInputRequestKind, action: UserInputAction) -> Vec<StoredEvent> {
+        vec![
+            StoredEvent::new(
+                "thread",
+                Some("turn".into()),
+                StoredEventKind::UserInputRequested {
+                    request: UserInputRequest {
+                        id: "question".into(),
+                        thread_id: "thread".into(),
+                        turn_id: "turn".into(),
+                        tool_call_id: "ask".into(),
+                        kind,
+                        questions: vec![UserInputQuestion {
+                            question: "如何处理入口？".into(),
+                            options: vec![],
+                        }],
+                        created_at_ms: 1,
+                        expires_at_ms: Some(2),
+                    },
+                },
+            ),
+            StoredEvent::new(
+                "thread",
+                Some("turn".into()),
+                StoredEventKind::UserInputResolved {
+                    request_id: "question".into(),
+                    resolution: UserInputResolution {
+                        action,
+                        answers: vec![UserInputAnswer {
+                            question: "如何处理入口？".into(),
+                            answer: "改成可点击的状态面板".into(),
+                        }],
+                    },
+                },
+            ),
+        ]
+    }
+
+    fn legacy_empty_compaction() -> StoredEvent {
+        StoredEvent::new(
+            "thread",
+            Some("turn".into()),
+            StoredEventKind::ContextCompacted {
+                summary: serde_json::from_value(serde_json::json!({
+                    "contractVersion": 5, "summary": "", "userConstraints": [],
+                    "recentToolResults": [], "compactedMessageCount": 100,
+                }))
+                .unwrap(),
+                automatic: true,
+            },
+        )
+    }
+
+    #[test]
+    fn legacy_compaction_restores_answered_choices_and_progress_from_original_events() {
+        let mut events = question_events(
+            UserInputRequestKind::ModelQuestion,
+            UserInputAction::Answered,
+        );
+        events.push(StoredEvent::new(
+            "thread",
+            Some("turn".into()),
+            StoredEventKind::AssistantToolCalls {
+                item_id: None,
+                text: "组件已实现，现在补充 e2e 测试。".into(),
+                calls: vec![],
+            },
+        ));
+        events.extend([legacy_empty_compaction(), legacy_empty_compaction()]);
+        let restored = provider_history(events, false);
+        let summary = restored.summary().unwrap();
+        assert_eq!(
+            summary.user_clarifications,
+            ["Q: 如何处理入口？\nA: 改成可点击的状态面板"]
+        );
+        assert_eq!(
+            summary.recent_assistant_progress,
+            ["组件已实现，现在补充 e2e 测试。"]
+        );
+        let rendered = serde_json::to_string(&restored.request_messages()).unwrap();
+        assert!(rendered.contains("改成可点击的状态面板"));
+        assert!(rendered.contains("补充 e2e 测试"));
+    }
+
+    #[test]
+    fn answered_question_survives_interruption_before_its_tool_result_without_compaction() {
+        let mut events = vec![StoredEvent::new(
+            "thread",
+            Some("turn".into()),
+            StoredEventKind::AssistantToolCalls {
+                item_id: None,
+                text: "确认入口方案".into(),
+                calls: vec![crate::protocol::ToolCall {
+                    id: "ask".into(),
+                    name: "request_user_input".into(),
+                    arguments: serde_json::json!({}),
+                    metadata: serde_json::json!({}),
+                }],
+            },
+        )];
+        events.extend(question_events(
+            UserInputRequestKind::ModelQuestion,
+            UserInputAction::Answered,
+        ));
+        events.push(StoredEvent::new(
+            "thread",
+            Some("turn".into()),
+            StoredEventKind::TurnCancelled,
+        ));
+        let restored = provider_history(events, false);
+        assert!(restored.summary().is_none());
+        let messages = restored.request_messages();
+        let rendered = serde_json::to_string(&messages).unwrap();
+        assert!(rendered.contains("改成可点击的状态面板"));
+        assert!(rendered.contains("do not grant tool authorization"));
+        assert!(!messages.iter().any(|message| matches!(
+            message,
+            ProviderMessage::AssistantToolCalls { .. } | ProviderMessage::ToolResult { .. }
+        )));
+    }
+
+    #[test]
+    fn clarification_replay_requires_a_matching_answered_model_question() {
+        let valid = question_events(
+            UserInputRequestKind::ModelQuestion,
+            UserInputAction::Answered,
+        );
+        let mut cases = vec![
+            question_events(
+                UserInputRequestKind::TurnContinuation,
+                UserInputAction::Answered,
+            ),
+            question_events(
+                UserInputRequestKind::ModelQuestion,
+                UserInputAction::Skipped,
+            ),
+            question_events(
+                UserInputRequestKind::ModelQuestion,
+                UserInputAction::Cancelled,
+            ),
+            vec![valid[1].clone()],
+        ];
+        let mut wrong_turn = valid.clone();
+        wrong_turn[1].turn_id = Some("other".into());
+        cases.push(wrong_turn);
+        let mut wrong_thread = valid.clone();
+        wrong_thread[1].thread_id = "other".into();
+        cases.push(wrong_thread);
+        let mut wrong_question = valid;
+        if let StoredEventKind::UserInputResolved { resolution, .. } = &mut wrong_question[1].kind {
+            resolution.answers[0].question = "unrelated question".into();
+        }
+        cases.push(wrong_question);
+        for mut events in cases {
+            assert!(
+                !serde_json::to_string(&provider_history(events.clone(), false).request_messages())
+                    .unwrap()
+                    .contains("改成可点击的状态面板")
+            );
+            events.push(legacy_empty_compaction());
+            assert!(
+                provider_history(events, false)
+                    .summary()
+                    .unwrap()
+                    .user_clarifications
+                    .is_empty()
+            );
+        }
+    }
 
     #[test]
     fn restored_compaction_preserves_latest_image_without_text_only_leakage() {
@@ -250,7 +486,7 @@ mod tests {
         let (summary, _) = context::compact(&messages, 1_024, None, &user_context);
         let rendered = context::render_summary(&summary);
 
-        assert_eq!(summary.contract_version, 5);
+        assert_eq!(summary.contract_version, 6);
         assert!(rendered.contains("Permission.Util/Permission.Util/Model/TData.cs"));
         assert!(rendered.contains("6ab4159a"));
         assert!(rendered.contains(r#""startLine":1"#));
