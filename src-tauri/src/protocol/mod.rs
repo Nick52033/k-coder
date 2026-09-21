@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+use crate::providers::ProviderCatalogView;
 use crate::storage::{
     ThreadSummary, ToolActivitySnapshot, TurnSnapshot, TurnTimelineItem, UserInputSnapshot,
 };
@@ -7,7 +8,7 @@ use crate::storage::{
 pub mod memory;
 
 pub const PROTOCOL_VERSION: u32 = 1;
-pub const AGENT_EVENT_SCHEMA_VERSION: u32 = 7;
+pub const AGENT_EVENT_SCHEMA_VERSION: u32 = 8;
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -227,6 +228,21 @@ pub struct ThreadHistorySnapshot {
     pub context_usage: Option<TokenUsage>,
     pub turns: ThreadTurnsPage,
     pub unscoped_items: Vec<ThreadItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadModelSelection {
+    pub provider_id: String,
+    pub model: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ThreadModelSelectionResult {
+    pub schema_version: u32,
+    pub selection: ThreadModelSelection,
+    pub catalog: ProviderCatalogView,
 }
 
 /// 应用层的推理强度，Provider 适配器负责映射到兼容字段。
@@ -782,7 +798,9 @@ impl AgentEvent {
     /// 根据事件类型推断默认的 turn phase。
     fn default_phase(&self) -> TurnPhase {
         match self {
-            Self::TurnStarted { .. } | Self::ProviderRetryWaiting { .. } => TurnPhase::Exploring,
+            Self::TurnStarted { .. }
+            | Self::ProviderRetryWaiting { .. }
+            | Self::ProviderStreamRetry { .. } => TurnPhase::Exploring,
             Self::TurnSteered { .. } => TurnPhase::Exploring,
             Self::TurnRejected { .. } => TurnPhase::Failed,
             Self::ActivityStatusChanged { status, .. } => match status {
@@ -838,6 +856,14 @@ pub enum AgentEvent {
         thread_id: String,
         turn_id: String,
         retry_at_ms: u64,
+    },
+    /// Provider 连接或流式响应中断后自动重试的瞬时展示事件（不落盘）。
+    /// 让界面显示"重连中 n/m"，而不是盯着看似冻结的状态。
+    ProviderStreamRetry {
+        thread_id: String,
+        turn_id: String,
+        attempt: u32,
+        max_attempts: u32,
     },
     TurnStarted {
         thread_id: String,

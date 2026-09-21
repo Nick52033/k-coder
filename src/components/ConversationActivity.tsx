@@ -1,5 +1,6 @@
 import {
   Activity,
+  Bot,
   Check,
   ChevronDown,
   ChevronRight,
@@ -55,6 +56,8 @@ export const ConversationTurnActivity = memo(function ConversationTurnActivity({
   streaming = false,
   initialTextVisible = false,
   activityStatus = null,
+  activitySinceMs,
+  streamRetry = null,
   retryAtMs,
   finalMessageId,
   renderText,
@@ -72,6 +75,10 @@ export const ConversationTurnActivity = memo(function ConversationTurnActivity({
   streaming?: boolean;
   initialTextVisible?: boolean;
   activityStatus?: AgentActivityStatus | null;
+  /** 当前活动阶段的开始时间，用于"思考中 · 23s"等待计时。 */
+  activitySinceMs?: number;
+  /** Provider 流中断后的自动重试进度。 */
+  streamRetry?: { attempt: number; maxAttempts: number } | null;
   retryAtMs?: number;
   finalMessageId?: string;
   renderText?: (text: string) => ReactNode;
@@ -149,6 +156,19 @@ export const ConversationTurnActivity = memo(function ConversationTurnActivity({
       awaiting_approval: "等待确认",
       finalizing: "整理结果中",
     }[activityStatus] : visuallyStreaming ? "生成回复中" : null;
+  // codex 式状态行：阶段文案 + 秒级等待计时；思考时提升最新一条可见推理摘要为动态标题；
+  // 流中断自动重试时显示"重连中 n/m"，让"卡了"从猜测变成可见事实。
+  const reasoningHint = activityStatus === "thinking" ? latestReasoningHint(visibleTimeline) : null;
+  const liveStatusLabel = activityStatus && activityStatus !== "rate_limited" && statusLabel
+    ? (
+      <ActivityStatusLabel
+        label={statusLabel}
+        hint={reasoningHint}
+        sinceMs={activitySinceMs}
+        streamRetry={streamRetry}
+      />
+    )
+    : statusLabel;
   const processContent = (
     <div className="turn-disclosure-panel">
       <div className={visuallyStreaming ? "turn-execution-live" : "turn-execution-content"}>
@@ -221,7 +241,7 @@ export const ConversationTurnActivity = memo(function ConversationTurnActivity({
         >
           <summary>
             <SummaryIcon size={15} aria-hidden="true" className={visuallyStreaming ? "turn-tool-running" : undefined} />
-            <span className="turn-disclosure-title">{visuallyStreaming && activityStatus === "rate_limited" ? <RetryWaitingLabel retryAtMs={retryAtMs} /> : visuallyStreaming ? statusLabel : summaryTitle}</span>
+            <span className="turn-disclosure-title">{visuallyStreaming && activityStatus === "rate_limited" ? <RetryWaitingLabel retryAtMs={retryAtMs} /> : visuallyStreaming ? liveStatusLabel : summaryTitle}</span>
             {visuallyStreaming ? (
               <span className="turn-live-status-dots" aria-hidden="true"><i /><i /><i /></span>
             ) : (
@@ -277,6 +297,49 @@ function usesChineseSummaryLanguage(summary: string) {
   const hanCount = summary.match(HAN_SCRIPT_PATTERN)?.length ?? 0;
   const latinCount = summary.match(LATIN_SCRIPT_PATTERN)?.length ?? 0;
   return hanCount >= 2 && hanCount * 4 >= latinCount;
+}
+
+/**
+ * 从时间线提取最新一条可见推理摘要的最后一行，作为活动状态的动态标题。
+ * 复用与"思考摘要"展示一致的中文/内容过滤；最新摘要不可展示时回退到固定阶段文案。
+ */
+function latestReasoningHint(timeline: TurnTimelineItem[]) {
+  const item = [...timeline].reverse().find(
+    (entry): entry is ReasoningTimelineItem => entry.type === "reasoning",
+  );
+  if (!item || !isDisplayableReasoningSummary(item.summary)) return null;
+  const line = item.summary.split("\n").map((part) => part.trim()).filter(Boolean).pop() ?? "";
+  const cleaned = line.replace(/^[#>*_`\-\s]+/, "").replace(/[#*_`\s]+$/, "").trim();
+  if (!cleaned) return null;
+  return cleaned.length > 40 ? `${cleaned.slice(0, 40)}…` : cleaned;
+}
+
+/**
+ * 活动状态行：阶段文案 + 秒级等待计时；流中断重试时改为"重连中 n/m"且计时不清零。
+ * 只在活动 Turn 期间挂载，setInterval 随组件卸载清理。
+ */
+function ActivityStatusLabel({
+  label,
+  hint,
+  sinceMs,
+  streamRetry,
+}: {
+  label: string;
+  hint: string | null;
+  sinceMs?: number;
+  streamRetry?: { attempt: number; maxAttempts: number } | null;
+}) {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    setNow(Date.now());
+    const timer = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [sinceMs, streamRetry?.attempt]);
+  const elapsed = sinceMs !== undefined ? Math.max(0, Math.floor((now - sinceMs) / 1000)) : 0;
+  const text = streamRetry
+    ? `连接中断，正在重连 ${streamRetry.attempt}/${streamRetry.maxAttempts} · ${elapsed}s`
+    : `${hint ?? label} · ${elapsed}s${elapsed >= 60 ? "，等待时间较长" : ""}`;
+  return <span>{text}</span>;
 }
 
 function TimelineItem({
@@ -679,10 +742,14 @@ function ToolActivityRow({
       ? truncate(activity.result.output, 120)
       : activityStateLabel(activity);
   const subagentIds = subagentIdsOf(activity);
+  const isSubagentActivity = DELEGATION_TOOL_NAMES.has(activity.call.name);
+  const subagentLabel = isSubagentActivity ? subagentActivityLabel(activity) : null;
   return (
-    <div className={`turn-timeline-tool turn-timeline-tool--${noMatches ? "no-matches" : activity.state}${isCommand ? " turn-timeline-tool--command" : ""}`}>
+    <div className={`turn-timeline-tool turn-timeline-tool--${noMatches ? "no-matches" : activity.state}${isCommand ? " turn-timeline-tool--command" : ""}${isSubagentActivity ? " turn-timeline-tool--subagent" : ""}`}>
       {noMatches ? (
         <CircleDot size={15} aria-hidden="true" />
+      ) : isSubagentActivity ? (
+        <Bot className="subagent-tool-icon" size={15} aria-hidden="true" />
       ) : activity.state === "completed" ? (
         <CircleCheck size={15} aria-hidden="true" />
       ) : activity.state === "failed" ? (
@@ -694,7 +761,8 @@ function ToolActivityRow({
       )}
       <span className={isCommand ? "turn-command-summary" : undefined}>
         <span className="turn-tool-heading">
-        <strong title={isCommand && command ? command : undefined}>{title}</strong>
+        <strong title={isCommand && command ? command : undefined}>{isSubagentActivity && activity.call.name === "create_agent" ? "子智能体" : title}</strong>
+        {subagentLabel ? <span className="subagent-tool-label">{subagentLabel}</span> : null}
         {subagentIds.map((subagentId) => {
           const taskNumber = subagentTaskIndex?.[subagentId];
           return taskNumber !== undefined ? (
@@ -736,6 +804,18 @@ function ToolActivityRow({
       ) : null}
     </div>
   );
+}
+
+function subagentActivityLabel(activity: ToolActivity): string | null {
+  const args = activity.call.arguments ?? {};
+  if (activity.call.name === "create_agent" && typeof args.task === "string" && args.task.trim()) {
+    return truncate(args.task.trim(), 96);
+  }
+  if (activity.call.name === "wait_agent") return "等待回传";
+  if (activity.call.name === "send_agent_message") return "发送消息";
+  if (activity.call.name === "resume_agent") return "恢复任务";
+  if (activity.call.name === "close_agent") return "停止任务";
+  return null;
 }
 
 interface FileActivityDetailsValue {

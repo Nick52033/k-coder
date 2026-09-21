@@ -159,6 +159,7 @@ mod tests {
             archived: false,
             in_project,
             workspace_path: workspace_path.map(str::to_string),
+            model_selection: None,
         }
     }
 

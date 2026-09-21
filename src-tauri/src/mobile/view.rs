@@ -674,6 +674,7 @@ mod tests {
             archived: false,
             in_project: true,
             workspace_path: Some("D:\\code\\k-coder".to_string()),
+            model_selection: None,
         };
         let projected = MobileThreadSummary::from_summary(
             &summary,

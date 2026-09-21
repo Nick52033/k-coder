@@ -240,18 +240,7 @@ pub(super) fn is_unambiguous_rg_search(command: &str) -> bool {
     let Some(segments) = literal_pipeline(command) else {
         return false;
     };
-    let search = &segments[0];
-    if !search
-        .first()
-        .is_some_and(|s| s.eq_ignore_ascii_case("rg") || s.eq_ignore_ascii_case("rg.exe"))
-        || search.len() < 2
-        || search.iter().any(|arg| {
-            arg == "--no-messages"
-                || arg == "--quiet"
-                || arg.starts_with("--pre")
-                || (arg.starts_with('-') && !arg.starts_with("--") && arg.contains('q'))
-        })
-    {
+    if !is_plain_rg_search(&segments[0]) {
         return false;
     }
     if segments.len() == 1 {
@@ -262,6 +251,42 @@ pub(super) fn is_unambiguous_rg_search(command: &str) -> bool {
         && receiver.len() == 3
         && receiver[0].eq_ignore_ascii_case("Select-Object")
         && (receiver[1].eq_ignore_ascii_case("-First") || receiver[1].eq_ignore_ascii_case("-Last"))
+        && receiver[2].parse::<usize>().is_ok_and(|count| count > 0)
+}
+
+/// Detect a native `rg` search whose bounded `Select-Object -First` receiver
+/// stops reading before rg finishes writing. On Windows PowerShell this leaves
+/// rg with a broken pipe and exit code 1 even though the delivered lines are
+/// complete and correct, so the non-zero exit code is an artifact of the
+/// truncation rather than a search failure. Only the literal, unambiguous
+/// `rg ... | Select-Object -First N` shape qualifies: dynamic expressions,
+/// redirection and error suppression keep the original failure status.
+pub(super) fn is_bounded_rg_search(command: &str) -> bool {
+    let Some(segments) = literal_pipeline(command) else {
+        return false;
+    };
+    segments.len() == 2 && is_plain_rg_search(&segments[0]) && is_first_bounded_select(&segments[1])
+}
+
+/// A single rg invocation without error suppression, so an exit code still
+/// reflects the search itself instead of an explicitly hidden failure.
+fn is_plain_rg_search(search: &[String]) -> bool {
+    search.len() >= 2
+        && search
+            .first()
+            .is_some_and(|s| s.eq_ignore_ascii_case("rg") || s.eq_ignore_ascii_case("rg.exe"))
+        && !search.iter().any(|arg| {
+            arg == "--no-messages"
+                || arg == "--quiet"
+                || arg.starts_with("--pre")
+                || (arg.starts_with('-') && !arg.starts_with("--") && arg.contains('q'))
+        })
+}
+
+fn is_first_bounded_select(receiver: &[String]) -> bool {
+    receiver.len() == 3
+        && receiver[0].eq_ignore_ascii_case("Select-Object")
+        && receiver[1].eq_ignore_ascii_case("-First")
         && receiver[2].parse::<usize>().is_ok_and(|count| count > 0)
 }
 

@@ -18,8 +18,8 @@ use crate::agent::mailbox::{MailboxTurn, MailboxTurnKind, QueuedTurnSteerError};
 use crate::agent::query_rewrite::ModelQueryRewriter;
 use crate::agent::thread_operation::ThreadOperationGuard;
 use crate::agent::{
-    AgentRuntime, EventPublisher, RunTurnRequest, RuntimeInstructionProvider, SoftTurnLimits,
-    TurnOutcome, build_user_message,
+    AgentRuntime, DEFAULT_HARD_TURN_PROVIDER_CALLS, EventPublisher, RunTurnRequest,
+    RuntimeInstructionProvider, SoftTurnLimits, TurnOutcome, build_user_message,
 };
 use crate::app_state::{AppState, AppStateError};
 use crate::context::assembler::{ContextAssembler, memory_fragments};
@@ -58,8 +58,9 @@ use crate::protocol::{
     AgentEvent, AgentEventEnvelope, AgentMode, ApprovalMode, ApprovalResolution, ChangeSet,
     ImageAttachment, MessageRole, PROTOCOL_VERSION, PatchPreview, PluginOverview,
     QueuedTurnSteerRequest, ReasoningEffort, RuntimeStatus, ThreadForkRequest,
-    ThreadHistorySnapshot, ThreadMailboxChanged, ThreadMailboxSnapshot, ThreadRollbackRequest,
-    TokenUsage, TurnHandle, TurnState, TurnSteerRequest, TurnSteerResponse, UserInputResolution,
+    ThreadHistorySnapshot, ThreadMailboxChanged, ThreadMailboxSnapshot, ThreadModelSelectionResult,
+    ThreadRollbackRequest, TokenUsage, TurnHandle, TurnState, TurnSteerRequest, TurnSteerResponse,
+    UserInputResolution,
 };
 use crate::providers::{
     ProviderConfigView, ProviderEvent, ProviderMessage, ProviderRequest, SaveProviderConfigRequest,
@@ -2138,6 +2139,25 @@ pub fn get_provider_catalog(
         .map_err(|error| CommandError::new("provider_config", error))
 }
 
+#[tauri::command(rename_all = "camelCase")]
+pub async fn select_thread_model(
+    state: State<'_, AppState>,
+    thread_id: String,
+    provider_id: String,
+    model: String,
+    update_default: Option<bool>,
+) -> CommandResult<ThreadModelSelectionResult> {
+    state
+        .select_thread_model(
+            &thread_id,
+            &provider_id,
+            &model,
+            update_default.unwrap_or(true),
+        )
+        .await
+        .map_err(|error| CommandError::new("thread_model", error))
+}
+
 #[tauri::command]
 pub fn save_provider_config(
     state: State<'_, AppState>,
@@ -2864,8 +2884,14 @@ pub async fn turn_steer(
         ));
     }
 
-    let message =
-        prepare_steer_message(&app, state.inner(), &request.input, request.attachments).await?;
+    let message = prepare_steer_message(
+        &app,
+        state.inner(),
+        &request.thread_id,
+        &request.input,
+        request.attachments,
+    )
+    .await?;
     let turn_id = state
         .steer_turn(&request.thread_id, &request.expected_turn_id, message)
         .await
@@ -2923,6 +2949,7 @@ pub async fn turn_steer_queued(
     let message = prepare_steer_message(
         &app,
         state.inner(),
+        &request.thread_id,
         &pending.request.input,
         pending.attachments,
     )
@@ -2947,11 +2974,13 @@ pub async fn turn_steer_queued(
 pub(crate) async fn prepare_steer_message(
     app: &AppHandle,
     state: &AppState,
+    thread_id: &str,
     input: &str,
     mut attachments: Vec<ImageAttachment>,
 ) -> CommandResult<crate::protocol::ChatMessage> {
     let supports_vision = state
-        .active_model_supports_vision()
+        .thread_model_supports_vision(thread_id)
+        .await
         .map_err(|error| CommandError::new("provider_config", error))?;
     if supports_vision {
         for attachment in &mut attachments {
@@ -3131,7 +3160,8 @@ async fn execute_turn(
         serde_json::json!({"threadId": thread_id}),
     );
     let supports_vision = state
-        .active_model_supports_vision()
+        .thread_model_supports_vision(&thread_id)
+        .await
         .map_err(|error| CommandError::new("provider_config", error))?;
     if supports_vision {
         for attachment in &mut attachments {
@@ -3142,9 +3172,9 @@ async fn execute_turn(
     }
     let (provider, model, context_limit) =
         if supports_vision && (has_image_attachments || history_has_images) {
-            state.build_vision_provider()
+            state.build_provider_for_thread(&thread_id, true).await
         } else {
-            state.build_provider()
+            state.build_provider_for_thread(&thread_id, false).await
         }
         .map_err(|error| CommandError::new("provider_config", error))?;
     if let Some(workflow_id) = requested_workflow_id {
@@ -3238,7 +3268,9 @@ async fn execute_turn(
     .with_user_inputs(state.user_inputs())
     .with_logger(state.logger());
     if let Some(limits) = ordinary_turn_soft_limits(goal_budget.is_some()) {
-        runtime = runtime.with_soft_turn_limits(limits);
+        runtime = runtime
+            .with_provider_call_budget(DEFAULT_HARD_TURN_PROVIDER_CALLS)
+            .with_soft_turn_limits(limits);
     }
     if let Some((_, Some(remaining_tokens))) = &goal_budget {
         runtime = runtime.with_token_budget(*remaining_tokens);
@@ -3383,7 +3415,8 @@ async fn execute_retry(
         .filter(|goal| goal.state == crate::advanced::GoalState::Active)
         .map(|goal| goal.time_budget_ms.saturating_sub(goal.elapsed_ms));
     let supports_vision = state
-        .active_model_supports_vision()
+        .thread_model_supports_vision(&thread_id)
+        .await
         .map_err(|error| CommandError::new("provider_config", error))?;
     if retry_has_images
         && !supports_vision
@@ -3403,9 +3436,9 @@ async fn execute_retry(
         ));
     }
     let (provider, model, context_limit) = if supports_vision && history_has_images {
-        state.build_vision_provider()
+        state.build_provider_for_thread(&thread_id, true).await
     } else {
-        state.build_provider()
+        state.build_provider_for_thread(&thread_id, false).await
     }
     .map_err(|error| CommandError::new("provider_config", error))?;
     let turn_id = assigned_turn_id.unwrap_or_else(|| Uuid::new_v4().to_string());
@@ -3488,7 +3521,9 @@ async fn execute_retry(
     .with_user_inputs(state.user_inputs())
     .with_logger(state.logger());
     if let Some(limits) = ordinary_turn_soft_limits(goal_budget.is_some()) {
-        runtime = runtime.with_soft_turn_limits(limits);
+        runtime = runtime
+            .with_provider_call_budget(DEFAULT_HARD_TURN_PROVIDER_CALLS)
+            .with_soft_turn_limits(limits);
     }
     if let Some((_, Some(remaining_tokens))) = &goal_budget {
         runtime = runtime.with_token_budget(*remaining_tokens);
@@ -4647,6 +4682,7 @@ mod tests {
             archived: false,
             in_project: false,
             workspace_path: None,
+            model_selection: None,
         };
 
         let error = require_project_thread_for_subagent(&summary).unwrap_err();

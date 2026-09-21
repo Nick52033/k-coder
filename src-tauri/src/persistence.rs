@@ -654,6 +654,7 @@ impl ProjectionDb {
                     archived: row.get::<_, i64>(4)? != 0,
                     workspace_path: row.get(5)?,
                     in_project: row.get::<_, i64>(6)? != 0,
+                    model_selection: None,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?)
@@ -1341,6 +1342,7 @@ mod tests {
                 archived: false,
                 in_project: true,
                 workspace_path: None,
+                model_selection: None,
             },
             last_turn: None,
             todos: Vec::new(),

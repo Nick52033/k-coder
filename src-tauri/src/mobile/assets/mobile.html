@@ -1081,6 +1081,10 @@
         state.activity = "等待重试…";
         renderChatMeta();
         break;
+      case "provider_stream_retry":
+        state.activity = "连接中断，重连中 " + (params.attempt ?? "?") + "/" + (params.maxAttempts ?? "?") + "…";
+        renderChatMeta();
+        break;
       default:
         break;
     }

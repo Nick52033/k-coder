@@ -24,9 +24,9 @@ use crate::protocol::{
     AgentItemStatus, AgentItemType, AgentMessagePhase, AgentMode, ApprovalAction, ApprovalRequest,
     ApprovalResolution, ApprovalSnapshot, ChangeSet, ChatMessage, ContentBlock,
     HistorySortDirection, MessageRole, PROTOCOL_VERSION, ThreadHistorySnapshot, ThreadItem,
-    ThreadItemEntry, ThreadItemPayload, ThreadItemsPage, ThreadTurn, ThreadTurnsPage, TodoItem,
-    TokenUsage, TokenUsageDetails, ToolCall, ToolResult, TurnError, TurnItemsView, TurnState,
-    UserInputAction, UserInputRequest, UserInputResolution,
+    ThreadItemEntry, ThreadItemPayload, ThreadItemsPage, ThreadModelSelection, ThreadTurn,
+    ThreadTurnsPage, TodoItem, TokenUsage, TokenUsageDetails, ToolCall, ToolResult, TurnError,
+    TurnItemsView, TurnState, UserInputAction, UserInputRequest, UserInputResolution,
 };
 
 mod event_validation;
@@ -85,6 +85,10 @@ pub enum StoredEventKind {
     },
     ThreadWorkspaceBound {
         path: String,
+    },
+    ThreadModelSelected {
+        provider_id: String,
+        model: String,
     },
     ThreadForked {
         source_thread_id: String,
@@ -201,6 +205,8 @@ pub struct ThreadSummary {
     #[serde(default = "default_in_project")]
     pub in_project: bool,
     pub workspace_path: Option<String>,
+    #[serde(default)]
+    pub model_selection: Option<ThreadModelSelection>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -415,6 +421,32 @@ impl JsonlThreadRepository {
         Ok(self.read_thread(thread_id).await?.summary)
     }
 
+    pub async fn set_thread_model_selection(
+        &self,
+        thread_id: &str,
+        provider_id: &str,
+        model: &str,
+    ) -> Result<ThreadSummary, StorageError> {
+        let provider_id = provider_id.trim();
+        let model = model.trim();
+        if provider_id.is_empty() || model.is_empty() {
+            return Err(StorageError::InvalidData(
+                "thread model selection must include a provider and model".into(),
+            ));
+        }
+        self.read_thread(thread_id).await?;
+        self.append(StoredEvent::new(
+            thread_id,
+            None,
+            StoredEventKind::ThreadModelSelected {
+                provider_id: provider_id.to_string(),
+                model: model.to_string(),
+            },
+        ))
+        .await?;
+        Ok(self.read_thread(thread_id).await?.summary)
+    }
+
     pub async fn list_threads(&self) -> Result<Vec<ThreadSummary>, StorageError> {
         self.projection
             .list_threads()
@@ -572,6 +604,14 @@ impl JsonlThreadRepository {
             },
         ))
         .await?;
+        if let Some(selection) = source.summary.model_selection.as_ref() {
+            self.set_thread_model_selection(
+                &destination.id,
+                &selection.provider_id,
+                &selection.model,
+            )
+            .await?;
+        }
 
         for source_event in events.into_iter().take(through) {
             if !is_fork_history_event(&source_event.kind) {
@@ -904,6 +944,7 @@ fn is_thread_metadata(kind: &StoredEventKind) -> bool {
         kind,
         StoredEventKind::ThreadCreated { .. }
             | StoredEventKind::ThreadWorkspaceBound { .. }
+            | StoredEventKind::ThreadModelSelected { .. }
             | StoredEventKind::ThreadForked { .. }
             | StoredEventKind::ThreadRolledBack { .. }
             | StoredEventKind::ThreadArchived
@@ -952,6 +993,7 @@ fn project_thread(thread_id: &str, events: &[StoredEvent]) -> Result<ThreadDetai
     let mut archived = false;
     let in_project = created.2;
     let mut workspace_path = None;
+    let mut model_selection = None;
     let mut last_turn = None;
     let mut tool_activities: Vec<ToolActivitySnapshot> = Vec::new();
     let mut turn_timeline: Vec<TurnTimelineItem> = Vec::new();
@@ -1006,6 +1048,12 @@ fn project_thread(thread_id: &str, events: &[StoredEvent]) -> Result<ThreadDetai
                     ));
                 }
                 workspace_path = Some(path.clone());
+            }
+            StoredEventKind::ThreadModelSelected { provider_id, model } => {
+                model_selection = Some(ThreadModelSelection {
+                    provider_id: provider_id.clone(),
+                    model: model.clone(),
+                });
             }
             StoredEventKind::ThreadForked { .. } | StoredEventKind::ThreadRolledBack { .. } => {}
             StoredEventKind::UserMessage { message } => {
@@ -1409,6 +1457,7 @@ fn project_thread(thread_id: &str, events: &[StoredEvent]) -> Result<ThreadDetai
             archived,
             in_project,
             workspace_path,
+            model_selection,
         },
         messages,
         message_turn_ids,
@@ -1797,6 +1846,7 @@ fn project_thread_history(
             }
             StoredEventKind::ThreadCreated { .. }
             | StoredEventKind::ThreadWorkspaceBound { .. }
+            | StoredEventKind::ThreadModelSelected { .. }
             | StoredEventKind::ThreadForked { .. }
             | StoredEventKind::ThreadRolledBack { .. }
             | StoredEventKind::TurnStarted
@@ -2551,6 +2601,31 @@ mod tests {
             .await
             .expect("thread should archive");
         assert!(repository.list_threads().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn thread_model_selection_is_replayed_without_affecting_other_threads() {
+        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        let repository =
+            JsonlThreadRepository::new(directory.path()).expect("repository should be created");
+        let first = repository.create_thread().await.unwrap();
+        let second = repository.create_thread().await.unwrap();
+
+        repository
+            .set_thread_model_selection(&first.id, "provider-a", "model-a")
+            .await
+            .unwrap();
+
+        let first_detail = repository.read_thread(&first.id).await.unwrap();
+        let second_detail = repository.read_thread(&second.id).await.unwrap();
+        assert_eq!(
+            first_detail.summary.model_selection,
+            Some(ThreadModelSelection {
+                provider_id: "provider-a".into(),
+                model: "model-a".into(),
+            })
+        );
+        assert_eq!(second_detail.summary.model_selection, None);
     }
 
     #[tokio::test]

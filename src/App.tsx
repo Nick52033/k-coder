@@ -67,6 +67,7 @@ import { buildSubagentTurnIndex } from "./lib/subagent";
 import { ConversationTurnActivity, isVisibleConversationTimelineItem } from "./components/ConversationActivity";
 import { MarkdownContent } from "./components/MarkdownContent";
 import { ImagePreviewDialog } from "./components/ImagePreviewDialog";
+import { BrandMark } from "./components/BrandMark";
 import { cn } from "./lib/cn";
 import { open } from "@tauri-apps/plugin-dialog";
 import { readFile, stat } from "@tauri-apps/plugin-fs";
@@ -113,26 +114,6 @@ import { THEME_STORAGE_KEY, isDarkResolvedTheme, parseThemePreference, resolveTh
 import "./App.css";
 import "./enhanced-animations.css"; // UI 增强动画
 import "./components/ModeSelector.css";
-
-function BrandGlyph({ size = 20 }: { size?: number }) {
-  return (
-    <svg
-      data-brand-mark="k-letter"
-      viewBox="0 0 512 512"
-      width={size}
-      height={size}
-      fill="none"
-      aria-hidden="true"
-      xmlns="http://www.w3.org/2000/svg"
-    >
-      <rect width="512" height="512" rx="104" fill="currentColor" />
-      <path
-        d="M154 112h72v119l104-119h88L298 247l128 153h-91L250 294l-24 27v79h-72V112Z"
-        fill="var(--color-surface)"
-      />
-    </svg>
-  );
-}
 
 function WelcomeGlyph({ size = 48 }: { size?: number }) {
   return (
@@ -473,6 +454,7 @@ function App() {
     providerConfig,
     providerConfigs,
     activeProviderId,
+    threadModelSelection,
     approvalMode,
     reasoningEffort,
     plan: savedPlan,
@@ -496,6 +478,7 @@ function App() {
     undoAppliedChange,
     saveProvider,
     activateProvider,
+    selectThreadModel,
     deleteProvider,
     setApprovalMode,
     setReasoningEffort,
@@ -1212,22 +1195,30 @@ function App() {
   );
   const anyTurnBusy = Object.keys(activeTurns).length > 0;
   const retryable = !currentThreadBusy && ["failed", "cancelled"].includes(lastTurn?.state ?? "");
-  const activeModelContextWindow = providerConfig?.models.find(
-    (model) => model.id === providerConfig.model,
+  const selectedThreadProvider = useMemo(() => {
+    if (!threadModelSelection) return providerConfig;
+    const configured = providerConfigs.find((provider) => provider.id === threadModelSelection.providerId);
+    return configured ? { ...configured, model: threadModelSelection.model } : providerConfig;
+  }, [providerConfig, providerConfigs, threadModelSelection]);
+  const selectedThreadProviderId = threadModelSelection?.providerId ?? activeProviderId;
+  const activeModelContextWindow = selectedThreadProvider?.models.find(
+    (model) => model.id === selectedThreadProvider.model,
   )?.contextWindow ?? null;
   // 标题栏运行时面板展示当前会话的 Turn 摘要：忙时给实时阶段，空闲时给最近一次的终态与错误。
   const runtimeTurnSummary = useMemo<{ label: string; detail: string } | null>(() => {
     const busyTurnId = currentThreadTurnId ?? restoredCurrentTurnId;
     if (busyTurnId) {
       const statusLabel = activityStatus && activityStatus.turnId === busyTurnId
-        ? {
-          rate_limited: "限流等待",
-          thinking: "思考中",
-          responding: "生成回复中",
-          running_tool: "处理工具结果中",
-          awaiting_approval: "等待确认",
-          finalizing: "整理结果中",
-        }[activityStatus.status]
+        ? activityStatus.streamRetry
+          ? `重连中 ${activityStatus.streamRetry.attempt}/${activityStatus.streamRetry.maxAttempts}`
+          : {
+            rate_limited: "限流等待",
+            thinking: "思考中",
+            responding: "生成回复中",
+            running_tool: "处理工具结果中",
+            awaiting_approval: "等待确认",
+            finalizing: "整理结果中",
+          }[activityStatus.status]
         : null;
       const cancelling = Boolean(activeThreadId && cancellingTurns[activeThreadId] === busyTurnId);
       return {
@@ -1445,6 +1436,8 @@ function App() {
               streaming={turnId === currentThreadTurnId}
               initialTextVisible={turnId === restoredCurrentTurnId}
               activityStatus={turnId === activityStatus?.turnId ? activityStatus.status : null}
+              activitySinceMs={activityStatus?.sinceMs}
+              streamRetry={activityStatus?.streamRetry ?? null}
               renderText={renderMessageText}
               onRetry={retryable && lastTurn?.turnId === turnId ? () => void retryLastTurn() : undefined}
               retryAtMs={activityStatus?.retryAtMs}
@@ -1579,6 +1572,8 @@ function App() {
             streaming={segmentStreaming}
             initialTextVisible={segment.turnId === restoredCurrentTurnId}
             activityStatus={segmentActivityStatus}
+            activitySinceMs={activityStatus?.sinceMs}
+            streamRetry={activityStatus?.streamRetry ?? null}
             finalMessageId={segmentFinalMessageId}
             renderText={renderMessageText}
             onRetry={segment.isLast && retryable && lastTurn?.turnId === segment.turnId
@@ -1648,6 +1643,8 @@ function App() {
                   streaming={attemptIsTerminalSegment && turnId === currentThreadTurnId}
                   initialTextVisible={turnId === restoredCurrentTurnId}
                   activityStatus={attemptActivityStatus}
+                  activitySinceMs={activityStatus?.sinceMs}
+                  streamRetry={activityStatus?.streamRetry ?? null}
                   finalMessageId={attemptFinalMessageId}
                   renderText={renderMessageText}
                   onRetry={attemptIsTerminalSegment && retryable && lastTurn?.turnId === turnId
@@ -2159,7 +2156,7 @@ function App() {
       <header className="titlebar" data-tauri-drag-region>
         <div className="brand" data-tauri-drag-region>
           <span className="brand-mark" aria-hidden="true">
-            <BrandGlyph size={20} />
+            <BrandMark size={20} />
           </span>
           <strong>k-Coder</strong>
         </div>
@@ -2167,7 +2164,7 @@ function App() {
           <RuntimeStatePanel
             runtime={runtime}
             runtimeError={runtimeError}
-            model={providerConfig?.model ?? null}
+            model={selectedThreadProvider?.model ?? null}
             turn={runtimeTurnSummary}
           />
           <div className="titlebar-segmented" role="group" aria-label="面板切换">
@@ -2593,6 +2590,8 @@ function App() {
                           streaming={message.status === "streaming"}
                           initialTextVisible={message.turnId === restoredCurrentTurnId}
                           activityStatus={messageActivityStatus}
+                          activitySinceMs={activityStatus?.sinceMs}
+                          streamRetry={activityStatus?.streamRetry ?? null}
                           finalMessageId={message.id}
                           renderText={renderMessageText}
                           onRetry={retryable && lastTurn?.turnId === message.turnId ? () => void retryLastTurn() : undefined}
@@ -2917,7 +2916,17 @@ function App() {
                   title={attachment.name}
                 >
                   {attachment.kind === "image"
-                    ? <img src={attachment.content} alt={attachment.name} className="attachment-thumb" />
+                    ? (
+                      <button
+                        type="button"
+                        className="attachment-thumb-button"
+                        aria-label={`查看图片 ${attachment.name}`}
+                        title={`查看 ${attachment.name}`}
+                        onClick={() => setPreviewImage({ name: attachment.name, dataUrl: attachment.content })}
+                      >
+                        <img src={attachment.content} alt={attachment.name} className="attachment-thumb" />
+                      </button>
+                    )
                     : <Paperclip size={12} />}
                   <span className="attachment-name">{attachment.name}</span>
                   {attachment.kind === "document" && attachment.truncated
@@ -3065,11 +3074,10 @@ function App() {
                   onChange={setReasoningEffort}
                 />
                 <ModelSelector
-                  provider={providerConfig}
+                  provider={selectedThreadProvider}
                   providers={providerConfigs}
-                  activeProviderId={activeProviderId}
-                  onSaveProvider={saveProvider}
-                  onActivateProvider={activateProvider}
+                  activeProviderId={selectedThreadProviderId}
+                  onSelectThreadModel={selectThreadModel}
                 />
               </div>
               <div className="composer-actions">

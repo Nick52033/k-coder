@@ -1,0 +1,72 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+playwright-report
+test-results
+*.local
+
+# 本地部署配置（含机器相关路径，不随仓库走）
+scripts/deploy.config.json
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# ONNX Runtime debug symbols are not needed at runtime and exceed GitHub's file limit.
+*.pdb
+
+# 本地 UI 取证产物（截图、metrics、一次性调试脚本），结论沉淀在 docs/
+.tmp-ui/
+
+# 运行产物 / 临时输出（截图、日志、导出文件），不纳入版本管理
+outputs/
+
+# TypeScript 增量构建产物（`tsc -b` 由 vite.config.ts / tsconfig.*.json 生成，不是源码）
+*.tsbuildinfo
+vite.config.js
+vite.config.d.ts
+
+# ===== ↑ 以上同步自 .gitignore（「从 .gitignore 同步」只重写以上部分）=====
+.git/
+.hg/
+.svn/
+bower_components/
+jspm_packages/
+__pycache__/
+site-packages/
+venv/
+coverage/
+htmlcov/
+lcov-report/
+cmakefiles/
+cmake-build-*/
+bazel-*/
+pods/
+deriveddata/
+storybook-static/
+allure-results/
+allure-report/
+cdk.out/
+*.egg-info/
+*.dist-info/
+eggs/
+pip-wheel-metadata/
+wheels/
+# ----- ↑ 以上为 ZCode 默认排除规则（自定义规则请写在本行下方，不会被同步/恢复改动）-----
+# 自定义规则写在下方（本行提示可删除）

@@ -1364,7 +1364,6 @@ impl ToolHandler for RunCommandTool {
             .read(&id, 0, 1000)
             .await
             .map_err(|error| ToolError::Execution(error.to_string()))?;
-        let success = matches!(status.state, CommandState::Exited { code: 0 });
         let mut text = output
             .chunks
             .iter()
@@ -1375,23 +1374,37 @@ impl ToolHandler for RunCommandTool {
             CommandState::Exited { code } => Some(*code),
             _ => None,
         };
-        let result_kind = (shell == "powershell"
-            && !status.output_truncated
-            && !output.truncated_before_cursor
-            && output.next_cursor == status.next_cursor)
-            .then(|| command_result_kind(&arguments.command, exit_code, output_was_empty))
-            .flatten();
-        if output_was_empty
-            && let Some(message) = empty_command_failure_message(result_kind, exit_code)
-        {
-            text.push_str(&message);
-        }
         let stderr = output
             .chunks
             .iter()
             .filter(|chunk| matches!(chunk.stream, crate::execution::OutputStream::Stderr))
             .map(|chunk| chunk.text.as_str())
             .collect::<String>();
+        let stderr_was_empty = stderr.trim().is_empty();
+        let result_kind = (shell == "powershell"
+            && !status.output_truncated
+            && !output.truncated_before_cursor
+            && output.next_cursor == status.next_cursor)
+            .then(|| {
+                command_result_kind(
+                    &arguments.command,
+                    exit_code,
+                    output_was_empty,
+                    stderr_was_empty,
+                )
+            })
+            .flatten();
+        // A bounded `rg ... | Select-Object -First N` search reports exit code 1
+        // once the receiver stops reading early, because rg is left with a broken
+        // pipe. The delivered lines are complete and correct, so treat this shape
+        // as a successful search and expose the exit code separately.
+        let success = matches!(status.state, CommandState::Exited { code: 0 })
+            || result_kind == Some("bounded_output");
+        if output_was_empty
+            && let Some(message) = empty_command_failure_message(result_kind, exit_code)
+        {
+            text.push_str(&message);
+        }
         let recovery_hint = if shell == "powershell" && !success && powershell_parse_error(&stderr)
         {
             Some(
@@ -1456,7 +1469,18 @@ fn command_result_kind(
     command: &str,
     exit_code: Option<i32>,
     output_is_empty: bool,
+    stderr_is_empty: bool,
 ) -> Option<&'static str> {
+    // A non-empty stderr means rg itself reported a real failure (IO error,
+    // invalid regex, invalid glob), so the non-zero exit code is not an
+    // artifact of the bounded receiver stopping early.
+    if !output_is_empty
+        && stderr_is_empty
+        && exit_code.is_some_and(|code| code != 0)
+        && command_diagnostics::is_bounded_rg_search(command)
+    {
+        return Some("bounded_output");
+    }
     (output_is_empty
         && exit_code == Some(1)
         && command_diagnostics::is_unambiguous_rg_search(command))
@@ -2230,7 +2254,13 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         std::fs::write(
             directory.path().join("sample.cs"),
-            "class UniqueMarker {}\n",
+            // Enough lines that rg cannot finish writing before the bounded
+            // receiver stops reading, so the broken pipe is deterministic
+            // instead of racing the pipe buffer.
+            (1..=600)
+                .map(|index| format!("class Item{index} {{}}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
         )
         .unwrap();
         let runtime = CommandRuntime::new_with_bundled_tools(
@@ -2259,9 +2289,30 @@ mod tests {
             }
         };
         // This exact shape used to consume the open pipe for the entire 120s timeout.
-        let found = run("rg -n UniqueMarker --glob '*.cs' -l").await;
+        let found = run("rg -n class --glob '*.cs' -l").await;
         assert!(found.success, "{found:?}");
         assert!(found.output.contains("sample.cs"));
+        // A bounded `Select-Object -First` receiver stops reading before rg
+        // finishes, so rg dies from a broken pipe and reports exit code 1 even
+        // though every delivered line is complete and correct.
+        let bounded = run("rg -n class --glob '*.cs' . | Select-Object -First 1").await;
+        assert!(bounded.success, "{bounded:?}");
+        assert_eq!(bounded.metadata["resultKind"], "bounded_output");
+        assert_eq!(bounded.metadata["exitCode"], 1);
+        assert!(bounded.output.contains("sample.cs"), "{bounded:?}");
+        // A real rg failure also reports a non-zero exit code with bounded
+        // output, so stderr must keep it failing instead of forgiving the pipe.
+        let real_error =
+            run("rg -n class --glob '*.cs' . missing-dir | Select-Object -First 5").await;
+        assert!(!real_error.success, "{real_error:?}");
+        assert!(
+            real_error.metadata.get("resultKind").is_none(),
+            "{real_error:?}"
+        );
+        assert!(
+            real_error.output.contains("系统找不到指定的文件"),
+            "{real_error:?}"
+        );
         for command in [
             "rg -n AbsentMarker .",
             "rg -n AbsentMarker . | Select-Object -First 20",
@@ -2942,15 +2993,63 @@ mod tests {
     #[test]
     fn command_result_kind_marks_only_empty_rg_exit_one_as_no_matches() {
         assert_eq!(
-            command_result_kind("rg -n missing .", Some(1), true),
+            command_result_kind("rg -n missing .", Some(1), true, true),
             Some("no_matches")
         );
         assert_eq!(
-            command_result_kind("rg -n missing .; Write-Output other", Some(1), false),
+            command_result_kind("rg -n missing .; Write-Output other", Some(1), false, true),
             None
         );
-        assert_eq!(command_result_kind("rg -n missing .", Some(2), true), None);
-        assert_eq!(command_result_kind("cargo test", Some(1), true), None);
+        assert_eq!(
+            command_result_kind("rg -n missing .", Some(2), true, true),
+            None
+        );
+        assert_eq!(command_result_kind("cargo test", Some(1), true, true), None);
+    }
+
+    #[test]
+    fn command_result_kind_forgives_only_a_bounded_rg_pipe_without_rg_errors() {
+        // Truncated output and a broken pipe: rg reports exit code 1 although
+        // every delivered line is complete and correct.
+        assert_eq!(
+            command_result_kind(
+                "rg -n needle --glob '*.ts' src | Select-Object -First 20",
+                Some(1),
+                false,
+                true,
+            ),
+            Some("bounded_output")
+        );
+        // rg itself reported a failure, so the non-zero exit code is real.
+        assert_eq!(
+            command_result_kind(
+                "rg -n needle --glob '*.ts' src missing | Select-Object -First 20",
+                Some(1),
+                false,
+                false,
+            ),
+            None
+        );
+        // A pipeline the diagnostics cannot read literally stays a failure.
+        assert_eq!(
+            command_result_kind(
+                "rg -n needle $paths | Select-Object -First $limit",
+                Some(1),
+                false,
+                true
+            ),
+            None
+        );
+        // Empty output keeps the no-matches classification, never bounded_output.
+        assert_eq!(
+            command_result_kind(
+                "rg -n needle --glob '*.ts' src | Select-Object -First 20",
+                Some(1),
+                true,
+                true,
+            ),
+            Some("no_matches")
+        );
     }
 
     #[test]

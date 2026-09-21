@@ -36,6 +36,7 @@ use crate::tools::{
 };
 
 mod input;
+use input::truncate_utf8;
 pub(crate) mod instructions;
 pub mod mailbox;
 mod provider_history;
@@ -58,13 +59,22 @@ const MAX_REASONING_SUMMARY_BYTES: usize = 64 * 1024;
 const MAX_PROVIDER_CONTEXT_BYTES: usize = 512 * 1024;
 const MAX_TOOL_OUTPUT_BYTES: usize = 128 * 1024;
 const MAX_IDENTICAL_TOOL_CALLS: usize = 2;
+/// 工具失败写入本地运行日志时保留的错误输出上限，避免一次失败写爆日志文件。
+const MAX_TOOL_FAILURE_OUTPUT_BYTES: usize = 4 * 1024;
 const PROGRESS_CHECK_WINDOW: usize = 5;
 const MAX_NO_PROGRESS_WINDOWS: usize = 3;
 const MAX_PROTOCOL_RETRIES: usize = 5;
+/// Provider 流式响应的 idle 超时：每个事件之间最长静默时间。
+/// 超过即判定流已死亡，未产生输出时自动重试并向界面发布重连事件；
+/// 已有输出则失败而不是无限挂起。参考 codex 的 5 分钟默认。
+const DEFAULT_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 pub const DEFAULT_SOFT_TURN_PROVIDER_CALLS: u32 = 100;
 pub const DEFAULT_SOFT_TURN_TOTAL_TOKENS: u64 = 5_000_000;
 // Tool execution and provider latency alone must not interrupt an authorized turn.
 pub const DEFAULT_SOFT_TURN_DURATION_MS: Option<u64> = None;
+/// A hard cumulative cap prevents repeated continuation approvals from turning one
+/// Turn into an unbounded model/tool loop.
+pub const DEFAULT_HARD_TURN_PROVIDER_CALLS: u32 = 200;
 
 const TURN_CONTINUATION_TOOL_CALL_ID: &str = "runtime-turn-continuation";
 const TURN_CONTINUE: &str = "continue";
@@ -295,6 +305,7 @@ pub struct AgentRuntime {
     user_inputs: Arc<UserInputManager>,
     runtime_instruction_provider: Arc<dyn RuntimeInstructionProvider>,
     max_total_tokens: Option<u64>,
+    max_provider_calls: Option<u32>,
     soft_turn_limits: Option<SoftTurnLimits>,
     context_limit: usize,
     working_context_limit: usize,
@@ -303,6 +314,7 @@ pub struct AgentRuntime {
     supports_vision: bool,
     logger: Option<StructuredLogger>,
     transient_retry_delays: Vec<Duration>,
+    stream_idle_timeout: Duration,
 }
 
 impl AgentRuntime {
@@ -342,6 +354,7 @@ impl AgentRuntime {
             user_inputs: Arc::new(UserInputManager::new()),
             runtime_instruction_provider: Arc::new(|| Ok(String::new())),
             max_total_tokens: None,
+            max_provider_calls: None,
             soft_turn_limits: None,
             context_limit: DEFAULT_CONTEXT_LIMIT,
             working_context_limit: context::default_working_context_limit(DEFAULT_CONTEXT_LIMIT),
@@ -354,6 +367,7 @@ impl AgentRuntime {
                 Duration::from_secs(2),
                 Duration::from_secs(4),
             ],
+            stream_idle_timeout: DEFAULT_STREAM_IDLE_TIMEOUT,
         }
     }
 
@@ -381,6 +395,12 @@ impl AgentRuntime {
         self
     }
 
+    #[cfg(test)]
+    fn with_stream_idle_timeout(mut self, timeout: Duration) -> Self {
+        self.stream_idle_timeout = timeout;
+        self
+    }
+
     pub fn with_approval_mode(mut self, mode: ApprovalMode) -> Self {
         self.approval_mode = mode;
         self
@@ -388,6 +408,11 @@ impl AgentRuntime {
 
     pub fn with_token_budget(mut self, max_total_tokens: u64) -> Self {
         self.max_total_tokens = Some(max_total_tokens);
+        self
+    }
+
+    pub fn with_provider_call_budget(mut self, max_provider_calls: u32) -> Self {
+        self.max_provider_calls = Some(max_provider_calls.max(1));
         self
     }
 
@@ -804,6 +829,23 @@ impl AgentRuntime {
                 )
                 .await?;
             }
+            if self
+                .max_provider_calls
+                .is_some_and(|limit| provider_call_index >= limit)
+            {
+                let limit = self.max_provider_calls.unwrap_or_default();
+                return self
+                    .finish_failed(
+                        &thread_id,
+                        &turn_id,
+                        format!(
+                            "单个 Turn 已达到模型调用硬上限（{} 次），为防止执行循环已停止；请检查当前进展后开启新 Turn。",
+                            limit
+                        ),
+                        &publisher,
+                    )
+                    .await;
+            }
             if let (Some(limits), Some(segment)) =
                 (self.soft_turn_limits, soft_turn_segment.as_mut())
             {
@@ -1061,6 +1103,12 @@ impl AgentRuntime {
                                     thread_id: thread_id.clone(), turn_id: turn_id.clone(),
                                     retry_at_ms: crate::providers::retry_at_ms(delay),
                                 }));
+                            } else if transient {
+                                publisher.publish(AgentEventEnvelope::new(AgentEvent::ProviderStreamRetry {
+                                    thread_id: thread_id.clone(), turn_id: turn_id.clone(),
+                                    attempt: (transient_retry_count + 1) as u32,
+                                    max_attempts: self.transient_retry_delays.len() as u32,
+                                }));
                             }
                             if !wait_for_provider_retry(delay, &provider_cancellation).await {
                                 if !cancellation.is_cancelled()
@@ -1133,7 +1181,15 @@ impl AgentRuntime {
                             );
                             break None;
                         }
-                        event = stream.next() => event,
+                        event = tokio::time::timeout(self.stream_idle_timeout, stream.next()) => {
+                            match event {
+                                Ok(event) => event,
+                                Err(_elapsed) => Some(Err(ProviderError::Request(format!(
+                                    "provider stream idle timeout: no events for {}s",
+                                    self.stream_idle_timeout.as_secs()
+                                )))),
+                            }
+                        },
                     };
 
                     match event {
@@ -1485,6 +1541,12 @@ impl AgentRuntime {
                                 publisher.publish(AgentEventEnvelope::new(AgentEvent::ProviderRetryWaiting {
                                     thread_id: thread_id.clone(), turn_id: turn_id.clone(),
                                     retry_at_ms: crate::providers::retry_at_ms(delay),
+                                }));
+                            } else if transient {
+                                publisher.publish(AgentEventEnvelope::new(AgentEvent::ProviderStreamRetry {
+                                    thread_id: thread_id.clone(), turn_id: turn_id.clone(),
+                                    attempt: (transient_retry_count + 1) as u32,
+                                    max_attempts: self.transient_retry_delays.len() as u32,
                                 }));
                             }
                                 if !wait_for_provider_retry(delay, &provider_cancellation).await {
@@ -2696,6 +2758,9 @@ impl AgentRuntime {
         status: AgentItemStatus,
         publisher: &Arc<dyn EventPublisher>,
     ) -> Result<(), AgentRuntimeError> {
+        if !result.success {
+            self.record_tool_failure(thread_id, turn_id, call, result, status);
+        }
         self.repository
             .append(StoredEvent::new(
                 thread_id,
@@ -2724,6 +2789,33 @@ impl AgentRuntime {
         )
         .await?;
         Ok(())
+    }
+
+    /// 工具失败埋点：所有失败（含被跳过、被取消和致命中止）都会写入本地运行日志，
+    /// 并按日志原始 `threadId` 标记来源对话。
+    fn record_tool_failure(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        call: &ToolCall,
+        result: &ToolResult,
+        status: AgentItemStatus,
+    ) {
+        let Some(logger) = &self.logger else {
+            return;
+        };
+        let _ = logger.log(
+            "error",
+            "tool_failed",
+            json!({
+                "threadId": thread_id,
+                "turnId": turn_id,
+                "tool": call.name,
+                "callId": call.id,
+                "itemStatus": status,
+                "output": truncate_utf8(&result.output, MAX_TOOL_FAILURE_OUTPUT_BYTES),
+            }),
+        );
     }
 
     async fn finish_completed(
@@ -5949,6 +6041,135 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_tools_are_logged_with_their_conversation_source() {
+        let (directory, _repository, runtime, thread_id) = runtime_fixture().await;
+        let logger = StructuredLogger::new(directory.path()).unwrap();
+        let runtime = runtime.with_logger(logger.clone());
+        let scripts = vec![
+            vec![
+                Ok(ProviderEvent::ToolCall {
+                    call: ToolCall {
+                        id: "call-fail".into(),
+                        name: "list_directory".into(),
+                        arguments: json!({ "path": "missing-directory" }),
+                        metadata: json!({}),
+                    },
+                }),
+                Ok(ProviderEvent::Completed),
+            ],
+            vec![
+                Ok(ProviderEvent::TextDelta {
+                    delta: "done".to_string(),
+                }),
+                Ok(ProviderEvent::Completed),
+            ],
+        ];
+
+        let outcome = runtime
+            .run_turn(
+                Arc::new(FakeProvider::script(scripts)),
+                "fixture".into(),
+                RunTurnRequest {
+                    thread_id: thread_id.clone(),
+                    input: "inspect a missing directory".to_string(),
+                    agent_mode: None,
+                },
+                CancellationToken::new(),
+                Arc::new(RecordingPublisher::default()),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.state, TurnState::Completed);
+        let logs = logger
+            .read_logs(crate::logging::LogQuery {
+                limit: None,
+                level: Some("error".into()),
+                event: Some("tool_failed".into()),
+                after_timestamp_ms: None,
+            })
+            .unwrap();
+        assert_eq!(logs.records.len(), 1);
+        let record = &logs.records[0];
+        assert_eq!(record.level, "error");
+        // 日志原始 threadId 是来源对话的唯一标记，读取端据此关联对话名称。
+        assert_eq!(record.thread_id.as_deref(), Some(thread_id.as_str()));
+        assert_eq!(record.fields["threadId"], thread_id);
+        assert_eq!(record.fields["tool"], "list_directory");
+        assert_eq!(record.fields["callId"], "call-fail");
+        assert_eq!(record.fields["itemStatus"], "failed");
+        let output = record.fields["output"].as_str().unwrap();
+        assert!(output.contains("missing-directory"));
+        assert!(output.len() <= MAX_TOOL_FAILURE_OUTPUT_BYTES);
+    }
+
+    #[tokio::test]
+    async fn successful_tools_do_not_write_failure_logs() {
+        let (directory, _repository, runtime, thread_id) = runtime_fixture().await;
+        let logger = StructuredLogger::new(directory.path()).unwrap();
+        let runtime = runtime.with_logger(logger.clone());
+        let scripts = vec![
+            vec![
+                Ok(ProviderEvent::ToolCall {
+                    call: ToolCall {
+                        id: "call-ok".into(),
+                        name: "list_directory".into(),
+                        arguments: json!({ "path": "." }),
+                        metadata: json!({}),
+                    },
+                }),
+                Ok(ProviderEvent::Completed),
+            ],
+            vec![
+                Ok(ProviderEvent::TextDelta {
+                    delta: "done".to_string(),
+                }),
+                Ok(ProviderEvent::Completed),
+            ],
+        ];
+
+        let outcome = runtime
+            .run_turn(
+                Arc::new(FakeProvider::script(scripts)),
+                "fixture".into(),
+                RunTurnRequest {
+                    thread_id,
+                    input: "list the workspace root".to_string(),
+                    agent_mode: None,
+                },
+                CancellationToken::new(),
+                Arc::new(RecordingPublisher::default()),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.state, TurnState::Completed);
+        let logs = logger
+            .read_logs(crate::logging::LogQuery {
+                limit: None,
+                level: None,
+                event: Some("tool_failed".into()),
+                after_timestamp_ms: None,
+            })
+            .unwrap();
+        assert!(logs.records.is_empty());
+    }
+
+    #[test]
+    fn tool_failure_output_is_bounded_before_it_reaches_the_log_file() {
+        let oversized = "x".repeat(MAX_TOOL_FAILURE_OUTPUT_BYTES);
+        let bounded = truncate_utf8(&oversized, 8);
+        assert_eq!(bounded, "xxxxxxxx");
+
+        // 多字节字符必须落在字符边界上，截断不能产生无效 UTF-8。
+        let multibyte = "汉字测试".repeat(64);
+        let bounded = truncate_utf8(&multibyte, 10);
+        assert!(bounded.len() <= 10);
+        assert!(multibyte.starts_with(bounded));
+        assert_eq!(bounded.chars().count(), 3);
+    }
+
+    #[tokio::test]
     async fn recovered_rate_limits_keep_bounded_diagnostics_for_both_provider_paths() {
         for wrapped in [false, true] {
             let (directory, _repository, runtime, thread_id) = runtime_fixture().await;
@@ -6461,6 +6682,142 @@ mod tests {
 
         assert_eq!(outcome.state, TurnState::Failed);
         assert_eq!(provider.requests().len(), 1);
+    }
+
+    /// 每个 outcome 是一组先行事件 + 是否在之后永久挂起（模拟流静默卡死）。
+    struct IdleStreamProvider {
+        outcomes: Mutex<VecDeque<(Vec<Result<ProviderEvent, ProviderError>>, bool)>>,
+        requests: Mutex<Vec<ProviderRequest>>,
+    }
+
+    impl IdleStreamProvider {
+        fn new(outcomes: Vec<(Vec<Result<ProviderEvent, ProviderError>>, bool)>) -> Self {
+            Self {
+                outcomes: Mutex::new(outcomes.into()),
+                requests: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn requests(&self) -> Vec<ProviderRequest> {
+            self.requests.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl Provider for IdleStreamProvider {
+        async fn stream(
+            &self,
+            request: ProviderRequest,
+            _cancellation: CancellationToken,
+        ) -> Result<crate::providers::ProviderStream, ProviderError> {
+            self.requests.lock().unwrap().push(request);
+            match self.outcomes.lock().unwrap().pop_front() {
+                Some((events, hang_after)) => {
+                    if hang_after {
+                        Ok(Box::pin(
+                            futures_util::stream::iter(events)
+                                .chain(futures_util::stream::pending()),
+                        ))
+                    } else {
+                        Ok(Box::pin(futures_util::stream::iter(events)))
+                    }
+                }
+                None => Err(ProviderError::InvalidResponse(
+                    "idle stream test provider ran out of outcomes".into(),
+                )),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_idle_timeout_retries_visibly_then_succeeds() {
+        let (_directory, _repository, runtime, thread_id) = runtime_fixture().await;
+        let publisher = Arc::new(RecordingPublisher::default());
+        let provider = Arc::new(IdleStreamProvider::new(vec![
+            (vec![], true),
+            (
+                vec![
+                    Ok(ProviderEvent::TextDelta {
+                        delta: "recovered".into(),
+                    }),
+                    Ok(ProviderEvent::Completed),
+                ],
+                false,
+            ),
+        ]));
+
+        let outcome = runtime
+            .with_stream_idle_timeout(Duration::from_millis(20))
+            .with_transient_retry_delays(vec![Duration::from_millis(1); 3])
+            .run_turn(
+                provider.clone(),
+                "gpt-5".into(),
+                RunTurnRequest {
+                    thread_id,
+                    input: "retry a stalled stream".into(),
+                    agent_mode: None,
+                },
+                CancellationToken::new(),
+                publisher.clone(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.state, TurnState::Completed);
+        assert_eq!(provider.requests().len(), 2);
+        let events = publisher.events.lock().unwrap();
+        assert!(
+            events.iter().any(|event| matches!(
+                &event.event,
+                AgentEvent::ProviderStreamRetry {
+                    attempt: 1,
+                    max_attempts: 3,
+                    ..
+                }
+            )),
+            "idle timeout should publish a visible stream retry event"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_idle_timeout_after_output_fails_without_replay() {
+        let (_directory, _repository, runtime, thread_id) = runtime_fixture().await;
+        let publisher = Arc::new(RecordingPublisher::default());
+        let provider = Arc::new(IdleStreamProvider::new(vec![(
+            vec![Ok(ProviderEvent::TextDelta {
+                delta: "partial".into(),
+            })],
+            true,
+        )]));
+
+        let outcome = runtime
+            .with_stream_idle_timeout(Duration::from_millis(20))
+            .with_transient_retry_delays(vec![Duration::from_millis(1); 3])
+            .run_turn(
+                provider.clone(),
+                "gpt-5".into(),
+                RunTurnRequest {
+                    thread_id,
+                    input: "do not replay a stalled partial response".into(),
+                    agent_mode: None,
+                },
+                CancellationToken::new(),
+                publisher.clone(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.state, TurnState::Failed);
+        assert_eq!(provider.requests().len(), 1);
+        let error = outcome.error.expect("stalled stream should fail the turn");
+        assert!(error.contains("idle timeout"));
+        let events = publisher.events.lock().unwrap();
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event.event, AgentEvent::ProviderStreamRetry { .. })),
+            "output already started must not publish retry events"
+        );
     }
 
     #[tokio::test]

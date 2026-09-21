@@ -26,17 +26,31 @@
   align-items: center;
   justify-content: space-between;
   gap: 8px;
-  padding: 10px 12px;
+  min-height: 54px;
+  padding: 10px 14px;
   border-bottom: 1px solid var(--color-border);
+  background: var(--color-surface);
 }
 
 .subagent-drawer-title {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 8px;
   font-size: var(--font-size-sm, 13px);
   font-weight: 600;
   color: var(--color-ink);
+}
+
+.subagent-brand-mark {
+  display: grid;
+  width: 28px;
+  height: 28px;
+  flex: 0 0 auto;
+  place-items: center;
+  border: 1px solid color-mix(in srgb, var(--color-brand) 22%, var(--color-border));
+  border-radius: 8px;
+  color: var(--color-brand);
+  background: color-mix(in srgb, var(--color-brand) 10%, var(--color-surface));
 }
 
 .subagent-drawer-actions {
@@ -123,7 +137,7 @@
   align-items: flex-start;
   gap: 4px;
   border: 1px solid var(--color-border);
-  border-radius: var(--radius-md, 6px);
+  border-radius: 8px;
   background: var(--color-surface);
   transition: border-color var(--transition-fast, 120ms ease);
 }
@@ -347,6 +361,30 @@
 .subagent-row--selected {
   border-color: var(--color-brand);
   background: var(--color-item-active-bg, var(--color-surface-hover));
+}
+
+.subagent-row--reference {
+  border-color: transparent;
+  background: transparent;
+  box-shadow: none;
+}
+
+.subagent-row--reference:hover,
+.subagent-row--reference.subagent-row--selected {
+  border-color: var(--color-border);
+  background: var(--color-surface-hover);
+}
+
+.subagent-row--reference .subagent-row-main {
+  padding: 9px 8px;
+}
+
+.subagent-row--reference .subagent-row-label {
+  font-weight: 560;
+}
+
+.subagent-row--reference .subagent-row-meta {
+  color: var(--color-ink-subtle);
 }
 
 /* The thread-list badge becomes a button so a subagent thread can open the drawer. */

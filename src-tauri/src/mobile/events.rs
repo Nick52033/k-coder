@@ -50,7 +50,8 @@ pub fn route_event(event: &AgentEvent) -> EventRoute {
         | AgentEvent::ToolOutputDelta { .. }
         | AgentEvent::ActivityStatusChanged { .. }
         | AgentEvent::UsageUpdated { .. }
-        | AgentEvent::ProviderRetryWaiting { .. } => EventRoute {
+        | AgentEvent::ProviderRetryWaiting { .. }
+        | AgentEvent::ProviderStreamRetry { .. } => EventRoute {
             priority: EventPriority::Droppable,
             forward: true,
         },
@@ -90,6 +91,7 @@ pub fn route_event(event: &AgentEvent) -> EventRoute {
 pub fn event_thread_id(event: &AgentEvent) -> &str {
     match event {
         AgentEvent::ProviderRetryWaiting { thread_id, .. }
+        | AgentEvent::ProviderStreamRetry { thread_id, .. }
         | AgentEvent::TurnStarted { thread_id, .. }
         | AgentEvent::TurnSteered { thread_id, .. }
         | AgentEvent::TurnRejected { thread_id, .. }

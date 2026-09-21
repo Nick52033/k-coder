@@ -91,7 +91,7 @@ pub(crate) fn build_user_message(
     user_message(input, attachments, supports_vision)
 }
 
-fn truncate_utf8(value: &str, max_bytes: usize) -> &str {
+pub(super) fn truncate_utf8(value: &str, max_bytes: usize) -> &str {
     if value.len() <= max_bytes {
         return value;
     }

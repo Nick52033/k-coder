@@ -24,6 +24,7 @@ import type {
   PtySessionView,
   PatchPreview,
   ProviderCatalogView,
+  ThreadModelSelectionResult,
   ProviderConfigView,
   ProviderConnectionTest,
   ReasoningEffort,
@@ -136,6 +137,10 @@ export function getProviderConfig() {
 
 export function getProviderCatalog() {
   return invoke<ProviderCatalogView>("get_provider_catalog");
+}
+
+export function selectThreadModel(threadId: string, providerId: string, model: string, updateDefault = true) {
+  return invoke<ThreadModelSelectionResult>("select_thread_model", { threadId, providerId, model, updateDefault });
 }
 
 export function saveProviderConfig(request: SaveProviderConfigRequest) {

@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { RefreshCw, ScrollText, Trash2, X } from "lucide-react";
+import { RefreshCw, Trash2, X } from "lucide-react";
 import { clearLogs, readLogs } from "../api/runtime";
 import type { LogLevel, LogRecord } from "../types/runtime";
+import { BrandMark } from "./BrandMark";
 
 const LEVELS: Array<{ value: LogLevel | ""; label: string }> = [
   { value: "", label: "全部级别" },
@@ -116,7 +117,7 @@ export function LogViewerDialog({ onClose }: LogViewerDialogProps) {
       >
         <header className="log-viewer-header">
           <div className="log-viewer-title">
-            <ScrollText size={18} />
+            <span className="dialog-brand-mark" aria-hidden="true"><BrandMark size={18} /></span>
             <h2 id="log-viewer-title">本地运行日志</h2>
           </div>
           <button

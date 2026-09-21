@@ -12,6 +12,57 @@ fn read_call(id: usize, start_line: usize, line_count: usize) -> ProviderEvent {
 }
 
 #[tokio::test]
+async fn hard_provider_call_budget_survives_continuation() {
+    let (_directory, _repository, runtime, thread_id) = runtime_fixture().await;
+    let scripts = (0..4)
+        .map(|id| {
+            vec![
+                Ok(ProviderEvent::ToolCall {
+                    call: ToolCall {
+                        id: format!("budget-call-{id}"),
+                        name: "list_directory".into(),
+                        arguments: json!({"path": format!("missing-{id}")}),
+                        metadata: json!({}),
+                    },
+                }),
+                Ok(ProviderEvent::Completed),
+            ]
+        })
+        .collect::<Vec<_>>();
+    let provider = Arc::new(FakeProvider::script(scripts));
+    let publisher = Arc::new(UserInputResolvingPublisher::new(
+        runtime.user_input_manager(),
+        TURN_CONTINUE,
+    ));
+    let outcome = runtime
+        .with_provider_call_budget(3)
+        .with_soft_turn_limits(SoftTurnLimits::new(1, u64::MAX, u64::MAX))
+        .run_turn(
+            provider.clone(),
+            "fake".into(),
+            RunTurnRequest {
+                thread_id,
+                input: "inspect until the task is complete".into(),
+                agent_mode: None,
+            },
+            CancellationToken::new(),
+            publisher,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.state, TurnState::Failed, "{outcome:?}");
+    assert!(
+        outcome
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("模型调用硬上限")),
+        "{outcome:?}"
+    );
+    assert_eq!(provider.requests().len(), 3);
+}
+
+#[tokio::test]
 async fn successful_repeated_reads_keep_the_body_and_allow_completion() {
     let (directory, repository, runtime, thread_id) = runtime_fixture().await;
     let body = "first line\nimplementation detail\nlast line";

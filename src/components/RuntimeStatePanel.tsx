@@ -21,53 +21,6 @@ interface RuntimeStatePanelProps {
   turn: RuntimeTurnSummary | null;
 }
 
-/** 能力标识的中文名，未收录的标识按原样展示。 */
-const CAPABILITY_LABELS: Record<string, string> = {
-  "streaming-chat": "流式对话",
-  "persistent-threads": "会话持久化",
-  cancellation: "取消 Turn",
-  "native-tool-calling": "原生工具调用",
-  "workspace-read-tools": "工作区读取工具",
-  "workspace-write-tools": "工作区写入工具",
-  "reviewable-patches": "可审阅补丁",
-  "change-undo": "变更撤销",
-  "command-sessions": "命令会话",
-  "bounded-command-output": "命令输出截断",
-  "process-tree-cancellation": "进程树清理",
-  "command-risk-policy": "命令风险策略",
-  "pty-terminal": "PTY 终端",
-  "sqlite-projections": "SQLite 投影",
-  "context-budgeting": "上下文预算",
-  "context-compaction": "上下文压缩",
-  "crash-recovery": "崩溃恢复",
-  "structured-logging": "结构化日志",
-  "programming-workbench": "编程工作台",
-  "runtime-instructions": "运行时指令",
-  skills: "Skill",
-  "mcp-stdio": "MCP Stdio",
-  "mcp-streamable-http": "MCP Streamable HTTP",
-  "tool-hooks": "工具钩子",
-  "extension-diagnostics": "扩展诊断",
-  "extension-audit": "扩展审计",
-  "multi-agent-delegation": "多智能体委派",
-  "bounded-subagents": "子智能体上限",
-  "subagent-cancellation": "子智能体取消",
-  "subagent-persistence": "子智能体持久化",
-  "persistent-plans": "计划持久化",
-  "plan-mode": "计划模式",
-  "user-input-tool": "向用户提问工具",
-  "budgeted-goals": "预算目标",
-  "builtin-workflows": "内置机器人工作流",
-  "browser-automation": "浏览器自动化",
-  "repository-search": "仓库搜索",
-  "opt-in-memory": "选择性记忆",
-  "bounded-document-extraction": "文档抽取",
-  "runtime-metrics": "运行时指标",
-  "knowledge-fts": "知识库全文检索",
-  "knowledge-citations": "知识库引用",
-  "embedding-configuration": "向量配置",
-};
-
 function formatUptime(uptimeSeconds: number) {
   if (!Number.isFinite(uptimeSeconds) || uptimeSeconds < 0) return "--";
   const total = Math.floor(uptimeSeconds);
@@ -81,14 +34,13 @@ function formatUptime(uptimeSeconds: number) {
   return `${seconds} 秒`;
 }
 
-function capabilityLabel(capability: string) {
-  return CAPABILITY_LABELS[capability] ?? capability;
-}
-
 /**
  * 标题栏运行时状态入口。静态标签只说明"是否连上"，看不到任何可操作信息，
  * 因此改为可点击面板：展开后给出 phase、版本、运行时长、当前模型与 Turn 状态、
- * 能力清单，以及连接失败时的原始错误详情。
+ * 以及连接失败时的原始错误详情。
+ *
+ * 后端 `runtime_status` 仍会下发能力清单（稳定的 IPC 契约），但这里不再渲染：
+ * 43 项标签会把弹层撑得很高，用户关心的只有当前连的是什么、跑了多久、在做什么。
  */
 export function RuntimeStatePanel({ runtime, runtimeError, model, turn }: RuntimeStatePanelProps) {
   const [isOpen, setIsOpen] = useState(false);
@@ -99,7 +51,6 @@ export function RuntimeStatePanel({ runtime, runtimeError, model, turn }: Runtim
 
   const failed = Boolean(runtimeError);
   const triggerLabel = failed ? "运行时不可用" : runtime ? "运行时就绪" : "正在连接";
-  const capabilities = runtime?.capabilities ?? [];
 
   function updatePopoverPosition() {
     const trigger = triggerRef.current;
@@ -215,24 +166,6 @@ export function RuntimeStatePanel({ runtime, runtimeError, model, turn }: Runtim
               <pre>{runtimeError}</pre>
             </div>
           ) : null}
-
-          <div className="runtime-state-capabilities">
-            <div className="runtime-state-capabilities-heading">
-              <strong>能力</strong>
-              <span>{capabilities.length} 项</span>
-            </div>
-            {capabilities.length > 0 ? (
-              <ul>
-                {capabilities.map((capability) => (
-                  <li key={capability} title={capability}>
-                    {capabilityLabel(capability)}
-                  </li>
-                ))}
-              </ul>
-            ) : (
-              <p className="runtime-state-capabilities-empty">连接后展示运行时能力清单</p>
-            )}
-          </div>
         </div>,
         document.body,
       )}

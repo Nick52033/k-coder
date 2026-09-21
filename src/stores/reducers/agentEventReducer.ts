@@ -27,7 +27,15 @@ export interface ConversationProjectionState {
   activeTurnThreadId: string | null;
   activeTurns: Record<string, string>;
   cancellingTurns: Record<string, string>;
-  activityStatus: { turnId: string; status: AgentActivityStatus; retryAtMs?: number } | null;
+  activityStatus: {
+    turnId: string;
+    status: AgentActivityStatus;
+    retryAtMs?: number;
+    /** 当前阶段开始时间，界面据此显示"思考中 · 23s"的等待计时。 */
+    sinceMs?: number;
+    /** Provider 流中断后的自动重试进度；下一次状态事件到达时清除。 */
+    streamRetry?: { attempt: number; maxAttempts: number };
+  } | null;
   pendingApproval: ApprovalRequest | null;
   pendingApprovals: ApprovalRequest[];
   pendingUserInput: UserInputRequest | null;
@@ -109,6 +117,20 @@ export interface AgentEventReduction {
   sideEffects?: Array<"processQueue" | "refreshPlan">;
 }
 
+/** 阶段切换时重置计时；同阶段重复事件（如重试后再次 thinking）保留原计时。 */
+function nextActivityStatus(
+  state: ConversationProjectionState,
+  turnId: string,
+  status: AgentActivityStatus,
+  extra?: { retryAtMs?: number; streamRetry?: { attempt: number; maxAttempts: number } },
+): NonNullable<ConversationProjectionState["activityStatus"]> {
+  const previous = state.activityStatus;
+  const sinceMs = previous && previous.turnId === turnId && previous.status === status && previous.sinceMs !== undefined
+    ? previous.sinceMs
+    : Date.now();
+  return { turnId, status, sinceMs, ...extra };
+}
+
 export function reduceAgentEvent(
   event: AgentEvent,
   state: ConversationProjectionState,
@@ -148,7 +170,7 @@ export function reduceAgentEvent(
           lastTurn: { turnId: event.turnId, state: "streaming", error: null },
           pendingApproval: null,
           pendingApprovals: [],
-          activityStatus: { turnId: event.turnId, status: "thinking" },
+          activityStatus: nextActivityStatus(state, event.turnId, "thinking"),
           turnUserMessageIds: state.turnUserMessageIds[event.turnId] || !latestUserMessage
             ? state.turnUserMessageIds
             : { ...state.turnUserMessageIds, [event.turnId]: latestUserMessage.id },
@@ -237,10 +259,18 @@ export function reduceAgentEvent(
       };
     }
     case "provider_retry_waiting":
-      return { state: { activityStatus: { turnId: event.turnId, status: "rate_limited", retryAtMs: event.retryAtMs } } };
+      return { state: { activityStatus: nextActivityStatus(state, event.turnId, "rate_limited", { retryAtMs: event.retryAtMs }) } };
+    case "provider_stream_retry":
+      return {
+        state: {
+          activityStatus: nextActivityStatus(state, event.turnId, "thinking", {
+            streamRetry: { attempt: event.attempt, maxAttempts: event.maxAttempts },
+          }),
+        },
+      };
     case "activity_status_changed":
       return {
-        state: { activityStatus: { turnId: event.turnId, status: event.status } },
+        state: { activityStatus: nextActivityStatus(state, event.turnId, event.status) },
       };
     case "text_delta": {
       const lastItem = state.turnTimeline[state.turnTimeline.length - 1];
@@ -262,7 +292,7 @@ export function reduceAgentEvent(
           }];
       return {
         state: {
-          activityStatus: { turnId: event.turnId, status: "responding" },
+          activityStatus: nextActivityStatus(state, event.turnId, "responding"),
           turnTimeline,
         },
       };
@@ -349,7 +379,7 @@ export function reduceAgentEvent(
       return {
         state: {
           lastTurn: { turnId: event.turnId, state: "running_tool", error: null },
-          activityStatus: { turnId: event.turnId, status: "running_tool" },
+          activityStatus: nextActivityStatus(state, event.turnId, "running_tool"),
           turnTimeline: hasExisting
             ? state.turnTimeline.map((item) => item.type === "tool"
               && item.activity.turnId === event.turnId
@@ -375,7 +405,7 @@ export function reduceAgentEvent(
       return {
         state: {
           lastTurn: { turnId: event.turnId, state: "running_tool", error: null },
-          activityStatus: { turnId: event.turnId, status: "running_tool" },
+          activityStatus: nextActivityStatus(state, event.turnId, "running_tool"),
           turnTimeline: hasExisting
             ? state.turnTimeline.map((item) => item.type === "tool"
               && item.activity.turnId === event.turnId
@@ -421,7 +451,7 @@ export function reduceAgentEvent(
       return {
         state: {
           lastTurn: { turnId: event.turnId, state: "streaming", error: null },
-          activityStatus: { turnId: event.turnId, status: "thinking" },
+          activityStatus: nextActivityStatus(state, event.turnId, "thinking"),
           turnTimeline: state.turnTimeline.map((item) =>
             item.type === "tool"
               && item.activity.turnId === event.turnId
@@ -465,7 +495,7 @@ export function reduceAgentEvent(
       return {
         state: {
           ...approvalQueueState(queue),
-          activityStatus: { turnId: event.turnId, status: "awaiting_approval" },
+          activityStatus: nextActivityStatus(state, event.turnId, "awaiting_approval"),
           lastTurn: { turnId: event.turnId, state: "awaiting_approval", error: null },
           turnTimeline: insertApprovalRequestEvent(
             state.turnTimeline,
@@ -489,10 +519,11 @@ export function reduceAgentEvent(
             state: queue.length ? "awaiting_approval" : "streaming",
             error: null,
           },
-          activityStatus: {
-            turnId: event.turnId,
-            status: queue.length ? "awaiting_approval" : "thinking",
-          },
+          activityStatus: nextActivityStatus(
+            state,
+            event.turnId,
+            queue.length ? "awaiting_approval" : "thinking",
+          ),
           turnTimeline: insertApprovalResolutionEvent(
             state.turnTimeline,
             `approval-resolved-${event.requestId}`,
@@ -510,7 +541,7 @@ export function reduceAgentEvent(
       return {
         state: {
           ...userInputQueueState(queue),
-          activityStatus: { turnId: event.turnId, status: "awaiting_approval" },
+          activityStatus: nextActivityStatus(state, event.turnId, "awaiting_approval"),
           lastTurn: { turnId: event.turnId, state: "awaiting_approval", error: null },
           turnTimeline: appendTimelineEvent(
             state.turnTimeline,
@@ -533,10 +564,11 @@ export function reduceAgentEvent(
             state: queue.length ? "awaiting_approval" : "streaming",
             error: null,
           },
-          activityStatus: {
-            turnId: event.turnId,
-            status: queue.length ? "awaiting_approval" : "thinking",
-          },
+          activityStatus: nextActivityStatus(
+            state,
+            event.turnId,
+            queue.length ? "awaiting_approval" : "thinking",
+          ),
           turnTimeline: appendTimelineEvent(
             state.turnTimeline,
             `user-input-resolved-${event.requestId}`,

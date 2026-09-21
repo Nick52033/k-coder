@@ -1226,13 +1226,17 @@ test("command diagnostics distinguish no matches and errors in live and restored
     { id: "stderr", command: "Get-ChildItem; rg x missing.cs", output: "sample.cs\nrg: missing.cs: IO error", metadata: { exitCode: 1, outputChunks: [{ stream: "stdout", cursor: 0, text: "sample.cs\n" }, { stream: "stderr", cursor: 1, text: "rg: missing.cs: IO error\n" }] }, label: "运行失败：rg: missing.cs: IO error" },
     { id: "partial", command: "Get-ChildItem; rg absent .", output: "normal-output.cs ParserError", metadata: { exitCode: 1, outputChunks: [{ stream: "stdout", cursor: 0, text: "normal-output.cs ParserError\n" }] }, label: "运行失败：退出码 1（已有部分输出）" },
     { id: "timeout", command: "Start-Sleep 50", output: "", metadata: { state: { state: "timed_out" }, exitCode: null, outputChunks: [] }, label: "运行超时" },
+    // A bounded `Select-Object -First` receiver stops reading before rg finishes, so rg dies from a
+    // broken pipe and reports exit code 1. The delivered lines are complete, so the backend forgives
+    // the exit code and the row must render as a successful command, not a failure.
+    { id: "bounded", state: "completed", command: "rg -n class --glob '*.cs' . | Select-Object -First 20", output: "src-tauri/tests/mobile_turn_lifecycle.rs:127:        _attachments: Vec<ImageAttachment>,", metadata: { resultKind: "bounded_output", exitCode: 1, outputChunks: [{ stream: "stdout", cursor: 0, text: "src-tauri/tests/mobile_turn_lifecycle.rs:127:        _attachments: Vec<ImageAttachment>,\n" }] }, label: "已运行" },
     { id: "legacy", command: "rg missing .; exit 1", output: "rg: no matches (exit code 1).", metadata: {}, label: "运行失败：rg: no matches (exit code 1)." },
     { id: "preflight", command: "rg -n 'AgentActivityStatus' src/App.tsx | Select-Object -First", output: "命令未执行：Select-Object 的 -First 必须带行数。", metadata: { resultKind: "invalid_command", executed: false, recoveryHint: "Select-Object 的 -First 必须带行数。" }, label: "未执行：Select-Object 的 -First 必须带行数。" },
     { id: "preflight-glob", command: "rg -n Marker src/*.tsx src/**/*.css", output: "命令未执行：请使用目录和 --glob。", metadata: { resultKind: "invalid_command", executed: false, recoveryHint: "请使用目录和 --glob。" }, label: "未执行：请使用目录和 --glob。" },
   ];
-  const activities = fixtures.map(({ id, command, output, metadata }) => ({
+  const activities = fixtures.map(({ id, command, output, metadata, state = "failed" }) => ({
     turnId: "turn-disclosure", call: { id, name: "run_command", arguments: { command }, metadata: {} },
-    state: "failed", result: { success: false, output, metadata },
+    state, result: { success: state === "completed", output, metadata },
   }));
   const events = (activity: typeof activities[number]) => [
     { type: "tool_started", call: activity.call },
@@ -1289,10 +1293,9 @@ test("surfaces runtime details from the titlebar state entry", async ({ page }, 
   await expect(rows.filter({ hasText: "当前模型" })).toContainText("gpt-4.1");
   await expect(rows.filter({ hasText: "当前 Turn" })).toContainText("空闲");
 
-  // 能力名称做了本地化，但 tooltip 仍保留稳定的后端标识。
-  const capability = popover.locator(".runtime-state-capabilities li").first();
-  await expect(capability).toHaveText("Skill");
-  await expect(capability).toHaveAttribute("title", "skills");
+  // 能力清单不再渲染：后端仍下发稳定标识，面板只保留这五组字段。
+  await expect(popover.locator(".runtime-state-capabilities")).toHaveCount(0);
+  await expect(rows).toHaveCount(5);
   await expect(popover.locator(".runtime-state-error")).toHaveCount(0);
 
   // 窄屏下面板会覆盖会话标题，点击标题栏其他控件同样属于面板外点击。
@@ -3245,7 +3248,7 @@ test("streams thinking, safe reasoning summaries, compact command states, and fi
     emit({ ...base, type: "item_started", phase: "planning", itemId: "rs-live", itemType: "reasoning" });
     emit({ ...base, type: "reasoning_summary_delta", phase: "planning", itemId: "rs-live", delta: "**Fixing context mismatch in patch**" });
   });
-  await expect(page.getByText("思考中", { exact: true })).toBeVisible();
+  await expect(page.getByText(/思考中 · \d+s/)).toBeVisible();
   await expect(page.getByText("Fixing context mismatch in patch", { exact: true })).toHaveCount(0);
   await expect(page.locator(".turn-reasoning")).toHaveCount(0);
   await expect(page.getByText("等待工具调用…", { exact: true })).toHaveCount(0);
@@ -3457,7 +3460,7 @@ test("paces streamed text and preserves timeline order before tools and completi
   await expect(liveMessage.locator(".turn-progress-text--typing")).toBeVisible();
   await expect(liveMessage.getByText("工具前说明终点", { exact: true })).toHaveCount(0);
   await expect(liveMessage.getByText("运行了命令", { exact: true })).toHaveCount(0);
-  await expect(liveMessage.getByText("生成回复中", { exact: true })).toBeVisible();
+  await expect(liveMessage.getByText(/^生成回复中( · \d+s)?$/)).toBeVisible();
   await expect(liveMessage.getByText("工具前说明终点", { exact: true })).toBeVisible({ timeout: 10_000 });
   await expect(liveMessage.getByText("运行了命令", { exact: true })).toBeVisible();
 
@@ -3483,10 +3486,44 @@ test("paces streamed text and preserves timeline order before tools and completi
   });
 
   await expect(liveMessage.locator(".turn-execution--live")).toBeVisible();
-  await expect(liveMessage.getByText("生成回复中", { exact: true })).toBeVisible();
+  await expect(liveMessage.getByText(/^生成回复中( · \d+s)?$/)).toBeVisible();
   await expect(liveMessage.locator(".turn-execution--live")).toHaveCount(0);
   await expect(liveMessage.locator(".turn-final-response").getByText("流式终点", { exact: true })).toBeVisible();
   await expect(liveMessage.getByText("执行了 1.8s", { exact: true })).toBeVisible();
+});
+
+test("shows elapsed time, reconnect progress, and reasoning hint in the live status line", async ({ page }) => {
+  await page.goto("/");
+  const emit = (event: Record<string, unknown>) => page.evaluate((payload) => {
+    (window as unknown as { __emitAgentEvent: (value: unknown) => void }).__emitAgentEvent(payload);
+  }, event);
+  const base = { schemaVersion: 8, threadId: "thread-1", turnId: "turn-status-live" };
+
+  await emit({ ...base, type: "turn_started", phase: "exploring" });
+  const liveMessage = page.locator(".message--assistant").last();
+  // 阶段文案带秒级计时：时间在走说明前端活着，等多久一目了然。
+  await expect(liveMessage.locator(".turn-disclosure-title").getByText(/思考中 · \d+s/)).toBeVisible();
+
+  // 流中断自动重试：显示重连进度，而不是看似冻结的"思考中"。
+  await emit({ ...base, type: "provider_stream_retry", phase: "exploring", attempt: 1, maxAttempts: 3 });
+  await expect(liveMessage.locator(".turn-disclosure-title").getByText(/连接中断，正在重连 1\/3 · \d+s/)).toBeVisible();
+
+  // 新一轮请求开始：回到思考中，重连标记清除。
+  await emit({ ...base, type: "activity_status_changed", phase: "exploring", status: "thinking" });
+  await expect(liveMessage.locator(".turn-disclosure-title").getByText(/思考中 · \d+s/)).toBeVisible();
+  await expect(liveMessage.locator(".turn-disclosure-title").getByText(/重连中/)).toHaveCount(0);
+
+  // 可见的中文推理摘要提升为动态状态标题。
+  await emit({ ...base, type: "item_started", phase: "planning", itemId: "rs-hint", itemType: "reasoning" });
+  await emit({ ...base, type: "reasoning_summary_delta", phase: "planning", itemId: "rs-hint", delta: "已确认失败原因来自退出码分类，准备修复前端渲染。" });
+  await expect(liveMessage.locator(".turn-disclosure-title").getByText(/已确认失败原因来自退出码分类/)).toBeVisible();
+
+  // 英文过程句被过滤，标题回退为固定阶段文案。
+  await emit({ ...base, type: "reasoning_summary_completed", phase: "planning", itemId: "rs-hint", summary: "已确认失败原因来自退出码分类，准备修复前端渲染。" });
+  await emit({ ...base, type: "item_started", phase: "planning", itemId: "rs-hint-en", itemType: "reasoning" });
+  await emit({ ...base, type: "reasoning_summary_delta", phase: "planning", itemId: "rs-hint-en", delta: "Checking the renderer now" });
+  await expect(liveMessage.locator(".turn-disclosure-title").getByText(/思考中 · \d+s/)).toBeVisible();
+  await expect(liveMessage.locator(".turn-disclosure-title").getByText(/Checking the renderer/)).toHaveCount(0);
 });
 
 test("keeps the active tool open and folds it as soon as it finishes", async ({ page }) => {
@@ -4538,6 +4575,45 @@ test("sends images without frontend OCR and opens the conversation preview", asy
   await page.getByRole("button", { name: "关闭图片预览" }).click();
 });
 
+test("opens the preview dialog from a pending composer image attachment", async ({ page }, testInfo) => {
+  await page.goto("/");
+  await expect(page.getByRole("heading", { name: "Phase 6 workbench" })).toBeVisible();
+  const composer = page.getByRole("textbox", { name: "消息" });
+  await composer.evaluate(async (element) => {
+    const transfer = new DataTransfer();
+    const canvas = document.createElement("canvas");
+    canvas.width = 320;
+    canvas.height = 180;
+    const context = canvas.getContext("2d")!;
+    context.fillStyle = "#166534";
+    context.fillRect(0, 0, canvas.width, canvas.height);
+    context.fillStyle = "#f8fafc";
+    context.font = "600 30px sans-serif";
+    context.fillText("Composer preview", 56, 100);
+    const blob = await new Promise<Blob>((resolve) => canvas.toBlob((value) => resolve(value!), "image/png"));
+    transfer.items.add(new File([blob], "composer-image.png", { type: "image/png" }));
+    element.dispatchEvent(new ClipboardEvent("paste", { bubbles: true, cancelable: true, clipboardData: transfer }));
+  });
+
+  await expect(page.getByLabel("待发送附件").locator(".attachment-tag")).toHaveCount(1);
+  const thumbButton = page.getByRole("button", { name: "查看图片 composer-image.png" });
+  await expect(thumbButton).toBeVisible();
+  await page.screenshot({ path: testInfo.outputPath("composer-image-attachment.png"), fullPage: true });
+
+  await thumbButton.click();
+  const imagePreview = page.getByRole("dialog", { name: "composer-image.png" });
+  await expect(imagePreview).toBeVisible();
+  await expect(imagePreview.locator("img")).toHaveAttribute("src", /^data:image\/png;base64,/);
+  await page.screenshot({ path: testInfo.outputPath("composer-image-preview.png"), fullPage: true });
+  await page.keyboard.press("Escape");
+  await expect(imagePreview).toHaveCount(0);
+
+  // 打开预览既不清空待发送附件，也不自动发送。
+  await expect(page.getByLabel("待发送附件").locator(".attachment-tag")).toHaveCount(1);
+  await expect(page.getByRole("button", { name: "移除 composer-image.png" })).toBeVisible();
+  await expect.poll(() => page.evaluate(() => (window as unknown as { __runTurnCalls: unknown[] }).__runTurnCalls.length)).toBe(0);
+});
+
 test("queues concurrent approvals and drops an expired request", async ({ page }) => {
   await page.goto("/");
   await expect(page.getByRole("heading", { name: "Phase 6 workbench" })).toBeVisible();
@@ -4608,7 +4684,7 @@ test("streams progress and tools in event order before the turn completes", asyn
   await expect(liveMessage.locator(".turn-timeline-tool--running .turn-tool-running")).toBeVisible();
   const liveExecution = liveMessage.locator(".turn-execution--live");
   await expect(liveExecution).toHaveAttribute("open", "");
-  await expect(liveExecution.locator("summary").getByText("处理工具结果中", { exact: true })).toBeVisible();
+  await expect(liveExecution.locator("summary").getByText(/处理工具结果中 · \d+s/)).toBeVisible();
   await expect(liveMessage.locator(".message-avatar")).toHaveCount(0);
   await page.screenshot({ path: testInfo.outputPath("active-file-read.png"), fullPage: true });
 
@@ -4626,7 +4702,7 @@ test("streams progress and tools in event order before the turn completes", asyn
   await completedReadGroup.locator(":scope > summary").click();
   await expect(liveMessage.locator(".turn-timeline-tool--completed").getByText("读取 src/App.tsx L3370-3382", { exact: true })).toBeVisible();
   await expect(liveMessage.locator(".turn-tool-meta > span").getByText("已完成", { exact: true })).toBeVisible();
-  await expect(liveMessage.getByText("思考中", { exact: true })).toBeVisible();
+  await expect(liveMessage.getByText(/思考中 · \d+s/)).toBeVisible();
   await emit({ ...base, type: "text_delta", phase: "planning", delta: "入口文件已读取。" });
   await emit({
     ...base,
@@ -5221,8 +5297,11 @@ test("replays live events received while a thread snapshot is loading", async ({
 test("shows and starts subagent activity without a default token budget", async ({ page }) => {
   await page.goto("/");
   await page.getByRole("button", { name: "子智能体", exact: true }).click();
+  const drawer = page.getByRole("complementary", { name: "子智能体", exact: true });
+  await expect(drawer.locator(".subagent-brand-mark")).toHaveCount(1);
+  await expect(drawer.locator(".subagent-row").first()).toHaveClass(/subagent-row--reference/);
   await expect(page.getByText(/420 tokens/)).toBeVisible();
-  await page.getByRole("complementary", { name: "子智能体", exact: true }).getByRole("button", { name: /检查后端/ }).click();
+  await drawer.getByRole("button", { name: /检查后端/ }).click();
   await expect(page.getByText("后端检查完成", { exact: true })).toBeVisible();
   await page.getByRole("button", { name: "返回列表" }).click();
   await page.getByRole("button", { name: "新建子任务" }).click();

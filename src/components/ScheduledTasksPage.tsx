@@ -24,6 +24,7 @@ import {
   X,
   Zap,
 } from "lucide-react";
+import { BrandMark } from "./BrandMark";
 import {
   deleteScheduledTask,
   getWorkspaceState,
@@ -385,7 +386,7 @@ export function ScheduledTasksPage() {
       {modalOpen && createPortal(
         <div className="scheduled-modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget && !saving) setModalOpen(false); }}>
           <section className="scheduled-modal" role="dialog" aria-modal="true" aria-labelledby="scheduled-modal-title">
-            <header className="scheduled-modal-header"><div><span>新建定时任务</span><h2 id="scheduled-modal-title">{editing ? "编辑任务" : "创建任务"}</h2></div><button type="button" aria-label="关闭" title="关闭" onClick={() => setModalOpen(false)} disabled={saving}><X size={18} /></button></header>
+            <header className="scheduled-modal-header"><div className="scheduled-modal-heading"><span className="dialog-brand-mark" aria-hidden="true"><BrandMark size={18} /></span><div><span>新建定时任务</span><h2 id="scheduled-modal-title">{editing ? "编辑任务" : "创建任务"}</h2></div></div><button type="button" aria-label="关闭" title="关闭" onClick={() => setModalOpen(false)} disabled={saving}><X size={18} /></button></header>
             <form className="scheduled-form" onSubmit={save}>
               <label><span>名称</span><input autoFocus maxLength={100} value={form.name} onChange={(event) => updateForm({ name: event.target.value })} placeholder="例如：每日整理客户反馈" required /></label>
               <div className="scheduled-form-row"><label><span>计划类型</span><select value={form.kind} onChange={(event) => updateForm({ kind: event.target.value as ScheduledTaskKind })}><option value="daily">每天重复</option><option value="weekly">每周重复</option><option value="once">只运行一次</option></select></label>{form.kind === "weekly" && <label><span>星期</span><select value={form.weekday} onChange={(event) => updateForm({ weekday: event.target.value })}>{WEEKDAYS.map((day, index) => <option key={day} value={index}>{day}</option>)}</select></label>}</div>

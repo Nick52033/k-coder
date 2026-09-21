@@ -2883,6 +2883,26 @@ button {
   min-width: 0;
 }
 
+.turn-timeline-tool--subagent {
+  border-top-color: color-mix(in srgb, var(--color-brand) 10%, var(--color-border));
+}
+
+.turn-timeline-tool--subagent > .subagent-tool-icon {
+  color: var(--color-brand);
+}
+
+.turn-timeline-tool--subagent strong {
+  color: var(--color-ink-rich);
+}
+
+.subagent-tool-label {
+  max-width: min(560px, 78vw);
+  overflow: hidden;
+  color: var(--color-brand);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .subagent-summary {
   margin: 16px 0;
   padding: 12px 0;
@@ -5725,6 +5745,24 @@ button {
 .attachment-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .attachment-truncated { display: grid; flex: 0 0 auto; place-items: center; color: var(--color-warning); }
 .attachment-strip button { display: grid; width: 20px; height: 20px; padding: 0; place-items: center; border: 0; background: transparent; cursor: pointer; }
+/* 待发送图片的缩略图本身是可点击预览按钮，必须从上面的通用按钮规则里取回原尺寸。 */
+.attachment-thumb-button {
+  display: grid;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  flex-shrink: 0;
+  place-items: center;
+  border: 0;
+  border-radius: 3px;
+  background: transparent;
+  cursor: zoom-in;
+}
+.attachment-thumb-button:hover .attachment-thumb { filter: brightness(1.08); }
+.attachment-thumb-button:focus-visible {
+  outline: 2px solid var(--color-brand);
+  outline-offset: 1px;
+}
 .usage-page { padding-bottom: 36px; }
 .usage-page .settings-page-header { margin-bottom: 8px; }
 .usage-loading { padding: 16px 0; color: var(--color-ink-subtle); font-size: var(--font-size-sm); }
@@ -6897,6 +6935,36 @@ button {
 .settings-title h2 {
   margin: 0;
   font-size: 14px;
+}
+
+.dialog-brand-heading,
+.image-preview-heading,
+.scheduled-modal-heading {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 10px;
+}
+
+.dialog-brand-mark {
+  display: grid;
+  width: 28px;
+  height: 28px;
+  flex: 0 0 auto;
+  place-items: center;
+  border: 1px solid color-mix(in srgb, var(--color-brand) 22%, var(--color-border));
+  border-radius: 8px;
+  color: var(--color-brand);
+  background: color-mix(in srgb, var(--color-brand) 10%, var(--color-surface));
+}
+
+.dialog-brand-mark svg { display: block; }
+
+.dialog-brand-caption {
+  color: var(--color-ink-subtle);
+  font-size: var(--font-size-xs);
+  font-weight: var(--font-weight-semibold);
+  letter-spacing: .03em;
 }
 
 .settings-layout {

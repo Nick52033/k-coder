@@ -344,6 +344,18 @@ export interface ThreadSummary {
   archived: boolean;
   inProject?: boolean;
   workspacePath?: string | null;
+  modelSelection?: ThreadModelSelection | null;
+}
+
+export interface ThreadModelSelection {
+  providerId: string;
+  model: string;
+}
+
+export interface ThreadModelSelectionResult {
+  schemaVersion: number;
+  selection: ThreadModelSelection;
+  catalog: ProviderCatalogView;
 }
 
 export interface TurnSnapshot {
@@ -981,6 +993,7 @@ export type AgentEvent =
   | (EventBase & { type: "item_started"; itemId: string; itemType: AgentItemType })
   | (EventBase & { type: "item_completed"; itemId: string; itemType: AgentItemType; status: AgentItemStatus })
   | (EventBase & { type: "provider_retry_waiting"; retryAtMs: number })
+  | (EventBase & { type: "provider_stream_retry"; attempt: number; maxAttempts: number })
   | (EventBase & { type: "activity_status_changed"; status: AgentActivityStatus })
   | (EventBase & { type: "text_delta"; itemId: string; delta: string })
   | (EventBase & { type: "reasoning_summary_delta"; itemId: string; delta: string })

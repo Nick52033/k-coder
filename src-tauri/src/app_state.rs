@@ -30,7 +30,8 @@ use crate::policy::{ApprovalManager, UserInputManager};
 use crate::protocol::{
     AgentItemStatus, AgentItemType, ApprovalAction, ApprovalMode, ApprovalResolution, ChangeSet,
     HistorySortDirection, PluginOverview, ReasoningEffort, ThreadHistorySnapshot, ThreadItemsPage,
-    ThreadTurnsPage, TurnItemsView, TurnState, UserInputAction, UserInputResolution,
+    ThreadModelSelectionResult, ThreadTurnsPage, TurnItemsView, TurnState, UserInputAction,
+    UserInputResolution,
 };
 use crate::providers::{
     AnthropicMessagesProvider, CredentialError, CredentialStore, DeepSeekChatCompletionsProvider,
@@ -903,6 +904,64 @@ impl AppState {
         })
     }
 
+    pub async fn select_thread_model(
+        &self,
+        thread_id: &str,
+        provider_id: &str,
+        model: &str,
+        update_default: bool,
+    ) -> Result<ThreadModelSelectionResult, AppStateError> {
+        let provider_id = provider_id.trim();
+        let model = model.trim();
+        if provider_id.is_empty() || model.is_empty() {
+            return Err(AppStateError::ProviderNotConfigured(
+                "a provider and model are required".to_string(),
+            ));
+        }
+        let config = self
+            .provider_config
+            .list()?
+            .1
+            .into_iter()
+            .find(|provider| provider.id == provider_id)
+            .ok_or_else(|| {
+                AppStateError::ProviderNotConfigured(format!(
+                    "provider {provider_id} was not found"
+                ))
+            })?;
+        if !config.models.iter().any(|candidate| candidate.id == model) {
+            return Err(AppStateError::ProviderNotConfigured(format!(
+                "model {model} is not configured for provider {provider_id}"
+            )));
+        }
+        if self.credentials.get_api_key(provider_id)?.is_none() {
+            return Err(AppStateError::ProviderNotConfigured(
+                "the provider API key is missing".to_string(),
+            ));
+        }
+
+        if update_default {
+            let mut active_config = config;
+            active_config.model = model.to_string();
+            self.provider_config.save_provider(&active_config, true)?;
+            self.persist_active_provider(&active_config)?;
+        }
+        let summary = self
+            .repository
+            .set_thread_model_selection(thread_id, provider_id, model)
+            .await?;
+        let selection = summary.model_selection.ok_or_else(|| {
+            AppStateError::ProviderNotConfigured(
+                "thread model selection was not persisted".to_string(),
+            )
+        })?;
+        Ok(ThreadModelSelectionResult {
+            schema_version: crate::protocol::PROTOCOL_VERSION,
+            selection,
+            catalog: self.provider_catalog()?,
+        })
+    }
+
     fn provider_view(&self, config: ProviderConfig) -> Result<ProviderConfigView, AppStateError> {
         let has_api_key = self.credentials.get_api_key(&config.id)?.is_some();
         Ok(ProviderConfigView {
@@ -1031,6 +1090,75 @@ impl AppState {
             .unwrap_or(false))
     }
 
+    pub async fn build_provider_for_thread(
+        &self,
+        thread_id: &str,
+        requires_vision: bool,
+    ) -> Result<(Arc<dyn Provider>, String, usize), AppStateError> {
+        let detail = self.repository.read_thread(thread_id).await?;
+        let Some(selection) = detail.summary.model_selection else {
+            return self.build_provider_for_capability(None, requires_vision);
+        };
+        let mut config = self
+            .provider_config
+            .list()?
+            .1
+            .into_iter()
+            .find(|provider| provider.id == selection.provider_id)
+            .ok_or_else(|| {
+                AppStateError::ProviderNotConfigured(format!(
+                    "provider {} is no longer configured",
+                    selection.provider_id
+                ))
+            })?;
+        if !config
+            .models
+            .iter()
+            .any(|model| model.id == selection.model)
+        {
+            return Err(AppStateError::ProviderNotConfigured(format!(
+                "model {} is no longer configured for provider {}",
+                selection.model, selection.provider_id
+            )));
+        }
+        config.model = selection.model;
+        self.build_provider_from_config(config, requires_vision)
+    }
+
+    pub async fn thread_model_supports_vision(
+        &self,
+        thread_id: &str,
+    ) -> Result<bool, AppStateError> {
+        let detail = self.repository.read_thread(thread_id).await?;
+        let Some(selection) = detail.summary.model_selection else {
+            return self.active_model_supports_vision();
+        };
+        let mut config = self
+            .provider_config
+            .list()?
+            .1
+            .into_iter()
+            .find(|provider| provider.id == selection.provider_id)
+            .ok_or_else(|| {
+                AppStateError::ProviderNotConfigured(format!(
+                    "provider {} is no longer configured",
+                    selection.provider_id
+                ))
+            })?;
+        if !config
+            .models
+            .iter()
+            .any(|model| model.id == selection.model)
+        {
+            return Err(AppStateError::ProviderNotConfigured(format!(
+                "model {} is no longer configured for provider {}",
+                selection.model, selection.provider_id
+            )));
+        }
+        config.model = selection.model;
+        Ok(model_supports_vision(&config, config.active_model()))
+    }
+
     fn build_provider_for_capability(
         &self,
         provider_id: Option<&str>,
@@ -1050,6 +1178,14 @@ impl AppState {
                 "configure a provider before starting a turn".to_string(),
             )
         })?;
+        self.build_provider_from_config(config, requires_vision)
+    }
+
+    fn build_provider_from_config(
+        &self,
+        config: ProviderConfig,
+        requires_vision: bool,
+    ) -> Result<(Arc<dyn Provider>, String, usize), AppStateError> {
         let api_key = self.credentials.get_api_key(&config.id)?.ok_or_else(|| {
             AppStateError::ProviderNotConfigured("the provider API key is missing".to_string())
         })?;

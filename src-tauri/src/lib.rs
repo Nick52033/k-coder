@@ -268,6 +268,7 @@ pub fn run() {
             commands::run_regression_evaluation,
             commands::get_provider_config,
             commands::get_provider_catalog,
+            commands::select_thread_model,
             commands::save_provider_config,
             commands::activate_provider,
             commands::delete_provider,

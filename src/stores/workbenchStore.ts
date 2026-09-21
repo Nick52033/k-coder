@@ -25,6 +25,7 @@ import {
   steerQueuedTurn,
   interruptTurn,
   saveProviderConfig,
+  selectThreadModel as selectThreadModelCommand,
   setApprovalMode as setApprovalModeCommand,
   setReasoningEffort as setReasoningEffortCommand,
   undoChange,
@@ -67,6 +68,7 @@ import type {
 
   TodoItem,
   ThreadMailboxChanged,
+  ThreadModelSelection,
 } from "../types/runtime";
 import {
   reduceAgentEvent,
@@ -111,7 +113,13 @@ interface WorkbenchState {
   contextUsage: TokenUsage | null;
   turnTimeline: TurnTimelineItem[];
   turnUserMessageIds: Record<string, string>;
-  activityStatus: { turnId: string; status: AgentActivityStatus; retryAtMs?: number } | null;
+  activityStatus: {
+    turnId: string;
+    status: AgentActivityStatus;
+    retryAtMs?: number;
+    sinceMs?: number;
+    streamRetry?: { attempt: number; maxAttempts: number };
+  } | null;
   pendingApproval: ApprovalRequest | null;
   pendingApprovals: ApprovalRequest[];
   pendingUserInput: UserInputRequest | null;
@@ -120,6 +128,7 @@ interface WorkbenchState {
   providerConfig: ProviderConfigView | null;
   providerConfigs: ProviderConfigView[];
   activeProviderId: string | null;
+  threadModelSelection: ThreadModelSelection | null;
   approvalMode: ApprovalMode;
   reasoningEffort: ReasoningEffort;
   plan: PlanView | null;
@@ -150,6 +159,7 @@ interface WorkbenchState {
   loadProviderCatalog: () => Promise<void>;
   saveProvider: (request: SaveProviderConfigRequest) => Promise<boolean>;
   activateProvider: (providerId: string) => Promise<boolean>;
+  selectThreadModel: (providerId: string, model: string) => Promise<boolean>;
   deleteProvider: (providerId: string) => Promise<boolean>;
   setApprovalMode: (mode: ApprovalMode) => Promise<boolean>;
   setReasoningEffort: (effort: ReasoningEffort) => Promise<boolean>;
@@ -417,6 +427,7 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
   providerConfig: null,
   providerConfigs: [],
   activeProviderId: null,
+  threadModelSelection: null,
   approvalMode: "ask",
   reasoningEffort: "medium",
   plan: null,
@@ -489,7 +500,16 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
 
   createThread: async (inProject = true) => {
     try {
-      const thread = await createThreadCommand(inProject);
+      const createdThread = await createThreadCommand(inProject);
+      const defaultProvider = get().providerConfigs.find(
+        (provider) => provider.id === get().activeProviderId,
+      ) ?? get().providerConfig;
+      const selection = defaultProvider
+        ? await selectThreadModelCommand(createdThread.id, defaultProvider.id, defaultProvider.model).catch(() => null)
+        : null;
+      const thread = selection
+        ? { ...createdThread, modelSelection: selection.selection }
+        : createdThread;
       set((state) => ({
         threads: [thread, ...state.threads],
         activeThreadId: thread.id,
@@ -507,6 +527,7 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
         pendingUserInput: null,
         pendingUserInputs: [],
         changes: [],
+        threadModelSelection: thread.modelSelection ?? null,
         plan: null,
         goal: null,
         workflowRun: null,
@@ -567,7 +588,21 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
       const hydration = hydrationBuffers.get(threadId);
       if (!hydration || hydration.token !== token) return;
       const lastTurn = history ? history.lastTurn : detail!.lastTurn;
-      const summary = history ? history.summary : detail!.summary;
+      let summary = history ? history.summary : detail!.summary;
+      let threadModelSelection = summary.modelSelection ?? null;
+      if (!threadModelSelection) {
+        const defaultProvider = get().providerConfigs.find(
+          (provider) => provider.id === get().activeProviderId,
+        ) ?? get().providerConfig;
+        if (defaultProvider) {
+          const selection = await selectThreadModelCommand(threadId, defaultProvider.id, defaultProvider.model, false)
+            .catch(() => null);
+          if (selection) {
+            threadModelSelection = selection.selection;
+            summary = { ...summary, modelSelection: selection.selection };
+          }
+        }
+      }
       const restoredActiveTurnId = mailbox?.activeTurnId ?? (lastTurn
         && ["queued", "streaming", "running_tool", "awaiting_approval"].includes(lastTurn.state)
         ? lastTurn.turnId
@@ -615,11 +650,16 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
         turnTimeline: terminalTimeline,
         turnUserMessageIds: projected?.turnUserMessageIds ?? detail!.turnUserMessageIds ?? {},
         activityStatus: restoredActiveTurnId
-          ? { turnId: lastTurn!.turnId, status: statusForTurnState(lastTurn!.state) ?? "thinking" }
+          ? {
+            turnId: lastTurn!.turnId,
+            status: statusForTurnState(lastTurn!.state) ?? "thinking",
+            sinceMs: Date.now(),
+          }
           : null,
         ...approvalQueueState(pendingApprovals),
         ...userInputQueueState(pendingUserInputs),
         changes: projected?.changes ?? detail!.changes,
+        threadModelSelection,
         todos,
         usage: history ? history.lastUsage : detail!.lastUsage ?? null,
         contextUsage: history
@@ -858,6 +898,19 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
       await saveProviderConfig(request);
       const catalog = await getProviderCatalog();
       set({ ...providerCatalogState(catalog), error: "" });
+      return true;
+    } catch (error) {
+      set({ error: errorMessage(error) });
+      return false;
+    }
+  },
+
+  selectThreadModel: async (providerId, model) => {
+    const threadId = get().activeThreadId;
+    if (!threadId) return false;
+    try {
+      const result = await selectThreadModelCommand(threadId, providerId, model);
+      set({ ...providerCatalogState(result.catalog), threadModelSelection: result.selection, error: "" });
       return true;
     } catch (error) {
       set({ error: errorMessage(error) });

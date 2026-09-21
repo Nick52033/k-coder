@@ -3,7 +3,6 @@ import {
   Check,
   Code2,
   Columns2,
-  FileDiff,
   RefreshCw,
   Rows3,
   Undo2,
@@ -17,6 +16,7 @@ import type {
   PatchFilePreview,
   PatchPreview,
 } from "../types/runtime";
+import { BrandMark } from "./BrandMark";
 
 interface PatchReviewDialogProps {
   request?: ApprovalRequest | null;
@@ -196,7 +196,7 @@ export function PatchReviewDialog({
     >
       <header className="review-header">
         <div className="review-heading">
-          <FileDiff size={18} />
+          <span className="dialog-brand-mark" aria-hidden="true"><BrandMark size={18} /></span>
           <div>
             <h2>{isApproval ? "待审阅变更" : change?.undone ? "已撤销变更" : "已应用变更"}</h2>
             <span>{preview.files.length} 个文件 · {formatBytes(preview.totalSnapshotBytes)}</span>
@@ -428,6 +428,7 @@ function GenericToolApproval({
       onKeyDown={handleKey}
     >
       <section className="claude-approval-panel" aria-busy={busy}>
+        <div className="dialog-brand-heading"><span className="dialog-brand-mark" aria-hidden="true"><BrandMark size={18} /></span><span className="dialog-brand-caption">k-Coder</span></div>
         <h2 className="claude-approval-title">
           确认执行 {request.toolName}{targetLine ? `: ${targetLine}` : ""}?
         </h2>

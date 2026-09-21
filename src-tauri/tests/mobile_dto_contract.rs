@@ -156,6 +156,7 @@ fn thread_summary_carries_an_optional_project_key() {
         archived: false,
         in_project: true,
         workspace_path: None,
+        model_selection: None,
     };
 
     let attached =

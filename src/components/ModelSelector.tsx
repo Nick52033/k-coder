@@ -1,22 +1,20 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { Check, ChevronDown, ServerCog } from "lucide-react";
-import type { ProviderConfigView, SaveProviderConfigRequest } from "../types/runtime";
+import type { ProviderConfigView } from "../types/runtime";
 
 interface ModelSelectorProps {
   provider: ProviderConfigView | null;
   providers: ProviderConfigView[];
   activeProviderId: string | null;
-  onSaveProvider: (request: SaveProviderConfigRequest) => Promise<boolean>;
-  onActivateProvider: (providerId: string) => Promise<boolean>;
+  onSelectThreadModel: (providerId: string, model: string) => Promise<boolean>;
 }
 
 export function ModelSelector({
   provider,
   providers,
   activeProviderId,
-  onSaveProvider,
-  onActivateProvider,
+  onSelectThreadModel,
 }: ModelSelectorProps) {
   const [isOpen, setIsOpen] = useState(false);
   const [switching, setSwitching] = useState(false);
@@ -144,17 +142,7 @@ export function ModelSelector({
     }
 
     setSwitching(true);
-    const success = await onSaveProvider({
-      id: provider.id,
-      kind: provider.kind,
-      transport: provider.transport,
-      name: provider.name,
-      baseUrl: provider.baseUrl,
-      model: modelId,
-      models: provider.models,
-      endpoints: provider.endpoints,
-      activate: true,
-    });
+    const success = await onSelectThreadModel(provider.id, modelId);
 
     setSwitching(false);
     if (success) {
@@ -165,7 +153,10 @@ export function ModelSelector({
   async function handleSelectProvider(providerId: string) {
     if (switching || providerId === activeProviderId) return;
     setSwitching(true);
-    const success = await onActivateProvider(providerId);
+    const candidate = providers.find((item) => item.id === providerId);
+    const success = candidate
+      ? await onSelectThreadModel(providerId, candidate.model)
+      : false;
     setSwitching(false);
     // 切完供应商保持弹窗打开，让用户继续选具体模型；
     // 只在切换失败时关闭弹窗。

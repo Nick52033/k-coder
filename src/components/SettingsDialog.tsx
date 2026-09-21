@@ -98,6 +98,7 @@ import {
   LockKeyhole,
   Smartphone,
 } from "lucide-react";
+import { BrandMark } from "./BrandMark";
 import type {
   ProviderConfigView,
   ProviderModelConfig,
@@ -324,7 +325,7 @@ export function SettingsDialog({
       >
         <header className="settings-header">
           <div className="settings-title">
-            <Settings size={18} />
+            <span className="dialog-brand-mark" aria-hidden="true"><BrandMark size={18} /></span>
             <h2 id="settings-title">设置</h2>
           </div>
           <button

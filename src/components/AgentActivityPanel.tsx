@@ -30,6 +30,7 @@ import type { AgentEvent, ChatMessage, SubagentState, SubagentView } from "../ty
 import { MarkdownContent } from "./MarkdownContent";
 import "./AgentActivityPanel.css";
 import { RetryWaitingLabel } from "./RetryWaitingLabel";
+import { BrandMark } from "./BrandMark";
 
 interface AgentActivityPanelProps {
   open: boolean;
@@ -180,7 +181,7 @@ export function AgentActivityPanel({
         <>
           <header className="subagent-drawer-header">
             <div className="subagent-drawer-title">
-              <Bot size={16} />
+              <span className="subagent-brand-mark" aria-hidden="true"><BrandMark size={17} /></span>
               <span>子智能体</span>
               {runningCount > 0 && <span className="agent-count-badge">{runningCount} 运行中</span>}
             </div>
@@ -334,7 +335,7 @@ function SubagentRow({ agent, selected, onSelect, onStop, onResume }: SubagentRo
   const elapsed = formatElapsed(agent.createdAtMs, agent.updatedAtMs);
 
   return (
-    <div className={cn("subagent-row", `subagent-row--${agent.state}`, selected && "subagent-row--selected")}>
+    <div className={cn("subagent-row", "subagent-row--reference", `subagent-row--${agent.state}`, selected && "subagent-row--selected")}>
       <button className="subagent-row-main" type="button" onClick={onSelect}>
         <span className="subagent-row-icon" style={{ color: statusInfo.color }}>
           <statusInfo.Icon size={14} className={cn(statusInfo.spinning && "spin")} />

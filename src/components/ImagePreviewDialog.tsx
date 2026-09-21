@@ -2,6 +2,7 @@ import { useEffect, useRef } from "react";
 import { X } from "lucide-react";
 
 import type { ImageAttachment } from "../types/runtime";
+import { BrandMark } from "./BrandMark";
 
 interface ImagePreviewDialogProps {
   image: ImageAttachment | null;
@@ -50,7 +51,7 @@ export function ImagePreviewDialog({ image, onClose }: ImagePreviewDialogProps) 
         onMouseDown={(event) => event.stopPropagation()}
       >
         <header className="image-preview-header">
-          <h2 id="image-preview-title" title={image.name}>{image.name}</h2>
+          <div className="image-preview-heading"><span className="dialog-brand-mark" aria-hidden="true"><BrandMark size={18} /></span><h2 id="image-preview-title" title={image.name}>{image.name}</h2></div>
           <button
             ref={closeButtonRef}
             type="button"
