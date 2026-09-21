@@ -12,6 +12,10 @@ const LEVELS: Array<{ value: LogLevel | ""; label: string }> = [
 
 const LIMIT_OPTIONS = [100, 200, 500, 1000];
 
+// 后端在写入和读取时都把 fields 收敛到 320 字符以内（src-tauri/src/logging.rs 的
+// MAX_FIELDS_CHARS），这里只是更激进的旧记录兜底，正常记录应当整行显示。
+const MAX_FIELDS_CHARS = 480;
+
 interface LogViewerDialogProps {
   onClose: () => void;
 }
@@ -31,7 +35,7 @@ function summarizeFields(fields: unknown): string {
   if (typeof fields === "string") return fields;
   try {
     const text = JSON.stringify(fields);
-    return text.length > 240 ? `${text.slice(0, 240)}…` : text;
+    return text.length > MAX_FIELDS_CHARS ? `${text.slice(0, MAX_FIELDS_CHARS)}…` : text;
   } catch {
     return String(fields);
   }

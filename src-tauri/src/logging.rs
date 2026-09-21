@@ -9,6 +9,20 @@ use serde_json::{Value, json};
 const MAX_LOG_BYTES: u64 = 2 * 1024 * 1024;
 const LOG_GENERATIONS: usize = 3;
 
+/// 本地运行日志按「主要信息」收敛：日志面板一行要能读完，所以单个字符串字段、数组与
+/// 嵌套对象的广度、以及整条 fields 的序列化长度都有界，超长正文以省略号结尾，完整内容
+/// 以会话事实事件为准。调用标识只在会话里追得回来，不写进运行日志。
+pub(crate) const MAX_FIELD_CHARS: usize = 160;
+pub(crate) const MAX_FIELDS_CHARS: usize = 320;
+const MAX_ARRAY_ITEMS: usize = 8;
+const TRUNCATION_MARK: &str = "…";
+/// 只有会话事实事件才追得回来的纯标识，运行日志不记录。
+const TRACE_ONLY_KEYS: &[&str] = &["callid", "turnid", "itemid", "requestid", "jobid", "spanid"];
+/// 预算超支时优先保留的「发生了什么」字段，其余字段按序排在其后取舍。
+const PRIMARY_DETAIL_KEYS: &[&str] = &["message", "reason", "output", "error", "detail", "code"];
+/// 来源对话标记：`read_logs` 据此关联对话名称，任何预算下都不丢弃。
+const SOURCE_KEYS: &[&str] = &["threadid"];
+
 #[derive(Clone)]
 pub struct StructuredLogger {
     path: PathBuf,
@@ -50,7 +64,7 @@ impl StructuredLogger {
             self.rotate()?;
         }
         let record = json!({ "timestampMs": crate::storage::now_ms(), "level": level,
-            "event": event, "fields": redact(fields) });
+            "event": event, "fields": compact(redact(fields)) });
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -226,6 +240,8 @@ impl StructuredLogger {
                         continue;
                     }
                 }
+                // 旧记录按写入时的原样落盘，读取端用同一策略收敛，面板才不会只看到半行 JSON。
+                let fields = compact(value.get("fields").cloned().unwrap_or(Value::Null));
                 records.push(LogRecord {
                     timestamp_ms: value
                         .get("timestampMs")
@@ -237,13 +253,13 @@ impl StructuredLogger {
                         .and_then(Value::as_str)
                         .unwrap_or_default()
                         .to_string(),
-                    fields: value.get("fields").cloned().unwrap_or(Value::Null),
-                    thread_id: value
-                        .pointer("/fields/threadId")
+                    thread_id: fields
+                        .pointer("/threadId")
                         .and_then(Value::as_str)
                         .filter(|id| !id.trim().is_empty())
                         .map(str::to_owned),
                     thread_title: None,
+                    fields,
                 });
             }
         }
@@ -300,6 +316,86 @@ fn redact(value: Value) -> Value {
         Value::Array(values) => Value::Array(values.into_iter().map(redact).collect()),
         other => other,
     }
+}
+
+/// 把一条记录的 fields 收敛成日志面板读得完的主要信息。写入与读取共用同一策略，因此
+/// 旧记录和新记录在面板里是一致的有界形态。
+fn compact(value: Value) -> Value {
+    match value {
+        Value::Object(map) => bound_total(compact_object(map)),
+        Value::Array(items) => {
+            let total = items.len();
+            let mut kept: Vec<Value> = items
+                .into_iter()
+                .take(MAX_ARRAY_ITEMS)
+                .map(compact)
+                .collect();
+            if total > MAX_ARRAY_ITEMS {
+                kept.push(Value::String(TRUNCATION_MARK.into()));
+            }
+            Value::Array(kept)
+        }
+        Value::String(text) => Value::String(truncate_chars(&text, MAX_FIELD_CHARS)),
+        other => other,
+    }
+}
+
+fn compact_object(map: serde_json::Map<String, Value>) -> serde_json::Map<String, Value> {
+    map.into_iter()
+        .filter(|(key, _)| !is_trace_only(key))
+        .map(|(key, value)| (key, compact(value)))
+        .collect()
+}
+
+/// 按优先级保留字段，直到整条 fields 的序列化长度落回预算内。排序稳定，因此丢弃顺序
+/// 是确定性的；只剩单个超大字段时也要留痕，而不是把记录收敛成空对象。
+fn bound_total(map: serde_json::Map<String, Value>) -> Value {
+    let mut ordered: Vec<(String, Value)> = map.into_iter().collect();
+    ordered.sort_by_key(|(key, _)| field_priority(key));
+    let fallback = ordered.first().map(|(key, _)| key.clone());
+    let mut kept = serde_json::Map::new();
+    for (key, value) in ordered {
+        kept.insert(key.clone(), value);
+        if serialized_chars(&kept) > MAX_FIELDS_CHARS {
+            kept.remove(&key);
+        }
+    }
+    if let Some(key) = fallback.filter(|_| kept.is_empty()) {
+        kept.insert(key, Value::String(TRUNCATION_MARK.into()));
+    }
+    Value::Object(kept)
+}
+
+fn field_priority(key: &str) -> usize {
+    let lower = key.to_ascii_lowercase();
+    if SOURCE_KEYS.contains(&lower.as_str()) {
+        return 0;
+    }
+    PRIMARY_DETAIL_KEYS
+        .iter()
+        .position(|candidate| *candidate == lower)
+        .map(|index| index + 1)
+        .unwrap_or(PRIMARY_DETAIL_KEYS.len() + 1)
+}
+
+fn is_trace_only(key: &str) -> bool {
+    let lower = key.to_ascii_lowercase();
+    TRACE_ONLY_KEYS.contains(&lower.as_str())
+}
+
+fn serialized_chars(map: &serde_json::Map<String, Value>) -> usize {
+    serde_json::to_string(map)
+        .map(|text| text.chars().count())
+        .unwrap_or(usize::MAX)
+}
+
+fn truncate_chars(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_owned();
+    }
+    let mut shortened: String = text.chars().take(max).collect();
+    shortened.push_str(TRUNCATION_MARK);
+    shortened
 }
 
 #[cfg(test)]
@@ -476,5 +572,178 @@ mod tests {
         let value = redact(json!({"apiKey":"abc", "nested":{"accessToken":"def", "ok":1}}));
         assert_eq!(value["apiKey"], "[REDACTED]");
         assert_eq!(value["nested"]["accessToken"], "[REDACTED]");
+    }
+
+    #[test]
+    fn writes_keep_only_the_main_information_the_panel_can_read() {
+        let data = tempfile::tempdir().unwrap();
+        let logger = StructuredLogger::new(data.path()).unwrap();
+        let output = format!(
+            "patch conflicts with the workspace: chunk for src/App.css matched 0 locations instead of exactly one\n{}",
+            "冲突细节".repeat(400)
+        );
+        logger
+            .log(
+                "error",
+                "tool_failed",
+                json!({
+                    "threadId": "4eff95a7-9acc-4357-8564-b381bc442c7e",
+                    "turnId": "ac8f71a1-3650-4093-beab-dfbd7eb38cb8",
+                    "tool": "apply_patch",
+                    "callId": "0dbff861-61c4-59c0-4836-8f12-bb0ea0ea83f9",
+                    "itemStatus": "failed",
+                    "output": output,
+                }),
+            )
+            .unwrap();
+        let persisted = fs::read_to_string(&logger.path).unwrap();
+        let record: Value = serde_json::from_str(persisted.lines().next().unwrap()).unwrap();
+        let fields = record["fields"].as_object().unwrap();
+        // 调用与 Turn 标识只在会话事实事件里追得回来，不占运行日志的版面。
+        assert!(fields.get("callId").is_none());
+        assert!(fields.get("turnId").is_none());
+        // 来源对话、工具与失败原因保留，且整条 fields 一行能读完。
+        assert_eq!(
+            record["fields"]["threadId"],
+            "4eff95a7-9acc-4357-8564-b381bc442c7e"
+        );
+        assert_eq!(record["fields"]["tool"], "apply_patch");
+        assert_eq!(record["fields"]["itemStatus"], "failed");
+        let output = record["fields"]["output"].as_str().unwrap();
+        assert!(output.starts_with("patch conflicts with the workspace"));
+        assert!(output.ends_with(TRUNCATION_MARK));
+        assert!(output.chars().count() <= MAX_FIELD_CHARS + 1);
+        assert!(serialized_chars(fields) <= MAX_FIELDS_CHARS);
+    }
+
+    #[test]
+    fn reads_compact_legacy_records_so_the_reason_stays_visible() {
+        let data = tempfile::tempdir().unwrap();
+        let logger = StructuredLogger::new(data.path()).unwrap();
+        let legacy = json!({
+            "timestampMs": 7,
+            "level": "error",
+            "event": "tool_failed",
+            "fields": {
+                "threadId": "old-thread",
+                "turnId": "old-turn",
+                "callId": "old-call",
+                "output": "x".repeat(4096),
+            },
+        });
+        fs::write(&logger.path, format!("{legacy}\n")).unwrap();
+        let result = logger.read_logs(query()).unwrap();
+        let record = &result.records[0];
+        // 来源对话的关联不能因为收敛而失效。
+        assert_eq!(record.thread_id.as_deref(), Some("old-thread"));
+        assert!(record.fields.get("turnId").is_none());
+        assert!(record.fields.get("callId").is_none());
+        let output = record.fields["output"].as_str().unwrap();
+        assert!(output.starts_with("xxx"));
+        assert!(output.ends_with(TRUNCATION_MARK));
+        assert!(serialized_chars(record.fields.as_object().unwrap()) <= MAX_FIELDS_CHARS);
+    }
+
+    #[test]
+    fn secondary_fields_are_dropped_until_the_record_fits_the_panel() {
+        let data = tempfile::tempdir().unwrap();
+        let logger = StructuredLogger::new(data.path()).unwrap();
+        logger
+            .log(
+                "error",
+                "turn_finished",
+                json!({
+                    "threadId": "4eff95a7-9acc-4357-8564-b381bc442c7e",
+                    "message": "provider request failed: error sending request for url (https://api.stepfun.com/step_plan/v1/chat/completions) (已自动重试 3 次)",
+                    "error": "e".repeat(400),
+                    "detail": "d".repeat(400),
+                    "success": false,
+                }),
+            )
+            .unwrap();
+        let result = logger.read_logs(query()).unwrap();
+        let fields = result.records[0].fields.as_object().unwrap();
+        // 先说发生了什么，再说背景；次要长字段整条丢弃，而不是留半行让人猜。
+        assert_eq!(fields["threadId"], "4eff95a7-9acc-4357-8564-b381bc442c7e");
+        assert!(
+            fields["message"]
+                .as_str()
+                .unwrap()
+                .starts_with("provider request failed")
+        );
+        assert!(fields.get("error").is_none());
+        assert!(fields.get("detail").is_none());
+        assert_eq!(fields["success"], false);
+        assert!(serialized_chars(fields) <= MAX_FIELDS_CHARS);
+    }
+
+    #[test]
+    fn nested_arrays_and_objects_stay_bounded() {
+        let data = tempfile::tempdir().unwrap();
+        let logger = StructuredLogger::new(data.path()).unwrap();
+        logger
+            .log(
+                "info",
+                "batch_reported",
+                json!({
+                    "threadId": "thread-1",
+                    "items": ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"],
+                    "nested": {
+                        "alpha": "a".repeat(400),
+                        "beta": "b".repeat(400),
+                        "gamma": "g".repeat(400),
+                    },
+                }),
+            )
+            .unwrap();
+        let result = logger.read_logs(query()).unwrap();
+        let fields = result.records[0].fields.as_object().unwrap();
+        let items = fields["items"].as_array().unwrap();
+        assert_eq!(items.len(), MAX_ARRAY_ITEMS + 1);
+        assert_eq!(items[MAX_ARRAY_ITEMS], TRUNCATION_MARK);
+        // 嵌套对象同样受总预算约束，只留下按序第一个字段。
+        let nested = fields["nested"].as_object().unwrap();
+        assert_eq!(nested.len(), 1);
+        assert!(nested["alpha"].as_str().unwrap().ends_with(TRUNCATION_MARK));
+        assert!(serialized_chars(fields) <= MAX_FIELDS_CHARS);
+    }
+
+    #[test]
+    fn compaction_is_idempotent_and_keeps_secret_redaction_intact() {
+        let data = tempfile::tempdir().unwrap();
+        let logger = StructuredLogger::new(data.path()).unwrap();
+        logger
+            .log(
+                "error",
+                "turn_failed",
+                json!({
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "apiKey": "sk-should-never-survive",
+                    "message": "m".repeat(400),
+                }),
+            )
+            .unwrap();
+        let first = logger.read_logs(query()).unwrap();
+        let once = first.records[0].fields.clone();
+        fs::write(
+            &logger.path,
+            format!(
+                "{}\n",
+                serde_json::to_string(&json!({
+                    "timestampMs": 1,
+                    "level": "error",
+                    "event": "turn_failed",
+                    "fields": once,
+                }))
+                .unwrap()
+            ),
+        )
+        .unwrap();
+        let twice = logger.read_logs(query()).unwrap();
+        // 再收敛一次不改变形态：面板每次刷新看到的是同一条有界记录。
+        assert_eq!(once, twice.records[0].fields);
+        assert_eq!(twice.records[0].fields["apiKey"], "[REDACTED]");
+        assert!(twice.records[0].fields.get("turnId").is_none());
     }
 }

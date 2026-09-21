@@ -6096,11 +6096,14 @@ mod tests {
         assert_eq!(record.thread_id.as_deref(), Some(thread_id.as_str()));
         assert_eq!(record.fields["threadId"], thread_id);
         assert_eq!(record.fields["tool"], "list_directory");
-        assert_eq!(record.fields["callId"], "call-fail");
+        // 调用与 Turn 标识只在会话事实事件里追得回来，运行日志只保留主要信息。
+        assert!(record.fields.get("callId").is_none());
+        assert!(record.fields.get("turnId").is_none());
         assert_eq!(record.fields["itemStatus"], "failed");
         let output = record.fields["output"].as_str().unwrap();
         assert!(output.contains("missing-directory"));
         assert!(output.len() <= MAX_TOOL_FAILURE_OUTPUT_BYTES);
+        assert!(output.chars().count() <= crate::logging::MAX_FIELD_CHARS + 1);
     }
 
     #[tokio::test]
@@ -6222,13 +6225,14 @@ mod tests {
             assert_eq!(logs.records.len(), 1);
             let fields = &logs.records[0].fields;
             assert_eq!(fields["threadId"], thread_id);
-            assert!(fields["turnId"].as_str().is_some_and(|id| !id.is_empty()));
+            // Turn 标识不进运行日志，重试序号、退避与脱敏原因才是面板要读的主要信息。
+            assert!(fields.get("turnId").is_none());
             assert_eq!(fields["retryNumber"], 1);
             assert_eq!(fields["retryDelayMs"], 1);
             assert_eq!(fields["delaySource"], "retry_after");
             let message = fields["message"].as_str().unwrap();
             assert!(message.contains("fixture capacity reached [REDACTED]"));
-            assert_eq!(message.chars().count(), 1024);
+            assert!(message.chars().count() <= crate::logging::MAX_FIELD_CHARS + 1);
             let persisted =
                 std::fs::read_to_string(directory.path().join("logs/runtime.jsonl")).unwrap();
             assert!(!persisted.contains("sk-fixture-private"));

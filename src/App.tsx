@@ -2919,16 +2919,16 @@ function App() {
                     ? (
                       <button
                         type="button"
-                        className="attachment-thumb-button"
+                        className="attachment-image-open"
                         aria-label={`查看图片 ${attachment.name}`}
                         title={`查看 ${attachment.name}`}
                         onClick={() => setPreviewImage({ name: attachment.name, dataUrl: attachment.content })}
                       >
                         <img src={attachment.content} alt={attachment.name} className="attachment-thumb" />
+                        <span className="attachment-name">{attachment.name}</span>
                       </button>
                     )
                     : <Paperclip size={12} />}
-                  <span className="attachment-name">{attachment.name}</span>
                   {attachment.kind === "document" && attachment.truncated
                     ? (
                       <span className="attachment-truncated" aria-label={`${attachment.name} 内容已截断`} title="内容已按上限截断">

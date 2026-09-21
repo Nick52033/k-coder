@@ -2508,6 +2508,7 @@ button {
   display: flex;
   min-width: 0;
   flex-direction: column;
+  gap: 1px;
 }
 
 .turn-progress-text {
@@ -2779,44 +2780,40 @@ button {
   font-size: 0.9em;
 }
 
+/* ZCode 式扁平行：无卡片、无分隔线，单行内「图标 + 文案 + 尾部状态」，
+   全部使用低对比度墨色，让过程记录不抢正文的视觉重量。
+   `flex-wrap` 让命令输出/补丁详情换到第二行，不挤占摘要那一行。 */
 .turn-timeline-tool,
 .turn-timeline-event {
-  display: grid;
-  min-height: 42px;
-  padding: 7px 8px;
-  grid-template-columns: 18px minmax(0, 1fr);
-  align-items: start;
+  display: flex;
+  min-width: 0;
+  min-height: 26px;
+  padding: 2px 8px;
+  align-items: center;
+  flex-wrap: wrap;
   gap: 8px;
-  border-top: 1px solid var(--color-border);
-  color: var(--color-ink);
-}
-
-.turn-timeline-tool:last-of-type,
-.turn-timeline-event:last-of-type {
-  border-bottom: 1px solid var(--color-border);
+  border: 0;
+  color: var(--color-ink-subtle);
 }
 
 .turn-timeline-tool > svg,
 .turn-timeline-event > svg {
-  margin-top: 2px;
-  color: var(--color-success);
+  flex: 0 0 auto;
+  margin-top: 0;
+  color: var(--color-ink-faint);
 }
 
 .turn-timeline-tool--running > svg { color: var(--color-brand); }
 .turn-timeline-tool--failed > svg { color: var(--color-error); }
-.turn-timeline-tool--no-matches > svg { color: var(--color-ink-muted); }
-.turn-timeline-tool--cancelled > svg { color: var(--color-ink-muted); opacity: 0.7; }
-.turn-timeline-tool--cancelled .turn-tool-duration { color: var(--color-ink-muted); }
+.turn-timeline-tool--no-matches > svg,
+.turn-timeline-tool--cancelled > svg { color: var(--color-ink-faint); }
+.turn-timeline-tool--cancelled .turn-tool-duration { color: var(--color-ink-faint); }
 .turn-timeline-event--turn_failed > svg { color: var(--color-error); }
-.turn-timeline-event--turn_cancelled > svg { color: var(--color-ink-muted); }
-
-.turn-timeline-tool--running {
-  position: relative;
-}
+.turn-timeline-event--turn_cancelled > svg { color: var(--color-ink-faint); }
 
 .turn-timeline-tool--running > strong,
 .turn-timeline-tool--running > span > strong {
-  color: var(--color-ink-rich);
+  color: var(--color-ink);
 }
 
 .turn-timeline-tool--running .turn-tool-duration {
@@ -2824,33 +2821,69 @@ button {
   font-variant-numeric: tabular-nums;
 }
 
+/* 单行内的两段：左侧标题可压缩截断，右侧状态/耗时固定不换行。 */
 .turn-timeline-tool > span,
 .turn-timeline-event > span {
   display: flex;
   min-width: 0;
-  flex-direction: column;
-  gap: 1px;
+  flex: 1;
+  flex-direction: row;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.turn-tool-heading {
+  display: flex;
+  min-width: 0;
+  flex: 1;
+  align-items: center;
+  flex-wrap: nowrap;
+  gap: 5px;
+}
+
+.turn-tool-kind {
+  flex: 0 0 auto;
+  color: var(--color-ink-faint);
+  font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-medium);
+  white-space: nowrap;
 }
 
 .turn-timeline-tool strong,
 .turn-timeline-event strong {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--color-ink-subtle);
+  text-overflow: ellipsis;
+  white-space: nowrap;
   font-size: var(--font-size-sm);
-  font-weight: 600;
-  line-height: 1.35;
+  font-weight: var(--font-weight-medium);
+  line-height: 1.45;
 }
 
 .turn-timeline-tool small,
 .turn-timeline-event small {
-  color: var(--color-ink-subtle);
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: min(46%, 460px);
+  color: var(--color-ink-faint);
   font-size: var(--font-size-xs);
-  line-height: 1.4;
-  overflow-wrap: anywhere;
+  line-height: 1.45;
+  white-space: nowrap;
 }
 
 .turn-tool-meta {
   display: flex;
+  min-width: 0;
   align-items: center;
   gap: 8px;
+}
+
+.turn-tool-meta > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* Inline `taskN` chip rendered next to delegation tool rows in the conversation timeline.
@@ -2873,18 +2906,6 @@ button {
   cursor: pointer;
   flex-shrink: 0;
   transition: background-color var(--transition-fast), color var(--transition-fast);
-}
-
-.turn-tool-heading {
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 4px;
-  min-width: 0;
-}
-
-.turn-timeline-tool--subagent {
-  border-top-color: color-mix(in srgb, var(--color-brand) 10%, var(--color-border));
 }
 
 .turn-timeline-tool--subagent > .subagent-tool-icon {
@@ -2989,10 +3010,11 @@ button {
   gap: 4px;
 }
 
+/* 过程区不再用上下边框围成"卡片带"：与 ZCode 一致，只靠留白与左导线分层。
+   失败态保留极淡的红色底色，让"这一轮没成功"仍然一眼可见。 */
 .turn-disclosure {
-  border-top: 1px solid var(--color-border);
-  border-bottom: 1px solid var(--color-border);
-  color: var(--color-ink);
+  border: 0;
+  color: var(--color-ink-subtle);
   interpolate-size: allow-keywords;
 }
 
@@ -3037,11 +3059,11 @@ button {
 
 .turn-disclosure > summary {
   display: grid;
-  min-height: 42px;
-  padding: 0 12px;
+  min-height: 30px;
+  padding: 0 8px;
   grid-template-columns: auto auto minmax(0, 1fr) auto auto;
   align-items: center;
-  gap: 10px;
+  gap: 8px;
   cursor: pointer;
   list-style: none;
   user-select: none;
@@ -3055,18 +3077,19 @@ button {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  color: var(--color-ink-subtle);
   font-size: var(--font-size-sm);
-  font-weight: 600;
+  font-weight: var(--font-weight-medium);
 }
 
 .turn-disclosure-status {
-  color: var(--color-ink-subtle);
+  color: var(--color-ink-faint);
   font-size: var(--font-size-xs);
   white-space: nowrap;
 }
 
 .turn-disclosure-chevron {
-  color: var(--color-ink-muted);
+  color: var(--color-ink-faint);
   transition: transform 320ms cubic-bezier(0.16, 1, 0.3, 1);
 }
 
@@ -3088,20 +3111,16 @@ button {
   color: var(--color-error);
 }
 
-.turn-execution--failed {
-  border-color: color-mix(in srgb, var(--color-error) 24%, var(--color-border));
-}
-
 .turn-execution--failed > summary {
-  background: color-mix(in srgb, var(--color-error) 4%, transparent);
+  background: color-mix(in srgb, var(--color-error) 5%, transparent);
 }
 
 .turn-execution--failed > summary:hover {
-  background: color-mix(in srgb, var(--color-error) 7%, var(--color-surface-hover));
+  background: color-mix(in srgb, var(--color-error) 8%, var(--color-surface-hover));
 }
 
 .turn-execution--cancelled > summary > svg:first-child {
-  color: var(--color-ink-muted);
+  color: var(--color-ink-faint);
 }
 
 .turn-execution--live > summary {
@@ -3135,7 +3154,7 @@ button {
 
 .turn-execution-content {
   min-width: 0;
-  padding: 2px 8px 10px 27px;
+  padding: 2px 8px 8px 23px;
 }
 
 .turn-execution-live {
@@ -3224,36 +3243,99 @@ button {
   padding-top: 12px;
 }
 
+/* 思考行与工具行同一套扁平语法：单行摘要 + 可展开正文，正文用左导线缩进。 */
 .turn-reasoning {
-  display: grid;
+  display: block;
   min-width: 0;
-  padding: 8px 12px 10px;
-  gap: 5px;
+  padding: 0;
+  gap: 0;
   border: 0;
-  color: var(--color-ink);
+  color: var(--color-ink-subtle);
   background: transparent;
+  interpolate-size: allow-keywords;
 }
 
-.turn-reasoning-heading {
+.turn-reasoning-summary {
   display: flex;
   min-width: 0;
+  min-height: 26px;
+  padding: 2px 8px;
   align-items: center;
   gap: 8px;
-  font-size: var(--font-size-sm);
-  font-weight: 600;
-  line-height: 1.4;
+  cursor: pointer;
+  list-style: none;
+  user-select: none;
 }
 
-.turn-reasoning-heading > svg {
+.turn-reasoning-summary::-webkit-details-marker { display: none; }
+
+.turn-reasoning-icon {
   flex: 0 0 auto;
-  color: var(--color-brand);
+  color: var(--color-ink-faint);
+}
+
+.turn-reasoning-label {
+  flex: 0 0 auto;
+  color: var(--color-ink-subtle);
+  font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-medium);
+  white-space: nowrap;
+}
+
+.turn-reasoning-duration {
+  flex: 0 0 auto;
+  color: var(--color-ink-faint);
+  font-size: var(--font-size-xs);
+  white-space: nowrap;
+}
+
+/* 流式期间右侧跟一条最新推理行，超宽时截断而不是把标签挤成多行。 */
+.turn-reasoning-hint {
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+  color: var(--color-ink-faint);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--font-size-xs);
+}
+
+.turn-reasoning-chevron {
+  flex: 0 0 auto;
+  margin-left: auto;
+  color: var(--color-ink-faint);
+  opacity: 0;
+  transition: opacity var(--transition-fast), transform var(--transition-fast);
+}
+
+.turn-reasoning-summary:hover .turn-reasoning-chevron { opacity: 1; }
+.turn-reasoning[open] > .turn-reasoning-summary .turn-reasoning-chevron {
+  opacity: 1;
+  transform: rotate(180deg);
+}
+
+.turn-reasoning::details-content {
+  block-size: 0;
+  overflow-y: clip;
+  opacity: 0;
+  transition:
+    block-size 380ms cubic-bezier(0.16, 1, 0.3, 1),
+    opacity 240ms ease,
+    content-visibility 380ms allow-discrete;
+}
+
+.turn-reasoning[open]::details-content {
+  block-size: auto;
+  opacity: 1;
 }
 
 .turn-reasoning-content {
   display: grid;
-  gap: 8px;
-  padding-left: 23px;
-  color: var(--color-ink-muted);
+  gap: 6px;
+  margin: 2px 0 6px 23px;
+  padding-left: 13px;
+  border-left: 1px solid var(--color-border);
+  color: var(--color-ink-subtle);
   font-size: var(--font-size-sm);
   line-height: 1.6;
   overflow-wrap: anywhere;
@@ -3271,7 +3353,7 @@ button {
   display: block;
   min-height: 0;
   padding: 0;
-  border-top: 1px solid var(--color-border);
+  border-top: 0;
 }
 
 .turn-event-step > summary {
@@ -3287,12 +3369,12 @@ button {
 }
 
 .turn-event-step.turn-timeline-event--turn_cancelled > summary > svg:first-child {
-  color: var(--color-ink-muted);
+  color: var(--color-ink-faint);
 }
 
 .turn-event-step-content {
   min-width: 0;
-  padding: 0 12px 11px 39px;
+  padding: 2px 8px 8px 31px;
   color: var(--color-ink-subtle);
   font-size: var(--font-size-xs);
   line-height: 1.5;
@@ -3305,14 +3387,14 @@ button {
 }
 
 .turn-tool-group {
-  margin: 3px 0;
+  margin: 2px 0;
   border: 0;
   background: transparent;
 }
 
 .turn-tool-group > summary {
-  min-height: 34px;
-  padding: 5px 9px;
+  min-height: 26px;
+  padding: 2px 8px;
   grid-template-columns: 7px minmax(0, 1fr);
   gap: 8px;
   border: 0;
@@ -3325,7 +3407,7 @@ button {
 }
 
 .turn-tool-group > summary:hover .turn-disclosure-title {
-  color: var(--color-brand-light);
+  color: var(--color-ink);
 }
 
 .turn-tool-group-marker {
@@ -3341,7 +3423,7 @@ button {
   width: 6px;
   height: 6px;
   border-radius: 50%;
-  background: var(--color-success);
+  background: var(--color-ink-faint);
 }
 
 .turn-tool-group--running .turn-tool-group-marker > span,
@@ -3355,7 +3437,7 @@ button {
 }
 
 .turn-tool-group--cancelled .turn-tool-group-marker > span {
-  background: var(--color-ink-muted);
+  background: var(--color-ink-faint);
 }
 
 .turn-tool-group-chevron {
@@ -3363,7 +3445,7 @@ button {
   width: 15px;
   height: 15px;
   align-self: center;
-  color: var(--color-ink-muted);
+  color: var(--color-ink-faint);
   transition: color var(--transition-fast);
 }
 
@@ -3372,7 +3454,7 @@ button {
 }
 
 .turn-tool-group > summary:hover .turn-tool-group-chevron {
-  color: var(--color-ink);
+  color: var(--color-ink-subtle);
 }
 
 .turn-tool-group-copy {
@@ -3382,13 +3464,12 @@ button {
   min-width: 0;
   align-items: center;
   justify-self: start;
-  gap: 4px;
-  line-height: 1.25;
+  gap: 6px;
+  line-height: 1.45;
 }
 
 .turn-tool-group-copy .turn-disclosure-title {
   flex: 0 1 auto;
-  font-weight: 600;
 }
 
 .turn-tool-group-copy .turn-disclosure-status {
@@ -3428,8 +3509,8 @@ button {
 }
 
 .turn-tool-group-content .turn-timeline-tool {
-  min-height: 36px;
-  padding: 6px 8px;
+  min-height: 26px;
+  padding: 2px 8px;
   border-top-color: transparent;
   border-bottom-color: transparent;
 }
@@ -3439,7 +3520,6 @@ button {
 }
 
 .turn-tool-group-content .turn-timeline-tool--command {
-  min-height: 34px;
   align-items: center;
 }
 
@@ -3449,15 +3529,18 @@ button {
 
 .turn-timeline-tool > .turn-command-summary {
   flex-direction: row;
-  align-items: baseline;
+  align-items: center;
   gap: 8px;
 }
 
+/* 收起态命令与同一行文案保持一致：普通无衬线字体，超宽截断；
+   展开后的完整命令在 `.turn-tool-output pre` 里保留等宽。 */
 .turn-command-summary > strong {
   min-width: 0;
-  overflow-wrap: anywhere;
-  font-family: var(--font-family-mono);
-  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: var(--font-weight-medium);
 }
 
 .turn-command-summary .turn-tool-meta {
@@ -3514,7 +3597,7 @@ button {
 
 .turn-tool-output {
   min-width: 0;
-  grid-column: 2;
+  flex: 0 0 100%;
   margin: 5px 0 2px;
   border: 1px solid var(--color-border);
   border-radius: var(--radius-sm);
@@ -5113,7 +5196,7 @@ button {
 
 .turn-tool-details {
   min-width: 0;
-  grid-column: 2;
+  flex: 0 0 100%;
   margin: 5px 0 2px;
   border: 1px solid var(--color-border);
   border-radius: var(--radius-sm);
@@ -5745,21 +5828,29 @@ button {
 .attachment-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .attachment-truncated { display: grid; flex: 0 0 auto; place-items: center; color: var(--color-warning); }
 .attachment-strip button { display: grid; width: 20px; height: 20px; padding: 0; place-items: center; border: 0; background: transparent; cursor: pointer; }
-/* 待发送图片的缩略图本身是可点击预览按钮，必须从上面的通用按钮规则里取回原尺寸。 */
-.attachment-thumb-button {
+/* 待发送图片的缩略图和文件名同属一个可点击预览按钮，必须从上面的通用按钮规则里取回原尺寸。 */
+.attachment-strip .attachment-image-open {
   display: grid;
-  width: 20px;
-  height: 20px;
+  width: auto;
+  height: auto;
+  min-width: 0;
+  flex: 1 1 auto;
+  align-items: center;
+  justify-items: stretch;
+  gap: 6px;
+  grid-template-columns: auto minmax(0, 1fr);
   padding: 0;
-  flex-shrink: 0;
-  place-items: center;
   border: 0;
   border-radius: 3px;
   background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
   cursor: zoom-in;
 }
-.attachment-thumb-button:hover .attachment-thumb { filter: brightness(1.08); }
-.attachment-thumb-button:focus-visible {
+.attachment-strip .attachment-image-open .attachment-thumb { flex: 0 0 auto; }
+.attachment-strip .attachment-image-open:hover .attachment-thumb { filter: brightness(1.08); }
+.attachment-strip .attachment-image-open:focus-visible {
   outline: 2px solid var(--color-brand);
   outline-offset: 1px;
 }

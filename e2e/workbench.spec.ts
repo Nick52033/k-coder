@@ -1272,6 +1272,128 @@ test("command diagnostics distinguish no matches and errors in live and restored
   await assertLabels();
 });
 
+test("renders conversation process rows as flat single lines", async ({ page }, testInfo) => {
+  await page.emulateMedia({ reducedMotion: "reduce" });
+  await page.goto("/");
+  await expect(page.getByRole("heading", { name: "Phase 6 workbench" })).toBeVisible();
+  await emitDisclosureEvents(page, [
+    { type: "turn_started" },
+    { type: "tool_started", call: { id: "flat-cmd", name: "run_command", arguments: { command: "pnpm build" }, metadata: {} } },
+    { type: "tool_completed", callId: "flat-cmd", name: "run_command", result: { success: true, output: "done", metadata: { durationMs: 1234 } } },
+    { type: "tool_started", call: { id: "flat-read", name: "read_file", arguments: { path: "src/App.tsx", startLine: 10, lineCount: 5 }, metadata: {} } },
+    { type: "tool_completed", callId: "flat-read", name: "read_file", result: { success: true, output: "ok", metadata: { startLine: 10, endLine: 14 } } },
+  ]);
+  const group = page.locator(".turn-execution--live .turn-tool-group");
+  await group.locator(":scope > summary").click();
+  const rows = page.locator(".message--assistant").last().locator(".turn-timeline-tool");
+  await expect(rows).toHaveCount(2);
+
+  // 命令行带 ZCode 式「终端」类型标签，命令本体仍是独立元素，方便精确断言与复制。
+  const commandRow = rows.filter({ hasText: "pnpm build" });
+  await expect(commandRow.locator(".turn-tool-kind")).toHaveText("终端");
+  await expect(commandRow.locator("strong")).toHaveText("pnpm build");
+
+  // 扁平行：无卡片边框、无第二行堆叠，标题与尾部状态共享同一行且行高紧凑。
+  for (const index of [0, 1]) {
+    const row = rows.nth(index);
+    await expect(row).toHaveCSS("border-top-width", "0px");
+    await expect(row).toHaveCSS("border-bottom-width", "0px");
+    const metrics = await row.evaluate((element) => {
+      const strong = element.querySelector("strong") as HTMLElement;
+      const meta = element.querySelector(".turn-tool-meta") as HTMLElement;
+      return {
+        height: element.getBoundingClientRect().height,
+        titleTop: strong.getBoundingClientRect().top,
+        metaTop: meta.getBoundingClientRect().top,
+      };
+    });
+    expect(metrics.height).toBeLessThanOrEqual(34);
+    expect(Math.abs(metrics.metaTop - metrics.titleTop)).toBeLessThanOrEqual(6);
+  }
+
+  // 过程记录使用低对比度墨色，不再把每条工具行染成绿色成功态。
+  // 令牌要在同一继承上下文里解析：`[data-tone]` 会在更深的节点上覆盖 ink-faint。
+  const iconColor = await rows.first().locator("> svg").evaluate((element) => {
+    const probe = document.createElement("span");
+    probe.style.color = "var(--color-ink-faint)";
+    element.parentElement!.append(probe);
+    const value = getComputedStyle(probe).color;
+    probe.remove();
+    return value;
+  });
+  const resolvedIconColor = await rows.first().locator("> svg").evaluate((element) => getComputedStyle(element).color);
+  expect(resolvedIconColor).toBe(iconColor);
+  const successColor = await rows.first().locator("> svg").evaluate((element) => {
+    const probe = document.createElement("span");
+    probe.style.color = "var(--color-success)";
+    element.parentElement!.append(probe);
+    const value = getComputedStyle(probe).color;
+    probe.remove();
+    return value;
+  });
+  expect(resolvedIconColor).not.toBe(successColor);
+
+  // 工具组摘要同样去框：无边框、透明底，标题与箭头同一行。
+  const summary = group.locator(":scope > summary");
+  await expect(summary).toHaveCSS("border-top-width", "0px");
+  await expect(summary).toHaveCSS("background-color", "rgba(0, 0, 0, 0)");
+  const summaryAlignment = await summary.evaluate((element) => {
+    const title = element.querySelector<HTMLElement>(".turn-disclosure-title")?.getBoundingClientRect();
+    const arrow = element.querySelector<SVGElement>(".turn-tool-group-chevron")?.getBoundingClientRect();
+    return title && arrow ? Math.abs(arrow.top - title.top) : null;
+  });
+  expect(summaryAlignment).not.toBeNull();
+  expect(summaryAlignment!).toBeLessThanOrEqual(6);
+  await page.screenshot({ path: testInfo.outputPath("flat-conversation-rows.png"), fullPage: true });
+});
+
+test("collapses a finished reasoning row into a single 思考 summary line", async ({ page }) => {
+  await page.emulateMedia({ reducedMotion: "reduce" });
+  await page.goto("/");
+  await expect(page.getByRole("heading", { name: "Phase 6 workbench" })).toBeVisible();
+  const summary = "已确认超时来自退出码分类，因此需要保留原始退出码。";
+  await emitDisclosureEvents(page, [
+    { type: "turn_started" },
+    { type: "item_started", itemId: "rs-done", itemType: "reasoning" },
+    { type: "reasoning_summary_delta", itemId: "rs-done", delta: summary },
+  ]);
+  const reasoning = page.locator(".turn-reasoning");
+  await expect(reasoning.locator(".turn-reasoning-label")).toHaveText("思考中");
+  await expect(reasoning).toHaveAttribute("open", "");
+
+  await emitDisclosureEvents(page, [
+    { type: "reasoning_summary_completed", itemId: "rs-done", summary },
+    { type: "item_completed", itemId: "rs-done", itemType: "reasoning", status: "completed" },
+    {
+      type: "turn_completed",
+      phase: "complete",
+      message: { schemaVersion: 1, id: "reasoning-answer", role: "assistant", content: [{ type: "text", text: "核对完成" }], createdAtMs: 5 },
+      usage: null,
+      startedAtMs: 1,
+      completedAtMs: 5,
+      durationMs: 4200,
+    },
+  ]);
+  // 这一段思考结束后回到单行摘要：标签变「思考」并带上真实耗时，正文自动收起。
+  await expect(reasoning.locator(".turn-reasoning-label")).toHaveText("思考");
+  await expect(reasoning.locator(".turn-reasoning-duration")).toHaveText(/· 持续了 \d+ 秒/);
+  await expect(reasoning).not.toHaveAttribute("open", "");
+  await expect(reasoning.locator(".turn-reasoning-segment")).toHaveCount(1);
+  // 收起态不显示流式提示，避免和展开后的正文重复。
+  await expect(reasoning.locator(".turn-reasoning-hint")).toHaveCount(0);
+
+  // Turn 收尾后外层执行过程默认收起，先展开它再操作思考行。
+  const execution = page.locator(".message--assistant").last().locator(".turn-execution");
+  await expect(execution).not.toHaveAttribute("open", "");
+  await execution.locator(":scope > summary").click();
+  await expect(execution).toHaveAttribute("open", "");
+
+  // 用户手动展开后，选择被记住，不会因为状态变化被自动改回去。
+  await reasoning.locator(":scope > summary").click();
+  await expect(reasoning).toHaveAttribute("open", "");
+  await expect(reasoning.locator(".turn-reasoning-segment")).toHaveText(summary);
+});
+
 test("surfaces runtime details from the titlebar state entry", async ({ page }, testInfo) => {
   await page.goto("/");
   if (testInfo.project.name === "narrow") await page.setViewportSize({ width: 420, height: 820 });
@@ -3294,11 +3416,21 @@ test("streams thinking, safe reasoning summaries, compact command states, and fi
   });
 
   const reasoning = page.locator(".turn-reasoning").last();
-  await expect(page.getByText("思考摘要", { exact: true })).toHaveCount(1);
-  await expect(reasoning.locator(":scope > .turn-reasoning-heading > svg.lucide-lightbulb")).toHaveCount(1);
+  // 思考行改为 ZCode 式单行摘要：大脑图标 + 「思考中」+ 秒级耗时，正文仍可展开。
+  await expect(reasoning.locator(":scope > summary > svg.lucide-brain")).toHaveCount(1);
+  await expect(reasoning.locator(".turn-reasoning-label")).toHaveText("思考中");
+  await expect(reasoning.locator(".turn-reasoning-duration")).toHaveText(/· 持续了 \d+ 秒/);
   await expect(page.getByText("思考内容", { exact: true })).toHaveCount(0);
   await expect(reasoning.locator(".turn-reasoning-segment")).toHaveCount(2);
-  await expect(reasoning.locator(":scope > summary, .turn-disclosure-status, .turn-disclosure-chevron")).toHaveCount(0);
+  await expect(reasoning).toHaveAttribute("open", "");
+  // 展开态不把最新推理行再重复一遍；收起时才在摘要行右侧给一条流式提示。
+  await expect(reasoning.locator(".turn-reasoning-hint")).toHaveCount(0);
+  await reasoning.locator(":scope > summary").click();
+  await expect(reasoning).not.toHaveAttribute("open", "");
+  await expect(reasoning.locator(".turn-reasoning-hint")).toHaveText("已完成扁平布局，正在核对窄屏边界。");
+  await reasoning.locator(":scope > summary").click();
+  await expect(reasoning).toHaveAttribute("open", "");
+  await expect(reasoning.locator(".turn-disclosure-status, .turn-disclosure-chevron")).toHaveCount(0);
   await expect(reasoning).toHaveCSS("border-top-width", "0px");
   await expect(reasoning).toHaveCSS("background-color", "rgba(0, 0, 0, 0)");
   await expect(page.getByText("Fixing context mismatch in patch", { exact: true })).toHaveCount(0);
@@ -4607,6 +4739,12 @@ test("opens the preview dialog from a pending composer image attachment", async 
   await page.screenshot({ path: testInfo.outputPath("composer-image-preview.png"), fullPage: true });
   await page.keyboard.press("Escape");
   await expect(imagePreview).toHaveCount(0);
+
+  // 点击待发送图片的文件名同样打开预览。
+  await page.getByLabel("待发送附件").getByText("composer-image.png", { exact: true }).click();
+  await expect(page.getByRole("dialog", { name: "composer-image.png" })).toBeVisible();
+  await page.getByRole("button", { name: "关闭图片预览" }).click();
+  await expect(page.getByRole("dialog", { name: "composer-image.png" })).toHaveCount(0);
 
   // 打开预览既不清空待发送附件，也不自动发送。
   await expect(page.getByLabel("待发送附件").locator(".attachment-tag")).toHaveCount(1);
@@ -7293,7 +7431,7 @@ async function installRuntimeLogFixture(page: import('@playwright/test').Page) {
           ? [{ timestampMs: 1750000000004, level: 'info', event: 'logs_cleared', fields: {}, threadId: null, threadTitle: null }]
           : [
             { timestampMs: 1750000000000, level: 'info', event: 'turn_requested', fields: {}, threadId: 'thread-1', threadTitle: '来源对话 A' },
-            { timestampMs: 1750000000001, level: 'error', event: 'turn_failed', fields: { message: '模型请求失败' }, threadId: 'thread-2', threadTitle: '来源对话 B' },
+            { timestampMs: 1750000000001, level: 'error', event: 'tool_failed', fields: { threadId: 'thread-2', tool: 'apply_patch', itemStatus: 'failed', output: 'patch conflicts with the workspace: chunk for src/App.css matched 0 locations instead of exactly one' }, threadId: 'thread-2', threadTitle: '来源对话 B' },
             { timestampMs: 1750000000002, level: 'error', event: 'legacy_failed', fields: {}, threadId: 'deleted-thread', threadTitle: null },
             { timestampMs: 1750000000003, level: 'error', event: 'runtime_failed', fields: {}, threadId: null, threadTitle: null },
           ];
@@ -7317,6 +7455,11 @@ test('runtime logs show two levels, original conversation sources and confirmed 
   await expect(dialog.getByLabel('级别').locator('option')).toHaveText(['全部级别', 'Info', 'Error']);
   await expect(dialog.locator('.log-row')).toHaveCount(4);
   await expect(dialog.locator('.log-time').first()).not.toContainText('Invalid');
+  // 后端已把 fields 收敛到主要信息，失败原因应整行读完，而不是截断成省略号。
+  const toolFailureFields = dialog.locator('.log-fields').filter({ hasText: 'patch conflicts' });
+  await expect(toolFailureFields).toHaveCount(1);
+  await expect(toolFailureFields).toContainText('instead of exactly one');
+  expect(await toolFailureFields.innerText()).not.toContain('…');
   await expect(dialog.locator('.log-source')).toHaveText([
     '来源：应用运行时（无关联对话）', '来源：对话名称不可用 （deleted-thread）', '来源：来源对话 B （thread-2）',
   ]);

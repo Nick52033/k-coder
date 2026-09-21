@@ -1,6 +1,7 @@
 import {
   Activity,
   Bot,
+  Brain,
   Check,
   ChevronDown,
   ChevronRight,
@@ -12,7 +13,6 @@ import {
   Clock3,
   Copy,
   FileText,
-  Lightbulb,
   LoaderCircle,
   RotateCcw,
   SquareTerminal,
@@ -178,6 +178,7 @@ export const ConversationTurnActivity = memo(function ConversationTurnActivity({
               <ReasoningGroup
                 items={entry.items}
                 renderText={renderText}
+                streaming={visuallyStreaming}
                 key={`reasoning-group-${entry.items.map((item) => item.itemId).join("-")}`}
               />
             ) : entry.type === "tool_group" ? (
@@ -192,6 +193,7 @@ export const ConversationTurnActivity = memo(function ConversationTurnActivity({
                 item={entry.item}
                 changes={changes}
                 renderText={renderText}
+                streaming={visuallyStreaming}
                 typing={entry.item.type === "text" && paced.pendingTextIds.has(entry.item.id)}
                 key={timelineItemKey(entry.item)}
               />
@@ -346,11 +348,13 @@ function TimelineItem({
   item,
   changes,
   renderText,
+  streaming = false,
   typing = false,
 }: {
   item: TurnTimelineItem;
   changes: ChangeSet[];
   renderText?: (text: string) => ReactNode;
+  streaming?: boolean;
   typing?: boolean;
 }) {
   if (item.type === "text") {
@@ -361,7 +365,7 @@ function TimelineItem({
     );
   }
   if (item.type === "reasoning") {
-    return <ReasoningGroup items={[item]} renderText={renderText} />;
+    return <ReasoningGroup items={[item]} renderText={renderText} streaming={streaming} />;
   }
   if (item.type === "event") {
     return <TimelineEventRow item={item} changes={changes} />;
@@ -573,16 +577,35 @@ function groupConsecutiveTimeline(items: TurnTimelineItem[]): TimelineRenderEntr
 function ReasoningGroup({
   items,
   renderText,
+  streaming = false,
 }: {
   items: ReasoningTimelineItem[];
   renderText?: (text: string) => ReactNode;
+  /** 所属 Turn 是否仍在流式输出；决定思考行是"思考中"还是"思考 · 持续了 N 秒"。 */
+  streaming?: boolean;
 }) {
+  const lastItem = items[items.length - 1];
+  const active = streaming && lastItem?.complete !== true;
+  // Follow activity only until the user chooses; a finished block must not re-open itself.
+  const [userExpanded, setUserExpanded] = useState<boolean | null>(null);
+  const expanded = userExpanded ?? active;
+  // 与 ZCode 一致：右侧流式提示只在收起态出现，展开时不重复已经可见的正文。
+  const hint = active && !expanded ? latestReasoningLine(lastItem?.summary ?? "") : null;
   return (
-    <div className="turn-reasoning" role="group" aria-label="思考摘要">
-      <div className="turn-reasoning-heading">
-        <Lightbulb size={15} aria-hidden="true" />
-        <span>思考摘要</span>
-      </div>
+    <details className="turn-reasoning" open={expanded}>
+      <summary
+        className="turn-reasoning-summary"
+        onClick={(event) => {
+          event.preventDefault();
+          setUserExpanded((previous) => !(previous ?? active));
+        }}
+      >
+        <Brain size={15} aria-hidden="true" className="turn-reasoning-icon" />
+        <span className="turn-reasoning-label">{active ? "思考中" : "思考"}</span>
+        <ReasoningDuration active={active} />
+        {hint ? <span className="turn-reasoning-hint">{hint}</span> : null}
+        <ChevronDown className="turn-reasoning-chevron" size={14} aria-hidden="true" />
+      </summary>
       <div className="turn-reasoning-content">
         {items.map((item) => (
           <div className="turn-reasoning-segment" key={`${item.turnId}-${item.itemId}`}>
@@ -590,8 +613,48 @@ function ReasoningGroup({
           </div>
         ))}
       </div>
-    </div>
+    </details>
   );
+}
+
+/**
+ * 秒级耗时单独成一个组件：计时器的 setState 只重渲染这一小节，
+ * 不会每秒带着整段思考正文（可能是长 Markdown）重跑一遍。
+ */
+function ReasoningDuration({ active }: { active: boolean }) {
+  const seconds = useElapsedSeconds(active);
+  if (seconds === null) return null;
+  return <span className="turn-reasoning-duration">· 持续了 {seconds} 秒</span>;
+}
+
+/**
+ * 秒级计时：只在 `active` 为真时跑，停止后保留最后一次读数，因此"思考 · 持续了 N 秒"
+ * 记录的是这一段思考真实的耗时；历史恢复的思考没有可测起点，保持不显示而不是编一个数。
+ */
+function useElapsedSeconds(active: boolean): number | null {
+  const startedAtRef = useRef<number | null>(null);
+  const [seconds, setSeconds] = useState<number | null>(null);
+  useEffect(() => {
+    if (!active) {
+      startedAtRef.current = null;
+      return undefined;
+    }
+    if (startedAtRef.current === null) startedAtRef.current = Date.now();
+    const startedAt = startedAtRef.current;
+    const tick = () => setSeconds(Math.max(1, Math.round((Date.now() - startedAt) / 1000)));
+    tick();
+    const timer = window.setInterval(tick, 1000);
+    return () => window.clearInterval(timer);
+  }, [active]);
+  return seconds;
+}
+
+/** 取最新一条推理摘要的最后一行非空文本，作为思考行右侧的流式提示。 */
+function latestReasoningLine(summary: string) {
+  const line = summary.split("\n").map((part) => part.trim()).filter(Boolean).pop() ?? "";
+  const cleaned = line.replace(/^[#>*_`\-\s]+/, "").replace(/[#*_`\s]+$/, "").trim();
+  if (!cleaned) return null;
+  return cleaned.length > 48 ? `${cleaned.slice(0, 48)}…` : cleaned;
 }
 
 function ToolActivityGroup({
@@ -761,6 +824,7 @@ function ToolActivityRow({
       )}
       <span className={isCommand ? "turn-command-summary" : undefined}>
         <span className="turn-tool-heading">
+        {isCommand ? <span className="turn-tool-kind">终端</span> : null}
         <strong title={isCommand && command ? command : undefined}>{isSubagentActivity && activity.call.name === "create_agent" ? "子智能体" : title}</strong>
         {subagentLabel ? <span className="subagent-tool-label">{subagentLabel}</span> : null}
         {subagentIds.map((subagentId) => {
