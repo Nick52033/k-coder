@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
 use super::common::{
-    build_client, read_error_message, redact_error, redact_event, require_api_key,
+    build_client, read_error_details, redact_error, redact_event, require_api_key,
 };
 use super::sse::SseDecoder;
 use super::{
@@ -240,8 +240,14 @@ impl Provider for AnthropicMessagesProvider {
         if !response.status().is_success() {
             let status = response.status().as_u16();
             let retry_after = super::common::retry_after(&response);
-            let message = read_error_message(response, &cancellation, &self.api_key).await?;
-            return Err(ProviderError::from_http(status, message, retry_after));
+            let details = read_error_details(response, &cancellation, &self.api_key).await?;
+            return Err(ProviderError::from_http_with_diagnostics(
+                status,
+                details.message,
+                retry_after,
+                details.code,
+                details.request_id,
+            ));
         }
 
         let secret = self.api_key.clone();

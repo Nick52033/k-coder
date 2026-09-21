@@ -5,6 +5,19 @@ use tokio_util::sync::CancellationToken;
 use super::{ProviderError, ProviderEvent};
 
 const MAX_ERROR_BODY_BYTES: usize = 8 * 1024;
+const MAX_PROVIDER_CODE_CHARS: usize = 120;
+const MAX_PROVIDER_REQUEST_ID_CHARS: usize = 160;
+
+/// The small, non-secret part of an HTTP error response that is useful for
+/// diagnosing provider-specific 429s.  In particular, StepFun uses the code
+/// to distinguish a temporary resource limit from a project/member Credit
+/// ceiling, even though both are returned as HTTP 429.
+#[derive(Debug, Default)]
+pub(super) struct ErrorDetails {
+    pub message: String,
+    pub code: Option<String>,
+    pub request_id: Option<String>,
+}
 
 pub(super) fn retry_after(response: &Response) -> Option<std::time::Duration> {
     parse_retry_after(
@@ -49,11 +62,11 @@ pub(super) fn require_api_key(api_key: &str) -> Result<(), ProviderError> {
     }
 }
 
-pub(super) async fn read_error_message(
+pub(super) async fn read_error_details(
     mut response: Response,
     cancellation: &CancellationToken,
     secret: &str,
-) -> Result<String, ProviderError> {
+) -> Result<ErrorDetails, ProviderError> {
     let mut bytes = Vec::new();
     while bytes.len() < MAX_ERROR_BODY_BYTES {
         let chunk = tokio::select! {
@@ -70,8 +83,9 @@ pub(super) async fn read_error_message(
     }
 
     let text = String::from_utf8_lossy(&bytes).trim().to_string();
-    let message = serde_json::from_str::<Value>(&text)
-        .ok()
+    let parsed = serde_json::from_str::<Value>(&text).ok();
+    let message = parsed
+        .as_ref()
         .and_then(|value| {
             value
                 .pointer("/error/message")
@@ -87,7 +101,68 @@ pub(super) async fn read_error_message(
                 text
             }
         });
-    Ok(redact(&message, secret))
+    let code = parsed
+        .as_ref()
+        .and_then(|value| {
+            value
+                .pointer("/error/code")
+                .or_else(|| value.get("code"))
+                .and_then(Value::as_str)
+        })
+        .and_then(|code| safe_provider_code(code));
+    let request_id = response_request_id(&response)
+        .or_else(|| {
+            parsed.as_ref().and_then(|value| {
+                value
+                    .pointer("/error/request_id")
+                    .or_else(|| value.pointer("/error/requestId"))
+                    .or_else(|| value.get("request_id"))
+                    .or_else(|| value.get("requestId"))
+                    .and_then(Value::as_str)
+            })
+        })
+        .and_then(|request_id| safe_request_id(request_id))
+        .map(|request_id| redact(&request_id, secret));
+    Ok(ErrorDetails {
+        message: redact(&message, secret),
+        code,
+        request_id,
+    })
+}
+
+fn response_request_id(response: &Response) -> Option<&str> {
+    ["x-request-id", "request-id"].iter().find_map(|name| {
+        response
+            .headers()
+            .get(*name)
+            .and_then(|value| value.to_str().ok())
+    })
+}
+
+fn safe_provider_code(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty()
+        || value.len() > MAX_PROVIDER_CODE_CHARS
+        || !value.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.')
+        })
+    {
+        return None;
+    }
+    Some(value.to_string())
+}
+
+fn safe_request_id(value: &str) -> Option<String> {
+    let value = value.trim();
+    if value.is_empty()
+        || value.len() > MAX_PROVIDER_REQUEST_ID_CHARS
+        || !value.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.' | ':' | '/')
+        })
+    {
+        return None;
+    }
+    Some(value.to_string())
 }
 
 pub(super) fn redact_event(event: ProviderEvent, secret: &str) -> ProviderEvent {
@@ -166,12 +241,25 @@ pub(super) fn classify_event_error(
     code: Option<&str>,
     error_type: Option<&str>,
 ) -> ProviderError {
-    if code.into_iter().chain(error_type).any(|value| {
+    let rate_limit_code = code.into_iter().chain(error_type).find(|value| {
         matches!(
-            value.trim(),
-            "rate_limit_exceeded" | "rate_limit_error" | "rate_limited"
+            value.trim().to_ascii_lowercase().as_str(),
+            "rate_limit_exceeded"
+                | "rate_limit_error"
+                | "rate_limited"
+                | "project_credit_limit_exceeded"
+                | "member_project_credit_limit_exceeded"
         )
-    }) {
+    });
+    let normalized_message = message.to_ascii_lowercase();
+    if rate_limit_code.is_some()
+        || normalized_message.contains("rate limit")
+        || normalized_message.contains("too many requests")
+    {
+        let message = rate_limit_code
+            .and_then(safe_provider_code)
+            .map(|code| format!("{message} (provider code: {code})"))
+            .unwrap_or(message);
         return ProviderError::RateLimited {
             message,
             retry_after: None,
@@ -194,7 +282,6 @@ pub(super) fn classify_event_error(
                     | "temporarily_unavailable"
             )
         });
-    let normalized_message = message.to_ascii_lowercase();
     let transient_message = normalized_message.contains("overloaded")
         || normalized_message.contains("temporarily unavailable")
         || normalized_message.contains("server is busy")
@@ -245,9 +332,9 @@ mod tests {
             let (mut socket, _) = listener.accept().await.unwrap();
             let mut request = [0; 4096];
             socket.read(&mut request).await.unwrap();
-            let body = r#"{"error":{"message":"Free-tier request limit reached secret-fixture"}}"#;
+            let body = r#"{"error":{"message":"Free-tier request limit reached secret-fixture","code":"project_credit_limit_exceeded"}}"#;
             let wire = format!(
-                "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 73\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 73\r\nX-Request-Id: step-test-429/abc\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                 body.len(),
                 body
             );
@@ -261,19 +348,35 @@ mod tests {
             .unwrap();
         let hint = super::retry_after(&response);
         let status = response.status().as_u16();
-        let message = super::read_error_message(
+        let details = super::read_error_details(
             response,
             &tokio_util::sync::CancellationToken::new(),
             "secret-fixture",
         )
         .await
         .unwrap();
-        let error = crate::providers::ProviderError::from_http(status, message, hint);
+        assert_eq!(
+            details.code.as_deref(),
+            Some("project_credit_limit_exceeded")
+        );
+        assert_eq!(details.request_id.as_deref(), Some("step-test-429/abc"));
+        let error = crate::providers::ProviderError::from_http_with_diagnostics(
+            status,
+            details.message,
+            hint,
+            details.code,
+            details.request_id,
+        );
         assert_eq!(
             error.rate_limit_delay(),
             Some(std::time::Duration::from_secs(73))
         );
         assert!(!error.to_string().contains("secret-fixture"));
+        assert!(
+            error
+                .to_string()
+                .contains("provider code: project_credit_limit_exceeded")
+        );
         assert_eq!(error.turn_error(error.to_string()).code, "rate_limited");
         server.await.unwrap();
     }
@@ -301,6 +404,32 @@ mod tests {
                 Some("invalid_request_error"),
                 None
             ),
+            ProviderError::InvalidResponse(_)
+        ));
+    }
+
+    #[test]
+    fn classifies_stepfun_credit_codes_and_rate_limit_messages() {
+        for code in [
+            "project_credit_limit_exceeded",
+            "member_project_credit_limit_exceeded",
+        ] {
+            assert!(matches!(
+                classify_event_error("upstream rejected the request".into(), Some(code), None),
+                ProviderError::RateLimited { message, .. }
+                    if message.contains(code) && message.contains("provider code")
+            ));
+        }
+        assert!(matches!(
+            classify_event_error(
+                "Rate limit reached, please try again later".into(),
+                None,
+                None
+            ),
+            ProviderError::RateLimited { .. }
+        ));
+        assert!(matches!(
+            classify_event_error("invalid request".into(), Some("server_error_code"), None),
             ProviderError::InvalidResponse(_)
         ));
     }

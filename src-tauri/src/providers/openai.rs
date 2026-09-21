@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use super::common::{classify_event_error, read_error_message, redact_error, redact_event};
+use super::common::{classify_event_error, read_error_details, redact_error, redact_event};
 use super::sse::SseDecoder;
 use super::{
     Provider, ProviderConfig, ProviderError, ProviderEvent, ProviderMessage, ProviderRequest,
@@ -452,12 +452,12 @@ impl Provider for OpenAiChatCompletionsProvider {
         if !response.status().is_success() {
             let status = response.status().as_u16();
             let retry_after = super::common::retry_after(&response);
-            let message = read_error_message(response, &cancellation, &self.api_key).await?;
+            let details = read_error_details(response, &cancellation, &self.api_key).await?;
             let can_retry_with_degraded_history =
                 deepseek.as_ref().is_some_and(|(_, thinking_enabled)| {
                     *thinking_enabled
                         && has_native_deepseek_tool_history(&payload)
-                        && is_deepseek_reasoning_passback_error(&message)
+                        && is_deepseek_reasoning_passback_error(&details.message)
                         && status == 400
                 });
             if can_retry_with_degraded_history {
@@ -472,16 +472,24 @@ impl Provider for OpenAiChatCompletionsProvider {
                 if !response.status().is_success() {
                     let retry_status = response.status().as_u16();
                     let retry_after = super::common::retry_after(&response);
-                    let retry_message =
-                        read_error_message(response, &cancellation, &self.api_key).await?;
-                    return Err(ProviderError::from_http(
+                    let retry_details =
+                        read_error_details(response, &cancellation, &self.api_key).await?;
+                    return Err(ProviderError::from_http_with_diagnostics(
                         retry_status,
-                        retry_message,
+                        retry_details.message,
                         retry_after,
+                        retry_details.code,
+                        retry_details.request_id,
                     ));
                 }
             } else {
-                return Err(ProviderError::from_http(status, message, retry_after));
+                return Err(ProviderError::from_http_with_diagnostics(
+                    status,
+                    details.message,
+                    retry_after,
+                    details.code,
+                    details.request_id,
+                ));
             }
         }
 

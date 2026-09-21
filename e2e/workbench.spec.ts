@@ -3353,6 +3353,40 @@ test("selects and persists the global reasoning effort", async ({ page }) => {
   await expect.poll(() => page.evaluate(() => (window as unknown as { __invoked: string[] }).__invoked.filter((command) => command === "set_reasoning_effort").length)).toBe(1);
 });
 
+test("explains when an active model has no displayable reasoning summary", async ({ page }) => {
+  await page.goto("/");
+  await expect(page.getByRole("heading", { name: "Phase 6 workbench" })).toBeVisible();
+
+  await emitDisclosureEvents(page, [
+    { type: "turn_started" },
+    {
+      type: "tool_started",
+      call: { id: "read-for-thinking", name: "read_file", arguments: { path: "src/App.tsx" }, metadata: {} },
+    },
+    {
+      type: "tool_completed",
+      callId: "read-for-thinking",
+      name: "read_file",
+      result: { success: true, output: "export const app = true;", metadata: {} },
+    },
+    { type: "activity_status_changed", status: "thinking" },
+  ]);
+
+  const execution = page.locator(".message--assistant").last().locator(".turn-execution--live");
+  await expect(execution.locator(".turn-reasoning-unavailable")).toHaveText(
+    "当前模型未提供可展示的思考摘要，公开进度和工具活动仍会继续显示。",
+  );
+  await expect(execution.locator(".turn-reasoning")).toHaveCount(0);
+
+  await emitDisclosureEvents(page, [
+    { type: "item_started", itemId: "safe-summary", itemType: "reasoning" },
+    { type: "reasoning_summary_delta", itemId: "safe-summary", delta: "已确认读取范围，下一步核对相关实现。" },
+  ]);
+  await expect(execution.locator(".turn-reasoning-unavailable")).toHaveCount(0);
+  await expect(execution.locator(".turn-reasoning")).toHaveCount(1);
+  await expect(execution.locator(".turn-reasoning-segment")).toContainText("已确认读取范围");
+});
+
 test("streams thinking, safe reasoning summaries, compact command states, and file diffs inline", async ({ page, context }, testInfo) => {
   await context.grantPermissions(["clipboard-read", "clipboard-write"]);
   await page.goto("/");
@@ -6086,6 +6120,52 @@ test("shows detailed usage tracking by token, day, and model", async ({ page }, 
   await page.screenshot({ path: testInfo.outputPath(`usage-models-${testInfo.project.name}.png`), fullPage: true });
 });
 
+test("explains why the commit button is disabled while nothing is staged", async ({ page }, testInfo) => {
+  await page.goto("/");
+  await page.evaluate(() => {
+    const host = window as unknown as {
+      __TAURI_INTERNALS__: { invoke: (command: string, args?: Record<string, unknown>) => Promise<unknown> };
+      __gitActions: Array<Record<string, unknown>>;
+    };
+    const originalInvoke = host.__TAURI_INTERNALS__.invoke;
+    host.__gitActions = [];
+    host.__TAURI_INTERNALS__.invoke = async (command, args) => {
+      if (command === "git_status") {
+        // 只有未暂存的改动，暂存区为空——这正是"提交按钮一直是灰色"的场景。
+        // 状态列必须写成两个字符：多字节路径（中文文件名）加上两列状态，
+        // 界面的按字节解析才不会把路径切错。
+        return {
+          isRepository: true,
+          branch: "main",
+          upstream: "origin/main",
+          ahead: 0,
+          behind: 0,
+          files: [{ path: "docs/sys/开发路线图.md", indexStatus: " ", worktreeStatus: "M" }],
+        };
+      }
+      if (command === "git_action") {
+        host.__gitActions.push(args ?? {});
+        return "ok";
+      }
+      return originalInvoke(command, args);
+    };
+  });
+  await page.getByRole("button", { name: "工作台", exact: true }).click();
+  await page.getByRole("tab", { name: "Git" }).click();
+
+  // 提交按钮必须是灰的，并给用户可执行的指引，而不是让人以为提交功能坏了。
+  await expect(page.getByRole("button", { name: "提交", exact: true })).toBeDisabled();
+  await expect(page.locator(".git-commit-hint")).toContainText("尚未暂存");
+  // 中文路径必须原样展示，状态列只有 "M" 时不能把路径的开头切掉。
+  await expect(page.locator(".git-file span")).toHaveText("docs/sys/开发路线图.md");
+  await expect(page.locator(".git-file code")).toHaveText("M");
+  // 未暂存时仍需能暂存，用户由此可以把改动推进到提交。
+  await expect(page.getByRole("button", { name: "暂存 docs/sys/开发路线图.md" })).toBeEnabled();
+  await page.screenshot({ path: testInfo.outputPath(`git-nothing-staged-${testInfo.project.name}.png`), fullPage: true });
+  // 只有未暂存改动时提交按钮只能是灰的——这是解释，不是提交功能坏了。
+  await expect(page.locator(".git-commit-hint")).toContainText("提交按钮不可用");
+});
+
 test("colors file formats and wires complete Git actions", async ({ page }, testInfo) => {
   await page.goto("/");
   await page.evaluate(() => {
@@ -6140,6 +6220,9 @@ test("colors file formats and wires complete Git actions", async ({ page }, test
   await page.getByRole("button", { name: "拉取" }).click();
   await page.getByRole("button", { name: "推送" }).click();
   await page.getByLabel("提交说明").fill("test workbench Git actions");
+  // 夹具里 staged.ts 处于已暂存状态，因此提交按钮可用，且提示行说明"提交后仍需推送"。
+  await expect(page.getByRole("button", { name: "提交", exact: true })).toBeEnabled();
+  await expect(page.locator(".git-commit-hint")).toContainText("提交后仍需推送");
   await page.screenshot({ path: testInfo.outputPath("git-actions.png"), fullPage: true });
   await page.getByRole("button", { name: "提交", exact: true }).click();
 
@@ -6149,6 +6232,60 @@ test("colors file formats and wires complete Git actions", async ({ page }, test
     "push",
     "commit",
   ]);
+});
+
+test("reports a successful commit instead of leaving the staged hint behind", async ({ page }, testInfo) => {
+  await page.goto("/");
+  await page.evaluate(() => {
+    const host = window as unknown as {
+      __TAURI_INTERNALS__: { invoke: (command: string, args?: Record<string, unknown>) => Promise<unknown> };
+      __committed: boolean;
+    };
+    const originalInvoke = host.__TAURI_INTERNALS__.invoke;
+    // 提交生效前暂存区里有内容；提交成功后 worktree 变干净、ahead 变成 1。
+    // 不能用「第几次调用 git_status」来区分：工作台里其它视图也会在 Git 面板挂载前
+    // 调用同一个命令，调用次序不是这个场景的契约。
+    host.__committed = false;
+    host.__TAURI_INTERNALS__.invoke = async (command, args) => {
+      if (command === "git_status") {
+        return host.__committed
+          ? {
+              isRepository: true,
+              branch: "main",
+              upstream: "origin/main",
+              ahead: 1,
+              behind: 0,
+              files: [],
+            }
+          : {
+              isRepository: true,
+              branch: "main",
+              upstream: "origin/main",
+              ahead: 0,
+              behind: 0,
+              files: [{ path: "staged.ts", indexStatus: "M", worktreeStatus: " " }],
+            };
+      }
+      if (command === "git_action") {
+        host.__committed = true;
+        return "ok";
+      }
+      return originalInvoke(command, args);
+    };
+  });
+  await page.getByRole("button", { name: "工作台", exact: true }).click();
+  await page.getByRole("tab", { name: "Git" }).click();
+
+  await page.getByLabel("提交说明").fill("提交已暂存的更改");
+  page.on("dialog", (dialog) => dialog.accept());
+  await page.getByRole("button", { name: "提交", exact: true }).click();
+
+  // 提交成功后必须换成「已提交」的说法，且提醒仍需推送；不能再显示「已经暂存」。
+  await expect(page.locator(".git-commit-hint")).toContainText("已提交");
+  await expect(page.locator(".git-commit-hint")).toContainText("推送");
+  await expect(page.locator(".git-commit-hint")).not.toContainText("已经暂存");
+  await expect(page.getByText("提交完成")).toBeVisible();
+  await page.screenshot({ path: testInfo.outputPath(`git-commit-done-${testInfo.project.name}.png`), fullPage: true });
 });
 
 test("hides project-bound sessions from the plain conversation list", async ({ page }, testInfo) => {
@@ -7119,7 +7256,7 @@ test("rate limit waiting and all child states are visible with only one wait cal
   const roundSummary = page.getByRole("region", { name: "本轮子智能体状态" });
   const summary = page.getByRole("region", { name: "本会话子智能体状态" });
   await expect(roundSummary.locator("li")).toHaveCount(1);
-  await expect(roundSummary).toContainText("架构文档限流等待");
+  await expect(roundSummary).toContainText("架构文档上游返回 429");
   await expect(summary.locator("li")).toHaveCount(1);
   await expect(summary).toContainText("项目文档运行中");
   await expect(page.locator(".message--assistant").last().locator(".turn-timeline-tool")).toHaveCount(1);
@@ -7131,14 +7268,14 @@ test("rate limit waiting and all child states are visible with only one wait cal
     const bridge = window as unknown as { __emitAgentEvent: (event: unknown) => void };
     bridge.__emitAgentEvent({ schemaVersion: 7, threadId: "thread-1", turnId: "quota-turn", phase: "exploring", type: "provider_retry_waiting", retryAtMs: Date.now() + 60000 });
   });
-  await expect(page.locator(".turn-execution--live > summary > .turn-disclosure-title").last()).toContainText("限流等待");
+  await expect(page.locator(".turn-execution--live > summary > .turn-disclosure-title").last()).toContainText("上游返回 429");
   await page.evaluate(() => {
     (window as unknown as { __emitAgentEvent: (event: unknown) => void }).__emitAgentEvent({ schemaVersion: 7, threadId: "thread-1", turnId: "quota-turn", phase: "exploring", type: "activity_status_changed", status: "thinking" });
   });
-  await expect(page.locator(".turn-execution--live > summary > .turn-disclosure-title").last()).not.toContainText("限流等待");
+  await expect(page.locator(".turn-execution--live > summary > .turn-disclosure-title").last()).not.toContainText("上游返回 429");
   await chip.click();
   const drawer = page.getByRole("complementary", { name: "子智能体", exact: true });
-  await expect(drawer.locator(".agent-retry-wait")).toContainText("限流等待");
+  await expect(drawer.locator(".agent-retry-wait")).toContainText("上游返回 429");
   await page.screenshot({ path: testInfo.outputPath("child-rate-limit.png"), fullPage: true });
 
   await page.evaluate(() => {
@@ -7146,7 +7283,7 @@ test("rate limit waiting and all child states are visible with only one wait cal
     bridge.__emitAgentEvent({ schemaVersion: 7, threadId: "thread-1", turnId: "quota-turn", phase: "exploring", type: "activity_status_changed", status: "thinking" });
     bridge.__emitTauriEvent("subagent-event", { schemaVersion: 1, id: "agent-2", parentAgentId: null, parentThreadId: "thread-1", threadId: "child-2", label: "架构文档", task: "检查文档", state: "failed", depth: 1, workspaceRoot: "D:\\code\\k-coder", capabilities: ["read_file"], tokenBudget: null, tokensUsed: 0, timeoutMs: 600000, createdAtMs: 2, updatedAtMs: 20, summary: null, error: "provider returned HTTP 429", turnCount: 1 });
   });
-  await expect(page.locator(".turn-execution--live > summary > .turn-disclosure-title").last()).not.toContainText("限流等待");
+  await expect(page.locator(".turn-execution--live > summary > .turn-disclosure-title").last()).not.toContainText("上游返回 429");
   await expect(roundSummary).toContainText("架构文档失败");
   await expect(drawer.locator(".agent-retry-wait")).toHaveCount(0);
 });

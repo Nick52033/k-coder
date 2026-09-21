@@ -11,6 +11,15 @@
 - 磁盘满会在链接期报 `LNK1201`。判别：`cargo check` 干净 + 链接失败 ⇒ 环境（磁盘/并发）问题，先 `df -k /c /d`，别急着清缓存。真要腾空间，`target/debug/incremental` 是最安全的清理目标。
 - `src-tauri/target` 常有另一条工作流并发跑 cargo，出现 `failed to remove file ...rlib: 拒绝访问 (os error 5)` 属瞬时锁，稍后重试即可。
 
+## 部署脚本 `k-coder-build-deploy.bat`
+
+- 两份必须同步：仓库 `scripts/k-coder-build-deploy.bat` 与用户桌面副本 `C:\Users\nealk\Desktop\k-coder-build-deploy.bat`（用户实际双击的是桌面那份）。
+- 默认 `REPO=D:\code\Nick\k-coder`、`DEST=D:\apps\k-coder`，可用环境变量 `KC_REPO`/`KC_DEST` 覆盖；参数 `--skip-build`/`--no-launch`/`--no-pause`/`--full`。指纹文件 `src-tauri/target/.kc-deploy-stamp` 命中就跳过构建。
+- **必须保持纯 ASCII（含注释）**：cmd 以 OEM 代码页 cp936 读 .bat，UTF-8 中文注释会被错误解码并在控制台冒出假的「不是内部或外部命令」报错。
+- **运行时资源目录只有 `skills/`、`tools/`、`ocr/`**（由 `tauri.conf.json` 的 `bundle.resources` 映射，`--no-bundle` 也会产出），**没有 `resources/`**；Rust 侧一律 `resource_dir().join("skills"/"tools"/"ocr")`。robocopy 对不存在的源目录返回 **16**，脚本已改为「缺目录只告警」，别再把它加回致命检查。
+- robocopy 退出码语义：0–7 = 成功（1 = 有文件被拷贝），≥8 = 失败；`/MIR` 会删掉目标端多余文件。
+- **沙箱内跑不了 .bat**：Bash 工具与 PowerShell 工具都拦截 cmd.exe（`dangerouslyDisableSandbox` 也一样）。验证只能用 robocopy 直测 + 纯 Python 静态检查（ASCII/CRLF/标签-goto/括号），真跑需用户手动双击。
+
 ## Git 状态
 
 - 分支 `codex/robot-workflow-skills`，HEAD `e2f33eb`（2026-09-21 12:08），工作树干净、无 stash，**已推送**（远端同名分支同 SHA）。`origin/main` = `a6e111f`，落后 HEAD 34 个提交。

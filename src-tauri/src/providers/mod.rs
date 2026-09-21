@@ -187,12 +187,22 @@ impl ProviderError {
         }
     }
 
-    pub(crate) fn from_http(
+    pub(crate) fn from_http_with_diagnostics(
         status: u16,
-        message: String,
+        mut message: String,
         retry_after: Option<std::time::Duration>,
+        provider_code: Option<String>,
+        provider_request_id: Option<String>,
     ) -> Self {
         if status == 429 {
+            if let Some(code) = provider_code.filter(|code| !code.is_empty()) {
+                message = format!("{message} (provider code: {code})");
+            }
+            if let Some(request_id) =
+                provider_request_id.filter(|request_id| !request_id.is_empty())
+            {
+                message = format!("{message} (provider request id: {request_id})");
+            }
             Self::RateLimited {
                 message,
                 retry_after,

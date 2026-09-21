@@ -31,6 +31,7 @@ import { changeLineStats } from "../lib/diff";
 import { DELEGATION_TOOL_NAMES, subagentIdsOf } from "../lib/subagent";
 import { PlanProgress } from "./PlanProgress";
 import { RetryWaitingLabel } from "./RetryWaitingLabel";
+import { BrandMark } from "./BrandMark";
 
 const ReadOnlyCodeEditor = lazy(() => import("./CodeEditor").then((module) => ({ default: module.CodeEditor })));
 const ChangeCodeDiffEditor = lazy(() => import("./CodeEditor").then((module) => ({ default: module.CodeDiffEditor })));
@@ -110,6 +111,19 @@ export const ConversationTurnActivity = memo(function ConversationTurnActivity({
   const hasItems = Boolean(activities.length || processItems.length);
   const hasProcess = hasItems || Boolean(activityStatus) || terminalEvent?.kind === "turn_failed" || terminalEvent?.kind === "turn_cancelled";
   const timelineHasTools = processTimeline.some((item) => item.type === "tool");
+  const hasDisplayableReasoning = processItems.some((item) => item.type === "reasoning");
+  const hasPublicProgress = Boolean(
+    activities.length
+      || timelineHasTools
+      || processItems.some((item) => item.type === "text" || item.type === "event"),
+  );
+  const showReasoningUnavailableNotice = Boolean(
+    visuallyStreaming
+      && activityStatus === "thinking"
+      && !terminalEvent
+      && !hasDisplayableReasoning
+      && hasPublicProgress,
+  );
   const toolCount = timelineHasTools
     ? groupedProcessTimeline.reduce(
       (count, entry) => count + (entry.type === "tool_group" ? hideSupersededPatchFailures(entry.activities).length : 0),
@@ -149,7 +163,7 @@ export const ConversationTurnActivity = memo(function ConversationTurnActivity({
   const statusLabel = paced.pendingTextIds.size
     ? "生成回复中"
     : activityStatus ? {
-      rate_limited: "限流等待",
+      rate_limited: "上游返回 429",
       thinking: "思考中",
       responding: "生成回复中",
       running_tool: "处理工具结果中",
@@ -170,8 +184,14 @@ export const ConversationTurnActivity = memo(function ConversationTurnActivity({
     )
     : statusLabel;
   const processContent = (
-    <div className="turn-disclosure-panel">
-      <div className={visuallyStreaming ? "turn-execution-live" : "turn-execution-content"}>
+      <div className="turn-disclosure-panel">
+        <div className={visuallyStreaming ? "turn-execution-live" : "turn-execution-content"}>
+        {showReasoningUnavailableNotice ? (
+          <div className="turn-reasoning-unavailable" role="status">
+            <Brain size={15} aria-hidden="true" />
+            <span>当前模型未提供可展示的思考摘要，公开进度和工具活动仍会继续显示。</span>
+          </div>
+        ) : null}
         {processItems.length ? (
           <div className="turn-timeline">
             {groupedProcessTimeline.map((entry) => entry.type === "reasoning_group" ? (
@@ -698,7 +718,7 @@ function ToolActivityGroup({
           setUserExpanded((previous) => !(previous ?? active));
         }}
       >
-        <span className="turn-tool-group-marker" aria-hidden="true"><span /></span>
+        <span className="turn-tool-group-marker" aria-hidden="true"><BrandMark size={14} /></span>
         <span className="turn-tool-group-copy">
           <span className="turn-disclosure-title">{title}</span>
           {expanded ? (

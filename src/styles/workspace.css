@@ -78,23 +78,68 @@
 .conversation {
   container-type: inline-size;
   --workspace-gutter: clamp(18px, 3cqw, 40px);
-  --conversation-content-width: min(820px, calc(100cqw - 2 * var(--workspace-gutter)));
+  /* ZCode keeps the transcript on a generous shared axis.  The old 820px
+     cap made the response column feel like a card inside the conversation;
+     use the available panel width until a readable desktop maximum. */
+  --conversation-content-width: min(1000px, calc(100cqw - 2 * var(--workspace-gutter)));
+  background: var(--color-surface);
 }
 .conversation-header {
   padding-inline: var(--workspace-gutter);
-  border-bottom-color: color-mix(in srgb, var(--color-border) 65%, transparent);
+  border-bottom-color: color-mix(in srgb, var(--color-border) 48%, transparent);
+  background: color-mix(in srgb, var(--color-surface-raised) 42%, transparent);
 }
 .conversation-header h1 { font-size: 16px; font-weight: var(--font-weight-semibold); }
 .message-area--populated {
-  padding: 28px 0 24px;
+  padding: 22px 0 28px;
   scrollbar-gutter: stable both-edges;
 }
 .message-list { width: var(--conversation-content-width); }
-.message { margin-bottom: 26px; }
+.message { margin-bottom: 20px; }
 .message:last-child { margin-bottom: 0; }
-.message-content { line-height: 1.75; }
-.message--user .message-content { padding: 12px 16px; border-radius: var(--workspace-radius); }
+
+/* ZCode's transcript has no repeated assistant speaker chrome.  Keep the
+   labels in the accessibility tree and in the DOM contracts used by the
+   history/retry views, but remove them from the visual flow. */
+.message--assistant .message-role {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+/* The user row keeps its copy action available without reserving a speaker
+   line above the bubble.  The text label remains semantically present but is
+   visually transparent; the button retains its focus target and hit area. */
+.message--user .message-body { position: relative; }
+.message--user .message-role {
+  position: absolute;
+  z-index: 1;
+  top: 6px;
+  right: 7px;
+  margin: 0;
+  color: transparent;
+  font-size: 0;
+  line-height: 1;
+}
+.message--user .message-copy-button { color: var(--color-ink-subtle); }
+
+.message-content { line-height: 1.7; }
+.message--user .message-content {
+  padding: 11px 14px;
+  border: 1px solid color-mix(in srgb, var(--color-user-msg-border) 72%, transparent);
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--color-user-msg-bg) 92%, var(--color-surface));
+}
 .turn-progress-text { line-height: 1.75; }
+.turn-context { margin: 0 0 10px; }
+.turn-progress-text { padding-top: 3px; padding-bottom: 10px; }
+.turn-final-response .turn-progress-text { padding-top: 8px; }
 
 /* Completed metadata remains expandable; errors and active states keep their
    existing semantic colors and visible actions. */
@@ -116,9 +161,9 @@
 .composer {
   width: var(--conversation-content-width);
   max-width: calc(100% - 2 * var(--workspace-gutter));
-  margin: 0 auto 18px;
-  border-color: var(--color-border);
-  border-radius: var(--workspace-radius);
+  margin: 0 auto 16px;
+  border-color: color-mix(in srgb, var(--color-border-input) 82%, transparent);
+  border-radius: 14px;
   background: var(--color-surface-raised);
   box-shadow: none;
 }
@@ -128,27 +173,27 @@
 }
 .composer-quick-actions {
   min-height: 36px;
-  padding: 6px 10px 0;
+  padding: 6px 12px 0;
   border-bottom: 0;
-  border-radius: var(--workspace-radius) var(--workspace-radius) 0 0;
+  border-radius: 14px 14px 0 0;
   background: transparent;
   gap: 4px;
 }
 .composer-quick-action:hover { border-color: transparent; color: var(--color-ink); }
 .composer textarea {
   field-sizing: content;
-  min-height: 64px;
+  min-height: 68px;
   max-height: min(240px, 28vh);
-  padding: 10px 16px 12px;
+  padding: 10px 18px 11px;
   overflow-y: auto;
-  font-size: 15px;
-  line-height: 1.65;
+  font-size: var(--font-size-md);
+  line-height: 1.6;
 }
 .composer textarea::placeholder { color: var(--color-ink-subtle); opacity: 1; }
 /* The composer owns focus feedback; nested textarea glow caused a second box
    and a one-pixel jump in enhanced-animations.css. */
 [data-theme] .composer textarea:focus { transform: none; box-shadow: none; }
-.composer-controls { padding: 6px 10px 10px; gap: var(--workspace-gap); }
+.composer-controls { padding: 6px 12px 10px; gap: var(--workspace-gap); }
 .composer-options { gap: 4px; flex-wrap: wrap; }
 .composer-options .model-selector { flex-basis: 180px; min-width: 0; }
 .composer-actions::before { display: none; }

@@ -1212,7 +1212,7 @@ function App() {
         ? activityStatus.streamRetry
           ? `重连中 ${activityStatus.streamRetry.attempt}/${activityStatus.streamRetry.maxAttempts}`
           : {
-            rate_limited: "限流等待",
+            rate_limited: "上游返回 429",
             thinking: "思考中",
             responding: "生成回复中",
             running_tool: "处理工具结果中",

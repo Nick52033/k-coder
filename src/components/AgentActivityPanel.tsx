@@ -330,7 +330,7 @@ interface SubagentRowProps {
 
 function SubagentRow({ agent, selected, onSelect, onStop, onResume }: SubagentRowProps) {
   const statusInfo = activeStates.has(agent.state) && agent.retryAtMs
-    ? { label: "限流等待", Icon: Clock, color: "var(--color-ink)", spinning: false }
+    ? { label: "上游返回 429", Icon: Clock, color: "var(--color-ink)", spinning: false }
     : getStatusInfo(agent.state);
   const elapsed = formatElapsed(agent.createdAtMs, agent.updatedAtMs);
 
@@ -392,7 +392,7 @@ function SubagentDetail({ agent, onBack, onStop, onResume, onError }: SubagentDe
   const [sending, setSending] = useState(false);
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const statusInfo = activeStates.has(agent.state) && agent.retryAtMs
-    ? { label: "限流等待", Icon: Clock, color: "var(--color-ink)", spinning: false }
+    ? { label: "上游返回 429", Icon: Clock, color: "var(--color-ink)", spinning: false }
     : getStatusInfo(agent.state);
 
   useEffect(() => {

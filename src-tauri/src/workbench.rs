@@ -580,11 +580,7 @@ pub fn git_status(root: &Path) -> Result<GitStatusView, WorkbenchError> {
     let behind = parse_counter(header, "behind ");
     let files = lines
         .filter(|line| line.len() >= 3)
-        .map(|line| GitFileStatus {
-            index_status: line[0..1].to_string(),
-            worktree_status: line[1..2].to_string(),
-            path: line[3..].to_string(),
-        })
+        .map(parse_git_file_status)
         .collect();
     Ok(GitStatusView {
         is_repository: true,
@@ -594,6 +590,34 @@ pub fn git_status(root: &Path) -> Result<GitStatusView, WorkbenchError> {
         behind,
         files,
     })
+}
+
+/// 解析 `git status --porcelain=v1` 的一行。
+///
+/// 取字节而不是按字符切片：路径会包含中文等多字节字符，按字节取前两列才不会错位。
+fn parse_git_file_status(line: &str) -> GitFileStatus {
+    let bytes = line.as_bytes();
+    let column = |index: usize| {
+        bytes
+            .get(index)
+            .filter(|byte| !byte.is_ascii_whitespace())
+            .map(|byte| char::from(*byte).to_string())
+            .unwrap_or_else(|| " ".to_string())
+    };
+    let index_status = column(0);
+    let worktree_status = column(1);
+    let rest = line.get(2..).unwrap_or("");
+    // 未跟踪/被忽略的文件用 "??"/"!!" 表示，其后是单空格分隔，不是两列状态之间的空格。
+    let path = if index_status == "?" || index_status == "!" {
+        rest.trim_start_matches(' ')
+    } else {
+        rest.strip_prefix(' ').unwrap_or(rest)
+    };
+    GitFileStatus {
+        index_status,
+        worktree_status,
+        path: path.to_string(),
+    }
 }
 
 pub fn git_diff(root: &Path, path: Option<&str>, staged: bool) -> Result<String, WorkbenchError> {
@@ -737,6 +761,25 @@ pub fn git_action(
             )
             .is_ok()
             {
+                // 推送只传输提交。工作区里未暂存/未提交的改动不会随推送离开本机，
+                // 因此这里必须如实说明「没有需要推送的提交」，而不是笼统地报告成功，
+                // 否则用户会以为界面里仍在的改动已经被同步到远端。
+                let ahead = git(root, &["rev-list", "--count", "@{upstream}..HEAD"])?
+                    .trim()
+                    .parse::<u64>()
+                    .unwrap_or(0);
+                if ahead == 0 {
+                    let pending = git_status(root)
+                        .map(|status| status.files.len())
+                        .unwrap_or(0);
+                    return Ok(if pending == 0 {
+                        "没有需要推送的提交：本地分支已与远端一致".to_string()
+                    } else {
+                        format!(
+                            "没有需要推送的提交：本地分支已与远端一致，另有 {pending} 个文件改动尚未提交"
+                        )
+                    });
+                }
                 git(root, &["push"])
             } else {
                 let branch = git(root, &["symbolic-ref", "--quiet", "--short", "HEAD"])?;
@@ -906,6 +949,29 @@ mod tests {
         git(root, &["config", "user.name", "k-Coder Tests"]).unwrap();
     }
 
+    /// 直接调用 `git` 二进制、并且只使用显式传入的配置。
+    ///
+    /// 测试结论不能受使用者 `~/.gitconfig` 影响：例如本机配置了 `http.proxy`，
+    /// 那断言「git 没有从配置里解析出代理」就会在正确的实现上失败。
+    fn isolated_git(root: &Path, args: &[&str]) -> (bool, String) {
+        let empty_config = root.join("empty-gitconfig");
+        if !empty_config.exists() {
+            std::fs::write(&empty_config, "").unwrap();
+        }
+        let output = Command::new("git")
+            .args(["--literal-pathspecs", "-C", &root.to_string_lossy()])
+            .env("GIT_CONFIG_GLOBAL", &empty_config)
+            .env("GIT_CONFIG_SYSTEM", &empty_config)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .args(args)
+            .output()
+            .unwrap();
+        (
+            output.status.success(),
+            String::from_utf8_lossy(&output.stdout).trim().to_string(),
+        )
+    }
+
     #[cfg(windows)]
     #[test]
     fn prepares_windows_shell_paths_without_verbatim_prefixes() {
@@ -971,7 +1037,10 @@ mod tests {
         }
         let status = git(root.path(), &["status", "--porcelain"]);
         let missing_remote = git(root.path(), &["remote", "get-url", "origin"]);
-        let effective_proxy = git(root.path(), &["config", "--get", "http.proxy"]);
+        // 在只读取显式配置的干净环境下查询有效代理：注入的环境变量不应在配置里出现。
+        // 不能用 `git config --get`，那会读到使用者自己的 `~/.gitconfig`（本机就配了
+        // http.proxy），使这条断言在正确实现上也会失败。
+        let effective_proxy = isolated_git(root.path(), &["config", "--get", "http.proxy"]);
         unsafe {
             for (name, value) in restore {
                 match value {
@@ -992,11 +1061,10 @@ mod tests {
             !error.contains("127.0.0.1:1"),
             "proxy value leaked into git: {error}"
         );
-        // No `http.proxy` is set in config either, so a direct connection remains the
-        // effective setting.
+        // 未向 Git 配置写入任何代理，因此注入的值不会变成配置项。
         assert!(
-            effective_proxy.is_err(),
-            "git must not resolve an injected proxy from its own config"
+            !effective_proxy.0 && effective_proxy.1.is_empty(),
+            "an injected proxy value must not become Git configuration: {effective_proxy:?}"
         );
     }
 
@@ -1241,6 +1309,50 @@ mod tests {
         assert!(git_action(root.path(), "reset", &[], None, true).is_err());
     }
 
+    /// 推送只传输提交。工作区里未暂存/未提交的改动不会随推送离开本机，
+    /// 因此「没有需要推送的提交」必须被如实报告，而不是笼统地报告成功。
+    #[test]
+    fn git_push_reports_when_there_is_nothing_to_push() {
+        let local = tempfile::tempdir().unwrap();
+        let remote = tempfile::tempdir().unwrap();
+        init_repository(local.path());
+        git(remote.path(), &["init", "--bare"]).unwrap();
+
+        std::fs::write(local.path().join("tracked.txt"), "first\n").unwrap();
+        git_action(local.path(), "stage", &[], None, false).unwrap();
+        git_action(local.path(), "commit", &[], Some("initial"), true).unwrap();
+        git(local.path(), &["branch", "-M", "main"]).unwrap();
+        let remote_path = remote.path().to_string_lossy().into_owned();
+        git(local.path(), &["remote", "add", "origin", &remote_path]).unwrap();
+        git_action(local.path(), "push", &[], None, true).unwrap();
+
+        // 已同步且工作区干净：没有待推送的提交。
+        let clean = git_action(local.path(), "push", &[], None, true).unwrap();
+        assert!(
+            clean.starts_with("没有需要推送的提交"),
+            "expected an explicit no-op notice, got: {clean}"
+        );
+        assert!(
+            !clean.contains("个文件改动尚未提交"),
+            "a clean worktree must not claim uncommitted changes: {clean}"
+        );
+
+        // 有未提交改动但仍然没有待推送提交：必须说明改动并未随之同步。
+        std::fs::write(local.path().join("dirty.txt"), "uncommitted\n").unwrap();
+        let dirty = git_action(local.path(), "push", &[], None, true).unwrap();
+        assert!(
+            dirty.contains("尚未提交"),
+            "expected the pending changes to be disclosed, got: {dirty}"
+        );
+        // 未提交的文件绝不会出现在远端。
+        let remote_ls = git(
+            local.path(),
+            &["ls-tree", "--name-only", "-r", "origin/main"],
+        )
+        .unwrap();
+        assert!(!remote_ls.contains("dirty.txt"));
+    }
+
     #[test]
     fn git_status_preserves_unicode_paths() {
         let root = tempfile::tempdir().unwrap();
@@ -1252,5 +1364,122 @@ mod tests {
         assert_eq!(status.files[0].path, "中文.rs");
         assert_eq!(status.files[0].index_status, "?");
         assert_eq!(status.files[0].worktree_status, "?");
+    }
+
+    /// 中文路径按字符切片会错位，界面因此会显示出错误的文件路径。
+    #[test]
+    fn git_status_parses_porcelain_columns_by_byte() {
+        let untracked = parse_git_file_status("?? docs/sys/开发路线图.md");
+        assert_eq!(untracked.index_status, "?");
+        assert_eq!(untracked.worktree_status, "?");
+        assert_eq!(untracked.path, "docs/sys/开发路线图.md");
+
+        let modified = parse_git_file_status(" M docs/sys/开发路线图.md");
+        assert_eq!(modified.index_status, " ");
+        assert_eq!(modified.worktree_status, "M");
+        assert_eq!(modified.path, "docs/sys/开发路线图.md");
+
+        let staged = parse_git_file_status("M  src/App.tsx");
+        assert_eq!(staged.index_status, "M");
+        assert_eq!(staged.worktree_status, " ");
+        assert_eq!(staged.path, "src/App.tsx");
+
+        // 同时存在暂存与未暂存改动时，两个状态列都必须保留。
+        let both = parse_git_file_status("MM src/App.tsx");
+        assert_eq!(both.index_status, "M");
+        assert_eq!(both.worktree_status, "M");
+        assert_eq!(both.path, "src/App.tsx");
+    }
+
+    /// 真实仓库里的暂存流程：暂存后状态必须转成「已暂存」，
+    /// 前端才可能启用提交按钮、并让「全部暂存」按钮按预期变化。
+    #[test]
+    fn git_stage_moves_unicode_files_from_unstaged_to_staged() {
+        let root = tempfile::tempdir().unwrap();
+        init_repository(root.path());
+        std::fs::write(root.path().join("开发笔记.md"), "note\n").unwrap();
+
+        let before = git_status(root.path()).unwrap();
+        assert_eq!(before.files.len(), 1);
+        assert_eq!(before.files[0].path, "开发笔记.md");
+        assert!(before.files.iter().any(|file| is_stageable(file)));
+
+        git_action(root.path(), "stage", &[], None, false).unwrap();
+
+        let after = git_status(root.path()).unwrap();
+        assert!(after.files.iter().all(|file| !is_stageable(file)));
+        assert!(after.files.iter().any(|file| is_staged(file)));
+    }
+
+    /// 提交必须只包含暂存内容：其余改动留在工作区。
+    /// `git commit` 默认就把索引当作提交内容，这条测试锁住该行为不被后续改动破坏。
+    #[test]
+    fn git_commit_only_records_staged_paths() {
+        let root = tempfile::tempdir().unwrap();
+        init_repository(root.path());
+        std::fs::write(root.path().join("staged.txt"), "staged\n").unwrap();
+        std::fs::write(root.path().join("other.txt"), "other\n").unwrap();
+
+        git_action(root.path(), "stage", &["staged.txt".into()], None, false).unwrap();
+        git_action(root.path(), "commit", &[], Some("only staged"), true).unwrap();
+
+        let committed = git(root.path(), &["ls-tree", "--name-only", "-r", "HEAD"]).unwrap();
+        assert!(committed.contains("staged.txt"));
+        assert!(
+            !committed.contains("other.txt"),
+            "未暂存的改动不得进入提交: {committed}"
+        );
+        assert!(std::fs::read_to_string(root.path().join("other.txt")).is_ok());
+        assert!(
+            git_action(root.path(), "commit", &[], Some("nothing staged"), true).is_err(),
+            "暂存区为空时提交必须失败，而不是生成空提交"
+        );
+    }
+
+    /// 已有提交时提交新改动：`HEAD..` 的计数必须递增，
+    /// 否则界面会认为「没有需要推送的提交」，让用户误以为推送无效。
+    #[test]
+    fn git_commit_then_push_reports_pending_commit() {
+        let local = tempfile::tempdir().unwrap();
+        let remote = tempfile::tempdir().unwrap();
+        init_repository(local.path());
+        git(remote.path(), &["init", "--bare"]).unwrap();
+
+        std::fs::write(local.path().join("tracked.txt"), "first\n").unwrap();
+        git_action(local.path(), "stage", &[], None, false).unwrap();
+        git_action(local.path(), "commit", &[], Some("initial"), true).unwrap();
+        git(local.path(), &["branch", "-M", "main"]).unwrap();
+        let remote_path = remote.path().to_string_lossy().into_owned();
+        git(local.path(), &["remote", "add", "origin", &remote_path]).unwrap();
+        git_action(local.path(), "push", &[], None, true).unwrap();
+
+        std::fs::write(local.path().join("tracked.txt"), "second\n").unwrap();
+        git_action(local.path(), "stage", &[], None, false).unwrap();
+        git_action(local.path(), "commit", &[], Some("second"), true).unwrap();
+
+        let status = git_status(local.path()).unwrap();
+        assert_eq!(status.ahead, 1, "提交后必须显示 1 个待推送提交");
+        assert!(
+            status.files.is_empty(),
+            "提交后工作区应干净: {:?}",
+            status.files
+        );
+
+        git_action(local.path(), "push", &[], None, true).unwrap();
+        assert_eq!(git_status(local.path()).unwrap().ahead, 0);
+        let remote_ls = git(
+            local.path(),
+            &["ls-tree", "--name-only", "-r", "origin/main"],
+        )
+        .unwrap();
+        assert!(remote_ls.contains("tracked.txt"));
+    }
+
+    fn is_stageable(file: &GitFileStatus) -> bool {
+        file.index_status == "?" || !file.worktree_status.trim().is_empty()
+    }
+
+    fn is_staged(file: &GitFileStatus) -> bool {
+        file.index_status != " " && file.index_status != "?"
     }
 }

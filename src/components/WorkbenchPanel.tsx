@@ -320,6 +320,9 @@ function GitView() {
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   const [busyAction, setBusyAction] = useState<"stage" | "unstage" | "commit" | "pull" | "push" | null>(null);
+  // 提交按钮放行的瞬间记下当时的索引指纹：提交后每条文件的索引列都会清空，
+  // 只有这个指纹才能区分「刚刚提交成功」和「一直没有暂存内容」。
+  const [committedIndex, setCommittedIndex] = useState<string | null>(null);
   const refresh = async () => {
     const [statusResult, branchesResult] = await Promise.allSettled([getGitStatus(), getGitBranches()]);
     if (statusResult.status === "fulfilled") { setStatus(statusResult.value); setError(""); }
@@ -327,6 +330,9 @@ function GitView() {
     if (branchesResult.status === "fulfilled") setBranches(branchesResult.value);
   };
   useEffect(() => { void refresh(); }, []);
+  const stagedFingerprint = status ? stagedFilePaths(status.files).join("\n") : "";
+  // 指纹一致说明看到的仍是提交前那份状态（刷新还没落地），提示不能提前翻篇。
+  const justCommitted = Boolean(committedIndex !== null && committedIndex !== stagedFingerprint);
   async function action(name: "stage" | "unstage" | "commit" | "pull" | "push", paths: string[] = []) {
     const confirmation = name === "commit" ? `提交当前已暂存的更改？\n\n${message}`
       : name === "pull" ? "从远程拉取并快进当前分支？"
@@ -335,13 +341,17 @@ function GitView() {
     if (confirmation && !window.confirm(confirmation)) return;
     setBusyAction(name);
     setNotice("");
+    if (name === "commit") setCommittedIndex(stagedFingerprint);
     try {
-      await runGitAction(name, paths, name === "commit" ? message : undefined, Boolean(confirmation));
+      const result = await runGitAction(name, paths, name === "commit" ? message : undefined, Boolean(confirmation));
       if (name === "commit") setMessage("");
       setError("");
-      setNotice(gitActionSuccessLabel(name));
+      // 后端在无可推送提交时会返回一句说明，优先如实展示它，避免笼统的「推送完成」
+      // 让用户以为工作区里仍在的改动已经被同步到远端。
+      setNotice(gitActionNotice(name, result));
       await refresh();
     } catch (error) {
+      if (name === "commit") setCommittedIndex(null);
       setError(toReadableError(error));
     } finally {
       setBusyAction(null);
@@ -355,12 +365,13 @@ function GitView() {
   if (status && !status.isRepository) return <div className="panel-empty"><GitBranch size={22} /><span>当前工作区不是 Git 仓库</span></div>;
   const hasUnstagedChanges = Boolean(status?.files.some(isGitFileStageable));
   const hasStagedChanges = Boolean(status?.files.some(isGitFileStaged));
+  const hasPendingCommits = Boolean(status && status.ahead > 0);
   return <div className="git-view">
     <div className="panel-toolbar"><span title={status?.upstream ?? "尚未关联远程分支"}><GitBranch size={14} /><strong>{status?.branch ?? "Git"}</strong>{status && (status.ahead || status.behind) ? <small>↑{status.ahead} ↓{status.behind}</small> : null}</span><button type="button" title="刷新" aria-label="刷新 Git 状态" onClick={() => void refresh()}><RefreshCw size={14} /></button></div>
     <div className="branch-controls"><select aria-label="当前分支" value={branches?.current ?? ""} onChange={(event) => void changeBranch(event.target.value)}>{branches?.branches.map((branch) => <option key={branch} value={branch}>{branch}</option>)}</select><button type="button" title="新建分支" aria-label="新建分支" onClick={() => { const branch = window.prompt("新分支名称"); if (branch?.trim()) void changeBranch(branch.trim(), true); }}><Plus size={14} /></button></div>
     <div className="git-actions">
       <button type="button" disabled={busyAction !== null || !status?.upstream} title={status?.upstream ? "从远程快进拉取" : "当前分支尚未关联远程分支"} onClick={() => void action("pull")}><GitActionIcon active={busyAction === "pull"} icon={<ArrowDownToLine size={14} />} />拉取</button>
-      <button type="button" disabled={busyAction !== null || !status?.branch} title={status?.upstream ? "推送当前分支" : "首次推送将关联 origin"} onClick={() => void action("push")}><GitActionIcon active={busyAction === "push"} icon={<Upload size={14} />} />推送</button>
+      <button type="button" disabled={busyAction !== null || !status?.branch} title={!status?.upstream ? "首次推送将关联 origin" : hasPendingCommits ? "推送当前分支" : "没有需要推送的提交：本地分支已与远端一致"} onClick={() => void action("push")}><GitActionIcon active={busyAction === "push"} icon={<Upload size={14} />} />推送</button>
       <button type="button" disabled={busyAction !== null || !hasUnstagedChanges} title="暂存全部更改" onClick={() => void action("stage")}><GitActionIcon active={busyAction === "stage"} icon={<Plus size={14} />} />全部暂存</button>
     </div>
     <div className="git-files">{status?.files.map((file) => {
@@ -369,6 +380,13 @@ function GitView() {
       return <div className="git-file" key={file.path}><button type="button" title="查看 Diff" onClick={() => void getGitDiff(file.path, isGitFileStaged(file) && !isGitFileStageable(file)).then(setDiff).catch((reason) => setError(String(reason)))}><span>{file.path}</span><code>{file.indexStatus}{file.worktreeStatus}</code></button><button type="button" disabled={busyAction !== null} title={actionLabel} aria-label={`${actionLabel} ${file.path}`} onClick={() => void action(nextAction, [file.path])}>{nextAction === "stage" ? "+" : "−"}</button></div>;
     })}</div>
     {diff && <pre className="git-diff">{diff}</pre>}
+    {status && (status.files.length > 0 || justCommitted) && <div className="git-commit-hint">{status.files.length === 0
+      ? "已提交，工作区干净；提交只有推送后才会同步到远端。"
+      : hasStagedChanges
+        ? "已暂存的更改可以提交；提交后仍需推送才会同步到远端。"
+        : justCommitted
+          ? "更改已提交；提交只有推送后才会同步到远端。"
+          : "当前改动尚未暂存，提交按钮不可用：请先点「全部暂存」或单个文件的 + 号。"}</div>}
     <div className="commit-box"><input value={message} onChange={(event) => setMessage(event.target.value)} placeholder="提交说明" aria-label="提交说明" /><button type="button" disabled={busyAction !== null || !message.trim() || !hasStagedChanges} title={hasStagedChanges ? "提交已暂存的更改" : "请先暂存更改"} onClick={() => void action("commit")}>{busyAction === "commit" ? "提交中" : "提交"}</button></div>
     {notice && <div className="panel-notice" role="status">{notice}</div>}
     {error && <div className="panel-error">{error}</div>}
@@ -412,6 +430,24 @@ function gitActionSuccessLabel(action: "stage" | "unstage" | "commit" | "pull" |
   return action === "stage" ? "更改已暂存" : action === "unstage" ? "已取消暂存" : action === "commit" ? "提交完成" : action === "pull" ? "拉取完成" : "推送完成";
 }
 
+/**
+ * 推送只传输提交，工作区里未暂存的改动不会离开本机。后端在无可推送提交时
+ * 会返回一句明确说明，这里优先如实展示它，而不是笼统地报告「推送完成」。
+ */
+function gitActionNotice(action: "stage" | "unstage" | "commit" | "pull" | "push", result: string) {
+  const detail = result.trim();
+  if (action === "push" && detail.startsWith("没有需要推送的提交")) return detail;
+  return gitActionSuccessLabel(action);
+}
+
 function GitActionIcon({ active, icon }: { active: boolean; icon: React.ReactNode }) {
   return active ? <RefreshCw className="git-action-spinner" size={14} /> : icon;
+}
+
+/**
+ * 已暂存文件的路径指纹。提交会清空索引列，前后指纹不同才是「这一次确实提交了」的证据。
+ * 只比对状态列不够：`MM`（已暂存且又有新改动）提交后变成 ` M`，索引变了但文件名相同。
+ */
+function stagedFilePaths(files: GitStatusView["files"]) {
+  return files.filter(isGitFileStaged).map((file) => file.path);
 }

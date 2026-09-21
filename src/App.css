@@ -3349,6 +3349,23 @@ button {
 .turn-reasoning-segment > :first-child { margin-top: 0; }
 .turn-reasoning-segment > :last-child { margin-bottom: 0; }
 
+.turn-reasoning-unavailable {
+  display: flex;
+  min-width: 0;
+  min-height: 26px;
+  padding: 2px 8px;
+  align-items: center;
+  gap: 8px;
+  color: var(--color-ink-faint);
+  font-size: var(--font-size-xs);
+  line-height: 1.45;
+}
+
+.turn-reasoning-unavailable > svg {
+  flex: 0 0 auto;
+  color: var(--color-ink-faint);
+}
+
 .turn-timeline-event.turn-event-step {
   display: block;
   min-height: 0;
@@ -3395,7 +3412,7 @@ button {
 .turn-tool-group > summary {
   min-height: 26px;
   padding: 2px 8px;
-  grid-template-columns: 7px minmax(0, 1fr);
+  grid-template-columns: 15px minmax(0, 1fr);
   gap: 8px;
   border: 0;
   border-radius: 0;
@@ -3412,32 +3429,30 @@ button {
 
 .turn-tool-group-marker {
   display: inline-flex;
-  width: 7px;
-  height: 7px;
+  width: 15px;
+  height: 15px;
   align-items: center;
   justify-content: center;
+  color: var(--color-ink-faint);
 }
 
-.turn-tool-group-marker > span {
+.turn-tool-group-marker > svg {
   display: block;
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: var(--color-ink-faint);
+  flex: 0 0 auto;
 }
 
-.turn-tool-group--running .turn-tool-group-marker > span,
-.turn-tool-group--pending .turn-tool-group-marker > span {
-  background: var(--color-brand);
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--color-brand) 12%, transparent);
+.turn-tool-group--running .turn-tool-group-marker,
+.turn-tool-group--pending .turn-tool-group-marker {
+  color: var(--color-brand);
+  filter: drop-shadow(0 0 3px color-mix(in srgb, var(--color-brand) 26%, transparent));
 }
 
-.turn-tool-group--failed .turn-tool-group-marker > span {
-  background: var(--color-error);
+.turn-tool-group--failed .turn-tool-group-marker {
+  color: var(--color-error);
 }
 
-.turn-tool-group--cancelled .turn-tool-group-marker > span {
-  background: var(--color-ink-faint);
+.turn-tool-group--cancelled .turn-tool-group-marker {
+  color: var(--color-ink-faint);
 }
 
 .turn-tool-group-chevron {
@@ -5695,6 +5710,7 @@ button {
 .git-file span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--font-size-sm); }
 .git-file code { color: var(--color-warning); font-size: var(--font-size-xs); }
 .git-diff { flex: 1; border-top: 1px solid var(--color-border); font-size: 10px; }
+.git-commit-hint { padding: 6px 7px 0; color: var(--color-ink-faint); font-size: 12px; line-height: 1.45; }
 .commit-box { display: grid; padding: 7px; grid-template-columns: minmax(0,1fr) auto; gap: 5px; border-top: 1px solid var(--color-border); }
 .commit-box input { min-width: 0; height: 30px; padding: 0 8px; border: 1px solid var(--color-border-input); border-radius: 5px; color: var(--color-ink); background: var(--color-surface); }
 .commit-box button { padding: 0 9px; border: 0; border-radius: 5px; color: var(--color-surface); background: var(--color-brand); cursor: pointer; }

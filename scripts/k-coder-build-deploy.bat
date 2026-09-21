@@ -1,10 +1,23 @@
 @echo off
 setlocal EnableDelayedExpansion
 
-set REPO=D:\code\k-coder
+rem =====================================================================
+rem  k-Coder build + deploy helper.
+rem
+rem  IMPORTANT: keep this file pure ASCII (7-bit).
+rem  cmd.exe reads .bat files with the OEM codepage (cp936 on this
+rem  machine), so UTF-8 comments get mis-decoded and leak into the
+rem  console as bogus "not recognized as a command" errors.
+rem =====================================================================
+
+if "%KC_REPO%"=="" (
+    set REPO=D:\code\Nick\k-coder
+) else (
+    set REPO=%KC_REPO%
+)
 set RELEASE=%REPO%\src-tauri\target\release
 if "%KC_DEST%"=="" (
-    set DEST=E:\Program Files\k-coder
+    set DEST=D:\apps\k-coder
 ) else (
     set DEST=%KC_DEST%
 )
@@ -22,6 +35,7 @@ for %%A in (%*) do (
 
 set STAMP=%REPO%\src-tauri\target\.kc-deploy-stamp
 if "%FULL_BUILD%"=="1" (set MODE=full) else (set MODE=fast)
+set RC=0
 
 title k-Coder Build and Deploy
 echo ============================================================
@@ -33,11 +47,11 @@ echo ============================================================
 echo.
 
 rem ---------------------------------------------------------------
-rem 快速模式：只对本次构建生效的 cargo release 覆盖
-rem   opt-level=1 + 256 codegen-units + 增量编译
-rem 小改动重编译从几分钟降到几十秒；代价是二进制运行性能略低。
-rem 注意：首次切到 fast（或 fast/full 之间切换）会触发一次全量重编。
-rem 需要发布级性能时用 --full 构建。
+rem Fast mode: release profile overrides for this build only
+rem   opt-level=1 + 256 codegen-units + incremental
+rem Recompiles drop from minutes to tens of seconds; the binary is
+rem slightly slower at runtime. The first switch into or out of fast
+rem triggers one full rebuild. Use --full for a release-grade build.
 rem ---------------------------------------------------------------
 if "%MODE%"=="fast" (
     set CARGO_PROFILE_RELEASE_OPT_LEVEL=1
@@ -49,7 +63,7 @@ if "%MODE%"=="fast" (
 echo [1/4] Build...
 if "%SKIP_BUILD%"=="1" goto skip_build
 
-rem --- 源码指纹：HEAD + 工作区改动 diff 的 SHA256，没变就跳过构建 ---
+rem --- Source stamp: SHA256 of HEAD + working tree diff. Skip if same ---
 pushd "%REPO%"
 if errorlevel 1 goto err_repo
 git rev-parse HEAD > "%TEMP%\kc_stamp_src.txt" 2>nul
@@ -106,7 +120,7 @@ if not errorlevel 1 set KILLED=1
 set WAIT=0
 :wait_dead
 set /a WAIT+=1
-rem wmic removed on Win11; use tasklist with filter (returns "INFO: No tasks..." when absent)
+rem wmic was removed on Win11; use tasklist with filter instead
 tasklist /FI "IMAGENAME eq k-coder.exe" | find /I "k-coder.exe" >nul
 if errorlevel 1 goto wait_done
 if !WAIT! EQU 10 echo      Still running, retrying taskkill...
@@ -138,7 +152,15 @@ if errorlevel 8 (
     echo *** Failed to copy k-coder.exe, robocopy exit code !errorlevel!
     goto hardfail
 )
-for %%D in (skills tools ocr resources) do (
+
+rem Resource folders declared by bundle.resources in tauri.conf.json.
+rem They map to skills/, tools/ and ocr/ next to the exe. A folder that
+rem is absent from the build output is a warning, never a hard failure
+rem (robocopy returns 16 when the source directory does not exist).
+for %%D in (skills tools ocr) do if not exist "%RELEASE%\%%D" (
+    echo      WARNING: %RELEASE%\%%D missing in build output, skipped.
+)
+for %%D in (skills tools ocr) do if exist "%RELEASE%\%%D" (
     robocopy "%RELEASE%\%%D" "%DEST%\%%D" /MIR /R:2 /W:1 /NFL /NDL /NJH /NJS /NP
     if errorlevel 8 (
         echo *** Failed to copy %RELEASE%\%%D, robocopy exit code !errorlevel!
@@ -186,6 +208,7 @@ echo *** %EXE% not found, cannot start.
 goto hardfail
 
 :hardfail
+set RC=1
 echo.
 echo *** BUILD/DEPLOY FAILED. See messages above. ***
 
@@ -195,5 +218,4 @@ if "%PAUSE_AT_END%"=="1" (
     echo Press any key to close this window...
     pause >nul
 )
-endlocal
-exit /b 0
+endlocal & exit /b %RC%
