@@ -765,11 +765,37 @@ fn hide_console_window(command: &mut Command) {
     command.creation_flags(CREATE_NO_WINDOW);
 }
 
+/// Proxy-related environment variables that must not leak into `git` subprocesses.
+///
+/// The desktop host inherits whatever proxy the surrounding environment exports. On
+/// Windows that is frequently a process-local interceptor (an IDE/agent sandbox proxy,
+/// a corporate MITM shim, or a stale value from a previous session) which answers every
+/// CONNECT with `502 Bad Gateway`. Because `git` prefers these variables over its own
+/// configuration, the workbench then fails with `Recv failure: Connection was reset`
+/// even though the user's real proxy is running and perfectly healthy.
+///
+/// Network access is therefore left to Git's own resolution order: `http.proxy` /
+/// `https.proxy` from the config files, falling back to a direct connection. Callers
+/// that genuinely need a proxy keep working by setting it in Git config.
+const INHERITED_PROXY_ENV: [&str; 8] = [
+    "http_proxy",
+    "https_proxy",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "all_proxy",
+    "NO_PROXY",
+    "no_proxy",
+];
+
 fn git(root: &Path, args: &[&str]) -> Result<String, WorkbenchError> {
     let mut command = Command::new("git");
     command
         .args(["--literal-pathspecs", "-C", &root.to_string_lossy()])
         .args(args);
+    for name in INHERITED_PROXY_ENV {
+        command.env_remove(name);
+    }
     #[cfg(target_os = "windows")]
     hide_console_window(&mut command);
     let output = command
@@ -915,6 +941,63 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let result = open_external(root.path(), "../outside.txt", false);
         assert!(matches!(result, Err(WorkbenchError::Invalid(_))));
+    }
+
+    /// A hijacked `https_proxy` (sandbox interceptor, corporate MITM, stale value) makes
+    /// `git` fail with `Recv failure: Connection was reset` even when the user's real proxy
+    /// is reachable. The workbench must not hand these variables to `git`, otherwise local
+    /// repository inspection breaks for reasons the user cannot see.
+    ///
+    /// Driven through the real `git` binary rather than by mocking the command builder, so
+    /// the assertion holds for whatever `git` the deployment resolves at runtime.
+    #[test]
+    fn git_subprocess_does_not_inherit_proxy_environment() {
+        let root = tempfile::tempdir().unwrap();
+        init_repository(root.path());
+
+        // A deliberately unparsable proxy value: if it were inherited, every Git call
+        // below would fail with a proxy resolution error instead of a Git-level result.
+        let poisoned = "http://127.0.0.1:1";
+        // SAFETY: the test process is single-threaded with respect to these variables for
+        // the duration of the block; no other thread reads or writes the environment here.
+        let restore: Vec<(&str, Option<std::ffi::OsString>)> = INHERITED_PROXY_ENV
+            .iter()
+            .map(|name| (*name, std::env::var_os(name)))
+            .collect();
+        unsafe {
+            for name in INHERITED_PROXY_ENV {
+                std::env::set_var(name, poisoned);
+            }
+        }
+        let status = git(root.path(), &["status", "--porcelain"]);
+        let missing_remote = git(root.path(), &["remote", "get-url", "origin"]);
+        let effective_proxy = git(root.path(), &["config", "--get", "http.proxy"]);
+        unsafe {
+            for (name, value) in restore {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+
+        assert!(
+            status.is_ok(),
+            "git status must ignore inherited proxy variables: {status:?}"
+        );
+        // No remote is configured, so this must fail as a missing config entry rather than
+        // as a transport error mentioning the injected proxy value.
+        let error = missing_remote.unwrap_err().to_string();
+        assert!(
+            !error.contains("127.0.0.1:1"),
+            "proxy value leaked into git: {error}"
+        );
+        // No `http.proxy` is set in config either, so a direct connection remains the
+        // effective setting.
+        assert!(
+            effective_proxy.is_err(),
+            "git must not resolve an injected proxy from its own config"
+        );
     }
 
     #[test]
