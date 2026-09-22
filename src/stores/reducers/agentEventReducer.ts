@@ -15,6 +15,7 @@ import type {
   TurnTimelineItem,
   UserInputRequest,
 } from "../../types/runtime";
+import { selectVisibleReasoningSummary } from "../../lib/reasoningSummary";
 import { mergeConversationAttachments } from "./historyProjection";
 
 const MAX_REASONING_SUMMARY_CHARS = 64 * 1024;
@@ -315,18 +316,28 @@ export function reduceAgentEvent(
         return {
           state: {
             turnTimeline: state.turnTimeline.map((item, index) => index === existing && item.type === "reasoning"
-              ? { ...item, summary: (item.summary + event.delta).slice(0, MAX_REASONING_SUMMARY_CHARS), complete: false }
+              ? (() => {
+                const summary = (item.summary + event.delta).slice(0, MAX_REASONING_SUMMARY_CHARS);
+                return {
+                  ...item,
+                  summary,
+                  visibleSummary: selectVisibleReasoningSummary(summary, item.visibleSummary),
+                  complete: false,
+                };
+              })()
               : item),
           },
         };
       }
+      const summary = event.delta.slice(0, MAX_REASONING_SUMMARY_CHARS);
       return {
         state: {
           turnTimeline: [...state.turnTimeline, {
             type: "reasoning" as const,
             itemId: event.itemId,
             turnId: event.turnId,
-            summary: event.delta.slice(0, MAX_REASONING_SUMMARY_CHARS),
+            summary,
+            visibleSummary: selectVisibleReasoningSummary(summary),
             complete: false,
           }],
         },
@@ -334,22 +345,23 @@ export function reduceAgentEvent(
     }
     case "reasoning_summary_completed": {
       const summary = event.summary.slice(0, MAX_REASONING_SUMMARY_CHARS);
-      const exists = state.turnTimeline.some((item) =>
+      const existingItem = state.turnTimeline.find((item) =>
         item.type === "reasoning" && item.turnId === event.turnId && item.itemId === event.itemId,
       );
       return {
         state: {
-          turnTimeline: exists
+          turnTimeline: existingItem
             ? state.turnTimeline.map((item) => item.type === "reasoning"
                 && item.turnId === event.turnId
                 && item.itemId === event.itemId
-              ? { ...item, summary, complete: true }
+              ? { ...item, summary, visibleSummary: selectVisibleReasoningSummary(summary, item.visibleSummary), complete: true }
               : item)
             : [...state.turnTimeline, {
                 type: "reasoning" as const,
                 itemId: event.itemId,
                 turnId: event.turnId,
                 summary,
+                visibleSummary: selectVisibleReasoningSummary(summary),
                 complete: true,
               }],
         },

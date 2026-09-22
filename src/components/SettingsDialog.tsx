@@ -195,6 +195,7 @@ function editableModel(model?: Partial<ProviderModelConfig>): EditableProviderMo
 
 const transportOptions: Array<{ value: ProviderTransport; label: string }> = [
   { value: "open_ai_chat_completions", label: "OpenAI Chat Completions" },
+  { value: "open_ai_image_generations", label: "OpenAI Images 图片生成" },
   { value: "deep_seek_chat_completions", label: "DeepSeek Chat Completions" },
   { value: "open_ai_responses", label: "OpenAI Responses API" },
   { value: "anthropic_messages", label: "Anthropic Messages API" },
@@ -910,6 +911,7 @@ function ProviderEditor({ providerItem, error, onSave }: ProviderEditorProps) {
   const [testing, setTesting] = useState(false);
   const [testResult, setTestResult] = useState("");
   const deepSeekTextOnly = transport === "deep_seek_chat_completions";
+  const imageGenerationTransport = transport === "open_ai_image_generations";
 
   const normalizedModels = models.map(({ id, displayName, contextWindow, maxOutputTokens, supportsVision, fallback }) => ({
     id: id.trim(),
@@ -994,9 +996,19 @@ function ProviderEditor({ providerItem, error, onSave }: ProviderEditorProps) {
             </span>
           </div>
           <div className="provider-tags" aria-label="供应商能力">
-            <span>LLM</span>
-            <span>CHAT</span>
-            <span>STREAM</span>
+            {imageGenerationTransport ? (
+              <>
+                <span>IMAGE</span>
+                <span>GENERATE</span>
+                <span>B64</span>
+              </>
+            ) : (
+              <>
+                <span>LLM</span>
+                <span>CHAT</span>
+                <span>STREAM</span>
+              </>
+            )}
           </div>
         </div>
       </header>
@@ -1032,6 +1044,9 @@ function ProviderEditor({ providerItem, error, onSave }: ProviderEditorProps) {
             onChange={(event) => { setBaseUrl(event.target.value); markChanged(); }}
             placeholder="https://api.example.com/v1"
           />
+          {transport === "open_ai_image_generations" ? (
+            <small>图片端点会自动追加 /images/generations；StepFun 请填写 https://api.stepfun.com/step_plan/v1。点击测试会实际生成一张图片，可能产生供应商费用。</small>
+          ) : null}
         </label>
 
         <section className="provider-models provider-form-field--wide" aria-labelledby="provider-models-title">
@@ -1206,7 +1221,10 @@ function ProviderEditor({ providerItem, error, onSave }: ProviderEditorProps) {
             }).finally(() => setTesting(false));
           }}
         >
-          <Network size={15} />{testing ? "测试中" : "测试连接"}
+          <Network size={15} />
+          {testing
+            ? (imageGenerationTransport ? "生成测试图中" : "测试中")
+            : (imageGenerationTransport ? "测试图片生成" : "测试连接")}
         </button>
         <button
           className="primary-button settings-command"

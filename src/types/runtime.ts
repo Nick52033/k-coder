@@ -41,7 +41,6 @@ export interface SetEmbeddingSettingsRequest { semanticEnabled: boolean; batchSi
 export interface FileEntry { name: string; path: string; isDirectory: boolean; size: number | null; modifiedAtMs: number | null; }
 export interface FilePreview { path: string; name: string; language: string; content: string | null; dataUrl: string | null; size: number; truncated: boolean; editable: boolean; contentHash: string | null; }
 export interface SaveWorkspaceFileRequest { path: string; content: string; expectedHash: string; }
-export type OcrStatus = "processing" | "complete" | "failed";
 export interface AttachmentContent {
   path: string;
   name: string;
@@ -49,13 +48,8 @@ export interface AttachmentContent {
   content: string;
   size: number;
   truncated: boolean;
-  ocrStatus?: OcrStatus;
-  ocrText?: string;
-  ocrLineCount?: number;
-  ocrDurationMs?: number;
-  ocrError?: string;
 }
-export interface ImageAttachment { name: string; dataUrl: string; ocrText?: string; }
+export interface ImageAttachment { name: string; dataUrl: string; }
 export interface ConversationImageAttachment extends ImageAttachment {
   /** Zero-based display segment within a steered turn. */
   turnSegmentIndex?: number;
@@ -591,13 +585,22 @@ export type TimelineEventKind =
 
 export type TurnTimelineItem =
   | { type: "text"; id: string; turnId: string; text: string }
-  | { type: "reasoning"; itemId: string; turnId: string; summary: string; complete?: boolean }
+  | {
+      type: "reasoning";
+      itemId: string;
+      turnId: string;
+      summary: string;
+      complete?: boolean;
+      /** 最后一次通过公开摘要过滤的快照；仅用于前端流式展示稳定性。 */
+      visibleSummary?: string;
+    }
   | { type: "tool"; activity: ToolActivity }
   | { type: "event"; itemId: string; turnId: string; kind: TimelineEventKind; title: string; detail: string | null; durationMs?: number };
 
 export type ProviderKind = "open_ai_compatible";
 export type ProviderTransport =
   | "open_ai_chat_completions"
+  | "open_ai_image_generations"
   | "deep_seek_chat_completions"
   | "open_ai_responses"
   | "anthropic_messages"

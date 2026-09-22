@@ -11,7 +11,6 @@ pub mod logging;
 pub mod memory;
 pub mod mobile;
 pub mod multi_agent;
-pub mod ocr;
 pub mod patch;
 pub mod persistence;
 pub mod policy;
@@ -363,7 +362,6 @@ pub fn run() {
             commands::resize_pty,
             commands::wait_pty,
             commands::close_pty,
-            commands::recognize_image,
             commands::read_logs,
             commands::clear_logs,
         ])

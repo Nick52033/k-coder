@@ -611,6 +611,7 @@ impl AgentRuntime {
             request.thread_id,
             Some(message),
             agent_mode,
+            false,
             turn_id,
             cancellation,
             control,
@@ -704,6 +705,7 @@ impl AgentRuntime {
             thread_id,
             None,
             agent_mode,
+            true,
             turn_id,
             cancellation,
             control,
@@ -775,6 +777,7 @@ impl AgentRuntime {
         thread_id: String,
         new_input: Option<ChatMessage>,
         agent_mode: AgentMode,
+        retry_continuation: bool,
         turn_id: String,
         cancellation: CancellationToken,
         control: Option<Arc<TurnControl>>,
@@ -827,13 +830,27 @@ impl AgentRuntime {
         publisher.publish(AgentEventEnvelope::new(AgentEvent::TurnStarted {
             thread_id: thread_id.clone(),
             turn_id: turn_id.clone(),
-            user_message: started_user_message,
+            user_message: started_user_message.clone(),
         }));
 
         let result = async {
         if cancellation.is_cancelled() {
             return self
                 .finish_cancelled(&thread_id, &turn_id, &publisher)
+                .await;
+        }
+        // 图片识别一律交给模型：当前模型不具备多模态能力时不发起 Provider 请求，
+        // 直接在对话里给出提示，避免调用模型后得到无意义回答。
+        let vision_unsupported = !self.supports_vision
+            && started_user_message.as_ref().is_some_and(|message| {
+                message
+                    .content
+                    .iter()
+                    .any(|block| matches!(block, ContentBlock::Image { .. }))
+            });
+        if vision_unsupported {
+            return self
+                .finish_vision_unsupported(&thread_id, &turn_id, &model, &publisher)
                 .await;
         }
 
@@ -1078,6 +1095,12 @@ impl AgentRuntime {
                     read_observations.reset_context();
                     history = compacted;
                 }
+            }
+            if retry_continuation {
+                history.push(ProviderMessage::Text {
+                    role: MessageRole::User,
+                    text: instructions::RETRY_CONTINUATION_REQUEST.to_string(),
+                });
             }
             if !request_runtime_instructions.trim().is_empty() {
                 history.insert(
@@ -3027,6 +3050,85 @@ impl AgentRuntime {
         ))
     }
 
+    /// 当前模型没有多模态能力时，直接以助手消息回复提示，不发起 Provider 请求。
+    /// 用户消息里的图片已随 UserMessage 事件落库，历史中仍然可见。
+    async fn finish_vision_unsupported(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        model: &str,
+        publisher: &Arc<dyn EventPublisher>,
+    ) -> Result<TurnOutcome, AgentRuntimeError> {
+        let item_id = Uuid::new_v4().to_string();
+        self.start_item(
+            thread_id,
+            turn_id,
+            &item_id,
+            AgentItemType::AgentMessage,
+            publisher,
+        )
+        .await?;
+        let message = assistant_message_with_content(
+            item_id.clone(),
+            vision_unsupported_message(model),
+            Vec::new(),
+        );
+        publisher.publish(AgentEventEnvelope::new(AgentEvent::ItemStarted {
+            thread_id: thread_id.to_string(),
+            turn_id: turn_id.to_string(),
+            item_id: item_id.clone(),
+            item_type: AgentItemType::AgentMessage,
+        }));
+        self.complete_item(
+            thread_id,
+            turn_id,
+            &item_id,
+            AgentItemType::AgentMessage,
+            AgentItemStatus::Completed,
+            publisher,
+        )
+        .await?;
+        publisher.publish(AgentEventEnvelope::new(AgentEvent::ItemCompleted {
+            thread_id: thread_id.to_string(),
+            turn_id: turn_id.to_string(),
+            item_id: item_id.clone(),
+            item_type: AgentItemType::AgentMessage,
+            status: AgentItemStatus::Completed,
+        }));
+        self.repository
+            .append(StoredEvent::new(
+                thread_id,
+                Some(turn_id.to_string()),
+                StoredEventKind::AssistantMessage {
+                    message: message.clone(),
+                },
+            ))
+            .await?;
+        let timing = self
+            .append_terminal_event(
+                thread_id,
+                turn_id,
+                StoredEventKind::TurnCompleted { usage: None },
+            )
+            .await?;
+        publisher.publish(AgentEventEnvelope::new(AgentEvent::TurnCompleted {
+            thread_id: thread_id.to_string(),
+            turn_id: turn_id.to_string(),
+            message,
+            usage: None,
+            started_at_ms: timing.started_at_ms,
+            completed_at_ms: timing.completed_at_ms,
+            duration_ms: timing.duration_ms,
+        }));
+        Ok(outcome(
+            thread_id,
+            turn_id,
+            TurnState::Completed,
+            None,
+            timing,
+        ))
+    }
+
     async fn finish_failed(
         &self,
         thread_id: &str,
@@ -3679,6 +3781,17 @@ fn assistant_message_with_content(
     }
 }
 
+/// 当前模型没有多模态能力时的回复文案。图片识别已全部交给模型，
+/// 这里只说明现状与可选动作，不再提供本地 OCR 兜底。
+fn vision_unsupported_message(model: &str) -> String {
+    let model = model.trim();
+    if model.is_empty() {
+        "当前模型不支持图片识别：请改用支持多模态的模型，或用文字描述图片内容。".to_string()
+    } else {
+        format!("当前模型（{model}）不支持图片识别：请改用支持多模态的模型，或用文字描述图片内容。")
+    }
+}
+
 fn outcome(
     thread_id: &str,
     turn_id: &str,
@@ -3723,7 +3836,6 @@ mod tests {
             vec![ImageAttachment {
                 name: "screen.png".into(),
                 data_url: "data:image/png;base64,iVBORw0KGgo=".into(),
-                ocr_text: None,
             }],
             true,
         )
@@ -3737,50 +3849,12 @@ mod tests {
             Some(ProviderMessage::UserContent { text, images })
                 if text == "inspect this screenshot" && images.len() == 1
         ));
-
-        let ocr_message = user_message(
-            "inspect this screenshot".into(),
-            vec![ImageAttachment {
-                name: "screen.png".into(),
-                data_url: "data:image/png;base64,iVBORw0KGgo=".into(),
-                ocr_text: Some("compiler error E0308".into()),
-            }],
-            false,
-        )
-        .unwrap();
-        assert!(matches!(
-            &ocr_message.content[1],
-            ContentBlock::Context { text } if text.contains("compiler error E0308")
-        ));
-        assert!(matches!(
-            &ocr_message.content[2],
-            ContentBlock::Image { name, .. } if name == "screen.png"
-        ));
-        assert!(matches!(
-            chat_to_provider(ocr_message, false),
-            Some(ProviderMessage::Text { role: MessageRole::User, text })
-                if text.contains("inspect this screenshot")
-                    && text.contains("compiler error E0308")
-        ));
-        assert!(
-            user_message(
-                "missing OCR".into(),
-                vec![ImageAttachment {
-                    name: "screen.png".into(),
-                    data_url: "data:image/png;base64,iVBORw0KGgo=".into(),
-                    ocr_text: None,
-                }],
-                false,
-            )
-            .is_err()
-        );
         assert!(
             user_message(
                 "bad image".into(),
                 vec![ImageAttachment {
                     name: "bad.svg".into(),
                     data_url: "data:image/svg+xml;base64,PHN2Zy8+".into(),
-                    ocr_text: None,
                 }],
                 true,
             )
@@ -3792,7 +3866,6 @@ mod tests {
             vec![ImageAttachment {
                 name: "only.png".into(),
                 data_url: "data:image/png;base64,iVBORw0KGgo=".into(),
-                ocr_text: None,
             }],
             true,
         )
@@ -4325,7 +4398,104 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn uses_the_caller_assigned_turn_id_for_events_and_persistence() {
+    async fn vision_unsupported_models_reply_without_calling_the_provider() {
+        let (_directory, repository, runtime, thread_id) = runtime_fixture().await;
+        let publisher = Arc::new(RecordingPublisher::default());
+        let image_attachment = ImageAttachment {
+            name: "screen.png".to_string(),
+            data_url: "data:image/png;base64,iVBORw0KGgo=".to_string(),
+        };
+        let runtime = runtime.with_vision_support(false);
+        let provider = Arc::new(FakeProvider::text(&["done"]));
+        let outcome = runtime
+            .run_turn_with_attachments(
+                provider.clone(),
+                "text-only".to_string(),
+                RunTurnRequest {
+                    thread_id: thread_id.clone(),
+                    input: "看看这张图".to_string(),
+                    agent_mode: None,
+                },
+                vec![image_attachment],
+                CancellationToken::new(),
+                publisher.clone(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.state, TurnState::Completed);
+        assert!(outcome.error.is_none());
+        // 能力闸门必须短路：不发起任何 Provider 请求。
+        assert!(provider.requests().is_empty());
+        let events = repository.load(&thread_id).await.unwrap();
+        let assistant_text = events
+            .iter()
+            .filter_map(|event| match &event.kind {
+                StoredEventKind::AssistantMessage { message } => Some(message.text()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(assistant_text.len(), 1);
+        assert!(assistant_text[0].contains("当前模型（text-only）不支持图片识别"));
+        // 用户消息与图片仍然落库，历史可见。
+        assert!(
+            events
+                .iter()
+                .any(|event| { matches!(event.kind, StoredEventKind::UserMessage { .. }) })
+        );
+        assert!(repository.load(&thread_id).await.unwrap().iter().any(|event| {
+            matches!(
+                &event.kind,
+                StoredEventKind::UserMessage { message } if message.content.iter().any(|block| {
+                    matches!(block, ContentBlock::Image { .. })
+                })
+            )
+        }));
+        let published = publisher.events.lock().unwrap();
+        assert!(published.iter().any(|event| matches!(
+            &event.event,
+            AgentEvent::TurnCompleted { message, .. } if message.text().contains("不支持图片识别")
+        )));
+        drop(published);
+        assert!(
+            repository
+                .load(&thread_id)
+                .await
+                .unwrap()
+                .iter()
+                .all(|event| { !matches!(event.kind, StoredEventKind::TurnFailed { .. }) })
+        );
+    }
+
+    #[tokio::test]
+    async fn vision_capable_models_still_receive_images() {
+        let (_directory, _repository, runtime, thread_id) = runtime_fixture().await;
+        let publisher = Arc::new(RecordingPublisher::default());
+        let runtime = runtime.with_vision_support(true);
+        let outcome = runtime
+            .run_turn_with_attachments(
+                Arc::new(FakeProvider::text(&["图里是一只猫"])),
+                "vision-model".to_string(),
+                RunTurnRequest {
+                    thread_id: thread_id.clone(),
+                    input: "这张图是什么".to_string(),
+                    agent_mode: None,
+                },
+                vec![ImageAttachment {
+                    name: "cat.png".to_string(),
+                    data_url: "data:image/png;base64,iVBORw0KGgo=".to_string(),
+                }],
+                CancellationToken::new(),
+                publisher,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.state, TurnState::Completed);
+    }
+
+    #[tokio::test]
+    async fn caller_assigned_turn_id_is_used_for_events_and_persistence() {
         let (_directory, repository, runtime, thread_id) = runtime_fixture().await;
         let publisher = Arc::new(RecordingPublisher::default());
         let turn_id = "turn-from-start-handle".to_string();
@@ -7086,6 +7256,13 @@ mod tests {
             assert_eq!(outcome.state, TurnState::Completed);
             let first = serde_json::to_string(&resumed_provider.requests()[0]).unwrap();
             assert!(first.contains("<interrupted_task_continuation>"));
+            if retry {
+                assert!(
+                    first.contains("<retry_continuation_request>"),
+                    "manual retry must carry a non-persistent continuation request"
+                );
+                assert!(first.contains("继续上一次未完成任务"));
+            }
             assert!(first.contains("实现可点击状态面板"));
             assert!(first.contains("现在补充 e2e 回归"));
             assert!(first.contains("状态面板步骤 5"));

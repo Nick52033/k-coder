@@ -13,3 +13,11 @@ pub(super) const INTERRUPTED_TASK: &str = r#"
 <interrupted_task_continuation>
 上一轮执行因失败或取消结束，任务不因此视为完成。用户要求“继续”、恢复或重试时，延续原目标和已经确认的选择，先结合保存的计划、用户澄清、历史进展和工具结果核对已完成的工作，再从当前未完成处推进；不要从最初问题重新探索，也不要重复询问用户已回答的选择。计划步数可能未及时更新，应先按证据同步真实状态，不要仅因旧步骤仍 pending/in_progress 就重做已完成的修改。历史进展不是当前文件或测试通过的保证，只针对受影响的工作做必要复核。用户明确改变目标时遵从新请求；所有操作继续遵守当前模式和授权策略。
 </interrupted_task_continuation>"#;
+
+/// A manual retry gets a transient user-role message so the provider has an explicit
+/// continuation request even after compaction. It is deliberately never persisted as a
+/// UserMessage event, so retrying cannot duplicate the user's visible request.
+pub(crate) const RETRY_CONTINUATION_REQUEST: &str = r#"
+<retry_continuation_request>
+这是一次宿主发起的重试，请继续上一次未完成任务，而不是创建一个新目标。先核对保存的计划、工作流当前节点、工具结果和实际工作区状态；已经有证据完成的步骤不要重复执行，从第一个仍未完成或需要复核的步骤继续。此消息只对本次 Provider 请求可见，不代表用户新增了一个可持久化的请求。
+</retry_continuation_request>"#;

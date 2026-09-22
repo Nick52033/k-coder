@@ -374,7 +374,6 @@
     run_regression_evaluation: { total: 3, passed: 3, passRate: 1, failures: [] },
     cancel_turn: true,
     create_thread: secondThread,
-    recognize_image: { text: "hidden OCR fixture", lineCount: 1, durationMs: 12 },
     list_threads: [thread],
     read_thread: { schemaVersion: 1, summary: thread, messages: [
       { schemaVersion: 1, id: "message-user", role: "user", content: [{ type: "text", text: "\u68C0\u67E5\u5DE5\u4F5C\u533A" }], createdAtMs: 1 },
@@ -631,15 +630,6 @@
             const input = String(request?.input ?? "").trim();
             const content = input ? [{ type: "text", text: input }] : [{ type: "context", text: "\u8BF7\u5206\u6790\u7528\u6237\u63D0\u4F9B\u7684\u56FE\u7247\u3002" }];
             for (const attachment of attachments) {
-              if (attachment.ocrText?.trim()) {
-                content.push({
-                  type: "context",
-                  text: `
-
-[\u56FE\u7247\u6587\u5B57\u8BC6\u522B: ${attachment.name}]
-${attachment.ocrText.trim()}`
-                });
-              }
               content.push({
                 type: "image",
                 name: attachment.name,

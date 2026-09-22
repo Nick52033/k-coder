@@ -36,9 +36,9 @@ use crate::protocol::{
 use crate::providers::{
     AnthropicMessagesProvider, CredentialError, CredentialStore, DeepSeekChatCompletionsProvider,
     FallbackProvider, FallbackTarget, GoogleGeminiProvider, OpenAiChatCompletionsProvider,
-    OpenAiResponsesProvider, OsCredentialStore, Provider, ProviderCatalogView, ProviderConfig,
-    ProviderConfigError, ProviderConfigStore, ProviderConfigView, ProviderTransport,
-    SaveProviderConfigRequest,
+    OpenAiImageGenerationsProvider, OpenAiResponsesProvider, OsCredentialStore, Provider,
+    ProviderCatalogView, ProviderConfig, ProviderConfigError, ProviderConfigStore,
+    ProviderConfigView, ProviderTransport, SaveProviderConfigRequest,
 };
 use crate::scheduled_tasks::ScheduledTaskStore;
 use crate::storage::knowledge_entity_repository::KnowledgeEntityRepository;
@@ -1231,6 +1231,9 @@ impl AppState {
             }
             ProviderTransport::OpenAiChatCompletions => {
                 Arc::new(OpenAiChatCompletionsProvider::new(config, api_key)?)
+            }
+            ProviderTransport::OpenAiImageGenerations => {
+                Arc::new(OpenAiImageGenerationsProvider::new(config, api_key)?)
             }
             ProviderTransport::DeepSeekChatCompletions => {
                 Arc::new(DeepSeekChatCompletionsProvider::new(config, api_key)?)

@@ -392,7 +392,6 @@ mod tests {
             vec![crate::protocol::ImageAttachment {
                 name: "example.png".into(),
                 data_url: "data:image/png;base64,AA==".into(),
-                ocr_text: None,
             }],
             true,
         )

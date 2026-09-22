@@ -523,7 +523,6 @@ test.beforeEach(async ({ page }) => {
       run_regression_evaluation: { total: 3, passed: 3, passRate: 1, failures: [] },
       cancel_turn: true,
       create_thread: secondThread,
-      recognize_image: { text: "hidden OCR fixture", lineCount: 1, durationMs: 12 },
       list_threads: [thread],
       read_thread: { schemaVersion: 1, summary: thread, messages: [
         { schemaVersion: 1, id: "message-user", role: "user", content: [{ type: "text", text: "检查工作区" }], createdAtMs: 1 },
@@ -713,7 +712,6 @@ test.beforeEach(async ({ page }) => {
             const attachments = (args?.attachments as Array<{
               name: string;
               dataUrl: string;
-              ocrText?: string;
             }> | undefined) ?? [];
             if (queued) {
               mailboxByThread.set(threadId, [
@@ -756,12 +754,6 @@ test.beforeEach(async ({ page }) => {
                 ? [{ type: "text", text: input }]
                 : [{ type: "context", text: "请分析用户提供的图片。" }];
               for (const attachment of attachments) {
-                if (attachment.ocrText?.trim()) {
-                  content.push({
-                    type: "context",
-                    text: `\n\n[图片文字识别: ${attachment.name}]\n${attachment.ocrText.trim()}`,
-                  });
-                }
                 content.push({
                   type: "image",
                   name: attachment.name,
@@ -3383,8 +3375,41 @@ test("explains when an active model has no displayable reasoning summary", async
     { type: "reasoning_summary_delta", itemId: "safe-summary", delta: "已确认读取范围，下一步核对相关实现。" },
   ]);
   await expect(execution.locator(".turn-reasoning-unavailable")).toHaveCount(0);
-  await expect(execution.locator(".turn-reasoning")).toHaveCount(1);
-  await expect(execution.locator(".turn-reasoning-segment")).toContainText("已确认读取范围");
+  await expect(execution.locator(".turn-reasoning")).toHaveCount(0);
+  await expect(execution.locator(".turn-tool-group-reasoning")).toContainText("已确认读取范围");
+});
+
+test("keeps the first visible reasoning snapshot when a later delta becomes generic", async ({ page }) => {
+  await page.goto("/");
+  await expect(page.getByRole("heading", { name: "Phase 6 workbench" })).toBeVisible();
+
+  const emit = (event: Record<string, unknown>) => page.evaluate((payload) => {
+    (window as unknown as { __emitAgentEvent: (value: unknown) => void }).__emitAgentEvent(payload);
+  }, event);
+  const base = { schemaVersion: 1, threadId: "thread-1", turnId: "turn-reasoning-stable" };
+
+  await emit({ ...base, type: "turn_started", phase: "exploring" });
+  await emit({ ...base, type: "activity_status_changed", phase: "exploring", status: "thinking" });
+  await emit({ ...base, type: "item_started", phase: "planning", itemId: "rs-stable", itemType: "reasoning" });
+  await emit({ ...base, type: "reasoning_summary_delta", phase: "planning", itemId: "rs-stable", delta: "正在" });
+
+  const reasoning = page.locator(".turn-reasoning");
+  await expect(reasoning).toHaveCount(1);
+  await expect(reasoning.locator(".turn-reasoning-segment")).toHaveText("正在");
+
+  await emit({ ...base, type: "reasoning_summary_delta", phase: "planning", itemId: "rs-stable", delta: "检查相关文件" });
+  await expect(reasoning).toHaveCount(1);
+  await expect(reasoning.locator(".turn-reasoning-segment")).toHaveText("正在");
+
+  await emit({
+    ...base,
+    type: "reasoning_summary_completed",
+    phase: "planning",
+    itemId: "rs-stable",
+    summary: "正在检查相关文件",
+  });
+  await expect(reasoning).toHaveCount(1);
+  await expect(reasoning.locator(".turn-reasoning-segment")).toHaveText("正在");
 });
 
 test("streams thinking, safe reasoning summaries, compact command states, and file diffs inline", async ({ page, context }, testInfo) => {
@@ -3757,6 +3782,49 @@ test("keeps the active tool open and folds it as soon as it finishes", async ({ 
   });
   await expect(group).not.toHaveAttribute("open", "");
   await expect(page.locator(".message--assistant").last().locator(".turn-execution")).not.toHaveAttribute("open", "");
+});
+
+test("keeps safe reasoning between tool calls inside one activity group", async ({ page }) => {
+  await page.goto("/");
+  const emit = (event: Record<string, unknown>) => page.evaluate((payload) => {
+    (window as unknown as { __emitAgentEvent: (value: unknown) => void }).__emitAgentEvent(payload);
+  }, event);
+  const base = { schemaVersion: 1, threadId: "thread-1", turnId: "turn-group-reasoning" };
+
+  await emit({ ...base, type: "turn_started", phase: "exploring" });
+  await emit({
+    ...base,
+    type: "tool_started",
+    phase: "executing",
+    call: { id: "call-before-reasoning", name: "read_file", arguments: { path: "src/App.tsx" }, metadata: {} },
+  });
+  await emit({
+    ...base,
+    type: "tool_completed",
+    phase: "executing",
+    callId: "call-before-reasoning",
+    name: "read_file",
+    result: { success: true, output: "const app = true;", metadata: {} },
+  });
+  await emit({ ...base, type: "item_started", phase: "planning", itemId: "rs-group-detail", itemType: "reasoning" });
+  await emit({
+    ...base,
+    type: "reasoning_summary_delta",
+    phase: "planning",
+    itemId: "rs-group-detail",
+    delta: "已确认工具结果，下一步继续处理。",
+  });
+  await emit({
+    ...base,
+    type: "tool_started",
+    phase: "executing",
+    call: { id: "call-after-reasoning", name: "search_repository", arguments: { query: "const app" }, metadata: {} },
+  });
+
+  const group = page.locator(".message--assistant").last().locator(".turn-tool-group");
+  await expect(group).toHaveCount(1);
+  await expect(group.locator(".turn-timeline-tool")).toHaveCount(2);
+  await expect(group.locator(".turn-tool-group-reasoning")).toContainText("已确认工具结果");
 });
 
 test("uses an unframed disclosure and scrolls long multi-command groups", async ({ page }, testInfo) => {
@@ -4680,7 +4748,7 @@ test("imports one image when clipboard files and items expose the same entry", a
   await expect(page.getByAltText("image.png")).toBeVisible();
 });
 
-test("sends images without frontend OCR and opens the conversation preview", async ({ page }, testInfo) => {
+test("sends images without frontend text recognition and opens the conversation preview", async ({ page }, testInfo) => {
   await page.goto("/");
   const composer = page.getByRole("textbox", { name: "消息" });
   await composer.evaluate(async (element) => {
@@ -4695,28 +4763,22 @@ test("sends images without frontend OCR and opens the conversation preview", asy
     context.font = "600 30px sans-serif";
     context.fillText("Image preview", 56, 100);
     const blob = await new Promise<Blob>((resolve) => canvas.toBlob((value) => resolve(value!), "image/png"));
-    transfer.items.add(new File([blob], "ocr-fixture.png", { type: "image/png" }));
+    transfer.items.add(new File([blob], "image-fixture.png", { type: "image/png" }));
     element.dispatchEvent(new ClipboardEvent("paste", { bubbles: true, clipboardData: transfer }));
   });
 
-  await expect(page.getByAltText("ocr-fixture.png")).toBeVisible();
+  await expect(page.getByAltText("image-fixture.png")).toBeVisible();
   await expect(page.getByLabel("待发送附件").locator(".attachment-tag")).toHaveCount(1);
-  await expect.poll(() => page.evaluate(() => (window as unknown as { __invoked: string[] }).__invoked.filter((command) => command === "recognize_image").length)).toBe(0);
-  await expect(page.getByText("hidden OCR fixture", { exact: true })).toHaveCount(0);
-  await expect(page.getByText("查看识别文字", { exact: true })).toHaveCount(0);
-  await expect(page.locator(".attachment-ocr-state, .attachment-ocr-details")).toHaveCount(0);
-  await page.screenshot({ path: testInfo.outputPath("ocr-hidden-from-composer.png"), fullPage: true });
+  await page.screenshot({ path: testInfo.outputPath("image-hidden-from-composer.png"), fullPage: true });
 
   await page.getByRole("button", { name: "发送消息", exact: true }).click();
   const imageMessage = page.locator(".message--user").filter({ has: page.locator(".message-image-attachment") });
-  await expect(imageMessage.getByText("ocr-fixture.png", { exact: true })).toBeVisible();
+  await expect(imageMessage.getByText("image-fixture.png", { exact: true })).toBeVisible();
   await expect(imageMessage.locator(".message-content")).toHaveCount(0);
-  await expect(page.getByText("hidden OCR fixture", { exact: true })).toHaveCount(0);
   await expect.poll(() => page.evaluate(() => (window as unknown as { __runTurnCalls: Array<{ request?: { input?: string } }> }).__runTurnCalls[0]?.request?.input)).toBe("");
   await expect.poll(() => page.evaluate(() => (window as unknown as { __runTurnCalls: Array<{ attachments?: unknown[] }> }).__runTurnCalls[0]?.attachments?.length)).toBe(1);
-  await expect.poll(() => page.evaluate(() => (window as unknown as { __runTurnCalls: Array<{ attachments?: Array<{ ocrText?: string }> }> }).__runTurnCalls[0]?.attachments?.[0]?.ocrText)).toBeUndefined();
-  await imageMessage.getByRole("button", { name: "查看图片 ocr-fixture.png" }).click();
-  const imagePreview = page.getByRole("dialog", { name: "ocr-fixture.png" });
+  await imageMessage.getByRole("button", { name: "查看图片 image-fixture.png" }).click();
+  const imagePreview = page.getByRole("dialog", { name: "image-fixture.png" });
   await expect(imagePreview).toBeVisible();
   await expect(imagePreview.locator("img")).toHaveAttribute("src", /^data:image\/png;base64,/);
   await page.screenshot({ path: testInfo.outputPath("conversation-image-preview.png"), fullPage: true });
@@ -4733,8 +4795,7 @@ test("sends images without frontend OCR and opens the conversation preview", asy
       role: "user",
       content: [
         { type: "context", text: "请分析用户提供的图片。" },
-        { type: "context", text: "[图片文字识别: ocr-fixture.png]\nhidden OCR fixture" },
-        { type: "image", name: "ocr-fixture.png", dataUrl: "data:image/png;base64,iVBORw0KGgo=" },
+        { type: "image", name: "image-fixture.png", dataUrl: "data:image/png;base64,iVBORw0KGgo=" },
       ],
       createdAtMs: 1,
     }],
@@ -4750,11 +4811,10 @@ test("sends images without frontend OCR and opens the conversation preview", asy
     lastUsage: null,
   })));
   await page.reload();
-  await expect(imageMessage.getByText("ocr-fixture.png", { exact: true })).toBeVisible();
+  await expect(imageMessage.getByText("image-fixture.png", { exact: true })).toBeVisible();
   await expect(imageMessage.locator(".message-content")).toHaveCount(0);
-  await expect(page.getByText("hidden OCR fixture", { exact: true })).toHaveCount(0);
-  await imageMessage.getByRole("button", { name: "查看图片 ocr-fixture.png" }).click();
-  await expect(page.getByRole("dialog", { name: "ocr-fixture.png" })).toBeVisible();
+  await imageMessage.getByRole("button", { name: "查看图片 image-fixture.png" }).click();
+  await expect(page.getByRole("dialog", { name: "image-fixture.png" })).toBeVisible();
   await page.getByRole("button", { name: "关闭图片预览" }).click();
 });
 
@@ -7491,6 +7551,7 @@ test("robot progress follows authoritative nodes across failure retry and reload
   await page.keyboard.press("Escape");
   await page.evaluate(() => (window as unknown as { __emitAgentEvent: (event: unknown) => void }).__emitAgentEvent({ schemaVersion: 1, threadId: "thread-1", turnId: "retry-progress", phase: "responding", type: "turn_failed", message: "provider request failed" }));
   await expect(progress).toContainText("第 3/8 步");
+  await expect(page.locator(".turn-execution--failed").last().getByRole("button", { name: "继续当前步骤", exact: true })).toBeVisible();
   await page.reload();
   await expect(progress).toContainText("第 3/8 步");
   await expect(control).toContainText("3 / 8");

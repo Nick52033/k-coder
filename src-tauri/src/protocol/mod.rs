@@ -537,8 +537,6 @@ pub enum ContentBlock {
 pub struct ImageAttachment {
     pub name: String,
     pub data_url: String,
-    #[serde(default)]
-    pub ocr_text: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

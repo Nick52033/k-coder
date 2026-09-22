@@ -4,6 +4,7 @@ mod config;
 mod credentials;
 mod fallback;
 mod gemini;
+mod image;
 mod openai;
 mod rate_limit;
 mod responses;
@@ -35,6 +36,9 @@ pub use config::{
 pub use credentials::{CredentialError, CredentialStore, OsCredentialStore};
 pub use fallback::{FallbackProvider, FallbackTarget};
 pub use gemini::GoogleGeminiProvider;
+pub use image::{
+    GeneratedImage, ImageGenerationRequest, ImageResponseFormat, OpenAiImageGenerationsProvider,
+};
 pub use openai::{DeepSeekChatCompletionsProvider, OpenAiChatCompletionsProvider};
 pub use rate_limit::RateLimitRegistry;
 pub(crate) use rate_limit::retry_at_ms;

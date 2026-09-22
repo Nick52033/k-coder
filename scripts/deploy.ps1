@@ -61,7 +61,7 @@ New-Item -ItemType Directory -Force -Path $Dest | Out-Null
 # 3. 增量镜像同步（robocopy 退出码 0-7 均成功，>=8 为错误）
 #
 # 只同步运行时真正需要的产物。$source 是 cargo 的 target/release 目录，
-# 里面同时住着交付物（k-coder.exe + skills/ tools/ ocr/）和编译中间件；
+# 里面同时住着交付物（k-coder.exe + skills/ tools/）和编译中间件；
 # 不加排除时 deps/ 与 build/ 会被整目录镜像过去，安装目录会从 ~90 MB 涨到 3 GB+。
 $excludeDirs = @("deps", "build", "incremental", ".fingerprint", "examples")
 $excludeFiles = @("k_coder.pdb", "k-coder.d")

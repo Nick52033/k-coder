@@ -154,13 +154,13 @@ if errorlevel 8 (
 )
 
 rem Resource folders declared by bundle.resources in tauri.conf.json.
-rem They map to skills/, tools/ and ocr/ next to the exe. A folder that
+rem They map to skills/ and tools/ next to the exe. A folder that
 rem is absent from the build output is a warning, never a hard failure
 rem (robocopy returns 16 when the source directory does not exist).
-for %%D in (skills tools ocr) do if not exist "%RELEASE%\%%D" (
+for %%D in (skills tools) do if not exist "%RELEASE%\%%D" (
     echo      WARNING: %RELEASE%\%%D missing in build output, skipped.
 )
-for %%D in (skills tools ocr) do if exist "%RELEASE%\%%D" (
+for %%D in (skills tools) do if exist "%RELEASE%\%%D" (
     robocopy "%RELEASE%\%%D" "%DEST%\%%D" /MIR /R:2 /W:1 /NFL /NDL /NJH /NJS /NP
     if errorlevel 8 (
         echo *** Failed to copy %RELEASE%\%%D, robocopy exit code !errorlevel!

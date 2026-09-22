@@ -78,8 +78,6 @@ tauri-plugin-single-instance = "2"
 
 [target.'cfg(windows)'.dependencies]
 image = { version = "0.25", default-features = false, features = ["bmp", "gif", "ico", "jpeg", "png", "webp"] }
-ndarray = "0.17"
-ort = { version = "=2.0.0-rc.13", default-features = false, features = ["std", "ndarray", "load-dynamic"] }
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
 
 [target.'cfg(unix)'.dependencies]
@@ -104,7 +102,7 @@ tokio-tungstenite = "0.29"
 # 构建体积控制
 #
 # 背景：dev 档默认 debug = 2（完整 DWARF），而本项目依赖图很大
-# （tauri / ort / chromiumoxide / rusqlite(bundled) / pdf-extract / image …），
+# （tauri / chromiumoxide / rusqlite(bundled) / pdf-extract / image …），
 # 曾把 target/ 撑到 83 GB：debug/deps 19.8 GB、debug/incremental 33 GB、
 # debug/build 1.9 GB（每个依赖的 build script 都会带一份 .pdb）。
 #

@@ -109,6 +109,7 @@ pub enum ProviderKind {
 pub enum ProviderTransport {
     #[default]
     OpenAiChatCompletions,
+    OpenAiImageGenerations,
     DeepSeekChatCompletions,
     OpenAiResponses,
     AnthropicMessages,
@@ -260,6 +261,10 @@ impl ProviderConfig {
 
     pub fn chat_completions_url(&self) -> Result<Url, ProviderConfigError> {
         self.endpoint_url("chat/completions", "chat completions")
+    }
+
+    pub fn images_generations_url(&self) -> Result<Url, ProviderConfigError> {
+        self.endpoint_url("images/generations", "image generations")
     }
 
     pub fn responses_url(&self) -> Result<Url, ProviderConfigError> {
@@ -670,6 +675,25 @@ mod tests {
                 .expect("endpoint should build")
                 .as_str(),
             "https://example.com/v1/chat/completions"
+        );
+        assert_eq!(
+            validated
+                .images_generations_url()
+                .expect("image endpoint should build")
+                .as_str(),
+            "https://example.com/v1/images/generations"
+        );
+    }
+
+    #[test]
+    fn deserializes_the_openai_image_generations_transport() {
+        let transport: ProviderTransport = serde_json::from_str(r#""open_ai_image_generations""#)
+            .expect("OpenAI Images transport should deserialize");
+
+        assert_eq!(transport, ProviderTransport::OpenAiImageGenerations);
+        assert_eq!(
+            serde_json::to_string(&transport).expect("transport should serialize"),
+            r#""open_ai_image_generations""#
         );
     }
 

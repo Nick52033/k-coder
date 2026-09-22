@@ -31,6 +31,7 @@ import type {
   TurnTimelineItem,
 } from "../types/runtime";
 import { changeLineStats } from "../lib/diff";
+import { isDisplayableReasoningSummary } from "../lib/reasoningSummary";
 import { DELEGATION_TOOL_NAMES, subagentIdsOf } from "../lib/subagent";
 import { PlanProgress } from "./PlanProgress";
 import { RetryWaitingLabel } from "./RetryWaitingLabel";
@@ -44,11 +45,6 @@ const HIDDEN_PROCESS_EVENT_KINDS = new Set<TimelineEventKind>([
   "approval_requested",
   "approval_resolved",
 ]);
-const GENERIC_REASONING_NOTE_PATTERN = /^(?:(?:planning|preparing|checking|reviewing|inspecting|running|reading|analyzing|investigating|updating|implementing|verifying|testing|searching|exploring|gathering|examining|assessing|comparing|confirming|fixing|editing|applying|building|waiting)\b|(?:(?:正在|准备|计划|将要)?(?:规划|计划|准备|检查|查看|读取|运行|执行|验证|测试|搜索|分析|调查|更新|修改|修复|构建|等待)))/i;
-const REASONING_INSIGHT_PATTERN = /(?:found|confirmed|because|therefore|however|mismatch|failed|failure|risk|requires?|needs?|发现|确认|原因|因此|由于|但是|不一致|失败|风险|需要)/i;
-const HAN_SCRIPT_PATTERN = /[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]/g;
-const LATIN_SCRIPT_PATTERN = /[a-z]/gi;
-
 export const ConversationTurnActivity = memo(function ConversationTurnActivity({
   activities,
   timeline = [],
@@ -210,6 +206,8 @@ export const ConversationTurnActivity = memo(function ConversationTurnActivity({
             ) : entry.type === "tool_group" ? (
               <ToolActivityGroup
                 activities={entry.activities}
+                reasoning={entry.reasoning}
+                renderText={renderText}
                 key={`tool-group-${entry.activities[0].call.id}`}
                 subagentTaskIndex={subagentTaskIndex}
                 onFocusSubagent={onFocusSubagent}
@@ -229,6 +227,7 @@ export const ConversationTurnActivity = memo(function ConversationTurnActivity({
           <div className="turn-timeline">
             <ToolActivityGroup
               activities={activities}
+              renderText={renderText}
               subagentTaskIndex={subagentTaskIndex}
               onFocusSubagent={onFocusSubagent}
             />
@@ -244,7 +243,7 @@ export const ConversationTurnActivity = memo(function ConversationTurnActivity({
             {onRetry ? (
               <button className="turn-retry-button" type="button" onClick={onRetry}>
                 <RotateCcw size={14} aria-hidden="true" />
-                <span>{providerCallLimitExceeded ? "开启新 Turn" : "重试"}</span>
+                <span>{providerCallLimitExceeded ? "开启新 Turn" : plan?.steps.length ? "继续当前步骤" : "重试"}</span>
               </button>
             ) : null}
           </div>
@@ -252,7 +251,7 @@ export const ConversationTurnActivity = memo(function ConversationTurnActivity({
           <div className="turn-terminal-actions">
             <button className="turn-retry-button" type="button" onClick={onRetry}>
               <RotateCcw size={14} aria-hidden="true" />
-              <span>重试</span>
+              <span>{plan?.steps.length ? "继续当前步骤" : "重试"}</span>
             </button>
           </div>
         ) : null}
@@ -308,23 +307,17 @@ function isTerminalEvent(kind: TimelineEventKind): kind is TerminalEventKind {
 }
 
 export function isVisibleConversationTimelineItem(item: TurnTimelineItem) {
-  if (item.type === "reasoning") return isDisplayableReasoningSummary(item.summary);
+  if (item.type === "reasoning") return isDisplayableReasoningItem(item);
   if (item.type !== "event") return true;
   return item.kind !== "turn_completed" && !HIDDEN_PROCESS_EVENT_KINDS.has(item.kind);
 }
 
-function isDisplayableReasoningSummary(summary: string) {
-  const normalized = summary.replace(/\s+/g, " ").trim().replace(/^[#>*_`\-\s]+/, "");
-  if (!normalized) return false;
-  if (!usesChineseSummaryLanguage(normalized)) return false;
-  if (summary.includes("\n") || normalized.length > 160 || REASONING_INSIGHT_PATTERN.test(normalized)) return true;
-  return !GENERIC_REASONING_NOTE_PATTERN.test(normalized);
+function isDisplayableReasoningItem(item: ReasoningTimelineItem) {
+  return Boolean(item.visibleSummary) || isDisplayableReasoningSummary(item.summary);
 }
 
-function usesChineseSummaryLanguage(summary: string) {
-  const hanCount = summary.match(HAN_SCRIPT_PATTERN)?.length ?? 0;
-  const latinCount = summary.match(LATIN_SCRIPT_PATTERN)?.length ?? 0;
-  return hanCount >= 2 && hanCount * 4 >= latinCount;
+function reasoningSummaryText(item: ReasoningTimelineItem) {
+  return item.visibleSummary ?? item.summary;
 }
 
 /**
@@ -333,10 +326,10 @@ function usesChineseSummaryLanguage(summary: string) {
  */
 function latestReasoningHint(timeline: TurnTimelineItem[]) {
   const item = [...timeline].reverse().find(
-    (entry): entry is ReasoningTimelineItem => entry.type === "reasoning",
+    (entry): entry is ReasoningTimelineItem => entry.type === "reasoning" && isDisplayableReasoningItem(entry),
   );
-  if (!item || !isDisplayableReasoningSummary(item.summary)) return null;
-  const line = item.summary.split("\n").map((part) => part.trim()).filter(Boolean).pop() ?? "";
+  if (!item) return null;
+  const line = reasoningSummaryText(item).split("\n").map((part) => part.trim()).filter(Boolean).pop() ?? "";
   const cleaned = line.replace(/^[#>*_`\-\s]+/, "").replace(/[#*_`\s]+$/, "").trim();
   if (!cleaned) return null;
   return cleaned.length > 40 ? `${cleaned.slice(0, 40)}…` : cleaned;
@@ -580,7 +573,7 @@ function timelineItemKey(item: TurnTimelineItem) {
 type ReasoningTimelineItem = Extract<TurnTimelineItem, { type: "reasoning" }>;
 type TimelineRenderEntry =
   | { type: "reasoning_group"; items: ReasoningTimelineItem[] }
-  | { type: "tool_group"; activities: ToolActivity[] }
+  | { type: "tool_group"; activities: ToolActivity[]; reasoning: ReasoningTimelineItem[] }
   | { type: "item"; item: Exclude<TurnTimelineItem, { type: "reasoning" | "tool" }> };
 
 function groupConsecutiveTimeline(items: TurnTimelineItem[]): TimelineRenderEntry[] {
@@ -588,11 +581,12 @@ function groupConsecutiveTimeline(items: TurnTimelineItem[]): TimelineRenderEntr
   for (const item of items) {
     const previous = grouped[grouped.length - 1];
     if (item.type === "reasoning") {
-      if (previous?.type === "reasoning_group") previous.items.push(item);
+      if (previous?.type === "tool_group") previous.reasoning.push(item);
+      else if (previous?.type === "reasoning_group") previous.items.push(item);
       else grouped.push({ type: "reasoning_group", items: [item] });
     } else if (item.type === "tool") {
       if (previous?.type === "tool_group") previous.activities.push(item.activity);
-      else grouped.push({ type: "tool_group", activities: [item.activity] });
+      else grouped.push({ type: "tool_group", activities: [item.activity], reasoning: [] });
     } else {
       grouped.push({ type: "item", item });
     }
@@ -616,7 +610,7 @@ function ReasoningGroup({
   const [userExpanded, setUserExpanded] = useState<boolean | null>(null);
   const expanded = userExpanded ?? active;
   // 与 ZCode 一致：右侧流式提示只在收起态出现，展开时不重复已经可见的正文。
-  const hint = active && !expanded ? latestReasoningLine(lastItem?.summary ?? "") : null;
+  const hint = active && !expanded ? latestReasoningLine(lastItem ? reasoningSummaryText(lastItem) : "") : null;
   return (
     <details className="turn-reasoning" open={expanded}>
       <summary
@@ -635,7 +629,7 @@ function ReasoningGroup({
       <div className="turn-reasoning-content">
         {items.map((item) => (
           <div className="turn-reasoning-segment" key={`${item.turnId}-${item.itemId}`}>
-            {renderText ? renderText(item.summary) : item.summary}
+            {renderText ? renderText(reasoningSummaryText(item)) : reasoningSummaryText(item)}
           </div>
         ))}
       </div>
@@ -685,10 +679,14 @@ function latestReasoningLine(summary: string) {
 
 function ToolActivityGroup({
   activities,
+  reasoning = [],
+  renderText,
   subagentTaskIndex,
   onFocusSubagent,
 }: {
   activities: ToolActivity[];
+  reasoning?: ReasoningTimelineItem[];
+  renderText?: (text: string) => ReactNode;
   subagentTaskIndex?: Record<string, number>;
   onFocusSubagent?: (agentId: string) => void;
 }) {
@@ -739,6 +737,19 @@ function ToolActivityGroup({
       </summary>
       <div className="turn-disclosure-panel">
         <div className="turn-tool-group-content">
+          {reasoning.length ? (
+            <div className="turn-tool-group-reasoning" aria-label="思考摘要">
+              {reasoning.map((item) => {
+                const summary = reasoningSummaryText(item);
+                return (
+                  <div className="turn-tool-group-reasoning-item" key={`${item.turnId}-${item.itemId}`}>
+                    <Brain size={14} aria-hidden="true" />
+                    <span>{renderText ? renderText(summary) : summary}</span>
+                  </div>
+                );
+              })}
+            </div>
+          ) : null}
           {visibleActivities.map((activity) => (
             <ToolActivityRow
               activity={activity}

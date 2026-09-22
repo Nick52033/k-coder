@@ -9,13 +9,12 @@ use super::AgentRuntimeError;
 const MAX_INPUT_BYTES: usize = 100_000;
 const MAX_IMAGE_COUNT: usize = 4;
 const MAX_IMAGE_BYTES: usize = 4 * 1024 * 1024;
-const MAX_OCR_TEXT_BYTES: usize = 16 * 1024;
 const MAX_TOTAL_IMAGE_BYTES: usize = 8 * 1024 * 1024;
 
 pub(super) fn user_message(
     text: String,
     attachments: Vec<ImageAttachment>,
-    supports_vision: bool,
+    _supports_vision: bool,
 ) -> Result<ChatMessage, AgentRuntimeError> {
     if attachments.len() > MAX_IMAGE_COUNT {
         return Err(AgentRuntimeError::InvalidInput(format!(
@@ -25,11 +24,7 @@ pub(super) fn user_message(
     let mut total = 0usize;
     let mut content = if text.is_empty() {
         vec![ContentBlock::Context {
-            text: if supports_vision {
-                "请分析用户提供的图片。".into()
-            } else {
-                "请根据本地图片文字识别结果回答。".into()
-            },
+            text: "请分析用户提供的图片。".into(),
         }]
     } else {
         vec![ContentBlock::Text { text }]
@@ -51,22 +46,6 @@ pub(super) fn user_message(
             return Err(AgentRuntimeError::InvalidInput(
                 "attached images exceed the 8 MiB total limit".into(),
             ));
-        }
-        let ocr_text = attachment
-            .ocr_text
-            .as_deref()
-            .map(str::trim)
-            .filter(|text| !text.is_empty());
-        if !supports_vision && ocr_text.is_none() {
-            return Err(AgentRuntimeError::InvalidInput(format!(
-                "the selected model does not support images and local OCR produced no text for {name}"
-            )));
-        }
-        if let Some(ocr_text) = ocr_text {
-            let ocr_text = truncate_utf8(ocr_text, MAX_OCR_TEXT_BYTES);
-            content.push(ContentBlock::Context {
-                text: format!("\n\n[图片文字识别: {name}]\n{ocr_text}"),
-            });
         }
         content.push(ContentBlock::Image {
             name,

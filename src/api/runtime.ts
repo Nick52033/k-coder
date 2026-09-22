@@ -531,16 +531,6 @@ export function closePty(sessionId: string) {
   return invoke<void>("close_pty", { sessionId });
 }
 
-export interface OcrResult {
-  text: string;
-  lineCount: number;
-  durationMs: number;
-}
-
-export function recognizeImage(dataUrl: string): Promise<OcrResult> {
-  return invoke<OcrResult>("recognize_image", { dataUrl });
-}
-
 export function readLogs(query: LogQuery = {}): Promise<LogQueryResult> {
   return invoke<LogQueryResult>("read_logs", {
     limit: query.limit,

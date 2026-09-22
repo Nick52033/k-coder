@@ -24,7 +24,7 @@ pub use evaluation::{EvaluationReport, run_recorded_evaluation};
 pub use goal::{CreateGoalRequest, GoalState, GoalStore, GoalTransitionRequest, GoalView};
 pub use memory::{MemorySettings, MemoryStore, MemoryUpsertRequest, MemoryView};
 pub use metrics::{MetricsSnapshot, RuntimeMetrics};
-pub use plan::{PlanStep, PlanStepState, PlanStore, PlanUpdateRequest, PlanView};
+pub use plan::{PlanStep, PlanStepInput, PlanStepState, PlanStore, PlanUpdateRequest, PlanView};
 pub use request_user_input::{
     REQUEST_USER_INPUT_TOOL_NAME, RequestUserInputArgs, RequestUserInputQuestion,
     RequestUserInputTool,
