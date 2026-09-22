@@ -5248,13 +5248,13 @@ test("labels the provider call hard limit and starts a new Turn", async ({ page 
       ...base,
       type: "turn_failed",
       phase: "failed",
-      message: "单个 Turn 已达到模型调用硬上限（200 次），为防止执行循环已停止；请检查当前进展后开启新 Turn。",
+      message: "单个 Turn 已达到模型调用硬上限（1000 次），为防止执行循环已停止；请检查当前进展后开启新 Turn。",
       error: {
         code: "provider_call_limit_exceeded",
-        message: "单个 Turn 已达到模型调用硬上限（200 次），为防止执行循环已停止；请检查当前进展后开启新 Turn。",
+        message: "单个 Turn 已达到模型调用硬上限（1000 次），为防止执行循环已停止；请检查当前进展后开启新 Turn。",
         retryable: true,
         category: "runtime",
-        details: { providerCalls: 200, maxProviderCalls: 200, recovery: "new_turn" },
+        details: { providerCalls: 1000, maxProviderCalls: 1000, recovery: "new_turn" },
       },
       startedAtMs: 1_000,
       completedAtMs: 201_000,
@@ -5266,7 +5266,7 @@ test("labels the provider call hard limit and starts a new Turn", async ({ page 
   await expect(failedExecution).not.toHaveAttribute("open", "");
   await failedExecution.locator(":scope > summary").click();
   await expect(failedExecution.getByText("本轮已达到安全上限", { exact: true })).toBeVisible();
-  await expect(failedExecution.getByText("单个 Turn 已达到模型调用硬上限（200 次），为防止执行循环已停止；请检查当前进展后开启新 Turn。", { exact: true })).toBeVisible();
+  await expect(failedExecution.getByText("单个 Turn 已达到模型调用硬上限（1000 次），为防止执行循环已停止；请检查当前进展后开启新 Turn。", { exact: true })).toBeVisible();
   await expect(failedExecution.getByRole("button", { name: "开启新 Turn", exact: true })).toBeVisible();
   await expect(failedExecution.getByRole("button", { name: "重试", exact: true })).toHaveCount(0);
 

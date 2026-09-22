@@ -286,6 +286,7 @@ mod tests {
             workspace_root: dir.path().to_path_buf(),
             approval: None,
             progress: None,
+            plan_reconciliation: None,
         };
         let error = RecallMemoryTool::new(store.clone())
             .execute(&context, json!({}), CancellationToken::new())

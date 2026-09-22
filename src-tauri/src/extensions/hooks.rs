@@ -402,6 +402,7 @@ mod tests {
             workspace_root: workspace.path().into(),
             approval: None,
             progress: None,
+            plan_reconciliation: None,
         };
         for mode in ["block", "invalid"] {
             let pipeline = HookPipeline::new(

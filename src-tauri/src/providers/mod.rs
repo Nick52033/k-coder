@@ -222,6 +222,17 @@ impl ProviderError {
         }
     }
 
+    /// 真实 HTTP 错误状态码，仅当错误确实来自服务端的 HTTP 响应时返回。
+    /// `429` 走 `RateLimited`，所以在 `rate_limit_delay()` 之外单独暴露，
+    /// 供调用方按状态码决定是否记本地运行日志。
+    pub(crate) fn http_status(&self) -> Option<u16> {
+        match self {
+            Self::Http { status, .. } => Some(*status),
+            Self::RateLimited { .. } => Some(429),
+            _ => None,
+        }
+    }
+
     pub(crate) fn is_transient(&self) -> bool {
         match self {
             Self::Request(_) => true,

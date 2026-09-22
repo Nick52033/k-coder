@@ -41,6 +41,25 @@ pub struct ToolProgress {
     pub delta: String,
 }
 
+/// Host-owned constraints applied while an ordinary plan is being reconciled
+/// immediately before a turn completes.  The model may update status/detail,
+/// but it must not turn a five-step plan into a six-step plan (or silently
+/// rename an existing step) during this bounded phase.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanReconciliationContext {
+    /// Revision observed when the host captured the reconciliation snapshot.
+    /// A status/detail update made by another writer must advance this value,
+    /// so a stale completion request cannot overwrite that newer plan state.
+    pub revision: u64,
+    pub steps: Vec<PlanReconciliationStep>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanReconciliationStep {
+    pub id: String,
+    pub step: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct ToolContext {
     pub thread_id: String,
@@ -49,6 +68,7 @@ pub struct ToolContext {
     pub workspace_root: PathBuf,
     pub approval: Option<ApprovedToolExecution>,
     pub progress: Option<mpsc::Sender<ToolProgress>>,
+    pub plan_reconciliation: Option<PlanReconciliationContext>,
 }
 
 impl ToolContext {
@@ -1919,6 +1939,7 @@ mod tests {
             workspace_root: root.to_path_buf(),
             approval: None,
             progress: None,
+            plan_reconciliation: None,
         }
     }
 

@@ -31,8 +31,8 @@ use crate::protocol::{
 use crate::providers::{Provider, ProviderError, ProviderEvent, ProviderMessage, ProviderRequest};
 use crate::storage::{StorageError, StoredEvent, StoredEventKind, ThreadRepository, now_ms};
 use crate::tools::{
-    ApprovedToolExecution, ToolContext, ToolError, ToolProgress, ToolRegistry,
-    tool_progress_channel,
+    ApprovedToolExecution, PlanReconciliationContext, ToolContext, ToolError, ToolProgress,
+    ToolRegistry, tool_progress_channel,
 };
 
 mod input;
@@ -73,15 +73,17 @@ pub const DEFAULT_SOFT_TURN_TOTAL_TOKENS: u64 = 5_000_000;
 // Tool execution and provider latency alone must not interrupt an authorized turn.
 pub const DEFAULT_SOFT_TURN_DURATION_MS: Option<u64> = None;
 /// A hard cumulative cap prevents repeated continuation approvals from turning one
-/// Turn into an unbounded model/tool loop.
-pub const DEFAULT_HARD_TURN_PROVIDER_CALLS: u32 = 200;
+/// Turn into an unbounded model/tool loop. ZCode 的普通 Turn 不设调用次数硬上限，
+/// loop 边界完全由上下文自动压缩与无进展检测承担；k-Coder 保留该背扑但放宽到 10 个
+/// 软额度段，让真实边界仍是「每段人工续跑确认 + 无进展检测 + 自动压缩」。
+pub const DEFAULT_HARD_TURN_PROVIDER_CALLS: u32 = 1_000;
 
 const TURN_CONTINUATION_TOOL_CALL_ID: &str = "runtime-turn-continuation";
 const TURN_CONTINUE: &str = "continue";
 const TURN_COMPACT_AND_CONTINUE: &str = "compact_and_continue";
 const TURN_STOP: &str = "stop";
 const MAX_PLAN_RECONCILIATION_DRAFT_BYTES: usize = 16 * 1024;
-const PLAN_RECONCILIATION_INSTRUCTIONS: &str = "[计划收尾门禁]\n当前回复已经形成最终答复草稿，但本轮刚刚更新的普通计划仍有进行中步骤。请先调用 update_plan 提交完整 steps 列表，只把已真实完成的步骤标为 completed，未完成步骤保留真实状态；工具成功后再输出最终答复。不要为了通过门禁伪造完成状态。\n";
+const PLAN_RECONCILIATION_INSTRUCTIONS: &str = "[计划收尾门禁]\n当前回复已经形成最终答复草稿，但本轮刚刚更新的普通计划仍有进行中步骤。请先调用 update_plan 提交完整 steps 列表，只把已真实完成的步骤标为 completed，未完成步骤保留真实状态；工具成功后再输出最终答复。不要为了通过门禁伪造完成状态。收尾同步不得新增步骤、删除步骤、改变步骤数量或新增/替换步骤 ID；必须提交收尾请求开始前已有的完整 steps 列表，只更新真实状态和 detail，步骤文本也不要改名。若工具拒绝了计划结构，请按拒绝原因修正后重试。\n";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SoftTurnLimits {
@@ -298,6 +300,17 @@ pub trait RuntimeInstructionProvider: Send + Sync {
 /// only when the current turn needs one bounded reconciliation request.
 pub trait TurnCompletionGuard: Send + Sync {
     fn needs_reconciliation(&self, turn_started_at_ms: u64) -> Result<bool, String>;
+
+    /// Returns the host-owned step identity snapshot to enforce while the
+    /// completion reconciliation request is running.  Existing custom guards
+    /// may omit this and retain the historical behavior; the live ordinary
+    /// plan guard supplies it.
+    fn reconciliation_context(
+        &self,
+        _turn_started_at_ms: u64,
+    ) -> Result<Option<PlanReconciliationContext>, String> {
+        Ok(None)
+    }
 }
 
 impl<F> TurnCompletionGuard for F
@@ -840,6 +853,7 @@ impl AgentRuntime {
         let mut plan_reconciliation_requested = false;
         let mut plan_reconciliation_draft = None::<String>;
         let mut plan_reconciliation_request_pending = false;
+        let mut plan_reconciliation_context = None::<PlanReconciliationContext>;
         // Reuse the streamed assistant item when the completion guard asks for one
         // reconciliation request. This lets the terminal TurnCompleted event replace
         // the temporary draft in the live timeline instead of leaving two answers.
@@ -1212,6 +1226,14 @@ impl AgentRuntime {
                                 "outputAlreadyStarted": false,
                             }));
                         }
+                        // 重试已耗尽或不可重试：只有真实 HTTP 错误（4xx/5xx）才写本地
+                        // 运行日志，网络抖动与取消不写。
+                        self.record_http_failure(
+                            &thread_id,
+                            &turn_id,
+                            &error,
+                            error.is_transient(),
+                        );
                         return self
                             .finish_failed_with_error(&thread_id, &turn_id, turn_error, &publisher)
                             .await;
@@ -1653,6 +1675,12 @@ impl AgentRuntime {
                                     "outputAlreadyStarted": attempt_had_output,
                                 }));
                             }
+                            self.record_http_failure(
+                                &thread_id,
+                                &turn_id,
+                                &error,
+                                error.is_transient(),
+                            );
                             return self
                                 .finish_failed_with_error(&thread_id, &turn_id, turn_error, &publisher)
                                 .await;
@@ -1805,6 +1833,9 @@ impl AgentRuntime {
                     if needs_reconciliation {
                         if !plan_reconciliation_requested {
                             plan_reconciliation_requested = true;
+                            plan_reconciliation_context = guard
+                                .reconciliation_context(turn_started_at_ms)
+                                .map_err(AgentRuntimeError::TurnCompletionGuard)?;
                             plan_reconciliation_draft = Some(response.clone());
                             plan_reconciliation_item_id = Some(assistant_item_id.clone());
                             plan_reconciliation_request_pending = true;
@@ -1971,6 +2002,11 @@ impl AgentRuntime {
                     workspace_root: self.workspace_root.clone(),
                     approval: None,
                     progress: None,
+                    plan_reconciliation: if plan_reconciliation_requested {
+                        plan_reconciliation_context.clone()
+                    } else {
+                        None
+                    },
                 };
 
                 let tool_started_at = tokio::time::Instant::now();
@@ -3337,6 +3373,45 @@ impl AgentRuntime {
         }
     }
 
+    /// Provider/模型请求失败埋点。只针对真实 HTTP 错误（4xx/5xx），网络抖动和
+    /// 用户取消不写日志：前者是诊断线索，后者是主动行为不是异常。
+    ///
+    /// 与 `provider_rate_limited` 分工不同：那条在自动重试前写，可能重试后成功；
+    /// 这条在错误真正终止 Turn 时写，是稳定的失败事实，事后可据此查因。
+    fn record_http_failure(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        error: &ProviderError,
+        retryable: bool,
+    ) {
+        let Some(status) = error.http_status() else {
+            return;
+        };
+        let Some(logger) = &self.logger else {
+            return;
+        };
+        // Provider adapters already strip their credential. Apply the shared
+        // secret-token filter too, and never log request bodies or headers.
+        let message: String = crate::execution::redact(&error.to_string())
+            .chars()
+            .take(1024)
+            .collect();
+        let _ = logger.log(
+            "error",
+            "provider_http_failed",
+            json!({
+                "threadId": thread_id,
+                "turnId": turn_id,
+                "status": status,
+                "message": message,
+                // 4xx/5xx 里只有一小部分可自动重试，用来区分「客户端参数问题」与「服务端可恢复」。
+                "retryable": retryable,
+                "retryAfterMs": error.rate_limit_delay().map(|delay| delay.as_millis().min(u64::MAX as u128) as u64),
+            }),
+        );
+    }
+
     fn record_provider_retry(&self) {
         if let Some(metrics) = &self.metrics {
             metrics.retry();
@@ -4635,6 +4710,115 @@ mod tests {
             &event.event,
             AgentEvent::TextReset { item_id, .. } if item_id == &completed.id
         )));
+    }
+
+    #[tokio::test]
+    async fn completion_reconciliation_rejects_an_added_plan_step_before_persisting_it() {
+        let (directory, repository, _, thread_id) = runtime_fixture().await;
+        let advanced = crate::advanced::AdvancedServices::new(directory.path()).unwrap();
+        let initial_request: crate::advanced::PlanUpdateRequest = serde_json::from_value(json!({
+            "threadId": thread_id,
+            "steps": [
+                { "id": "one", "step": "实现", "status": "completed" },
+                { "id": "two", "step": "验证", "status": "in_progress" }
+            ]
+        }))
+        .unwrap();
+        advanced.plans.update(initial_request).unwrap();
+        let handlers = advanced
+            .tool_handlers(directory.path())
+            .0
+            .into_iter()
+            .filter(|handler| handler.definition().name == "update_plan")
+            .collect();
+        let tools = ToolRegistry::new(handlers).unwrap();
+        let reconciliation = PlanReconciliationContext {
+            revision: 1,
+            steps: vec![
+                crate::tools::PlanReconciliationStep {
+                    id: "one".into(),
+                    step: "实现".into(),
+                },
+                crate::tools::PlanReconciliationStep {
+                    id: "two".into(),
+                    step: "验证".into(),
+                },
+            ],
+        };
+        struct TestGuard {
+            decisions: Mutex<VecDeque<bool>>,
+            context: PlanReconciliationContext,
+        }
+        impl TurnCompletionGuard for TestGuard {
+            fn needs_reconciliation(&self, _turn_started_at_ms: u64) -> Result<bool, String> {
+                Ok(self.decisions.lock().unwrap().pop_front().unwrap_or(true))
+            }
+
+            fn reconciliation_context(
+                &self,
+                _turn_started_at_ms: u64,
+            ) -> Result<Option<PlanReconciliationContext>, String> {
+                Ok(Some(self.context.clone()))
+            }
+        }
+        let runtime = AgentRuntime::with_tools(repository, tools, directory.path().to_path_buf())
+            .with_turn_completion_guard(Arc::new(TestGuard {
+                decisions: Mutex::new(VecDeque::from([true, true])),
+                context: reconciliation,
+            }));
+        let provider = Arc::new(FakeProvider::script(vec![
+            vec![
+                Ok(ProviderEvent::TextDelta {
+                    delta: "临时答复".into(),
+                }),
+                Ok(ProviderEvent::Completed),
+            ],
+            vec![
+                Ok(ProviderEvent::ToolCall {
+                    call: ToolCall {
+                        id: "add-step".into(),
+                        name: "update_plan".into(),
+                        arguments: json!({
+                            "steps": [
+                                { "id": "one", "step": "实现", "status": "completed" },
+                                { "id": "two", "step": "验证", "status": "completed" },
+                                { "id": "three", "step": "向用户说明", "status": "in_progress" }
+                            ]
+                        }),
+                        metadata: json!({}),
+                    },
+                }),
+                Ok(ProviderEvent::Completed),
+            ],
+            vec![
+                Ok(ProviderEvent::TextDelta {
+                    delta: "最终答复".into(),
+                }),
+                Ok(ProviderEvent::Completed),
+            ],
+        ]));
+        let outcome = runtime
+            .run_turn(
+                provider,
+                "fixture".into(),
+                RunTurnRequest {
+                    thread_id: thread_id.clone(),
+                    input: "执行计划任务".into(),
+                    agent_mode: None,
+                },
+                CancellationToken::new(),
+                Arc::new(RecordingPublisher::default()),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.state, TurnState::Failed);
+        let plan = advanced.plans.get(&thread_id).unwrap().unwrap();
+        assert_eq!(plan.steps.len(), 2);
+        assert!(!plan.steps.iter().any(|step| step.id == "three"));
+        assert!(plan.steps.iter().any(|step| {
+            step.id == "two" && step.status == crate::advanced::PlanStepState::InProgress
+        }));
     }
 
     #[tokio::test]
@@ -6442,6 +6626,233 @@ mod tests {
             })
             .unwrap();
         assert!(logs.records.is_empty());
+    }
+
+    #[tokio::test]
+    async fn provider_http_failures_are_logged_with_their_status_code() {
+        let (directory, _repository, runtime, thread_id) = runtime_fixture().await;
+        let logger = StructuredLogger::new(directory.path()).unwrap();
+        let runtime = runtime.with_logger(logger.clone());
+        // 402 属于不可重试的 4xx：一次请求就直接终止，日志必须留下状态码。
+        let provider = Arc::new(PreStreamProvider::new(vec![Err(ProviderError::Http {
+            status: 402,
+            message: "You exceeded your current quota".into(),
+        })]));
+
+        let outcome = runtime
+            .run_turn(
+                provider.clone(),
+                "fixture".into(),
+                RunTurnRequest {
+                    thread_id: thread_id.clone(),
+                    input: "实现可点击状态面板".into(),
+                    agent_mode: None,
+                },
+                CancellationToken::new(),
+                Arc::new(RecordingPublisher::default()),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.state, TurnState::Failed);
+        assert_eq!(provider.requests().len(), 1);
+        let logs = logger
+            .read_logs(crate::logging::LogQuery {
+                limit: None,
+                level: Some("error".into()),
+                event: Some("provider_http_failed".into()),
+                after_timestamp_ms: None,
+            })
+            .unwrap();
+        assert_eq!(logs.records.len(), 1);
+        let record = &logs.records[0];
+        assert_eq!(record.fields["status"], 402);
+        // 4xx 参数/额度问题不可自动重试，要与 5xx 可恢复失败区分开。
+        assert_eq!(record.fields["retryable"], false);
+        let message = record.fields["message"].as_str().unwrap();
+        assert!(message.contains("402"), "{message}");
+        assert!(message.contains("quota"), "{message}");
+        assert_eq!(record.thread_id.as_deref(), Some(thread_id.as_str()));
+    }
+
+    #[tokio::test]
+    async fn transient_http_failures_are_not_logged_until_the_retries_are_exhausted() {
+        let (directory, _repository, runtime, thread_id) = runtime_fixture().await;
+        let logger = StructuredLogger::new(directory.path()).unwrap();
+        let runtime = runtime.with_logger(logger.clone());
+        // 503 是可重试的 5xx：前两次失败只写 Info 级 provider_rate_limited，
+        // 第三次重试后成功，因此不应留下任何 Error 级 HTTP 失败记录。
+        let provider = Arc::new(PreStreamProvider::new(vec![
+            Err(ProviderError::Http {
+                status: 503,
+                message: "busy once".into(),
+            }),
+            Err(ProviderError::Http {
+                status: 503,
+                message: "busy twice".into(),
+            }),
+            Ok(vec![
+                Ok(ProviderEvent::TextDelta {
+                    delta: "recovered".into(),
+                }),
+                Ok(ProviderEvent::Completed),
+            ]),
+        ]));
+
+        let outcome = runtime
+            .with_transient_retry_delays(vec![Duration::from_millis(1); 3])
+            .run_turn(
+                provider.clone(),
+                "fixture".into(),
+                RunTurnRequest {
+                    thread_id,
+                    input: "inspect the repository".into(),
+                    agent_mode: None,
+                },
+                CancellationToken::new(),
+                Arc::new(RecordingPublisher::default()),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.state, TurnState::Completed);
+        assert_eq!(provider.requests().len(), 3);
+        let logs = logger
+            .read_logs(crate::logging::LogQuery {
+                limit: None,
+                level: Some("error".into()),
+                event: Some("provider_http_failed".into()),
+                after_timestamp_ms: None,
+            })
+            .unwrap();
+        assert!(
+            logs.records.is_empty(),
+            "retries succeeded, so no HTTP failure should be recorded: {:?}",
+            logs.records
+        );
+    }
+
+    #[tokio::test]
+    async fn exhausted_transient_http_retries_record_the_final_status_code() {
+        let (directory, _repository, runtime, thread_id) = runtime_fixture().await;
+        let logger = StructuredLogger::new(directory.path()).unwrap();
+        let runtime = runtime.with_logger(logger.clone());
+        let provider = Arc::new(PreStreamProvider::new(
+            (0..4)
+                .map(|_| {
+                    Err(ProviderError::Http {
+                        status: 503,
+                        message: "服务繁忙，请稍后重试".into(),
+                    })
+                })
+                .collect(),
+        ));
+
+        let outcome = runtime
+            .with_transient_retry_delays(vec![Duration::from_millis(1); 3])
+            .run_turn(
+                provider.clone(),
+                "fixture".into(),
+                RunTurnRequest {
+                    thread_id,
+                    input: "inspect the repository".into(),
+                    agent_mode: None,
+                },
+                CancellationToken::new(),
+                Arc::new(RecordingPublisher::default()),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.state, TurnState::Failed);
+        let logs = logger
+            .read_logs(crate::logging::LogQuery {
+                limit: None,
+                level: Some("error".into()),
+                event: Some("provider_http_failed".into()),
+                after_timestamp_ms: None,
+            })
+            .unwrap();
+        assert_eq!(logs.records.len(), 1);
+        let record = &logs.records[0];
+        assert_eq!(record.fields["status"], 503);
+        assert_eq!(record.fields["retryable"], true);
+        assert_eq!(
+            record.fields["message"].as_str().unwrap(),
+            "provider returned HTTP 503: 服务繁忙，请稍后重试"
+        );
+        assert_eq!(provider.requests().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn network_and_cancellation_failures_do_not_write_http_failure_logs() {
+        let (directory, _repository, runtime, thread_id) = runtime_fixture().await;
+        let logger = StructuredLogger::new(directory.path()).unwrap();
+        let runtime = runtime.with_logger(logger.clone());
+        let network_logger = logger.clone();
+        // 网络抖动只记 turn_failed 的通用失败，不冒充 HTTP 状态码失败。
+        let provider = Arc::new(PreStreamProvider::new(vec![Err(ProviderError::Request(
+            "connection reset by peer".into(),
+        ))]));
+
+        let outcome = runtime
+            .run_turn(
+                provider,
+                "fixture".into(),
+                RunTurnRequest {
+                    thread_id,
+                    input: "inspect the repository".into(),
+                    agent_mode: None,
+                },
+                CancellationToken::new(),
+                Arc::new(RecordingPublisher::default()),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.state, TurnState::Failed);
+        // 主动取消同样不写：那是用户行为不是异常。
+        let (directory, _repository, runtime, thread_id) = runtime_fixture().await;
+        let logger = StructuredLogger::new(directory.path()).unwrap();
+        let runtime = runtime.with_logger(logger.clone());
+        let cancelled_logger = logger.clone();
+        let token = CancellationToken::new();
+        token.cancel();
+        let outcome = runtime
+            .run_turn(
+                Arc::new(FakeProvider::script(vec![vec![Ok(
+                    ProviderEvent::TextDelta {
+                        delta: "never runs".into(),
+                    },
+                )]])),
+                "fixture".into(),
+                RunTurnRequest {
+                    thread_id,
+                    input: "cancel me".into(),
+                    agent_mode: None,
+                },
+                token,
+                Arc::new(RecordingPublisher::default()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome.state, TurnState::Cancelled);
+
+        for logger in [network_logger, cancelled_logger] {
+            let logs = logger
+                .read_logs(crate::logging::LogQuery {
+                    limit: None,
+                    level: None,
+                    event: Some("provider_http_failed".into()),
+                    after_timestamp_ms: None,
+                })
+                .unwrap();
+            assert!(
+                logs.records.is_empty(),
+                "network shake and cancellation must not be recorded as HTTP failures: {:?}",
+                logs.records
+            );
+        }
     }
 
     #[test]

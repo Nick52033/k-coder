@@ -75,7 +75,7 @@ use crate::storage::memory_repository::{
     CANDIDATE_STATUS_PENDING, MemoryCandidateRecord, MemoryRecord,
 };
 use crate::storage::{StoredEvent, StoredEventKind, ThreadRepository, ThreadSummary};
-use crate::tools::ToolRegistry;
+use crate::tools::{PlanReconciliationContext, PlanReconciliationStep, ToolRegistry};
 use crate::workbench::{
     self, AttachmentContent, FileEntry, FilePreview, GitBranchView, GitStatusView,
     SaveWorkspaceFileRequest, WorkspaceState,
@@ -687,21 +687,59 @@ fn live_turn_completion_guard(
         .get(&thread_id)?
         .map(|plan| plan.revision)
         .unwrap_or(0);
-    Ok(Some(Arc::new(move |turn_started_at_ms| {
-        let Some(plan) = advanced.plans.get(&thread_id)? else {
+    Ok(Some(Arc::new(LivePlanCompletionGuard {
+        advanced,
+        thread_id,
+        baseline_revision,
+    })))
+}
+
+struct LivePlanCompletionGuard {
+    advanced: crate::advanced::AdvancedServices,
+    thread_id: String,
+    baseline_revision: u64,
+}
+
+impl TurnCompletionGuard for LivePlanCompletionGuard {
+    fn needs_reconciliation(&self, turn_started_at_ms: u64) -> Result<bool, String> {
+        let Some(plan) = self.advanced.plans.get(&self.thread_id)? else {
             return Ok(false);
         };
         // A plan that predates this turn is historical context, not evidence that
         // this turn forgot to reconcile its own work. Revision is the primary
         // discriminator; the timestamp closes the same-millisecond edge case.
-        if plan.revision <= baseline_revision && plan.updated_at_ms < turn_started_at_ms {
+        if plan.revision <= self.baseline_revision && plan.updated_at_ms < turn_started_at_ms {
             return Ok(false);
         }
         Ok(plan
             .steps
             .iter()
             .any(|step| step.status == crate::advanced::PlanStepState::InProgress))
-    })))
+    }
+
+    fn reconciliation_context(
+        &self,
+        _turn_started_at_ms: u64,
+    ) -> Result<Option<PlanReconciliationContext>, String> {
+        // Capture the identity snapshot at the first completion-gate hit, not
+        // when the turn starts. A normal plan update may legitimately grow the
+        // plan while work is still underway; only the bounded reconciliation
+        // request is forbidden from growing it further.
+        let Some(plan) = self.advanced.plans.get(&self.thread_id)? else {
+            return Ok(None);
+        };
+        Ok(Some(PlanReconciliationContext {
+            revision: plan.revision,
+            steps: plan
+                .steps
+                .into_iter()
+                .map(|step| PlanReconciliationStep {
+                    id: step.id,
+                    step: step.step,
+                })
+                .collect(),
+        }))
+    }
 }
 
 /// Builds the `<memory>` payload for Task 2 memories, or `None` when there is nothing to inject.
@@ -4444,6 +4482,12 @@ mod tests {
 
         update("in_progress");
         assert!(guard.needs_reconciliation(u64::MAX).unwrap());
+        let reconciliation = guard
+            .reconciliation_context(u64::MAX)
+            .unwrap()
+            .expect("live plan guard should provide a step identity snapshot");
+        assert_eq!(reconciliation.steps.len(), 1);
+        assert_eq!(reconciliation.steps[0].step, "处理任务");
         update("completed");
         assert!(!guard.needs_reconciliation(u64::MAX).unwrap());
         update("pending");

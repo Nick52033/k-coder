@@ -3019,6 +3019,7 @@ mod tests {
             workspace_root: workspace.path().to_path_buf(),
             approval: None,
             progress: None,
+            plan_reconciliation: None,
         };
         let skill = handlers
             .iter()
@@ -3540,6 +3541,7 @@ mod tests {
             workspace_root: workspace.path().to_path_buf(),
             approval: None,
             progress: None,
+            plan_reconciliation: None,
         };
         assert!(
             retained
@@ -3688,6 +3690,7 @@ mod tests {
             workspace_root: workspace.path().to_path_buf(),
             approval: None,
             progress: None,
+            plan_reconciliation: None,
         };
         let denied = retained
             .execute(

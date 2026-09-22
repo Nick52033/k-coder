@@ -1214,17 +1214,18 @@ mod tests {
 
     #[test]
     fn provider_call_limit_error_preserves_new_turn_recovery_details() {
+        let limit = crate::agent::DEFAULT_HARD_TURN_PROVIDER_CALLS;
         let error = TurnError::provider_call_limit_exceeded(
-            "单个 Turn 已达到模型调用硬上限（200 次）".into(),
-            200,
-            200,
+            format!("单个 Turn 已达到模型调用硬上限（{} 次）", limit),
+            limit,
+            limit,
         );
 
         assert_eq!(error.code, "provider_call_limit_exceeded");
         assert!(error.retryable);
         assert_eq!(error.category, TurnErrorCategory::Runtime);
-        assert_eq!(error.details.as_ref().unwrap()["providerCalls"], 200);
-        assert_eq!(error.details.as_ref().unwrap()["maxProviderCalls"], 200);
+        assert_eq!(error.details.as_ref().unwrap()["providerCalls"], limit);
+        assert_eq!(error.details.as_ref().unwrap()["maxProviderCalls"], limit);
         assert_eq!(error.details.as_ref().unwrap()["recovery"], "new_turn");
         let encoded = serde_json::to_value(&error).unwrap();
         assert_eq!(encoded["code"], "provider_call_limit_exceeded");
@@ -1421,10 +1422,11 @@ mod tests {
 
     #[test]
     fn failed_event_carries_structured_error_and_reads_legacy_payloads() {
+        let limit = crate::agent::DEFAULT_HARD_TURN_PROVIDER_CALLS;
         let error = TurnError::provider_call_limit_exceeded(
-            "单个 Turn 已达到模型调用硬上限（200 次）".into(),
-            200,
-            200,
+            format!("单个 Turn 已达到模型调用硬上限（{} 次）", limit),
+            limit,
+            limit,
         );
         let event = AgentEventEnvelope::new(AgentEvent::TurnFailed {
             thread_id: "thread-1".into(),
@@ -1439,8 +1441,8 @@ mod tests {
 
         assert_eq!(value["type"], "turn_failed");
         assert_eq!(value["error"]["code"], "provider_call_limit_exceeded");
-        assert_eq!(value["error"]["details"]["providerCalls"], 200);
-        assert_eq!(value["error"]["details"]["maxProviderCalls"], 200);
+        assert_eq!(value["error"]["details"]["providerCalls"], limit);
+        assert_eq!(value["error"]["details"]["maxProviderCalls"], limit);
         assert_eq!(value["error"]["details"]["recovery"], "new_turn");
 
         let legacy = serde_json::json!({

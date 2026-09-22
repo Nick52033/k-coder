@@ -3004,6 +3004,7 @@ mod tests {
             workspace_root: workspace.to_path_buf(),
             approval: None,
             progress: None,
+            plan_reconciliation: None,
         }
     }
 

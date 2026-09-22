@@ -1824,6 +1824,7 @@ mod tests {
             workspace_root: workspace.path().into(),
             approval: None,
             progress: None,
+            plan_reconciliation: None,
         };
         for args in [
             json!({}),
