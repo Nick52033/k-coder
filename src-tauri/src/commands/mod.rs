@@ -19,7 +19,8 @@ use crate::agent::query_rewrite::ModelQueryRewriter;
 use crate::agent::thread_operation::ThreadOperationGuard;
 use crate::agent::{
     AgentRuntime, DEFAULT_HARD_TURN_PROVIDER_CALLS, EventPublisher, RunTurnRequest,
-    RuntimeInstructionProvider, SoftTurnLimits, TurnOutcome, build_user_message,
+    RuntimeInstructionProvider, SoftTurnLimits, TurnCompletionGuard, TurnOutcome,
+    build_user_message,
 };
 use crate::app_state::{AppState, AppStateError};
 use crate::context::assembler::{ContextAssembler, memory_fragments};
@@ -664,6 +665,43 @@ fn live_runtime_instruction_provider(
             &tool_names,
         ))
     })
+}
+
+/// Build the host-side plan completion check for an ordinary turn.
+///
+/// The baseline revision prevents an old, unrelated in-progress plan from
+/// blocking a later turn. Workflow plans stay authoritative in WorkflowStore;
+/// `complete_workflow_node`, rather than this ordinary-plan guard, closes them.
+fn live_turn_completion_guard(
+    state: &AppState,
+    thread_id: String,
+    tool_names: &[String],
+    workflow_active_at_turn_start: bool,
+) -> Result<Option<Arc<dyn TurnCompletionGuard>>, String> {
+    if workflow_active_at_turn_start || !tool_names.iter().any(|name| name == "update_plan") {
+        return Ok(None);
+    }
+    let advanced = state.advanced();
+    let baseline_revision = advanced
+        .plans
+        .get(&thread_id)?
+        .map(|plan| plan.revision)
+        .unwrap_or(0);
+    Ok(Some(Arc::new(move |turn_started_at_ms| {
+        let Some(plan) = advanced.plans.get(&thread_id)? else {
+            return Ok(false);
+        };
+        // A plan that predates this turn is historical context, not evidence that
+        // this turn forgot to reconcile its own work. Revision is the primary
+        // discriminator; the timestamp closes the same-millisecond edge case.
+        if plan.revision <= baseline_revision && plan.updated_at_ms < turn_started_at_ms {
+            return Ok(false);
+        }
+        Ok(plan
+            .steps
+            .iter()
+            .any(|step| step.status == crate::advanced::PlanStepState::InProgress))
+    })))
 }
 
 /// Builds the `<memory>` payload for Task 2 memories, or `None` when there is nothing to inject.
@@ -3177,7 +3215,7 @@ async fn execute_turn(
             state.build_provider_for_thread(&thread_id, false).await
         }
         .map_err(|error| CommandError::new("provider_config", error))?;
-    if let Some(workflow_id) = requested_workflow_id {
+    if let Some(workflow_id) = requested_workflow_id.clone() {
         let objective = if request.input.trim().is_empty() {
             "Process the user-provided attachments under this workflow."
         } else {
@@ -3251,8 +3289,19 @@ async fn execute_turn(
         request.input.clone(),
         project_workspace.clone(),
         mode_instructions,
-        tool_names,
+        tool_names.clone(),
     );
+    let workflow_active_at_turn_start = requested_workflow_id.is_some()
+        || current_workflow
+            .as_ref()
+            .is_some_and(|run| run.state == WorkflowRunState::Active);
+    let turn_completion_guard = live_turn_completion_guard(
+        state,
+        thread_id.clone(),
+        &tool_names,
+        workflow_active_at_turn_start,
+    )
+    .map_err(|error| CommandError::new("plan_state", error))?;
     let mut runtime = AgentRuntime::with_tools_and_approvals(
         state.runtime_repository(),
         tools,
@@ -3260,13 +3309,17 @@ async fn execute_turn(
         state.approvals(),
     )
     .with_approval_mode(state.approval_mode())
-    .with_runtime_instruction_provider(runtime_instruction_provider)
-    .with_context_limit(context_limit)
-    .with_metrics(advanced.metrics.clone())
-    .with_reasoning_effort(state.reasoning_effort())
-    .with_vision_support(supports_vision)
-    .with_user_inputs(state.user_inputs())
-    .with_logger(state.logger());
+    .with_runtime_instruction_provider(runtime_instruction_provider);
+    if let Some(guard) = turn_completion_guard {
+        runtime = runtime.with_turn_completion_guard(guard);
+    }
+    let mut runtime = runtime
+        .with_context_limit(context_limit)
+        .with_metrics(advanced.metrics.clone())
+        .with_reasoning_effort(state.reasoning_effort())
+        .with_vision_support(supports_vision)
+        .with_user_inputs(state.user_inputs())
+        .with_logger(state.logger());
     if let Some(limits) = ordinary_turn_soft_limits(goal_budget.is_some()) {
         runtime = runtime
             .with_provider_call_budget(DEFAULT_HARD_TURN_PROVIDER_CALLS)
@@ -3504,8 +3557,11 @@ async fn execute_retry(
         retry_input,
         project_workspace.clone(),
         mode_instructions,
-        tool_names,
+        tool_names.clone(),
     );
+    let turn_completion_guard =
+        live_turn_completion_guard(state, thread_id.clone(), &tool_names, workflow_active)
+            .map_err(|error| CommandError::new("plan_state", error))?;
     let mut runtime = AgentRuntime::with_tools_and_approvals(
         state.runtime_repository(),
         tools,
@@ -3513,13 +3569,17 @@ async fn execute_retry(
         state.approvals(),
     )
     .with_approval_mode(state.approval_mode())
-    .with_runtime_instruction_provider(runtime_instruction_provider)
-    .with_context_limit(context_limit)
-    .with_metrics(advanced.metrics.clone())
-    .with_reasoning_effort(state.reasoning_effort())
-    .with_vision_support(supports_vision)
-    .with_user_inputs(state.user_inputs())
-    .with_logger(state.logger());
+    .with_runtime_instruction_provider(runtime_instruction_provider);
+    if let Some(guard) = turn_completion_guard {
+        runtime = runtime.with_turn_completion_guard(guard);
+    }
+    let mut runtime = runtime
+        .with_context_limit(context_limit)
+        .with_metrics(advanced.metrics.clone())
+        .with_reasoning_effort(state.reasoning_effort())
+        .with_vision_support(supports_vision)
+        .with_user_inputs(state.user_inputs())
+        .with_logger(state.logger());
     if let Some(limits) = ordinary_turn_soft_limits(goal_budget.is_some()) {
         runtime = runtime
             .with_provider_call_budget(DEFAULT_HARD_TURN_PROVIDER_CALLS)
@@ -4022,7 +4082,9 @@ mod tests {
         CredentialError, CredentialStore, ProviderError, ProviderKind, ProviderModelConfig,
         ProviderTransport, SaveProviderConfigRequest, testing::FakeProvider,
     };
-    use crate::storage::{JsonlThreadRepository, StoredEvent, StoredEventKind, ThreadSummary};
+    use crate::storage::{
+        JsonlThreadRepository, StoredEvent, StoredEventKind, ThreadRepository, ThreadSummary,
+    };
     use crate::{patch::PatchService, tools::ToolRegistry};
 
     #[derive(Default)]
@@ -4121,6 +4183,33 @@ mod tests {
         );
         let server = tokio::spawn(async move {
             for _ in 0..request_count {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                sender
+                    .send(read_test_http_json(&mut stream).await)
+                    .await
+                    .unwrap();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        (format!("http://{address}/v1"), receiver, server)
+    }
+
+    async fn spawn_scripted_provider_server(
+        bodies: Vec<String>,
+    ) -> (
+        String,
+        mpsc::Receiver<serde_json::Value>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (sender, receiver) = mpsc::channel(bodies.len());
+        let server = tokio::spawn(async move {
+            for body in bodies {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 sender
                     .send(read_test_http_json(&mut stream).await)
@@ -4319,6 +4408,210 @@ mod tests {
         let disabled = compiler(vec!["read_file".into()]).compile().unwrap();
         assert!(!disabled.contains("[执行计划同步]"));
         assert!(!disabled.contains("\"revision\""));
+    }
+
+    #[test]
+    fn live_plan_completion_guard_only_blocks_new_in_progress_work() {
+        let data = tempfile::tempdir().unwrap();
+        let state =
+            AppState::with_credentials(data.path(), Arc::new(TestCredentials::default())).unwrap();
+        let thread_id = "plan-guard-thread".to_string();
+        let update = |status: &str| {
+            state
+                .advanced()
+                .plans
+                .update(
+                    serde_json::from_value(serde_json::json!({
+                        "threadId": thread_id,
+                        "steps": [{ "step": "处理任务", "status": status }],
+                    }))
+                    .unwrap(),
+                )
+                .unwrap();
+        };
+
+        // An old plan is context, not evidence that this turn forgot to reconcile.
+        update("in_progress");
+        let guard = super::live_turn_completion_guard(
+            &state,
+            thread_id.clone(),
+            &["update_plan".into()],
+            false,
+        )
+        .unwrap()
+        .expect("ordinary turns with update_plan should have a guard");
+        assert!(!guard.needs_reconciliation(u64::MAX).unwrap());
+
+        update("in_progress");
+        assert!(guard.needs_reconciliation(u64::MAX).unwrap());
+        update("completed");
+        assert!(!guard.needs_reconciliation(u64::MAX).unwrap());
+        update("pending");
+        assert!(!guard.needs_reconciliation(u64::MAX).unwrap());
+
+        assert!(
+            super::live_turn_completion_guard(
+                &state,
+                thread_id.clone(),
+                &["update_plan".into()],
+                true,
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            super::live_turn_completion_guard(&state, thread_id, &["read_file".into()], false,)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_path_reconciles_a_plan_before_marking_the_turn_complete() {
+        let text_body = |text: &str| {
+            format!(
+                "data: {}\n\ndata: [DONE]\n\n",
+                serde_json::json!({
+                    "choices": [{
+                        "delta": { "content": text },
+                        "finish_reason": "stop"
+                    }]
+                })
+            )
+        };
+        let tool_body = |call_id: &str, arguments: serde_json::Value| {
+            let arguments = arguments.to_string();
+            format!(
+                "data: {}\n\ndata: [DONE]\n\n",
+                serde_json::json!({
+                    "choices": [{
+                        "delta": {
+                            "tool_calls": [{
+                                "index": 0,
+                                "id": call_id,
+                                "function": {
+                                    "name": "update_plan",
+                                    "arguments": arguments
+                                }
+                            }]
+                        },
+                        "finish_reason": "tool_calls"
+                    }]
+                })
+            )
+        };
+        let (base_url, mut requests, server) = spawn_scripted_provider_server(vec![
+            tool_body(
+                "initial-plan",
+                serde_json::json!({
+                    "steps": [{
+                        "id": "one",
+                        "step": "执行修复",
+                        "status": "in_progress"
+                    }]
+                }),
+            ),
+            text_body("临时答复草稿"),
+            tool_body(
+                "reconcile-plan",
+                serde_json::json!({
+                    "steps": [{
+                        "id": "one",
+                        "step": "执行修复",
+                        "status": "completed"
+                    }]
+                }),
+            ),
+            text_body("retry 最终答复"),
+        ])
+        .await;
+        let data = tempfile::tempdir().unwrap();
+        let state =
+            AppState::with_credentials(data.path(), Arc::new(TestCredentials::default())).unwrap();
+        state
+            .save_provider_config(SaveProviderConfigRequest {
+                id: "retry-plan-guard".into(),
+                kind: ProviderKind::OpenAiCompatible,
+                transport: ProviderTransport::OpenAiChatCompletions,
+                name: "Retry plan guard fixture".into(),
+                base_url,
+                model: "fixture".into(),
+                models: vec![ProviderModelConfig {
+                    id: "fixture".into(),
+                    display_name: "Fixture".into(),
+                    context_window: 128_000,
+                    max_output_tokens: Some(256),
+                    supports_vision: false,
+                    fallback: false,
+                }],
+                endpoints: Vec::new(),
+                api_key: Some("fixture-key".into()),
+                activate: true,
+            })
+            .unwrap();
+        let thread = state.repository().create_standalone_thread().await.unwrap();
+        seed_failed_turn(&state, &thread.id, data.path()).await;
+
+        let publisher = Arc::new(RecordingPublisher::default());
+        let outcome = execute_retry(
+            &state,
+            thread.id.clone(),
+            None,
+            None,
+            publisher.clone(),
+            test_subagent_publishers(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome.state, crate::protocol::TurnState::Completed);
+        assert_eq!(requests.recv().await.unwrap()["model"], "fixture");
+        let first = requests.recv().await.unwrap();
+        assert!(first["messages"].to_string().contains("执行修复"));
+        let reconciliation = requests.recv().await.unwrap();
+        assert!(
+            reconciliation["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|message| {
+                    message["role"] == "system"
+                        && message["content"]
+                            .as_str()
+                            .is_some_and(|content| content.contains("计划收尾门禁"))
+                })
+        );
+        let final_request = requests.recv().await.unwrap();
+        assert!(
+            final_request["messages"]
+                .to_string()
+                .contains("临时答复草稿")
+        );
+        server.await.unwrap();
+
+        let plan = state.advanced().plans.get(&thread.id).unwrap().unwrap();
+        assert!(
+            plan.steps
+                .iter()
+                .all(|step| step.status == crate::advanced::PlanStepState::Completed)
+        );
+        let events = state.repository().load(&thread.id).await.unwrap();
+        assert!(events.iter().any(|event| matches!(
+            &event.kind,
+            StoredEventKind::AssistantMessage { message } if message.text() == "retry 最终答复"
+        )));
+        assert!(!events.iter().any(|event| matches!(
+            &event.kind,
+            StoredEventKind::AssistantMessage { message } if message.text() == "临时答复草稿"
+        )));
+        assert!(
+            publisher
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| matches!(&event.event, AgentEvent::TextReset { .. }))
+        );
     }
 
     #[tokio::test]

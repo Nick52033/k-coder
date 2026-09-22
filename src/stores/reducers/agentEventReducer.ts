@@ -297,6 +297,16 @@ export function reduceAgentEvent(
         },
       };
     }
+    case "text_reset":
+      return {
+        state: {
+          turnTimeline: state.turnTimeline.map((item) => item.type === "text"
+            && item.turnId === event.turnId
+            && item.id === event.itemId
+            ? { ...item, text: "" }
+            : item),
+        },
+      };
     case "reasoning_summary_delta": {
       const existing = state.turnTimeline.findIndex((item) =>
         item.type === "reasoning" && item.turnId === event.turnId && item.itemId === event.itemId,
@@ -700,7 +710,7 @@ export function reduceAgentEvent(
           lastTurn: {
             turnId: event.turnId,
             state: "failed",
-            error: event.message,
+            error: event.error ?? event.message,
           },
           messages: state.messages.map((message) =>
             message.turnId === event.turnId

@@ -2053,7 +2053,7 @@ test("supports the primary workbench inspection flow", async ({ page }, testInfo
   const inspectionGroup = page.locator(".turn-tool-group").filter({ hasText: "执行了多个操作" });
   await expect(inspectionGroup).toBeVisible();
   const inspectionSummary = inspectionGroup.locator(":scope > summary");
-  await expect(inspectionSummary.locator("svg.lucide-wrench, svg.lucide-square-terminal")).toHaveCount(0);
+  await expect(inspectionSummary.locator("svg.lucide-wrench, svg.lucide-square-terminal")).toHaveCount(1);
   await expect(inspectionSummary.locator(".turn-tool-group-copy > svg.turn-tool-group-chevron.lucide-chevron-right")).toHaveCount(1);
   await inspectionSummary.screenshot({ path: testInfo.outputPath("operation-group-chevron.png") });
   await expect(page.locator(".turn-timeline-tool").getByText("应用补丁 src/App.css", { exact: true })).toBeHidden();
@@ -2077,7 +2077,7 @@ test("supports the primary workbench inspection flow", async ({ page }, testInfo
   const commandGroup = page.locator(".turn-tool-group").filter({ hasText: "运行了命令" }).first();
   await expect(commandGroup).toBeVisible();
   const commandSummary = commandGroup.locator(":scope > summary");
-  await expect(commandSummary.locator("svg.lucide-wrench, svg.lucide-square-terminal")).toHaveCount(0);
+  await expect(commandSummary.locator("svg.lucide-wrench, svg.lucide-square-terminal")).toHaveCount(1);
   await expect(commandSummary.locator(".turn-tool-group-copy > svg.turn-tool-group-chevron.lucide-chevron-right")).toHaveCount(1);
   await expect(page.locator(".turn-timeline-tool--command").getByText("pnpm build", { exact: true })).toBeHidden();
   await commandSummary.click();
@@ -3568,6 +3568,23 @@ test("copies the user message text with the copy button", async ({ page, context
   await expect(userMessage.getByRole("button", { name: "已复制" })).toBeVisible();
   const clipboardText = await page.evaluate(() => navigator.clipboard.readText());
   expect(clipboardText).toBe("检查工作区");
+
+  // The copy action sits in the bubble gutter: it must stay clear of the text
+  // instead of covering the first line.
+  const geometry = await userMessage.evaluate((node) => {
+    const bubble = node.querySelector(".message-content") as HTMLElement;
+    const button = node.querySelector(".message-copy-button") as HTMLElement;
+    const rect = (element: Element) => {
+      const box = element.getBoundingClientRect();
+      return { top: box.top, left: box.left, right: box.right, bottom: box.bottom };
+    };
+    return { bubble: rect(bubble), button: rect(button) };
+  });
+  const overlaps = geometry.button.left < geometry.bubble.right
+    && geometry.button.right > geometry.bubble.left
+    && geometry.button.top < geometry.bubble.bottom
+    && geometry.button.bottom > geometry.bubble.top;
+  expect(overlaps).toBe(false);
 });
 
 test("wakes workspace files with @ and enabled Skills with /", async ({ page }) => {
@@ -3771,7 +3788,7 @@ test("uses an unframed disclosure and scrolls long multi-command groups", async 
   const group = page.locator(".turn-tool-group--multiple-commands").last();
   const summary = group.locator(":scope > summary");
   await expect(summary.getByText("运行了多个命令", { exact: true })).toBeVisible();
-  await expect(summary.locator("svg.lucide-wrench, svg.lucide-square-terminal")).toHaveCount(0);
+  await expect(summary.locator("svg.lucide-wrench, svg.lucide-square-terminal")).toHaveCount(1);
   await expect(summary.locator(".turn-tool-group-copy > svg.turn-tool-group-chevron.lucide-chevron-right")).toHaveCount(1);
   const summaryAlignment = await summary.evaluate((element) => {
     const title = element.querySelector<HTMLElement>(".turn-disclosure-title")?.getBoundingClientRect();
@@ -5215,6 +5232,45 @@ test("presents a failed turn as one actionable error disclosure", async ({ page 
   await page.waitForTimeout(450);
   await page.screenshot({ path: testInfo.outputPath("failed-turn-agent-ui-expanded.png"), fullPage: true });
   await failedExecution.getByRole("button", { name: "重试", exact: true }).click();
+  await expect.poll(() => page.evaluate(() => (
+    window as unknown as { __invoked: string[] }
+  ).__invoked.filter((command) => command === "turn_retry").length)).toBe(1);
+});
+
+test("labels the provider call hard limit and starts a new Turn", async ({ page }) => {
+  await page.addInitScript(() => localStorage.setItem("kcoder_e2e_hold_retry", "true"));
+  await page.goto("/");
+  await page.evaluate(() => {
+    const emit = (window as unknown as { __emitAgentEvent: (event: unknown) => void }).__emitAgentEvent;
+    const base = { schemaVersion: 9, threadId: "thread-1", turnId: "turn-provider-call-limit" };
+    emit({ ...base, type: "turn_started", phase: "exploring" });
+    emit({
+      ...base,
+      type: "turn_failed",
+      phase: "failed",
+      message: "单个 Turn 已达到模型调用硬上限（200 次），为防止执行循环已停止；请检查当前进展后开启新 Turn。",
+      error: {
+        code: "provider_call_limit_exceeded",
+        message: "单个 Turn 已达到模型调用硬上限（200 次），为防止执行循环已停止；请检查当前进展后开启新 Turn。",
+        retryable: true,
+        category: "runtime",
+        details: { providerCalls: 200, maxProviderCalls: 200, recovery: "new_turn" },
+      },
+      startedAtMs: 1_000,
+      completedAtMs: 201_000,
+      durationMs: 200_000,
+    });
+  });
+
+  const failedExecution = page.locator(".message--assistant").last().locator(".turn-execution--failed");
+  await expect(failedExecution).not.toHaveAttribute("open", "");
+  await failedExecution.locator(":scope > summary").click();
+  await expect(failedExecution.getByText("本轮已达到安全上限", { exact: true })).toBeVisible();
+  await expect(failedExecution.getByText("单个 Turn 已达到模型调用硬上限（200 次），为防止执行循环已停止；请检查当前进展后开启新 Turn。", { exact: true })).toBeVisible();
+  await expect(failedExecution.getByRole("button", { name: "开启新 Turn", exact: true })).toBeVisible();
+  await expect(failedExecution.getByRole("button", { name: "重试", exact: true })).toHaveCount(0);
+
+  await failedExecution.getByRole("button", { name: "开启新 Turn", exact: true }).click();
   await expect.poll(() => page.evaluate(() => (
     window as unknown as { __invoked: string[] }
   ).__invoked.filter((command) => command === "turn_retry").length)).toBe(1);

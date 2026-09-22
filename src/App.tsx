@@ -71,7 +71,7 @@ import { BrandMark } from "./components/BrandMark";
 import { cn } from "./lib/cn";
 import { open } from "@tauri-apps/plugin-dialog";
 import { readFile, stat } from "@tauri-apps/plugin-fs";
-import type { AttachmentContent, ConversationMessage, FileEntry, GoalView, ImageAttachment, ProjectRecord, RuntimeStatus, SubagentView, ThreadSummary, WorkspaceState } from "./types/runtime";
+import { turnErrorMessage, type AttachmentContent, type ConversationMessage, type FileEntry, type GoalView, type ImageAttachment, type ProjectRecord, type RuntimeStatus, type SubagentView, type ThreadSummary, type WorkspaceState } from "./types/runtime";
 
 /** Assigns `task1`, `task2`, ... per parent thread, oldest first. */
 function buildSubagentTaskIndex(subagents: SubagentView[]): Record<string, number> {
@@ -1227,7 +1227,7 @@ function App() {
       };
     }
     if (!lastTurn) return null;
-    return { label: stateLabel(lastTurn.state), detail: lastTurn.error ?? "" };
+    return { label: stateLabel(lastTurn.state), detail: turnErrorMessage(lastTurn.error) };
   }, [activeThreadId, activityStatus, cancellingTurns, currentThreadTurnId, lastTurn, restoredCurrentTurnId]);
   const toolActivities = useMemo(
     () => turnTimeline.flatMap((item) => item.type === "tool" ? [item.activity] : []),
@@ -1439,6 +1439,7 @@ function App() {
               activitySinceMs={activityStatus?.sinceMs}
               streamRetry={activityStatus?.streamRetry ?? null}
               renderText={renderMessageText}
+              failureError={lastTurn?.turnId === turnId ? lastTurn.error : null}
               onRetry={retryable && lastTurn?.turnId === turnId ? () => void retryLastTurn() : undefined}
               retryAtMs={activityStatus?.retryAtMs}
               subagentTaskIndex={subagentTaskIndex}
@@ -1576,6 +1577,7 @@ function App() {
             streamRetry={activityStatus?.streamRetry ?? null}
             finalMessageId={segmentFinalMessageId}
             renderText={renderMessageText}
+            failureError={lastTurn?.turnId === segment.turnId ? lastTurn.error : null}
             onRetry={segment.isLast && retryable && lastTurn?.turnId === segment.turnId
               ? () => void retryLastTurn()
               : undefined}
@@ -1647,6 +1649,7 @@ function App() {
                   streamRetry={activityStatus?.streamRetry ?? null}
                   finalMessageId={attemptFinalMessageId}
                   renderText={renderMessageText}
+                  failureError={lastTurn?.turnId === turnId ? lastTurn.error : null}
                   onRetry={attemptIsTerminalSegment && retryable && lastTurn?.turnId === turnId
                     ? () => void retryLastTurn()
                     : undefined}
@@ -2594,6 +2597,7 @@ function App() {
                           streamRetry={activityStatus?.streamRetry ?? null}
                           finalMessageId={message.id}
                           renderText={renderMessageText}
+                          failureError={lastTurn?.turnId === message.turnId ? lastTurn?.error ?? null : null}
                           onRetry={retryable && lastTurn?.turnId === message.turnId ? () => void retryLastTurn() : undefined}
                           retryAtMs={activityStatus?.retryAtMs}
                           subagentTaskIndex={subagentTaskIndex}

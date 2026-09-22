@@ -46,7 +46,7 @@ async fn hard_provider_call_budget_survives_continuation() {
                 agent_mode: None,
             },
             CancellationToken::new(),
-            publisher,
+            publisher.clone(),
         )
         .await
         .unwrap();
@@ -60,6 +60,21 @@ async fn hard_provider_call_budget_survives_continuation() {
         "{outcome:?}"
     );
     assert_eq!(provider.requests().len(), 3);
+    let events = publisher
+        .events
+        .lock()
+        .unwrap();
+    let failure = events
+        .iter()
+        .find_map(|event| match &event.event {
+            AgentEvent::TurnFailed { error: Some(error), .. } => Some(error),
+            _ => None,
+        })
+        .expect("hard provider call limit should publish a structured error");
+    assert_eq!(failure.code, "provider_call_limit_exceeded");
+    assert_eq!(failure.details.as_ref().unwrap()["providerCalls"], 3);
+    assert_eq!(failure.details.as_ref().unwrap()["maxProviderCalls"], 3);
+    assert_eq!(failure.details.as_ref().unwrap()["recovery"], "new_turn");
 }
 
 #[tokio::test]

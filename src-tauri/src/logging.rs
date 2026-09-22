@@ -13,13 +13,26 @@ const LOG_GENERATIONS: usize = 3;
 /// 嵌套对象的广度、以及整条 fields 的序列化长度都有界，超长正文以省略号结尾，完整内容
 /// 以会话事实事件为准。调用标识只在会话里追得回来，不写进运行日志。
 pub(crate) const MAX_FIELD_CHARS: usize = 160;
-pub(crate) const MAX_FIELDS_CHARS: usize = 320;
+/// 失败原因与失败指令本体要同屏读完，因此整条 fields 的预算与前端面板上限
+/// （`src/components/LogViewerDialog.tsx` 的 480）对齐：后台再松一档只会让面板重新
+/// 截断，紧一档又会把其中一半挤出可见区域。
+pub(crate) const MAX_FIELDS_CHARS: usize = 480;
 const MAX_ARRAY_ITEMS: usize = 8;
 const TRUNCATION_MARK: &str = "…";
 /// 只有会话事实事件才追得回来的纯标识，运行日志不记录。
 const TRACE_ONLY_KEYS: &[&str] = &["callid", "turnid", "itemid", "requestid", "jobid", "spanid"];
 /// 预算超支时优先保留的「发生了什么」字段，其余字段按序排在其后取舍。
-const PRIMARY_DETAIL_KEYS: &[&str] = &["message", "reason", "output", "error", "detail", "code"];
+/// `arguments` 与 `output` 同列：事后查因必须同时看到「哪条指令失败」和「失败原因」，
+/// 只留一半仍然无法定位。两者都在前端 480 字符面板预算内可读。
+const PRIMARY_DETAIL_KEYS: &[&str] = &[
+    "message",
+    "reason",
+    "output",
+    "arguments",
+    "error",
+    "detail",
+    "code",
+];
 /// 来源对话标记：`read_logs` 据此关联对话名称，任何预算下都不丢弃。
 const SOURCE_KEYS: &[&str] = &["threadid"];
 
@@ -617,6 +630,41 @@ mod tests {
     }
 
     #[test]
+    fn failed_command_arguments_survive_next_to_the_failure_reason() {
+        let data = tempfile::tempdir().unwrap();
+        let logger = StructuredLogger::new(data.path()).unwrap();
+        let command = "cd D:/code/Nick/k-coder; npx playwright test e2e/workbench.spec.ts -g \"commit button is disabled\"";
+        logger
+            .log(
+                "error",
+                "tool_failed",
+                json!({
+                    "threadId": "4eff95a7-9acc-4357-8564-b381bc442c7e",
+                    "turnId": "ac8f71a1-3650-4093-beab-dfbd7eb38cb8",
+                    "tool": "run_command",
+                    "callId": "0dbff861-61c4-59c0-4836-8f12-bb0ea0ea83f9",
+                    "itemStatus": "failed",
+                    "arguments": {"command": command},
+                    "output": "运行失败：退出码 1 (已有部分输出)",
+                }),
+            )
+            .unwrap();
+        let persisted = fs::read_to_string(&logger.path).unwrap();
+        let record: Value = serde_json::from_str(persisted.lines().next().unwrap()).unwrap();
+        let fields = record["fields"].as_object().unwrap();
+        // 事后查因必须在同一行里同时读到「哪条指令失败」和「失败原因」。
+        assert_eq!(fields["arguments"]["command"], command);
+        assert_eq!(fields["output"], "运行失败：退出码 1 (已有部分输出)");
+        assert_eq!(record["fields"]["tool"], "run_command");
+        assert_eq!(
+            record["fields"]["threadId"],
+            "4eff95a7-9acc-4357-8564-b381bc442c7e"
+        );
+        assert!(fields.get("callId").is_none());
+        assert!(fields.get("turnId").is_none());
+        assert!(serialized_chars(fields) <= MAX_FIELDS_CHARS);
+    }
+    #[test]
     fn reads_compact_legacy_records_so_the_reason_stays_visible() {
         let data = tempfile::tempdir().unwrap();
         let logger = StructuredLogger::new(data.path()).unwrap();
@@ -663,7 +711,8 @@ mod tests {
             .unwrap();
         let result = logger.read_logs(query()).unwrap();
         let fields = result.records[0].fields.as_object().unwrap();
-        // 先说发生了什么，再说背景；次要长字段整条丢弃，而不是留半行让人猜。
+        // 先说发生了什么，再说背景：主字段（message/error）在 480 预算内留得下，
+        // 更低优先级的长字段（detail）整条丢弃，而不是留半行让人猜。
         assert_eq!(fields["threadId"], "4eff95a7-9acc-4357-8564-b381bc442c7e");
         assert!(
             fields["message"]
@@ -671,7 +720,7 @@ mod tests {
                 .unwrap()
                 .starts_with("provider request failed")
         );
-        assert!(fields.get("error").is_none());
+        assert!(fields["error"].as_str().unwrap().ends_with(TRUNCATION_MARK));
         assert!(fields.get("detail").is_none());
         assert_eq!(fields["success"], false);
         assert!(serialized_chars(fields) <= MAX_FIELDS_CHARS);
@@ -701,10 +750,13 @@ mod tests {
         let items = fields["items"].as_array().unwrap();
         assert_eq!(items.len(), MAX_ARRAY_ITEMS + 1);
         assert_eq!(items[MAX_ARRAY_ITEMS], TRUNCATION_MARK);
-        // 嵌套对象同样受总预算约束，只留下按序第一个字段。
+        // 嵌套对象同样受总预算约束：预算从 320 放宽到 480 后，前两个长字段留得下，
+        // 第三个仍然被丢弃，记录始终不超预算。
         let nested = fields["nested"].as_object().unwrap();
-        assert_eq!(nested.len(), 1);
+        assert_eq!(nested.len(), 2);
         assert!(nested["alpha"].as_str().unwrap().ends_with(TRUNCATION_MARK));
+        assert!(nested["beta"].as_str().unwrap().ends_with(TRUNCATION_MARK));
+        assert!(nested.get("gamma").is_none());
         assert!(serialized_chars(fields) <= MAX_FIELDS_CHARS);
     }
 

@@ -925,6 +925,16 @@
         renderChatMeta();
         break;
       }
+      case "text_reset": {
+        const key = textKey(params.itemId);
+        const entry = ensureEntry(key, "agent");
+        entry.kind = "agent";
+        entry.text = "";
+        state.streamingKey = key;
+        scheduleSync();
+        renderChatMeta();
+        break;
+      }
       case "item_completed": {
         if (params.itemType === "agent_message" && state.streamingKey === textKey(params.itemId)) {
           state.streamingKey = null;

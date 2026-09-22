@@ -12,7 +12,7 @@ const LEVELS: Array<{ value: LogLevel | ""; label: string }> = [
 
 const LIMIT_OPTIONS = [100, 200, 500, 1000];
 
-// 后端在写入和读取时都把 fields 收敛到 320 字符以内（src-tauri/src/logging.rs 的
+// 后端在写入和读取时都把 fields 收敛到 480 字符以内（src-tauri/src/logging.rs 的
 // MAX_FIELDS_CHARS），这里只是更激进的旧记录兜底，正常记录应当整行显示。
 const MAX_FIELDS_CHARS = 480;
 

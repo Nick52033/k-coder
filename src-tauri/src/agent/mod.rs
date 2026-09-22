@@ -80,6 +80,8 @@ const TURN_CONTINUATION_TOOL_CALL_ID: &str = "runtime-turn-continuation";
 const TURN_CONTINUE: &str = "continue";
 const TURN_COMPACT_AND_CONTINUE: &str = "compact_and_continue";
 const TURN_STOP: &str = "stop";
+const MAX_PLAN_RECONCILIATION_DRAFT_BYTES: usize = 16 * 1024;
+const PLAN_RECONCILIATION_INSTRUCTIONS: &str = "[计划收尾门禁]\n当前回复已经形成最终答复草稿，但本轮刚刚更新的普通计划仍有进行中步骤。请先调用 update_plan 提交完整 steps 列表，只把已真实完成的步骤标为 completed，未完成步骤保留真实状态；工具成功后再输出最终答复。不要为了通过门禁伪造完成状态。\n";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SoftTurnLimits {
@@ -270,6 +272,8 @@ pub enum AgentRuntimeError {
     UserInput(#[from] UserInputError),
     #[error("runtime instructions could not be compiled: {0}")]
     RuntimeInstructions(String),
+    #[error("turn completion guard failed: {0}")]
+    TurnCompletionGuard(String),
     #[error("change audit failed: {storage_error}; rollback also failed: {rollback_error}")]
     AuditCompensation {
         storage_error: String,
@@ -285,6 +289,24 @@ pub trait RuntimeInstructionProvider: Send + Sync {
     /// Compile one immutable snapshot for an outer provider request. A
     /// transient retry of that request reuses the same snapshot.
     fn compile(&self) -> Result<String, String>;
+}
+
+/// Optional host-side check run immediately before a turn is marked completed.
+///
+/// The guard is deliberately injected by the command layer instead of making the
+/// agent loop depend on PlanStore or workflow storage. Implementations return true
+/// only when the current turn needs one bounded reconciliation request.
+pub trait TurnCompletionGuard: Send + Sync {
+    fn needs_reconciliation(&self, turn_started_at_ms: u64) -> Result<bool, String>;
+}
+
+impl<F> TurnCompletionGuard for F
+where
+    F: Fn(u64) -> Result<bool, String> + Send + Sync,
+{
+    fn needs_reconciliation(&self, turn_started_at_ms: u64) -> Result<bool, String> {
+        self(turn_started_at_ms)
+    }
 }
 
 impl<F> RuntimeInstructionProvider for F
@@ -304,6 +326,7 @@ pub struct AgentRuntime {
     approval_mode: ApprovalMode,
     user_inputs: Arc<UserInputManager>,
     runtime_instruction_provider: Arc<dyn RuntimeInstructionProvider>,
+    turn_completion_guard: Option<Arc<dyn TurnCompletionGuard>>,
     max_total_tokens: Option<u64>,
     max_provider_calls: Option<u32>,
     soft_turn_limits: Option<SoftTurnLimits>,
@@ -353,6 +376,7 @@ impl AgentRuntime {
             approval_mode: ApprovalMode::Ask,
             user_inputs: Arc::new(UserInputManager::new()),
             runtime_instruction_provider: Arc::new(|| Ok(String::new())),
+            turn_completion_guard: None,
             max_total_tokens: None,
             max_provider_calls: None,
             soft_turn_limits: None,
@@ -381,6 +405,11 @@ impl AgentRuntime {
         provider: Arc<dyn RuntimeInstructionProvider>,
     ) -> Self {
         self.runtime_instruction_provider = provider;
+        self
+    }
+
+    pub fn with_turn_completion_guard(mut self, guard: Arc<dyn TurnCompletionGuard>) -> Self {
+        self.turn_completion_guard = Some(guard);
         self
     }
 
@@ -775,13 +804,13 @@ impl AgentRuntime {
                 StoredEventKind::TurnModeSelected { mode: agent_mode },
             ))
             .await?;
-        self.repository
-            .append(StoredEvent::new(
-                &thread_id,
-                Some(turn_id.clone()),
-                StoredEventKind::TurnStarted,
-            ))
-            .await?;
+        let turn_started_event = StoredEvent::new(
+            &thread_id,
+            Some(turn_id.clone()),
+            StoredEventKind::TurnStarted,
+        );
+        let turn_started_at_ms = turn_started_event.created_at_ms;
+        self.repository.append(turn_started_event).await?;
         publisher.publish(AgentEventEnvelope::new(AgentEvent::TurnStarted {
             thread_id: thread_id.clone(),
             turn_id: turn_id.clone(),
@@ -808,6 +837,13 @@ impl AgentRuntime {
             .map(|_| SoftTurnSegment::new(provider_call_index, total_usage.total_tokens));
         let mut force_compaction = false;
         let tool_definitions = self.tools.provider_definitions();
+        let mut plan_reconciliation_requested = false;
+        let mut plan_reconciliation_draft = None::<String>;
+        let mut plan_reconciliation_request_pending = false;
+        // Reuse the streamed assistant item when the completion guard asks for one
+        // reconciliation request. This lets the terminal TurnCompleted event replace
+        // the temporary draft in the live timeline instead of leaving two answers.
+        let mut plan_reconciliation_item_id = None::<String>;
 
         // 进展检测变量
         let mut no_progress_count = 0usize;
@@ -834,13 +870,18 @@ impl AgentRuntime {
                 .is_some_and(|limit| provider_call_index >= limit)
             {
                 let limit = self.max_provider_calls.unwrap_or_default();
+                let message = format!(
+                    "单个 Turn 已达到模型调用硬上限（{} 次），为防止执行循环已停止；请检查当前进展后开启新 Turn。",
+                    limit
+                );
                 return self
-                    .finish_failed(
+                    .finish_failed_with_error(
                         &thread_id,
                         &turn_id,
-                        format!(
-                            "单个 Turn 已达到模型调用硬上限（{} 次），为防止执行循环已停止；请检查当前进展后开启新 Turn。",
-                            limit
+                        TurnError::provider_call_limit_exceeded(
+                            message,
+                            provider_call_index,
+                            limit,
                         ),
                         &publisher,
                     )
@@ -933,6 +974,19 @@ impl AgentRuntime {
                 .map_err(AgentRuntimeError::RuntimeInstructions)?;
             if previous_turn_interrupted {
                 request_runtime_instructions.push_str(instructions::INTERRUPTED_TASK);
+            }
+            if plan_reconciliation_requested {
+                request_runtime_instructions.push_str(PLAN_RECONCILIATION_INSTRUCTIONS);
+                if let Some(draft) = &plan_reconciliation_draft {
+                    request_runtime_instructions.push_str(
+                        "请在计划同步成功后复用或完善以下答复草稿，确保最终答复不会丢失已经完成的工作：\n",
+                    );
+                    request_runtime_instructions.push_str(truncate_utf8(
+                        draft,
+                        MAX_PLAN_RECONCILIATION_DRAFT_BYTES,
+                    ));
+                    request_runtime_instructions.push('\n');
+                }
             }
             let events = self.repository.load(&thread_id).await?;
             let last_context_usage = last_active_context_usage(&events);
@@ -1041,15 +1095,22 @@ impl AgentRuntime {
             let mut pending_tool_calls = Vec::<ToolCall>::new();
             let mut completed = false;
             let mut interrupted_for_steer = false;
-            let assistant_item_id = Uuid::new_v4().to_string();
-            self.start_item(
-                &thread_id,
-                &turn_id,
-                &assistant_item_id,
-                AgentItemType::AgentMessage,
-                &publisher,
-            )
-            .await?;
+            let reconciliation_request = plan_reconciliation_request_pending;
+            plan_reconciliation_request_pending = false;
+            let reusing_assistant_item = plan_reconciliation_item_id.is_some();
+            let assistant_item_id = plan_reconciliation_item_id
+                .clone()
+                .unwrap_or_else(|| Uuid::new_v4().to_string());
+            if !reusing_assistant_item {
+                self.start_item(
+                    &thread_id,
+                    &turn_id,
+                    &assistant_item_id,
+                    AgentItemType::AgentMessage,
+                    &publisher,
+                )
+                .await?;
+            }
             let provider_cancellation = control
                 .as_ref()
                 .map(|control| control.begin_provider_request(&cancellation))
@@ -1227,12 +1288,14 @@ impl AgentRuntime {
                                 ));
                                 responding_published = true;
                             }
-                            publisher.publish(AgentEventEnvelope::new(AgentEvent::TextDelta {
-                                thread_id: thread_id.clone(),
-                                turn_id: turn_id.clone(),
-                                item_id: assistant_item_id.clone(),
-                                delta,
-                            }));
+                            if !reconciliation_request {
+                                publisher.publish(AgentEventEnvelope::new(AgentEvent::TextDelta {
+                                    thread_id: thread_id.clone(),
+                                    turn_id: turn_id.clone(),
+                                    item_id: assistant_item_id.clone(),
+                                    delta,
+                                }));
+                            }
                         }
                         Some(Ok(ProviderEvent::Image { mime_type, data })) => {
                             attempt_had_output = true;
@@ -1735,6 +1798,45 @@ impl AgentRuntime {
                     iteration = iteration.saturating_add(1);
                     continue;
                 }
+                if let Some(guard) = &self.turn_completion_guard {
+                    let needs_reconciliation = guard
+                        .needs_reconciliation(turn_started_at_ms)
+                        .map_err(AgentRuntimeError::TurnCompletionGuard)?;
+                    if needs_reconciliation {
+                        if !plan_reconciliation_requested {
+                            plan_reconciliation_requested = true;
+                            plan_reconciliation_draft = Some(response.clone());
+                            plan_reconciliation_item_id = Some(assistant_item_id.clone());
+                            plan_reconciliation_request_pending = true;
+                            publisher.publish(AgentEventEnvelope::new(AgentEvent::TextReset {
+                                thread_id: thread_id.clone(),
+                                turn_id: turn_id.clone(),
+                                item_id: assistant_item_id.clone(),
+                            }));
+                            publisher.publish(AgentEventEnvelope::new(
+                                AgentEvent::ActivityStatusChanged {
+                                    thread_id: thread_id.clone(),
+                                    turn_id: turn_id.clone(),
+                                    status: AgentActivityStatus::Finalizing,
+                                },
+                            ));
+                            // Keep the item active and reuse its ID for the bounded
+                            // reconciliation request. The terminal TurnCompleted event then
+                            // replaces the temporary streamed draft with the authoritative
+                            // persisted answer; no draft AssistantMessage is written.
+                            iteration = iteration.saturating_add(1);
+                            continue;
+                        }
+                        return self
+                            .finish_failed(
+                                &thread_id,
+                                &turn_id,
+                                "计划收尾同步失败：本轮结束前仍有进行中的步骤；请检查计划后重新发送或继续。".to_string(),
+                                &publisher,
+                            )
+                            .await;
+                    }
+                }
                 publisher.publish(AgentEventEnvelope::new(AgentEvent::ActivityStatusChanged {
                     thread_id: thread_id.clone(),
                     turn_id: turn_id.clone(),
@@ -1766,19 +1868,28 @@ impl AgentRuntime {
                     Some(turn_id.clone()),
                     StoredEventKind::AssistantToolCalls {
                         item_id: Some(assistant_item_id.clone()),
-                        text: response.clone(),
+                        // The first guarded response is a temporary draft. Keep tool
+                        // calls for provider history, but do not project that draft as a
+                        // second commentary message after refresh.
+                        text: if reconciliation_request {
+                            String::new()
+                        } else {
+                            response.clone()
+                        },
                         calls: pending_tool_calls.clone(),
                     },
                 ))
                 .await?;
-            self.complete_active_items(
-                &thread_id,
-                &turn_id,
-                AgentItemType::AgentMessage,
-                AgentItemStatus::Completed,
-                &publisher,
-            )
-            .await?;
+            if !reconciliation_request {
+                self.complete_active_items(
+                    &thread_id,
+                    &turn_id,
+                    AgentItemType::AgentMessage,
+                    AgentItemStatus::Completed,
+                    &publisher,
+                )
+                .await?;
+            }
             for call in &pending_tool_calls {
                 self.start_item(
                     &thread_id,
@@ -2813,6 +2924,9 @@ impl AgentRuntime {
                 "tool": call.name,
                 "callId": call.id,
                 "itemStatus": status,
+                // 事后查因要能判定是哪一条指令失败，所以失败调用的参数本体一并记录；
+                // 日志 compact 会按预算截断，敏感字段另有 redact 兜底。
+                "arguments": call.arguments,
                 "output": truncate_utf8(&result.output, MAX_TOOL_FAILURE_OUTPUT_BYTES),
             }),
         );
@@ -2928,7 +3042,7 @@ impl AgentRuntime {
                 turn_id,
                 StoredEventKind::TurnFailed {
                     message: message.clone(),
-                    error: Some(error),
+                    error: Some(error.clone()),
                 },
             )
             .await?;
@@ -2936,6 +3050,7 @@ impl AgentRuntime {
             thread_id: thread_id.to_string(),
             turn_id: turn_id.to_string(),
             message: message.clone(),
+            error: Some(error),
             started_at_ms: timing.started_at_ms,
             completed_at_ms: timing.completed_at_ms,
             duration_ms: timing.duration_ms,
@@ -4406,6 +4521,175 @@ mod tests {
                 .filter(|event| matches!(event.kind, StoredEventKind::UserMessage { .. }))
                 .count(),
             2
+        );
+    }
+
+    #[tokio::test]
+    async fn completion_guard_reconciles_a_new_plan_once_without_persisting_the_draft() {
+        let (directory, repository, _, thread_id) = runtime_fixture().await;
+        let advanced = crate::advanced::AdvancedServices::new(directory.path()).unwrap();
+        let handlers = advanced
+            .tool_handlers(directory.path())
+            .0
+            .into_iter()
+            .filter(|handler| handler.definition().name == "update_plan")
+            .collect();
+        let tools = ToolRegistry::new(handlers).unwrap();
+        let guard_results = Arc::new(Mutex::new(VecDeque::from([true, false])));
+        let guard_results_for_runtime = guard_results.clone();
+        let guard: Arc<dyn TurnCompletionGuard> = Arc::new(move |_| {
+            Ok(guard_results_for_runtime
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(false))
+        });
+        let runtime =
+            AgentRuntime::with_tools(repository.clone(), tools, directory.path().to_path_buf())
+                .with_turn_completion_guard(guard);
+        let completed_steps = json!({
+            "steps": [
+                { "id": "one", "step": "实现功能", "status": "completed" },
+                { "id": "two", "step": "验证结果", "status": "completed" }
+            ]
+        });
+        let provider = Arc::new(FakeProvider::script(vec![
+            vec![
+                Ok(ProviderEvent::TextDelta {
+                    delta: "临时答复草稿".into(),
+                }),
+                Ok(ProviderEvent::Completed),
+            ],
+            vec![
+                Ok(ProviderEvent::ToolCall {
+                    call: ToolCall {
+                        id: "reconcile-plan".into(),
+                        name: "update_plan".into(),
+                        arguments: completed_steps,
+                        metadata: json!({}),
+                    },
+                }),
+                Ok(ProviderEvent::Completed),
+            ],
+            vec![
+                Ok(ProviderEvent::TextDelta {
+                    delta: "最终答复".into(),
+                }),
+                Ok(ProviderEvent::Completed),
+            ],
+        ]));
+        let publisher = Arc::new(RecordingPublisher::default());
+        let outcome = runtime
+            .run_turn(
+                provider.clone(),
+                "fixture".into(),
+                RunTurnRequest {
+                    thread_id: thread_id.clone(),
+                    input: "实现并验证功能".into(),
+                    agent_mode: Some("craft".into()),
+                },
+                CancellationToken::new(),
+                publisher.clone(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.state, TurnState::Completed);
+        assert_eq!(provider.requests().len(), 3);
+        assert_eq!(
+            repository.read_thread(&thread_id).await.unwrap().messages[1].text(),
+            "最终答复"
+        );
+        let plan = advanced.plans.get(&thread_id).unwrap().unwrap();
+        assert!(
+            plan.steps
+                .iter()
+                .all(|step| step.status == crate::advanced::PlanStepState::Completed)
+        );
+        let events = repository.load(&thread_id).await.unwrap();
+        assert!(events.iter().any(|event| matches!(
+            &event.kind,
+            StoredEventKind::AssistantToolCalls { text, .. } if text.is_empty()
+        )));
+        assert!(!events.iter().any(|event| matches!(
+            &event.kind,
+            StoredEventKind::AssistantToolCalls { text, .. } if text == "临时答复草稿"
+        )));
+        let published = publisher.events.lock().unwrap();
+        let completed = published
+            .iter()
+            .find_map(|event| match &event.event {
+                AgentEvent::TurnCompleted { message, .. } => Some(message),
+                _ => None,
+            })
+            .expect("guarded turn should complete");
+        assert_eq!(completed.text(), "最终答复");
+        assert!(published.iter().any(|event| matches!(
+            &event.event,
+            AgentEvent::ActivityStatusChanged {
+                status: AgentActivityStatus::Finalizing,
+                ..
+            }
+        )));
+        assert!(published.iter().any(|event| matches!(
+            &event.event,
+            AgentEvent::TextReset { item_id, .. } if item_id == &completed.id
+        )));
+    }
+
+    #[tokio::test]
+    async fn completion_guard_fails_after_one_unsuccessful_reconciliation_request() {
+        let (_directory, repository, runtime, thread_id) = runtime_fixture().await;
+        let guard_results = Arc::new(Mutex::new(VecDeque::from([true, true])));
+        let guard_results_for_runtime = guard_results.clone();
+        let runtime = runtime.with_turn_completion_guard(Arc::new(move |_| {
+            Ok(guard_results_for_runtime
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(true))
+        }));
+        let provider = Arc::new(FakeProvider::script(vec![
+            vec![
+                Ok(ProviderEvent::TextDelta {
+                    delta: "第一份草稿".into(),
+                }),
+                Ok(ProviderEvent::Completed),
+            ],
+            vec![
+                Ok(ProviderEvent::TextDelta {
+                    delta: "第二份草稿".into(),
+                }),
+                Ok(ProviderEvent::Completed),
+            ],
+        ]));
+        let outcome = runtime
+            .run_turn(
+                provider.clone(),
+                "fixture".into(),
+                RunTurnRequest {
+                    thread_id: thread_id.clone(),
+                    input: "执行计划任务".into(),
+                    agent_mode: None,
+                },
+                CancellationToken::new(),
+                Arc::new(RecordingPublisher::default()),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.state, TurnState::Failed);
+        assert_eq!(provider.requests().len(), 2);
+        let events = repository.load(&thread_id).await.unwrap();
+        assert!(events.iter().any(|event| matches!(
+            event.kind,
+            StoredEventKind::TurnFailed { ref message, .. }
+                if message.contains("计划收尾同步失败")
+        )));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event.kind, StoredEventKind::AssistantMessage { .. }))
         );
     }
 
@@ -6100,6 +6384,8 @@ mod tests {
         assert!(record.fields.get("callId").is_none());
         assert!(record.fields.get("turnId").is_none());
         assert_eq!(record.fields["itemStatus"], "failed");
+        // 事后查因要能判定是哪一条指令失败，失败调用的参数本体保留在日志里。
+        assert_eq!(record.fields["arguments"]["path"], "missing-directory");
         let output = record.fields["output"].as_str().unwrap();
         assert!(output.contains("missing-directory"));
         assert!(output.len() <= MAX_TOOL_FAILURE_OUTPUT_BYTES);

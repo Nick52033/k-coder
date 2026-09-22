@@ -358,10 +358,31 @@ export interface ThreadModelSelectionResult {
   catalog: ProviderCatalogView;
 }
 
+export type TurnErrorCategory = "provider" | "authentication" | "policy" | "tool" | "storage" | "protocol" | "runtime" | "legacy";
+
+export interface TurnError {
+  code: string;
+  message: string;
+  retryable: boolean;
+  category: TurnErrorCategory;
+  details?: Record<string, unknown> | null;
+}
+
+/** 兼容旧版历史快照：旧事件只保存了错误文本，新事件保存结构化 TurnError。 */
+export type TurnErrorValue = TurnError | string;
+
+export function turnErrorMessage(error: TurnErrorValue | null | undefined): string {
+  return typeof error === "string" ? error : error?.message ?? "";
+}
+
+export function isProviderCallLimitError(error: TurnErrorValue | null | undefined): boolean {
+  return typeof error === "object" && error?.code === "provider_call_limit_exceeded";
+}
+
 export interface TurnSnapshot {
   turnId: string;
   state: TurnState;
-  error: string | null;
+  error: TurnErrorValue | null;
 }
 
 export interface ThreadDetail {
@@ -419,7 +440,7 @@ export interface ThreadTurn {
   id: string;
   userMessageId: string | null;
   state: TurnState;
-  error: string | null;
+  error: TurnErrorValue | null;
   startedAtMs: number | null;
   completedAtMs: number | null;
   durationMs: number | null;
@@ -996,6 +1017,7 @@ export type AgentEvent =
   | (EventBase & { type: "provider_stream_retry"; attempt: number; maxAttempts: number })
   | (EventBase & { type: "activity_status_changed"; status: AgentActivityStatus })
   | (EventBase & { type: "text_delta"; itemId: string; delta: string })
+  | (EventBase & { type: "text_reset"; itemId: string })
   | (EventBase & { type: "reasoning_summary_delta"; itemId: string; delta: string })
   | (EventBase & { type: "reasoning_summary_completed"; itemId: string; summary: string })
   | (EventBase & {
@@ -1043,7 +1065,7 @@ export type AgentEvent =
       completedAtMs: number;
       durationMs: number;
     })
-  | (EventBase & { type: "turn_failed"; message: string; startedAtMs: number; completedAtMs: number; durationMs: number })
+  | (EventBase & { type: "turn_failed"; message: string; error?: TurnError | null; startedAtMs: number; completedAtMs: number; durationMs: number })
   | (EventBase & { type: "turn_cancelled"; startedAtMs: number; completedAtMs: number; durationMs: number })
   | (EventBase & { type: "user_input_requested"; request: UserInputRequest })
   | (EventBase & {

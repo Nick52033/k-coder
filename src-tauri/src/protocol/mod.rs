@@ -8,7 +8,7 @@ use crate::storage::{
 pub mod memory;
 
 pub const PROTOCOL_VERSION: u32 = 1;
-pub const AGENT_EVENT_SCHEMA_VERSION: u32 = 8;
+pub const AGENT_EVENT_SCHEMA_VERSION: u32 = 10;
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -652,6 +652,15 @@ impl TurnError {
         let normalized = message.to_ascii_lowercase();
         let (code, retryable, category) = if normalized.contains("repeated_observation_loop") {
             ("repeated_observation_loop", true, TurnErrorCategory::Tool)
+        } else if normalized.contains("provider_call_limit_exceeded")
+            || normalized.contains("provider call limit")
+            || normalized.contains("模型调用硬上限")
+        {
+            (
+                "provider_call_limit_exceeded",
+                true,
+                TurnErrorCategory::Runtime,
+            )
         } else if normalized.contains("token_budget_exceeded")
             || normalized.contains("response_limit")
         {
@@ -684,6 +693,24 @@ impl TurnError {
             retryable,
             category,
             details: None,
+        }
+    }
+
+    pub fn provider_call_limit_exceeded(
+        message: String,
+        provider_calls: u32,
+        max_provider_calls: u32,
+    ) -> Self {
+        Self {
+            code: "provider_call_limit_exceeded".to_string(),
+            message,
+            retryable: true,
+            category: TurnErrorCategory::Runtime,
+            details: Some(serde_json::json!({
+                "providerCalls": provider_calls,
+                "maxProviderCalls": max_provider_calls,
+                "recovery": "new_turn",
+            })),
         }
     }
 }
@@ -823,7 +850,7 @@ impl AgentEvent {
                     AgentItemType::AgentMessage | AgentItemType::Reasoning => TurnPhase::Planning,
                 }
             }
-            Self::TextDelta { .. } => TurnPhase::Planning,
+            Self::TextDelta { .. } | Self::TextReset { .. } => TurnPhase::Planning,
             Self::ReasoningSummaryDelta { .. } | Self::ReasoningSummaryCompleted { .. } => {
                 TurnPhase::Planning
             }
@@ -903,6 +930,13 @@ pub enum AgentEvent {
         turn_id: String,
         item_id: String,
         delta: String,
+    },
+    /// 瞬时清空尚未落盘的流式正文；收尾请求复用同一个 assistant item 时使用。
+    /// 该事件不写入 JSONL，刷新恢复仍以最终 AssistantMessage 为准。
+    TextReset {
+        thread_id: String,
+        turn_id: String,
+        item_id: String,
     },
     ReasoningSummaryDelta {
         thread_id: String,
@@ -992,6 +1026,8 @@ pub enum AgentEvent {
         thread_id: String,
         turn_id: String,
         message: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<TurnError>,
         started_at_ms: u64,
         completed_at_ms: u64,
         duration_ms: u64,
@@ -1174,6 +1210,25 @@ mod tests {
         assert_eq!(error.category, TurnErrorCategory::Tool);
         assert!(error.retryable);
         assert!(error.message.contains("模型在文件未变化时仍反复读取"));
+    }
+
+    #[test]
+    fn provider_call_limit_error_preserves_new_turn_recovery_details() {
+        let error = TurnError::provider_call_limit_exceeded(
+            "单个 Turn 已达到模型调用硬上限（200 次）".into(),
+            200,
+            200,
+        );
+
+        assert_eq!(error.code, "provider_call_limit_exceeded");
+        assert!(error.retryable);
+        assert_eq!(error.category, TurnErrorCategory::Runtime);
+        assert_eq!(error.details.as_ref().unwrap()["providerCalls"], 200);
+        assert_eq!(error.details.as_ref().unwrap()["maxProviderCalls"], 200);
+        assert_eq!(error.details.as_ref().unwrap()["recovery"], "new_turn");
+        let encoded = serde_json::to_value(&error).unwrap();
+        assert_eq!(encoded["code"], "provider_call_limit_exceeded");
+        assert_eq!(encoded["details"]["recovery"], "new_turn");
     }
 
     #[test]
@@ -1365,6 +1420,49 @@ mod tests {
     }
 
     #[test]
+    fn failed_event_carries_structured_error_and_reads_legacy_payloads() {
+        let error = TurnError::provider_call_limit_exceeded(
+            "单个 Turn 已达到模型调用硬上限（200 次）".into(),
+            200,
+            200,
+        );
+        let event = AgentEventEnvelope::new(AgentEvent::TurnFailed {
+            thread_id: "thread-1".into(),
+            turn_id: "turn-1".into(),
+            message: error.message.clone(),
+            error: Some(error),
+            started_at_ms: 10,
+            completed_at_ms: 25,
+            duration_ms: 15,
+        });
+        let value = serde_json::to_value(event).expect("failed event should serialize");
+
+        assert_eq!(value["type"], "turn_failed");
+        assert_eq!(value["error"]["code"], "provider_call_limit_exceeded");
+        assert_eq!(value["error"]["details"]["providerCalls"], 200);
+        assert_eq!(value["error"]["details"]["maxProviderCalls"], 200);
+        assert_eq!(value["error"]["details"]["recovery"], "new_turn");
+
+        let legacy = serde_json::json!({
+            "schemaVersion": 8,
+            "phase": "failed",
+            "type": "turn_failed",
+            "threadId": "thread-1",
+            "turnId": "turn-legacy",
+            "message": "provider failed",
+            "startedAtMs": 10,
+            "completedAtMs": 25,
+            "durationMs": 15,
+        });
+        let parsed: AgentEventEnvelope =
+            serde_json::from_value(legacy).expect("legacy failed event should remain readable");
+        assert!(matches!(
+            parsed.event,
+            AgentEvent::TurnFailed { error: None, .. }
+        ));
+    }
+
+    #[test]
     fn usage_event_separates_turn_totals_from_the_active_context_window() {
         let event = AgentEventEnvelope::new(AgentEvent::UsageUpdated {
             thread_id: "thread-1".to_string(),
@@ -1470,6 +1568,21 @@ mod tests {
         assert_eq!(value["type"], "text_delta");
         assert_eq!(value["itemId"], "agent-message-1");
         assert_eq!(value["delta"], "hello");
+    }
+
+    #[test]
+    fn assistant_text_reset_is_a_versioned_transient_event() {
+        let event = AgentEventEnvelope::new(AgentEvent::TextReset {
+            thread_id: "thread-1".into(),
+            turn_id: "turn-1".into(),
+            item_id: "agent-message-1".into(),
+        });
+        let value = serde_json::to_value(event).unwrap();
+
+        assert_eq!(value["schemaVersion"], AGENT_EVENT_SCHEMA_VERSION);
+        assert_eq!(value["type"], "text_reset");
+        assert_eq!(value["phase"], "planning");
+        assert_eq!(value["itemId"], "agent-message-1");
     }
 
     #[test]

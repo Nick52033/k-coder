@@ -16,8 +16,10 @@ import {
   LoaderCircle,
   RotateCcw,
   SquareTerminal,
+  Wrench,
 } from "lucide-react";
 import { lazy, memo, Suspense, useEffect, useRef, useState, type ReactNode } from "react";
+import { isProviderCallLimitError } from "../types/runtime";
 import type {
   AgentActivityStatus,
   ChangeSet,
@@ -25,13 +27,13 @@ import type {
   ToolActivity,
   ToolOutputDelta,
   TimelineEventKind,
+  TurnErrorValue,
   TurnTimelineItem,
 } from "../types/runtime";
 import { changeLineStats } from "../lib/diff";
 import { DELEGATION_TOOL_NAMES, subagentIdsOf } from "../lib/subagent";
 import { PlanProgress } from "./PlanProgress";
 import { RetryWaitingLabel } from "./RetryWaitingLabel";
-import { BrandMark } from "./BrandMark";
 
 const ReadOnlyCodeEditor = lazy(() => import("./CodeEditor").then((module) => ({ default: module.CodeEditor })));
 const ChangeCodeDiffEditor = lazy(() => import("./CodeEditor").then((module) => ({ default: module.CodeDiffEditor })));
@@ -63,6 +65,7 @@ export const ConversationTurnActivity = memo(function ConversationTurnActivity({
   finalMessageId,
   renderText,
   onRetry,
+  failureError,
   subagentTaskIndex,
   onFocusSubagent,
 }: {
@@ -84,6 +87,8 @@ export const ConversationTurnActivity = memo(function ConversationTurnActivity({
   finalMessageId?: string;
   renderText?: (text: string) => ReactNode;
   onRetry?: () => void;
+  /** 终态失败的结构化错误；旧历史允许只提供错误文本。 */
+  failureError?: TurnErrorValue | null;
   /** Maps a subagent id to its 1-based `taskN` label within the active thread. */
   subagentTaskIndex?: Record<string, number>;
   onFocusSubagent?: (agentId: string) => void;
@@ -160,6 +165,7 @@ export const ConversationTurnActivity = memo(function ConversationTurnActivity({
     : terminalEvent
       ? terminalMeta || "已结束"
       : toolCount ? `${toolCount} 个操作` : "处理中";
+  const providerCallLimitExceeded = isProviderCallLimitError(failureError);
   const statusLabel = paced.pendingTextIds.size
     ? "生成回复中"
     : activityStatus ? {
@@ -232,13 +238,13 @@ export const ConversationTurnActivity = memo(function ConversationTurnActivity({
           <div className="turn-failure-detail">
             <CircleAlert size={16} aria-hidden="true" />
             <div className="turn-failure-copy">
-              <strong>错误原因</strong>
+              <strong>{providerCallLimitExceeded ? "本轮已达到安全上限" : "错误原因"}</strong>
               <small>{terminalEvent.detail || "本轮未能完成，且没有返回更多错误信息。"}</small>
             </div>
             {onRetry ? (
               <button className="turn-retry-button" type="button" onClick={onRetry}>
                 <RotateCcw size={14} aria-hidden="true" />
-                <span>重试</span>
+                <span>{providerCallLimitExceeded ? "开启新 Turn" : "重试"}</span>
               </button>
             ) : null}
           </div>
@@ -703,6 +709,8 @@ function ToolActivityGroup({
           ? "等待执行"
           : "已完成";
   const active = state === "running" || state === "pending";
+  // Codex 式标记：行首用内容类型图标（命令组=终端，其他操作=工具），不用产品 Logo。
+  const GroupMarker = allCommands ? SquareTerminal : Wrench;
   // Follow activity only until the user chooses; subsequent tools must not reset that choice.
   const [userExpanded, setUserExpanded] = useState<boolean | null>(null);
   const expanded = userExpanded ?? active;
@@ -718,7 +726,7 @@ function ToolActivityGroup({
           setUserExpanded((previous) => !(previous ?? active));
         }}
       >
-        <span className="turn-tool-group-marker" aria-hidden="true"><BrandMark size={14} /></span>
+        <span className="turn-tool-group-marker" aria-hidden="true"><GroupMarker size={14} aria-hidden="true" /></span>
         <span className="turn-tool-group-copy">
           <span className="turn-disclosure-title">{title}</span>
           {expanded ? (
