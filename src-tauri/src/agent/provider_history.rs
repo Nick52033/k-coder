@@ -50,17 +50,13 @@ pub(super) fn provider_history(events: Vec<StoredEvent>, supports_vision: bool) 
     let mut history = Vec::new();
     let mut summary = None;
     let mut user_context = CompactionUserContext::default();
-    let mut latest_image_message = None;
+    let mut latest_image_message: Option<ProviderMessage> = None;
     let mut questions = HashMap::new();
     let mut assistant_progress = Vec::new();
     for event in events {
         let message = match event.kind {
             StoredEventKind::UserMessage { message } => {
                 let message = chat_to_provider(message, supports_vision);
-                if matches!(&message, Some(ProviderMessage::UserContent { images, .. }) if !images.is_empty())
-                {
-                    latest_image_message = message.clone();
-                }
                 if let Some(text) = message.as_ref().and_then(context::user_message_text) {
                     user_context.observe(text);
                 }
@@ -142,6 +138,14 @@ pub(super) fn provider_history(events: Vec<StoredEvent>, supports_vision: bool) 
             _ => None,
         };
         if let Some(message) = message {
+            if matches!(
+                &message,
+                ProviderMessage::UserContent { images, .. }
+                    | ProviderMessage::AssistantImageReference { images, .. }
+                    if !images.is_empty()
+            ) {
+                latest_image_message = Some(message.clone());
+            }
             assistant_progress = context::assistant_progress_history(
                 assistant_progress,
                 std::slice::from_ref(&message),
@@ -424,6 +428,59 @@ mod tests {
                 .request_messages()
                 .iter()
                 .any(|m| matches!(m, ProviderMessage::UserContent { .. }))
+        );
+    }
+
+    #[test]
+    fn restored_compaction_preserves_latest_assistant_generated_image_reference() {
+        let message = crate::protocol::ChatMessage {
+            schema_version: crate::protocol::PROTOCOL_VERSION,
+            id: "assistant-image".into(),
+            role: crate::protocol::MessageRole::Assistant,
+            content: vec![
+                crate::protocol::ContentBlock::Text {
+                    text: "已生成一张图片。".into(),
+                },
+                crate::protocol::ContentBlock::Image {
+                    name: "generated.png".into(),
+                    data_url: "data:image/png;base64,AA==".into(),
+                },
+            ],
+            created_at_ms: 1,
+        };
+        let provider_message = chat_to_provider(message.clone(), true).unwrap();
+        let (summary, _) = context::compact(
+            std::slice::from_ref(&provider_message),
+            2_000,
+            None,
+            &CompactionUserContext::default(),
+        );
+        let events = vec![
+            StoredEvent::new(
+                "thread",
+                None,
+                StoredEventKind::AssistantMessage { message },
+            ),
+            StoredEvent::new(
+                "thread",
+                None,
+                StoredEventKind::ContextCompacted {
+                    summary,
+                    automatic: true,
+                },
+            ),
+        ];
+
+        assert!(
+            provider_history(events.clone(), true)
+                .request_messages()
+                .contains(&provider_message)
+        );
+        assert!(
+            !provider_history(events, false)
+                .request_messages()
+                .iter()
+                .any(|message| matches!(message, ProviderMessage::AssistantImageReference { .. }))
         );
     }
 

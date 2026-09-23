@@ -253,6 +253,13 @@ fn responses_input(messages: &[ProviderMessage]) -> Vec<Value> {
                     })))
                     .collect::<Vec<_>>()
             })],
+            ProviderMessage::AssistantImageReference { text, .. } => {
+                if text.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![json!({ "role": "assistant", "content": text })]
+                }
+            }
             ProviderMessage::AssistantToolCalls { text, calls } => std::iter::once(text)
                 .filter(|text| !text.is_empty())
                 .map(|text| json!({ "role": "assistant", "content": text }))

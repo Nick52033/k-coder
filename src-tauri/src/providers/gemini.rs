@@ -311,6 +311,10 @@ fn gemini_contents(messages: &[ProviderMessage]) -> Vec<Value> {
                     }))
                     .collect::<Vec<_>>()
             })),
+            ProviderMessage::AssistantImageReference { text, .. } => Some(json!({
+                "role": "model",
+                "parts": [{ "text": text }]
+            })),
             ProviderMessage::AssistantToolCalls { text, calls } => {
                 let parts = std::iter::once(text).filter(|text| !text.is_empty()).map(|text| {
                     json!({ "text": text })

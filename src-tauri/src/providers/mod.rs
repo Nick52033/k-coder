@@ -70,6 +70,10 @@ pub enum ProviderMessage {
         text: String,
         images: Vec<ProviderImage>,
     },
+    AssistantImageReference {
+        text: String,
+        images: Vec<ProviderImage>,
+    },
     AssistantToolCalls {
         text: String,
         calls: Vec<ToolCall>,

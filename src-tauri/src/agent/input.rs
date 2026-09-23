@@ -116,13 +116,12 @@ pub(super) fn chat_to_provider(
             ContentBlock::Text { .. } | ContentBlock::Context { .. } => None,
         })
         .collect::<Vec<_>>();
-    if message.role == MessageRole::User && !images.is_empty() {
-        Some(ProviderMessage::UserContent { text, images })
-    } else {
-        Some(ProviderMessage::Text {
-            role: message.role,
-            text,
-        })
+    match (message.role, images.is_empty()) {
+        (MessageRole::User, false) => Some(ProviderMessage::UserContent { text, images }),
+        (MessageRole::Assistant, false) => {
+            Some(ProviderMessage::AssistantImageReference { text, images })
+        }
+        (role, _) => Some(ProviderMessage::Text { role, text }),
     }
 }
 
@@ -139,4 +138,41 @@ fn validate_input(input: &str, allow_empty: bool) -> Result<String, AgentRuntime
         )));
     }
     Ok(input.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn assistant_generated_images_become_reference_inputs_for_vision_providers() {
+        let message = ChatMessage {
+            schema_version: PROTOCOL_VERSION,
+            id: "assistant-image".into(),
+            role: MessageRole::Assistant,
+            content: vec![
+                ContentBlock::Text {
+                    text: "已生成一张图片。".into(),
+                },
+                ContentBlock::Image {
+                    name: "generated.png".into(),
+                    data_url: "data:image/png;base64,AA==".into(),
+                },
+            ],
+            created_at_ms: 1,
+        };
+
+        assert!(matches!(
+            chat_to_provider(message.clone(), true),
+            Some(ProviderMessage::AssistantImageReference { text, images })
+                if text == "已生成一张图片。"
+                    && images.len() == 1
+                    && images[0].data_url == "data:image/png;base64,AA=="
+        ));
+        assert!(matches!(
+            chat_to_provider(message, false),
+            Some(ProviderMessage::Text { role: MessageRole::Assistant, text })
+                if text == "已生成一张图片。"
+        ));
+    }
 }

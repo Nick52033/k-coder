@@ -362,6 +362,10 @@ fn anthropic_messages(messages: &[ProviderMessage]) -> Vec<Value> {
                     }))
                     .collect::<Vec<_>>()
             })),
+            ProviderMessage::AssistantImageReference { text, .. } => result.push(json!({
+                "role": "assistant",
+                "content": text
+            })),
             ProviderMessage::AssistantToolCalls { text, calls } => result.push(json!({
                 "role": "assistant",
                 "content": std::iter::once(text).filter(|text| !text.is_empty()).map(|text| {

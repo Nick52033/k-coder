@@ -641,6 +641,10 @@ fn chat_messages(messages: &[ProviderMessage]) -> Vec<Value> {
                     })))
                     .collect::<Vec<_>>()
             })),
+            ProviderMessage::AssistantImageReference { text, .. } => Some(json!({
+                "role": "assistant",
+                "content": text
+            })),
             ProviderMessage::AssistantToolCalls { text, calls } => Some(json!({
                 "role": "assistant",
                 "content": if text.is_empty() { Value::Null } else { Value::String(text.clone()) },
@@ -817,6 +821,12 @@ fn deepseek_chat_messages(
                     ));
                 }
                 wire.push(json!({ "role": "user", "content": text }));
+            }
+            ProviderMessage::AssistantImageReference { text, .. } => {
+                push_plain_assistant_context(
+                    &mut wire,
+                    sanitize_deepseek_assistant_text(text, &legacy_artifacts),
+                );
             }
             ProviderMessage::AssistantToolCalls { text, calls } => {
                 let text = sanitize_deepseek_assistant_text(text, &legacy_artifacts);

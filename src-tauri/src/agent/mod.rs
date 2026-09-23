@@ -5328,6 +5328,7 @@ mod tests {
                 .any(|message| match message {
                     ProviderMessage::Text { text, .. }
                     | ProviderMessage::UserContent { text, .. }
+                    | ProviderMessage::AssistantImageReference { text, .. }
                     | ProviderMessage::AssistantToolCalls { text, .. } => text.contains("安全摘要"),
                     ProviderMessage::ToolResult { .. }
                     | ProviderMessage::ProviderContext { .. } => false,

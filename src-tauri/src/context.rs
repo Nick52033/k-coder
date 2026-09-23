@@ -379,7 +379,12 @@ pub fn compact(
     // Text summaries cannot stand in for pixels. Retain one bounded upload batch,
     // even when tool output or a workspace mutation pushed it out of the tail.
     if let Some(image_message) = messages.iter().rev().find(|message| {
-        matches!(message, ProviderMessage::UserContent { images, .. } if !images.is_empty())
+        matches!(
+            message,
+            ProviderMessage::UserContent { images, .. }
+                | ProviderMessage::AssistantImageReference { images, .. }
+                if !images.is_empty()
+        )
     }) {
         if !kept.contains(image_message) {
             kept.insert(0, image_message.clone());
@@ -751,6 +756,9 @@ fn message_chars(message: &ProviderMessage) -> usize {
     match message {
         ProviderMessage::Text { text, .. } => text.len(),
         ProviderMessage::UserContent { text, images } => text.len() + images.len() * 4096,
+        ProviderMessage::AssistantImageReference { text, images } => {
+            text.len() + images.len() * 4096
+        }
         ProviderMessage::AssistantToolCalls { text, calls } => {
             text.len()
                 + calls

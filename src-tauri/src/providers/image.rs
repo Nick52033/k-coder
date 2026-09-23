@@ -13,6 +13,8 @@ use crate::protocol::MessageRole;
 
 const IMAGE_REQUEST_TIMEOUT_SECONDS: u64 = 300;
 const MAX_PROMPT_BYTES: usize = 32 * 1024;
+const IMAGE_CONTEXT_HEADER: &str = "Previous conversation context (oldest first):\n";
+const CURRENT_IMAGE_REQUEST_HEADER: &str = "\nCurrent image request:\n";
 const MAX_IMAGE_INPUT_BYTES: usize = 12 * 1024 * 1024;
 const MAX_RESPONSE_BODY_BYTES: usize = 16 * 1024 * 1024;
 const MAX_GENERATED_IMAGE_BYTES: usize = 8 * 1024 * 1024;
@@ -79,17 +81,22 @@ impl OpenAiImageGenerationsProvider {
     async fn send_request(
         &self,
         endpoint: reqwest::Url,
-        payload: &Value,
+        request: &ImageGenerationRequest,
         cancellation: &CancellationToken,
     ) -> Result<Response, ProviderError> {
+        let mut builder = self
+            .client
+            .post(endpoint)
+            .bearer_auth(&self.api_key)
+            .header(reqwest::header::ACCEPT, "application/json");
+        if request.image.is_some() || request.mask.is_some() {
+            builder = builder.multipart(build_edit_form(request)?);
+        } else {
+            builder = builder.json(&build_payload(request)?);
+        }
         tokio::select! {
             _ = cancellation.cancelled() => Err(ProviderError::Cancelled),
-            response = self.client
-                .post(endpoint)
-                .bearer_auth(&self.api_key)
-                .header(reqwest::header::ACCEPT, "application/json")
-                .json(payload)
-                .send() => response.map_err(|error| ProviderError::Request(error.to_string())),
+            response = builder.send() => response.map_err(|error| ProviderError::Request(error.to_string())),
         }
     }
 
@@ -102,12 +109,13 @@ impl OpenAiImageGenerationsProvider {
         request: ImageGenerationRequest,
         cancellation: &CancellationToken,
     ) -> Result<Vec<GeneratedImage>, ProviderError> {
-        let payload = build_payload(&request)?;
-        let endpoint = self
-            .config
-            .images_generations_url()
-            .map_err(|error| ProviderError::Request(error.to_string()))?;
-        let response = self.send_request(endpoint, &payload, cancellation).await?;
+        let endpoint = if request.image.is_some() || request.mask.is_some() {
+            self.config.images_edits_url()
+        } else {
+            self.config.images_generations_url()
+        }
+        .map_err(|error| ProviderError::Request(error.to_string()))?;
+        let response = self.send_request(endpoint, &request, cancellation).await?;
         if !response.status().is_success() {
             let status = response.status().as_u16();
             let retry_after = super::common::retry_after(&response);
@@ -132,32 +140,47 @@ impl OpenAiImageGenerationsProvider {
     fn request_from_provider(
         request: &ProviderRequest,
     ) -> Result<ImageGenerationRequest, ProviderError> {
-        let mut prompt = None;
-        let mut image = None;
-        for message in request.messages.iter().rev() {
-            match message {
+        let current_message_index = request.messages.iter().rposition(|message| match message {
+            ProviderMessage::Text {
+                role: MessageRole::User,
+                text,
+            } => !text.trim().is_empty(),
+            ProviderMessage::UserContent { text, .. } => !text.trim().is_empty(),
+            _ => false,
+        });
+        let (current_request, current_images) = if let Some(index) = current_message_index {
+            match &request.messages[index] {
                 ProviderMessage::Text {
                     role: MessageRole::User,
                     text,
-                } => {
-                    prompt = Some(text.clone());
-                    break;
-                }
+                } => (Some(text.as_str()), None),
                 ProviderMessage::UserContent { text, images } => {
-                    prompt = Some(text.clone());
-                    image = images.first().map(|value| value.data_url.clone());
-                    break;
+                    (Some(text.as_str()), Some(images.as_slice()))
                 }
-                _ => {}
+                _ => (None, None),
             }
-        }
-        let prompt = prompt
-            .filter(|value| !value.trim().is_empty())
-            .ok_or_else(|| {
-                ProviderError::InvalidToolArguments(
-                    "image generation requires a non-empty user prompt".to_string(),
-                )
-            })?;
+        } else {
+            (None, None)
+        };
+        let current_request = current_request.ok_or_else(|| {
+            ProviderError::InvalidToolArguments(
+                "image generation requires a non-empty user prompt".to_string(),
+            )
+        })?;
+        let history = &request.messages[..current_message_index.unwrap_or_default()];
+        let prompt = image_prompt_with_context(history, current_request);
+        let image = current_images
+            .and_then(|images| images.first())
+            .map(|value| value.data_url.clone())
+            .or_else(|| {
+                history.iter().rev().find_map(|message| match message {
+                    ProviderMessage::UserContent { images, .. }
+                    | ProviderMessage::AssistantImageReference { images, .. } => {
+                        images.first().map(|value| value.data_url.clone())
+                    }
+                    _ => None,
+                })
+            });
         Ok(ImageGenerationRequest {
             model: request.model.clone(),
             prompt,
@@ -170,6 +193,160 @@ impl OpenAiImageGenerationsProvider {
             mask: None,
         })
     }
+}
+
+fn image_prompt_with_context(messages: &[ProviderMessage], current_request: &str) -> String {
+    let current_request = if current_request.len() > MAX_PROMPT_BYTES {
+        format!(
+            "{}…",
+            truncate_utf8(current_request, MAX_PROMPT_BYTES - '…'.len_utf8())
+        )
+    } else {
+        current_request.to_string()
+    };
+    let context = messages
+        .iter()
+        .filter_map(|message| match message {
+            ProviderMessage::Text {
+                role: MessageRole::User,
+                text,
+            }
+            | ProviderMessage::UserContent { text, .. }
+                if !text.trim().is_empty() =>
+            {
+                Some(("User: ", text.as_str()))
+            }
+            ProviderMessage::Text {
+                role: MessageRole::Assistant,
+                text,
+            }
+            | ProviderMessage::AssistantToolCalls { text, .. }
+                if !text.trim().is_empty() =>
+            {
+                Some(("Assistant: ", text.as_str()))
+            }
+            ProviderMessage::AssistantImageReference { text, .. } if !text.trim().is_empty() => {
+                Some(("Assistant: ", text.as_str()))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if context.is_empty() {
+        return current_request;
+    }
+
+    let framing_bytes = IMAGE_CONTEXT_HEADER.len() + CURRENT_IMAGE_REQUEST_HEADER.len();
+    let Some(mut remaining) =
+        MAX_PROMPT_BYTES.checked_sub(current_request.len().saturating_add(framing_bytes))
+    else {
+        return current_request;
+    };
+    let mut selected = Vec::new();
+    for (role, text) in context.into_iter().rev() {
+        let required_bytes = role.len().saturating_add(text.len()).saturating_add(1);
+        if required_bytes <= remaining {
+            selected.push(format!("{role}{text}"));
+            remaining -= required_bytes;
+            continue;
+        }
+
+        // Preserve the newest text context. If it is too long, keep its leading
+        // portion and stop before older text messages.
+        let text_budget = remaining.saturating_sub(role.len().saturating_add(1));
+        if selected.is_empty() && text_budget > '…'.len_utf8() {
+            let prefix = truncate_utf8(text, text_budget - '…'.len_utf8());
+            if !prefix.is_empty() {
+                selected.push(format!("{role}{prefix}…"));
+            }
+        }
+        break;
+    }
+    if selected.is_empty() {
+        return current_request;
+    }
+    selected.reverse();
+
+    let mut prompt = String::with_capacity(MAX_PROMPT_BYTES - remaining);
+    prompt.push_str(IMAGE_CONTEXT_HEADER);
+    for line in selected {
+        prompt.push_str(&line);
+        prompt.push('\n');
+    }
+    prompt.push_str(CURRENT_IMAGE_REQUEST_HEADER);
+    prompt.push_str(&current_request);
+    prompt
+}
+
+fn build_edit_form(
+    request: &ImageGenerationRequest,
+) -> Result<reqwest::multipart::Form, ProviderError> {
+    validate_request(request)?;
+    let mut form = reqwest::multipart::Form::new()
+        .text("model", request.model.clone())
+        .text("prompt", request.prompt.clone())
+        .text(
+            "response_format",
+            request.response_format.as_str().to_string(),
+        );
+    if let Some(value) = request.cfg_scale {
+        form = form.text("cfg_scale", value.to_string());
+    }
+    if let Some(value) = request.steps {
+        form = form.text("steps", value.to_string());
+    }
+    if let Some(value) = request.seed {
+        form = form.text("seed", value.to_string());
+    }
+    if let Some(value) = request.text_mode {
+        form = form.text("text_mode", value.to_string());
+    }
+    if let Some(value) = &request.image {
+        form = form.part("image[]", image_part(value, "reference")?);
+    }
+    if let Some(value) = &request.mask {
+        form = form.part("mask", image_part(value, "mask")?);
+    }
+    Ok(form)
+}
+
+fn image_part(value: &str, label: &str) -> Result<reqwest::multipart::Part, ProviderError> {
+    let (mime_type, encoded) = super::split_image_data_url(value).ok_or_else(|| {
+        ProviderError::InvalidToolArguments(format!(
+            "image generation {label} input must be a base64 data URL"
+        ))
+    })?;
+    let extension = match mime_type {
+        "image/png" => "png",
+        "image/jpeg" => "jpg",
+        "image/webp" => "webp",
+        _ => {
+            return Err(ProviderError::InvalidToolArguments(format!(
+                "image generation {label} input must be PNG, JPEG, or WebP"
+            )));
+        }
+    };
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|_| {
+            ProviderError::InvalidToolArguments(format!(
+                "image generation {label} input contains invalid base64"
+            ))
+        })?;
+    reqwest::multipart::Part::bytes(bytes)
+        .file_name(format!("{label}.{extension}"))
+        .mime_str(mime_type)
+        .map_err(|error| ProviderError::InvalidToolArguments(error.to_string()))
+}
+
+fn truncate_utf8(value: &str, max_bytes: usize) -> &str {
+    if value.len() <= max_bytes {
+        return value;
+    }
+    let mut end = max_bytes;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
 }
 
 #[async_trait::async_trait]
@@ -398,6 +575,87 @@ mod tests {
     }
 
     #[test]
+    fn provider_request_includes_recent_conversation_and_previous_generated_image() {
+        let request = ProviderRequest {
+            schema_version: PROTOCOL_VERSION,
+            model: "gpt-image-1".into(),
+            reasoning_effort: Default::default(),
+            messages: vec![
+                ProviderMessage::Text {
+                    role: MessageRole::User,
+                    text: "画一位戴红围巾的宇航员，水彩风格".into(),
+                },
+                ProviderMessage::AssistantImageReference {
+                    text: String::new(),
+                    images: vec![crate::providers::ProviderImage {
+                        name: "generated.png".into(),
+                        data_url: "data:image/png;base64,AA==".into(),
+                    }],
+                },
+                ProviderMessage::ToolResult {
+                    call_id: "call-1".into(),
+                    name: "read_file".into(),
+                    success: true,
+                    output: "must not be sent to an image model".into(),
+                },
+                ProviderMessage::Text {
+                    role: MessageRole::User,
+                    text: "把背景改成月球表面".into(),
+                },
+            ],
+            tools: vec![],
+        };
+
+        let image_request = OpenAiImageGenerationsProvider::request_from_provider(&request)
+            .expect("image request should be assembled");
+
+        assert!(
+            image_request
+                .prompt
+                .contains("画一位戴红围巾的宇航员，水彩风格")
+        );
+        assert!(image_request.prompt.contains("Current image request:"));
+        assert!(image_request.prompt.contains("把背景改成月球表面"));
+        assert!(!image_request.prompt.contains("must not be sent"));
+        assert_eq!(
+            image_request.image.as_deref(),
+            Some("data:image/png;base64,AA==")
+        );
+    }
+
+    #[test]
+    fn image_context_is_bounded_and_keeps_the_newest_text_messages() {
+        let messages = vec![
+            ProviderMessage::Text {
+                role: MessageRole::User,
+                text: "oldest context".into(),
+            },
+            ProviderMessage::Text {
+                role: MessageRole::Assistant,
+                text: "older reply".into(),
+            },
+            ProviderMessage::Text {
+                role: MessageRole::User,
+                text: "x".repeat(MAX_PROMPT_BYTES),
+            },
+        ];
+
+        let prompt = image_prompt_with_context(&messages, "current request");
+
+        assert!(prompt.len() <= MAX_PROMPT_BYTES);
+        assert!(prompt.contains("current request"));
+        assert!(!prompt.contains("oldest context"));
+    }
+
+    #[test]
+    fn image_context_bounds_an_oversized_current_request() {
+        let prompt = image_prompt_with_context(&[], &"x".repeat(MAX_PROMPT_BYTES + 1));
+
+        assert!(prompt.len() <= MAX_PROMPT_BYTES);
+        assert!(prompt.ends_with('…'));
+    }
+
+    #[test]
     fn parses_b64_json_results_and_defaults_mime_type_to_png() {
         let images = parse_response(serde_json::json!({
             "data": [{ "b64_json": "AA==" }, { "b64_json": "AQ==", "mime_type": "image/jpeg" }]
@@ -533,5 +791,139 @@ mod tests {
         ));
         assert!(stream.next().await.is_none());
         server.await.expect("test server should finish");
+    }
+
+    #[tokio::test]
+    async fn provider_sends_conversation_context_and_prior_image_to_edits_endpoint() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test server should bind");
+        let address = listener
+            .local_addr()
+            .expect("server should have an address");
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("request should connect");
+            let mut request = Vec::new();
+            loop {
+                let mut chunk = [0_u8; 4096];
+                let read = socket.read(&mut chunk).await.expect("request should read");
+                assert!(read > 0, "request ended before headers");
+                request.extend_from_slice(&chunk[..read]);
+                if let Some(index) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                    let header_end = index + 4;
+                    let headers = String::from_utf8_lossy(&request[..header_end]);
+                    assert!(headers.contains("POST /v1/images/edits HTTP/1.1"));
+                    assert!(headers.lines().any(|line| {
+                        line.eq_ignore_ascii_case("authorization: Bearer test-key")
+                    }));
+                    assert!(
+                        headers.lines().any(|line| {
+                            line.to_ascii_lowercase().contains("multipart/form-data")
+                        })
+                    );
+                    let content_length = headers
+                        .lines()
+                        .filter_map(|line| line.split_once(':'))
+                        .find_map(|(name, value)| {
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().expect("valid length"))
+                        })
+                        .expect("multipart request should include content length");
+                    while request.len() < header_end + content_length {
+                        let read = socket
+                            .read(&mut chunk)
+                            .await
+                            .expect("request body should read");
+                        assert!(read > 0, "request ended before body");
+                        request.extend_from_slice(&chunk[..read]);
+                    }
+                    let body =
+                        String::from_utf8_lossy(&request[header_end..header_end + content_length]);
+                    assert!(body.contains("name=\"image[]\""));
+                    assert!(body.contains("name=\"model\""));
+                    assert!(body.contains("gpt-image-1"));
+                    assert!(body.contains("name=\"prompt\""));
+                    assert!(body.contains("戴红围巾的宇航员"));
+                    assert!(body.contains("Current image request:"));
+                    assert!(body.contains("把背景改成月球表面"));
+                    assert!(!body.contains("private tool output"));
+                    break;
+                }
+            }
+            let body = r#"{"data":[{"b64_json":"AA==","mime_type":"image/png"}]}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("response should write");
+        });
+
+        let config = ProviderConfig {
+            schema_version: PROTOCOL_VERSION,
+            id: "openai-image".into(),
+            kind: ProviderKind::OpenAiCompatible,
+            transport: ProviderTransport::OpenAiImageGenerations,
+            name: "OpenAI Images".into(),
+            base_url: format!("http://{address}/v1"),
+            model: "gpt-image-1".into(),
+            models: Vec::new(),
+            endpoints: Vec::new(),
+        };
+        let provider = OpenAiImageGenerationsProvider::new(config, "test-key".into())
+            .expect("image provider should build");
+        let request = ProviderRequest {
+            schema_version: PROTOCOL_VERSION,
+            model: "gpt-image-1".into(),
+            reasoning_effort: Default::default(),
+            messages: vec![
+                ProviderMessage::Text {
+                    role: MessageRole::User,
+                    text: "画一位戴红围巾的宇航员，水彩风格".into(),
+                },
+                ProviderMessage::AssistantImageReference {
+                    text: String::new(),
+                    images: vec![crate::providers::ProviderImage {
+                        name: "generated.png".into(),
+                        data_url: "data:image/png;base64,AA==".into(),
+                    }],
+                },
+                ProviderMessage::ToolResult {
+                    call_id: "call-1".into(),
+                    name: "read_file".into(),
+                    success: true,
+                    output: "private tool output".into(),
+                },
+                ProviderMessage::Text {
+                    role: MessageRole::User,
+                    text: "把背景改成月球表面".into(),
+                },
+            ],
+            tools: Vec::new(),
+        };
+        let mut stream = provider
+            .stream(request, CancellationToken::new())
+            .await
+            .expect("provider should return a stream");
+        assert!(matches!(
+            stream
+                .next()
+                .await
+                .expect("image event should exist")
+                .unwrap(),
+            ProviderEvent::Image { .. }
+        ));
+        assert!(matches!(
+            stream
+                .next()
+                .await
+                .expect("completion event should exist")
+                .unwrap(),
+            ProviderEvent::Completed
+        ));
+        server.await.expect("server should finish");
     }
 }

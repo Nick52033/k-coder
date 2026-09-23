@@ -1773,9 +1773,10 @@ fn model_supports_vision(
     config: &ProviderConfig,
     model: &crate::providers::ProviderModelConfig,
 ) -> bool {
-    model.supports_vision
-        && config.transport != ProviderTransport::DeepSeekChatCompletions
-        && !deepseek_dialect(config, &model.id)
+    config.transport == ProviderTransport::OpenAiImageGenerations
+        || (model.supports_vision
+            && config.transport != ProviderTransport::DeepSeekChatCompletions
+            && !deepseek_dialect(config, &model.id))
 }
 
 fn provider_target_specs(

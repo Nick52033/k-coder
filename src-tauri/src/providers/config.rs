@@ -267,6 +267,10 @@ impl ProviderConfig {
         self.endpoint_url("images/generations", "image generations")
     }
 
+    pub fn images_edits_url(&self) -> Result<Url, ProviderConfigError> {
+        self.endpoint_url("images/edits", "image edits")
+    }
+
     pub fn responses_url(&self) -> Result<Url, ProviderConfigError> {
         self.endpoint_url("responses", "responses")
     }
