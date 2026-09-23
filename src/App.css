@@ -2391,6 +2391,49 @@ button {
 
 .message-image-attachment span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
+.message-attachments--generated {
+  margin: 12px 0 0;
+  justify-content: flex-start;
+  gap: 12px;
+}
+
+.message-image-attachment--generated {
+  display: flex;
+  width: fit-content;
+  max-width: min(100%, 280px);
+  height: auto;
+  padding: 0;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 8px;
+  border: 0;
+  border-radius: var(--radius-md);
+  background: transparent;
+  cursor: zoom-in;
+}
+
+.message-image-attachment--generated:hover { background: transparent; }
+
+.message-image-attachment--generated img {
+  display: block;
+  width: auto;
+  height: auto;
+  max-width: min(100%, 280px);
+  max-height: min(200px, 32dvh);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  object-fit: contain;
+  transition: border-color var(--transition-fast);
+}
+
+.message-image-attachment--generated:hover img { border-color: var(--color-border-strong); }
+
+.message-image-attachment--generated span {
+  max-width: 100%;
+  color: var(--color-ink-muted);
+  font-size: var(--font-size-sm);
+}
+
 .image-preview-backdrop {
   position: fixed;
   z-index: 55;
@@ -2463,8 +2506,10 @@ button {
 
 .image-preview-stage img {
   display: block;
-  max-width: 100%;
-  max-height: 100%;
+  width: auto;
+  height: auto;
+  max-width: calc(100vw - 40px);
+  max-height: calc(100dvh - 88px);
   object-fit: contain;
 }
 

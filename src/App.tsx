@@ -1497,10 +1497,19 @@ function App() {
   ) {
     if (!message || !attachments?.length) return null;
     return (
-      <div className="message-attachments" aria-label={message.role === "user" ? "图片附件" : "生成的图片"}>
+      <div
+        className={cn(
+          "message-attachments",
+          message.role === "assistant" && "message-attachments--generated",
+        )}
+        aria-label={message.role === "user" ? "图片附件" : "生成的图片"}
+      >
         {attachments.map((attachment, index) => (
           <button
-            className="message-image-attachment"
+            className={cn(
+              "message-image-attachment",
+              message.role === "assistant" && "message-image-attachment--generated",
+            )}
             type="button"
             key={`${message.id}-${index}-${attachment.name}`}
             aria-label={`查看图片 ${attachment.name}`}
@@ -2581,7 +2590,7 @@ function App() {
                           <CopyMessageButton text={message.text} />
                         ) : null}
                       </div>
-                      {renderMessageAttachments(message)}
+                      {message.role === "user" ? renderMessageAttachments(message) : null}
                       {message.role === "assistant" && (
                         <ConversationTurnActivity
                           activities={messageActivities}
@@ -2615,6 +2624,8 @@ function App() {
                           </span>
                         ) : null}
                       </div> : null}
+
+                      {message.role === "assistant" ? renderMessageAttachments(message) : null}
 
                       {message.role === "assistant" ? renderMessageChanges(message.id, messageChanges) : null}
 

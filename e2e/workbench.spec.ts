@@ -4775,6 +4775,7 @@ test("sends images without frontend text recognition and opens the conversation 
   const imageMessage = page.locator(".message--user").filter({ has: page.locator(".message-image-attachment") });
   await expect(imageMessage.getByText("image-fixture.png", { exact: true })).toBeVisible();
   await expect(imageMessage.locator(".message-content")).toHaveCount(0);
+  await expect(imageMessage.locator(".message-image-attachment img")).toHaveCSS("width", "30px");
   await expect.poll(() => page.evaluate(() => (window as unknown as { __runTurnCalls: Array<{ request?: { input?: string } }> }).__runTurnCalls[0]?.request?.input)).toBe("");
   await expect.poll(() => page.evaluate(() => (window as unknown as { __runTurnCalls: Array<{ attachments?: unknown[] }> }).__runTurnCalls[0]?.attachments?.length)).toBe(1);
   await imageMessage.getByRole("button", { name: "查看图片 image-fixture.png" }).click();
@@ -4815,6 +4816,121 @@ test("sends images without frontend text recognition and opens the conversation 
   await expect(imageMessage.locator(".message-content")).toHaveCount(0);
   await imageMessage.getByRole("button", { name: "查看图片 image-fixture.png" }).click();
   await expect(page.getByRole("dialog", { name: "image-fixture.png" })).toBeVisible();
+  await page.getByRole("button", { name: "关闭图片预览" }).click();
+});
+
+test("renders generated images as clickable previews and fits the full image in the viewer", async ({ page }, testInfo) => {
+  await page.goto("/");
+  await page.evaluate(() => localStorage.setItem("kcoder_e2e_thread_detail", JSON.stringify({
+    schemaVersion: 1,
+    summary: { schemaVersion: 1, id: "thread-1", title: "Phase 6 workbench", createdAtMs: 1, updatedAtMs: 2, archived: false },
+    messages: [],
+    messageTurnIds: {},
+    turnUserMessageIds: {},
+    lastTurn: null,
+    toolActivities: [],
+    turnTimeline: [],
+    approvals: [],
+    userInputs: [],
+    changes: [],
+    todos: [],
+    lastUsage: null,
+  })));
+  await page.reload();
+
+  const dataUrl = await page.evaluate(() => {
+    const canvas = document.createElement("canvas");
+    canvas.width = 640;
+    canvas.height = 1200;
+    const context = canvas.getContext("2d")!;
+    context.fillStyle = "#315a72";
+    context.fillRect(0, 0, canvas.width, canvas.height);
+    context.fillStyle = "#f5f3ed";
+    context.font = "600 32px sans-serif";
+    context.fillText("Generated artwork", 48, 210);
+    return canvas.toDataURL("image/png");
+  });
+  const reply = "已经生成这张插画。";
+  await emitDisclosureEvents(page, [
+    {
+      type: "turn_started",
+      userMessage: {
+        schemaVersion: 1,
+        id: "message-generated-image-request",
+        role: "user",
+        content: [{ type: "text", text: "生成一张插画。" }],
+        createdAtMs: 1,
+      },
+    },
+    { type: "item_started", itemId: "message-generated-image-answer", itemType: "agent_message" },
+    { type: "text_delta", itemId: "message-generated-image-answer", delta: reply },
+    {
+      type: "turn_completed",
+      phase: "complete",
+      message: {
+        schemaVersion: 1,
+        id: "message-generated-image-answer",
+        role: "assistant",
+        content: [
+          { type: "text", text: reply },
+          { type: "image", name: "generated-image-1.png", dataUrl },
+        ],
+        createdAtMs: 2,
+      },
+      usage: null,
+      startedAtMs: 1,
+      completedAtMs: 2,
+      durationMs: 1,
+    },
+  ]);
+
+  const assistantMessage = page.locator(".message--assistant").last();
+  const generatedPreview = assistantMessage.locator(".message-image-attachment--generated");
+  const image = generatedPreview.locator("img");
+  await expect(assistantMessage.getByText(reply, { exact: true })).toBeVisible();
+  await expect(generatedPreview).toHaveAttribute("aria-label", "查看图片 generated-image-1.png");
+  await expect.poll(() => image.evaluate((element) => (element as HTMLImageElement).naturalWidth)).toBe(640);
+
+  const imageBounds = await image.boundingBox();
+  const userReplyBounds = await page.locator(".message--user").last().locator(".message-content").boundingBox();
+  expect(imageBounds).not.toBeNull();
+  expect(userReplyBounds).not.toBeNull();
+  expect(imageBounds!.width).toBeLessThanOrEqual(280);
+  expect(imageBounds!.height).toBeLessThanOrEqual(200);
+  expect(imageBounds!.x).toBeLessThan(userReplyBounds!.x);
+  expect(await assistantMessage.evaluate((element) => {
+    const replyElement = element.querySelector(".turn-final-response");
+    const imageElement = element.querySelector(".message-attachments--generated");
+    return Boolean(replyElement && imageElement && (
+      replyElement.compareDocumentPosition(imageElement) & Node.DOCUMENT_POSITION_FOLLOWING
+    ));
+  })).toBe(true);
+
+  await generatedPreview.click();
+  const imageDialog = page.getByRole("dialog", { name: "generated-image-1.png" });
+  const viewerImage = imageDialog.locator(".image-preview-stage img");
+  const stage = imageDialog.locator(".image-preview-stage");
+  await expect(imageDialog).toBeVisible();
+  await expect.poll(() => viewerImage.evaluate((element) => (element as HTMLImageElement).naturalHeight)).toBe(1200);
+
+  const viewerImageBounds = await viewerImage.boundingBox();
+  const stageBounds = await stage.boundingBox();
+  expect(viewerImageBounds).not.toBeNull();
+  expect(stageBounds).not.toBeNull();
+  expect(viewerImageBounds!.x).toBeGreaterThanOrEqual(stageBounds!.x);
+  expect(viewerImageBounds!.y).toBeGreaterThanOrEqual(stageBounds!.y);
+  expect(viewerImageBounds!.x + viewerImageBounds!.width).toBeLessThanOrEqual(stageBounds!.x + stageBounds!.width);
+  expect(viewerImageBounds!.y + viewerImageBounds!.height).toBeLessThanOrEqual(stageBounds!.y + stageBounds!.height);
+
+  if (testInfo.project.name === "narrow") await page.setViewportSize({ width: 375, height: 667 });
+  const narrowViewerImageBounds = await viewerImage.boundingBox();
+  const narrowStageBounds = await stage.boundingBox();
+  expect(narrowViewerImageBounds).not.toBeNull();
+  expect(narrowStageBounds).not.toBeNull();
+  expect(narrowViewerImageBounds!.x).toBeGreaterThanOrEqual(narrowStageBounds!.x);
+  expect(narrowViewerImageBounds!.y).toBeGreaterThanOrEqual(narrowStageBounds!.y);
+  expect(narrowViewerImageBounds!.x + narrowViewerImageBounds!.width).toBeLessThanOrEqual(narrowStageBounds!.x + narrowStageBounds!.width);
+  expect(narrowViewerImageBounds!.y + narrowViewerImageBounds!.height).toBeLessThanOrEqual(narrowStageBounds!.y + narrowStageBounds!.height);
   await page.getByRole("button", { name: "关闭图片预览" }).click();
 });
 
