@@ -35,7 +35,7 @@ for %%A in (%*) do (
 
 set STAMP=%REPO%\src-tauri\target\.kc-deploy-stamp
 if "%FULL_BUILD%"=="1" (set MODE=full) else (set MODE=fast)
-set RC=0
+set EXIT_CODE=0
 
 title k-Coder Build and Deploy
 echo ============================================================
@@ -90,6 +90,34 @@ if "!HASH!"=="" (
 )
 
 echo      Building release (%MODE%), this may take a while on first run...
+
+rem --- Resolve the Windows SDK resource compiler for Cargo's build script ---
+set "WINSDK_BIN_ROOT=%ProgramFiles(x86)%\Windows Kits\10\bin"
+if not exist "%WINSDK_BIN_ROOT%\" set "WINSDK_BIN_ROOT=%ProgramFiles%\Windows Kits\10\bin"
+set "WINSDK_RC_DIR="
+if exist "%WINSDK_BIN_ROOT%\" (
+    for /f "delims=" %%D in ('dir /b /ad /o-n "%WINSDK_BIN_ROOT%\10.*" 2^>nul') do (
+        if not defined WINSDK_RC_DIR if exist "%WINSDK_BIN_ROOT%\%%D\x64\rc.exe" set "WINSDK_RC_DIR=%WINSDK_BIN_ROOT%\%%D\x64"
+    )
+)
+if defined WINSDK_RC_DIR (
+    set "RC=%WINSDK_RC_DIR%\rc.exe"
+    echo      Using Windows SDK resource compiler: "%RC%"
+) else (
+    if defined RC (
+        if exist "%RC%" echo      Using configured resource compiler: "%RC%"
+        if not exist "%RC%" set "RC="
+    )
+    if not defined RC (
+        for /f "delims=" %%R in ('where.exe rc.exe 2^>nul') do if not defined RC set "RC=%%R"
+    )
+    if not defined RC (
+        echo *** Windows SDK x64 resource compiler rc.exe was not found.
+        echo     Install the Windows SDK or add its x64 bin directory to PATH.
+        goto hardfail
+    )
+)
+
 call pnpm tauri build --no-bundle
 set BUILD_RC=!errorlevel!
 popd
@@ -208,7 +236,7 @@ echo *** %EXE% not found, cannot start.
 goto hardfail
 
 :hardfail
-set RC=1
+set EXIT_CODE=1
 echo.
 echo *** BUILD/DEPLOY FAILED. See messages above. ***
 
@@ -218,4 +246,4 @@ if "%PAUSE_AT_END%"=="1" (
     echo Press any key to close this window...
     pause >nul
 )
-endlocal & exit /b %RC%
+endlocal & exit /b %EXIT_CODE%
