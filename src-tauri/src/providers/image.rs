@@ -137,7 +137,7 @@ impl OpenAiImageGenerationsProvider {
         parse_response(value).map_err(|error| redact_error(error, &self.api_key))
     }
 
-    fn request_from_provider(
+    pub(crate) fn request_from_provider(
         request: &ProviderRequest,
     ) -> Result<ImageGenerationRequest, ProviderError> {
         let current_message_index = request.messages.iter().rposition(|message| match message {
@@ -301,7 +301,7 @@ fn build_edit_form(
         form = form.text("text_mode", value.to_string());
     }
     if let Some(value) = &request.image {
-        form = form.part("image[]", image_part(value, "reference")?);
+        form = form.part("image", image_part(value, "reference")?);
     }
     if let Some(value) = &request.mask {
         form = form.part("mask", image_part(value, "mask")?);
@@ -839,7 +839,8 @@ mod tests {
                     }
                     let body =
                         String::from_utf8_lossy(&request[header_end..header_end + content_length]);
-                    assert!(body.contains("name=\"image[]\""));
+                    assert!(body.contains("name=\"image\""));
+                    assert!(!body.contains("name=\"image[]\""));
                     assert!(body.contains("name=\"model\""));
                     assert!(body.contains("gpt-image-1"));
                     assert!(body.contains("name=\"prompt\""));

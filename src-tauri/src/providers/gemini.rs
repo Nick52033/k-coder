@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use base64::Engine;
 use futures_util::StreamExt;
 use reqwest::Client;
 use serde::Deserialize;
@@ -15,6 +16,9 @@ use super::{
     ProviderStream,
 };
 use crate::protocol::{MessageRole, ReasoningEffort, TokenUsage, TokenUsageDetails, ToolCall};
+
+const MAX_GENERATED_IMAGE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_GEMINI_IMAGE_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 
 pub struct GoogleGeminiProvider {
     client: Client,
@@ -129,7 +133,12 @@ impl Provider for GoogleGeminiProvider {
             self.config.gemini_stream_url()
         }
         .map_err(|error| ProviderError::Request(error.to_string()))?;
-        let mut payload = json!({ "contents": gemini_contents(&request.messages) });
+        let contents = if image_generation {
+            gemini_image_contents(&request)?
+        } else {
+            gemini_contents(&request.messages)
+        };
+        let mut payload = json!({ "contents": contents });
         // Gemini 的 system 消息需要放在顶层 systemInstruction 字段
         let system_text: Vec<&str> = request
             .messages
@@ -196,19 +205,9 @@ impl Provider for GoogleGeminiProvider {
         let secret = self.api_key.clone();
         if image_generation {
             Ok(Box::pin(async_stream::stream! {
-                let body = tokio::select! {
-                    _ = cancellation.cancelled() => { yield Err(ProviderError::Cancelled); return; }
-                    body = response.bytes() => body,
-                };
-                let bytes = match body {
-                    Ok(bytes) => bytes,
-                    Err(error) => {
-                        yield Err(redact_error(ProviderError::Request(error.to_string()), &secret));
-                        return;
-                    }
-                };
-                let data = String::from_utf8_lossy(&bytes);
-                match parse_sse_data(&data, &format!("gemini-reasoning-{}", Uuid::new_v4())) {
+                let reasoning_item_id = format!("gemini-reasoning-{}", Uuid::new_v4());
+                let parsed = read_bounded_image_response(response, &cancellation, &reasoning_item_id).await;
+                match parsed {
                     Ok(parsed) => {
                         for event in parsed.events {
                             yield Ok(redact_event(event, &secret));
@@ -373,11 +372,29 @@ fn parse_sse_data(data: &str, reasoning_item_id: &str) -> Result<ParsedGeminiEve
                 if !part.thought {
                     if let Some(inline_data) = &part.inline_data {
                         if !inline_data.data.is_empty() {
+                            let decoded = base64::engine::general_purpose::STANDARD
+                                .decode(&inline_data.data)
+                                .map_err(|_| {
+                                    ProviderError::InvalidResponse(
+                                        "Gemini returned invalid base64 image data".to_string(),
+                                    )
+                                })?;
+                            if decoded.len() > MAX_GENERATED_IMAGE_BYTES {
+                                return Err(ProviderError::InvalidResponse(format!(
+                                    "Gemini generated image exceeds {MAX_GENERATED_IMAGE_BYTES} bytes"
+                                )));
+                            }
+                            let mime_type = inline_data.mime_type.as_deref().unwrap_or("image/png");
+                            if !matches!(
+                                mime_type,
+                                "image/png" | "image/jpeg" | "image/gif" | "image/webp"
+                            ) {
+                                return Err(ProviderError::InvalidResponse(
+                                    "Gemini returned an unsupported image MIME type".to_string(),
+                                ));
+                            }
                             events.push(ProviderEvent::Image {
-                                mime_type: inline_data
-                                    .mime_type
-                                    .clone()
-                                    .unwrap_or_else(|| "image/png".to_string()),
+                                mime_type: mime_type.to_string(),
                                 data: inline_data.data.clone(),
                             });
                         }
@@ -456,6 +473,58 @@ fn parse_sse_data(data: &str, reasoning_item_id: &str) -> Result<ParsedGeminiEve
         completed,
         terminal_error,
     })
+}
+
+fn gemini_image_contents(request: &ProviderRequest) -> Result<Vec<Value>, ProviderError> {
+    let image_request =
+        super::image::OpenAiImageGenerationsProvider::request_from_provider(request)?;
+    let mut parts = vec![json!({ "text": image_request.prompt })];
+    if let Some(image) = image_request.image {
+        let (mime_type, data) = super::split_image_data_url(&image).ok_or_else(|| {
+            ProviderError::InvalidToolArguments(
+                "Gemini image reference must be a base64 data URL".into(),
+            )
+        })?;
+        parts.push(json!({ "inlineData": { "mimeType": mime_type, "data": data } }));
+    }
+    Ok(vec![json!({ "role": "user", "parts": parts })])
+}
+
+fn read_image_response_body(
+    bytes: &[u8],
+    reasoning_item_id: &str,
+) -> Result<ParsedGeminiEvent, ProviderError> {
+    if bytes.len() > MAX_GEMINI_IMAGE_RESPONSE_BYTES {
+        return Err(ProviderError::InvalidResponse(format!(
+            "Gemini image response exceeds {MAX_GEMINI_IMAGE_RESPONSE_BYTES} bytes"
+        )));
+    }
+    let data = std::str::from_utf8(bytes).map_err(|_| {
+        ProviderError::InvalidResponse("Gemini image response is not valid UTF-8".into())
+    })?;
+    parse_sse_data(data, reasoning_item_id)
+}
+
+async fn read_bounded_image_response(
+    response: reqwest::Response,
+    cancellation: &CancellationToken,
+    reasoning_item_id: &str,
+) -> Result<ParsedGeminiEvent, ProviderError> {
+    let mut stream = response.bytes_stream();
+    let mut bytes = Vec::new();
+    while let Some(chunk) = tokio::select! {
+        _ = cancellation.cancelled() => return Err(ProviderError::Cancelled),
+        chunk = stream.next() => chunk,
+    } {
+        let chunk = chunk.map_err(|error| ProviderError::Request(error.to_string()))?;
+        if bytes.len().saturating_add(chunk.len()) > MAX_GEMINI_IMAGE_RESPONSE_BYTES {
+            return Err(ProviderError::InvalidResponse(format!(
+                "Gemini image response exceeds {MAX_GEMINI_IMAGE_RESPONSE_BYTES} bytes"
+            )));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    read_image_response_body(&bytes, reasoning_item_id)
 }
 
 fn gemini_schema(mut schema: Value) -> Value {
@@ -552,6 +621,101 @@ mod tests {
                 if mime_type == "image/png" && data == "AA=="
         ));
         assert!(parsed.completed);
+    }
+
+    #[test]
+    fn gemini_image_generation_uses_bounded_context_and_reference_image() {
+        let request = ProviderRequest {
+            schema_version: crate::protocol::PROTOCOL_VERSION,
+            model: "gemini-3.1-flash-image".into(),
+            reasoning_effort: ReasoningEffort::Off,
+            messages: vec![
+                ProviderMessage::Text {
+                    role: MessageRole::User,
+                    text: "Draw a red umbrella".into(),
+                },
+                ProviderMessage::AssistantImageReference {
+                    text: String::new(),
+                    images: vec![ProviderImage {
+                        name: "previous.png".into(),
+                        data_url: "data:image/png;base64,AA==".into(),
+                    }],
+                },
+                ProviderMessage::ToolResult {
+                    call_id: "call-1".into(),
+                    name: "read_file".into(),
+                    success: true,
+                    output: "private tool output".into(),
+                },
+                ProviderMessage::Text {
+                    role: MessageRole::User,
+                    text: "Make the sky blue".into(),
+                },
+            ],
+            tools: vec![],
+        };
+
+        let contents = gemini_image_contents(&request).unwrap();
+        assert_eq!(contents[0]["role"], "user");
+        assert!(
+            contents[0]["parts"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("Draw a red umbrella")
+        );
+        assert!(
+            contents[0]["parts"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("Make the sky blue")
+        );
+        assert!(
+            !contents[0]["parts"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("private tool output")
+        );
+        assert_eq!(
+            contents[0]["parts"][1]["inlineData"]["mimeType"],
+            "image/png"
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_or_oversized_generated_images() {
+        let invalid = parse_sse_data(
+            r#"{"candidates":[{"content":{"parts":[{"inlineData":{"mimeType":"image/png","data":"not-base64"}}]},"finishReason":"STOP"}]}"#,
+            "reasoning-1",
+        );
+        assert!(matches!(invalid, Err(ProviderError::InvalidResponse(_))));
+
+        let unsupported = parse_sse_data(
+            r#"{"candidates":[{"content":{"parts":[{"inlineData":{"mimeType":"text/plain","data":"AA=="}}]},"finishReason":"STOP"}]}"#,
+            "reasoning-1",
+        );
+        assert!(matches!(
+            unsupported,
+            Err(ProviderError::InvalidResponse(_))
+        ));
+
+        let oversized_data = vec![b'a'; MAX_GENERATED_IMAGE_BYTES + 1];
+        let oversized = format!(
+            r#"{{"candidates":[{{"content":{{"parts":[{{"inlineData":{{"mimeType":"image/png","data":"{}"}}}}]}},"finishReason":"STOP"}}]}}"#,
+            String::from_utf8(oversized_data).unwrap()
+        );
+        assert!(matches!(
+            parse_sse_data(&oversized, "reasoning-1"),
+            Err(ProviderError::InvalidResponse(_))
+        ));
+    }
+
+    #[test]
+    fn bounds_gemini_image_response_body_before_json_parsing() {
+        let body = vec![b' '; MAX_GEMINI_IMAGE_RESPONSE_BYTES + 1];
+        assert!(matches!(
+            read_image_response_body(&body, "reasoning-1"),
+            Err(ProviderError::InvalidResponse(message)) if message.contains("exceeds")
+        ));
     }
 
     #[test]

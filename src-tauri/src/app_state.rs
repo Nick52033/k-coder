@@ -1774,6 +1774,8 @@ fn model_supports_vision(
     model: &crate::providers::ProviderModelConfig,
 ) -> bool {
     config.transport == ProviderTransport::OpenAiImageGenerations
+        || (config.transport == ProviderTransport::GoogleGemini
+            && model.id.to_ascii_lowercase().contains("-image"))
         || (model.supports_vision
             && config.transport != ProviderTransport::DeepSeekChatCompletions
             && !deepseek_dialect(config, &model.id))
@@ -2254,6 +2256,42 @@ mod tests {
             assert_eq!(
                 deepseek_dialect(&config, model),
                 transport == ProviderTransport::OpenAiChatCompletions && !declared_vision
+            );
+        }
+    }
+
+    #[test]
+    fn gemini_image_models_are_vision_capable_without_a_manual_flag() {
+        for (model, expected) in [
+            ("gemini-3.1-flash-image", true),
+            ("gemini-3-pro-image-preview", true),
+            ("gemini-2.5-flash", false),
+        ] {
+            let config = SaveProviderConfigRequest {
+                id: "gemini".into(),
+                kind: ProviderKind::OpenAiCompatible,
+                transport: ProviderTransport::GoogleGemini,
+                name: "Gemini".into(),
+                base_url: "https://generativelanguage.googleapis.com/v1beta".into(),
+                model: model.into(),
+                models: vec![crate::providers::ProviderModelConfig {
+                    id: model.into(),
+                    display_name: model.into(),
+                    context_window: 1_000_000,
+                    max_output_tokens: None,
+                    supports_vision: false,
+                    fallback: false,
+                }],
+                endpoints: vec![],
+                api_key: None,
+                activate: true,
+            }
+            .public_config()
+            .unwrap();
+            assert_eq!(
+                model_supports_vision(&config, config.active_model()),
+                expected,
+                "unexpected vision capability for {model}"
             );
         }
     }
