@@ -329,19 +329,19 @@ export function isUnreconciledPlan(
 }
 
 function summarizeChanges(changes: ChangeSet[], turnId?: string) {
-  const paths = new Set<string>();
+  let files = 0;
   let added = 0;
   let deleted = 0;
   for (const change of changes) {
     if (change.undone || (turnId && change.turnId !== turnId)) continue;
     for (const file of change.files) {
-      paths.add(file.destinationPath || file.path);
+      files += 1;
       const stats = changeLineStats(file.unifiedDiff);
       added += stats.added;
       deleted += stats.deleted;
     }
   }
-  return { added, deleted, files: paths.size };
+  return { added, deleted, files };
 }
 
 function planStatusLabel(status: PlanStepState) {

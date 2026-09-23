@@ -7584,13 +7584,51 @@ test("robot node progress stays authoritative after a turn completes", async ({ 
   await expect(progress).not.toContainText("计划未收尾");
 });
 
-test("ordinary conversation keeps its independent plan progress", async ({ page }) => {
+test("plan progress counts every repeated file change without deduplicating paths", async ({ page }) => {
   await page.goto("/");
   const progress = page.locator(".plan-progress-trigger");
   await expect(progress).toHaveCount(1);
   // Turn 已经正常结束，计划却仍停在「进行中」：如实暴露未收尾，而不是继续显示误导性的进行中步数。
   await expect(progress).toContainText("计划未收尾 · 1/2 已完成");
   await expect(progress).toContainText("1 个文件已更新");
+  await page.evaluate(() => {
+    const emit = (window as unknown as { __emitAgentEvent: (event: unknown) => void }).__emitAgentEvent;
+    for (const index of [2, 3]) {
+      const id = `change-plan-summary-${index}`;
+      emit({
+        schemaVersion: 1,
+        threadId: "thread-1",
+        turnId: "turn-1",
+        phase: "executing",
+        type: "change_applied",
+        changeSet: {
+          id,
+          threadId: "thread-1",
+          turnId: "turn-1",
+          toolCallId: `call-edit-${index}`,
+          createdAtMs: index,
+          undone: false,
+          files: [{
+            path: "src/App.css",
+            destinationPath: null,
+            operation: "modify",
+            beforeHash: `before-${index}`,
+            afterHash: `after-${index}`,
+            beforeContent: "old\n",
+            afterContent: "new\n",
+            unifiedDiff: "--- a/src/App.css\n+++ b/src/App.css\n@@ -1 +1 @@\n-old\n+new\n",
+          }],
+        },
+      });
+    }
+  });
+  await expect(progress).toContainText("3 个文件已更新");
+  const changeToggle = page.locator(".message-changes .changes-toggle");
+  await expect(changeToggle).toContainText("3 个文件");
+  await changeToggle.click();
+  const changeItems = page.locator(".message-changes .changes-list .change-file-item");
+  await expect(changeItems).toHaveCount(3);
+  await expect(page.locator(".message-changes .changes-list").getByText("src/App.css", { exact: true })).toHaveCount(3);
   await page.evaluate(() => {
     (window as unknown as { __emitAgentEvent: (event: unknown) => void }).__emitAgentEvent({
       schemaVersion: 1, threadId: "thread-1", turnId: "turn-1", phase: "responding",
