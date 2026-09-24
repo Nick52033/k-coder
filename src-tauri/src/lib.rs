@@ -339,6 +339,7 @@ pub fn run() {
             commands::resolve_approval,
             commands::resolve_user_input,
             commands::undo_change,
+            commands::accept_changes,
             commands::mobile::mobile_status,
             commands::mobile::mobile_start,
             commands::mobile::mobile_stop,

@@ -622,7 +622,7 @@ export function reduceAgentEvent(
       return {
         state: {
           changes: state.changes.map((change) =>
-            change.id === event.changeId ? { ...change, undone: true } : change,
+            change.id === event.changeId ? { ...change, undone: true, needsReview: false } : change,
           ),
           turnTimeline: appendTimelineEvent(
             state.turnTimeline,
@@ -631,6 +631,14 @@ export function reduceAgentEvent(
             "change_undone",
             "已撤销文件变更",
             event.changeId,
+          ),
+        },
+      };
+    case "changes_accepted":
+      return {
+        state: {
+          changes: state.changes.map((change) =>
+            event.changeIds.includes(change.id) ? { ...change, needsReview: false } : change,
           ),
         },
       };

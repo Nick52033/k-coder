@@ -5159,6 +5159,7 @@ test("completes and restores an approved edit test repair workflow", async ({ pa
     toolCallId: callId,
     createdAtMs: 2,
     undone: false,
+    needsReview: true,
     files: [{
       path: "src/example.ts",
       destinationPath: null,
@@ -5240,6 +5241,10 @@ test("completes and restores an approved edit test repair workflow", async ({ pa
   await expect(liveMessage.getByText("修复完成，测试已经通过。", { exact: true })).toHaveCount(1);
   // 两次 apply_patch 改的是同一个 src/example.ts：去重后只算 1 个文件。
   await expect(liveMessage.locator(".changes-toggle")).toContainText("1 个文件");
+  await expect(liveMessage.locator(".changes-review-status")).toHaveText("待你确认");
+  await liveMessage.locator(".changes-review-actions").getByRole("button", { name: "接受" }).click();
+  await expect(liveMessage.locator(".changes-review-actions")).toHaveCount(0);
+  expect(await page.evaluate(() => (window as unknown as { __invoked: string[] }).__invoked)).toContain("accept_changes");
 
   const persistedTimeline = [
     { type: "text", id: "progress-read", turnId: "turn-self-edit", text: "先读取目标文件。" },
@@ -5267,7 +5272,7 @@ test("completes and restores an approved edit test repair workflow", async ({ pa
     toolActivities: [],
     turnTimeline: persistedTimeline,
     approvals: [{ request: approval("approval-edit-1", firstPatchCall.id), resolution: { action: "approved", patch: null, selectedPaths: [], expectedHashes: [] } }],
-    changes: [firstChange, repairedChange],
+    changes: [firstChange, repairedChange].map((change) => ({ ...change, needsReview: false })),
   });
   await page.reload();
 
@@ -5286,6 +5291,67 @@ test("completes and restores an approved edit test repair workflow", async ({ pa
   await expect(restoredMessage.locator(".changes-toggle")).toContainText("1 个文件");
   await restoredMessage.scrollIntoViewIfNeeded();
   await page.screenshot({ path: testInfo.outputPath("self-edit-recovery.png"), fullPage: true });
+});
+
+test("undoes pending file review from the message change list", async ({ page }) => {
+  await page.goto("/");
+  const change = {
+    id: "change-undo-review",
+    threadId: "thread-1",
+    turnId: "turn-undo-review",
+    toolCallId: "call-undo-review",
+    createdAtMs: 2,
+    undone: false,
+    needsReview: true,
+    files: [{
+      path: "src/example.ts",
+      destinationPath: null,
+      operation: "modify",
+      beforeHash: "before",
+      afterHash: "after",
+      beforeContent: "before\n",
+      afterContent: "after\n",
+      unifiedDiff: "-before\n+after",
+    }],
+  };
+  await page.evaluate((change) => {
+    const host = window as unknown as {
+      __TAURI_INTERNALS__: { invoke: (command: string, args?: Record<string, unknown>) => Promise<unknown> };
+      __invoked: string[];
+      __rejectUndo: boolean;
+      __emitAgentEvent: (event: unknown) => void;
+    };
+    const originalInvoke = host.__TAURI_INTERNALS__.invoke;
+    host.__rejectUndo = true;
+    host.__TAURI_INTERNALS__.invoke = async (command, args) => {
+      if (command === "undo_change") {
+        host.__invoked.push(command);
+        if (args?.threadId !== "thread-1" || args?.changeId !== change.id) throw new Error("unexpected undo arguments");
+        if (host.__rejectUndo) throw new Error("变更冲突：文件已被后续修改");
+        return { ...change, undone: true, needsReview: false };
+      }
+      return originalInvoke(command, args);
+    };
+    const emit = host.__emitAgentEvent;
+    const base = { schemaVersion: 11, threadId: "thread-1", turnId: "turn-undo-review" };
+    emit({ ...base, type: "turn_started", phase: "exploring" });
+    emit({ ...base, type: "change_applied", phase: "executing", changeSet: change });
+    emit({ ...base, type: "turn_failed", phase: "failed", message: "provider request failed", error: null, startedAtMs: 1, completedAtMs: 3, durationMs: 2 });
+  }, change);
+
+  const message = page.locator(".message--assistant").last();
+  await expect(message.locator(".changes-review-status")).toHaveText("待你确认");
+  await message.locator(".changes-review-actions").getByRole("button", { name: "撤销" }).click();
+  await expect(page.locator(".error-banner")).toContainText("变更冲突：文件已被后续修改");
+  await expect(message.locator(".changes-review-actions")).toHaveCount(1);
+  await page.evaluate(() => {
+    (window as unknown as { __rejectUndo: boolean }).__rejectUndo = false;
+  });
+  await message.locator(".changes-review-actions").getByRole("button", { name: "撤销" }).click();
+  await expect(message.locator(".message-changes")).toHaveCount(0);
+  await expect(page.locator(".error-banner")).toHaveCount(0);
+  await expect(page.locator(".activity-change-main").filter({ hasText: "已撤销" })).toHaveCount(1);
+  expect(await page.evaluate(() => (window as unknown as { __invoked: string[] }).__invoked)).toContain("undo_change");
 });
 
 test("keeps a cancelled turn busy until the terminal event and then retries", async ({ page }) => {

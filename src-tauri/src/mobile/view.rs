@@ -540,6 +540,7 @@ mod tests {
             tool_call_id: "call-1".to_string(),
             created_at_ms: 0,
             undone: false,
+            needs_review: true,
             files: vec![ChangeFileSnapshot {
                 path: "src/main.ts".to_string(),
                 destination_path: None,

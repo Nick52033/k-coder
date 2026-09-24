@@ -37,7 +37,7 @@ mod writer;
 
 use writer::ThreadWriters;
 
-pub const EVENT_SCHEMA_VERSION: u32 = 10;
+pub const EVENT_SCHEMA_VERSION: u32 = 11;
 
 fn default_in_project() -> bool {
     true
@@ -176,6 +176,9 @@ pub enum StoredEventKind {
     },
     ChangeUndone {
         change_id: String,
+    },
+    ChangesAccepted {
+        change_ids: Vec<String>,
     },
     TurnCompleted {
         usage: Option<TokenUsage>,
@@ -963,6 +966,7 @@ fn is_fork_history_event(kind: &StoredEventKind) -> bool {
             kind,
             StoredEventKind::ChangeApplied { .. }
                 | StoredEventKind::ChangeUndone { .. }
+                | StoredEventKind::ChangesAccepted { .. }
                 | StoredEventKind::ItemStarted {
                     item_type: AgentItemType::Change,
                     ..
@@ -1352,6 +1356,7 @@ fn project_thread(thread_id: &str, events: &[StoredEvent]) -> Result<ThreadDetai
                     .find(|change| change.id == *change_id)
                 {
                     change.undone = true;
+                    change.needs_review = false;
                 }
                 push_timeline_event(
                     &mut turn_timeline,
@@ -1360,6 +1365,14 @@ fn project_thread(thread_id: &str, events: &[StoredEvent]) -> Result<ThreadDetai
                     "已撤销文件变更",
                     Some(format!("变更 {change_id}")),
                 );
+            }
+            StoredEventKind::ChangesAccepted { change_ids } => {
+                for change in changes
+                    .iter_mut()
+                    .filter(|change| change_ids.iter().any(|id| id == &change.id))
+                {
+                    change.needs_review = false;
+                }
             }
             StoredEventKind::TurnModeSelected { .. } => {}
             StoredEventKind::TurnStarted => {
@@ -1849,6 +1862,7 @@ fn project_thread_history(
             | StoredEventKind::ThreadModelSelected { .. }
             | StoredEventKind::ThreadForked { .. }
             | StoredEventKind::ThreadRolledBack { .. }
+            | StoredEventKind::ChangesAccepted { .. }
             | StoredEventKind::TurnStarted
             | StoredEventKind::TurnModeSelected { .. }
             | StoredEventKind::ItemStarted { .. }
@@ -3214,6 +3228,7 @@ mod tests {
                 unified_diff: preview_file.unified_diff,
             }],
             undone: false,
+            needs_review: true,
         };
         for kind in [
             StoredEventKind::TurnStarted,

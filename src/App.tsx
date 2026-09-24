@@ -415,6 +415,7 @@ function App() {
   const [modeMenuOpen, setModeMenuOpen] = useState(false);
   const [modeMenuPosition, setModeMenuPosition] = useState({ left: 12, bottom: 48, width: 260, maxHeight: 320 });
   const [expandedChangeSets, setExpandedChangeSets] = useState<Set<string>>(new Set());
+  const [reviewingChangeIds, setReviewingChangeIds] = useState<Set<string>>(new Set());
   const [queueExpanded, setQueueExpanded] = useState(false);
   const messageAreaRef = useRef<HTMLDivElement>(null);
   const composerContainerRef = useRef<HTMLFormElement>(null);
@@ -476,6 +477,7 @@ function App() {
     resolvePendingApproval,
     resolvePendingUserInput,
     undoAppliedChange,
+    acceptAppliedChanges,
     saveProvider,
     activateProvider,
     selectThreadModel,
@@ -1453,6 +1455,10 @@ function App() {
               onStop={turnId === currentThreadTurnId ? () => void stopTurn() : undefined}
               cancelling={turnId === currentThreadTurnId && currentThreadCancelling}
             />
+            {renderMessageChanges(
+              `activity-${turnId}`,
+              changes.filter((change) => change.turnId === turnId && !change.undone),
+            )}
           </div>
         </article>
         {renderTurnSubagents(turnId)}
@@ -1471,23 +1477,77 @@ function App() {
       }
     }
     const files = [...dedupedFiles.values()];
+    const reviewableChanges = ownerChanges.filter((change) => change.needsReview && !change.undone);
+    const reviewableIds = reviewableChanges.map((change) => change.id);
+    const reviewInProgress = reviewableIds.some((id) => reviewingChangeIds.has(id));
+    const reviewBlockedByTurn = currentThreadBusy;
+    const acceptChanges = async () => {
+      setReviewingChangeIds((previous) => new Set([...previous, ...reviewableIds]));
+      try {
+        await acceptAppliedChanges(reviewableIds);
+      } finally {
+        setReviewingChangeIds((previous) => {
+          const next = new Set(previous);
+          reviewableIds.forEach((id) => next.delete(id));
+          return next;
+        });
+      }
+    };
+    const undoChanges = async () => {
+      setReviewingChangeIds((previous) => new Set([...previous, ...reviewableIds]));
+      try {
+        // 变更按事件顺序进入列表；逆序撤销可通过同一文件多次写入时的哈希保护。
+        for (const change of [...reviewableChanges].reverse()) {
+          if (!await undoAppliedChange(change.id)) break;
+        }
+      } finally {
+        setReviewingChangeIds((previous) => {
+          const next = new Set(previous);
+          reviewableIds.forEach((id) => next.delete(id));
+          return next;
+        });
+      }
+    };
     return (
       <div className="message-changes">
-        <button
-          type="button"
-          className="changes-toggle"
-          onClick={() => {
-            setExpandedChangeSets((previous) => {
-              const next = new Set(previous);
-              if (next.has(ownerId)) next.delete(ownerId);
-              else next.add(ownerId);
-              return next;
-            });
-          }}
-        >
-          <span className={cn("changes-arrow", expandedChangeSets.has(ownerId) && "changes-arrow--expanded")}>▶</span>
-          <span>{files.length} 个文件</span>
-        </button>
+        <div className="changes-header">
+          <button
+            type="button"
+            className="changes-toggle"
+            onClick={() => {
+              setExpandedChangeSets((previous) => {
+                const next = new Set(previous);
+                if (next.has(ownerId)) next.delete(ownerId);
+                else next.add(ownerId);
+                return next;
+              });
+            }}
+          >
+            <span className={cn("changes-arrow", expandedChangeSets.has(ownerId) && "changes-arrow--expanded")}>▶</span>
+            <span>{files.length} 个文件</span>
+            {reviewableChanges.length > 0 && <small className="changes-review-status">待你确认</small>}
+          </button>
+          {reviewableChanges.length > 0 && (
+            <div className="changes-review-actions">
+              <button
+                type="button"
+                disabled={reviewInProgress || reviewBlockedByTurn}
+                title="保留本轮修改"
+                onClick={() => void acceptChanges()}
+              >
+                <Check size={13} />接受
+              </button>
+              <button
+                type="button"
+                disabled={reviewInProgress || reviewBlockedByTurn}
+                title="按本轮修改的相反顺序撤销"
+                onClick={() => void undoChanges()}
+              >
+                <Undo2 size={13} />撤销
+              </button>
+            </div>
+          )}
+        </div>
 
         {expandedChangeSets.has(ownerId) ? (
           <div className="changes-list">
@@ -3233,7 +3293,7 @@ function App() {
                     <FileDiff size={15} />
                     <span>
                       <strong>{change.files.length} 个文件</strong>
-                      <small>{change.undone ? "已撤销" : "已应用"}</small>
+                      <small>{change.undone ? "已撤销" : change.needsReview ? "待你确认" : "已应用"}</small>
                     </span>
                   </button>
                   {!change.undone && (

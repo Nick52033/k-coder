@@ -161,6 +161,7 @@ impl PatchService {
             rollback_snapshots(&workspace_root, &change_set.files)?;
             let mut undone = change_set;
             undone.undone = true;
+            undone.needs_review = false;
             Ok(undone)
         })
         .await
@@ -793,6 +794,7 @@ fn change_set(
             })
             .collect(),
         undone: false,
+        needs_review: true,
     }
 }
 

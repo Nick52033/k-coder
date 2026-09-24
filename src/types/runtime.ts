@@ -538,6 +538,7 @@ export interface ChangeSet {
   createdAtMs: number;
   files: ChangeFileSnapshot[];
   undone: boolean;
+  needsReview: boolean;
 }
 
 export interface ToolCall {
@@ -1060,6 +1061,7 @@ export type AgentEvent =
     })
   | (EventBase & { type: "change_applied"; changeSet: ChangeSet })
   | (EventBase & { type: "change_undone"; changeId: string })
+  | (EventBase & { type: "changes_accepted"; changeIds: string[] })
   | (EventBase & {
       type: "turn_completed";
       message: ChatMessage;

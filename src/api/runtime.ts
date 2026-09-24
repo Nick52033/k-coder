@@ -425,6 +425,10 @@ export function resolveUserInput(requestId: string, resolution: UserInputResolut
 export function undoChange(threadId: string, changeId: string) {
   return invoke<ChangeSet>("undo_change", { threadId, changeId });
 }
+
+export function acceptChanges(threadId: string, changeIds: string[]) {
+  return invoke<void>("accept_changes", { threadId, changeIds });
+}
 export function testProviderConnection(providerId?: string) { return invoke<ProviderConnectionTest>("test_provider_connection", { providerId }); }
 
 export function searchThreads(query: string) { return invoke<ThreadSummary[]>("search_threads", { query }); }

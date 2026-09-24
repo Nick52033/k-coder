@@ -1706,6 +1706,70 @@ impl AppState {
         }
         Ok(undone_change)
     }
+
+    pub async fn accept_changes(
+        &self,
+        thread_id: &str,
+        change_ids: &[String],
+    ) -> Result<Vec<(String, Vec<String>)>, AppStateError> {
+        let events = self.repository.load(thread_id).await?;
+        let mut changes = HashMap::<String, ChangeSet>::new();
+        let mut accepted = HashSet::<String>::new();
+        let mut undone = HashSet::<String>::new();
+        for event in &events {
+            match &event.kind {
+                StoredEventKind::ChangeApplied { change_set } => {
+                    changes.insert(change_set.id.clone(), change_set.clone());
+                }
+                StoredEventKind::ChangesAccepted { change_ids } => {
+                    accepted.extend(change_ids.iter().cloned());
+                }
+                StoredEventKind::ChangeUndone { change_id } => {
+                    undone.insert(change_id.clone());
+                }
+                _ => {}
+            }
+        }
+
+        let mut groups = std::collections::BTreeMap::<String, Vec<String>>::new();
+        let mut seen = HashSet::new();
+        for change_id in change_ids {
+            if !seen.insert(change_id) || accepted.contains(change_id) {
+                continue;
+            }
+            let change = changes
+                .get(change_id)
+                .ok_or_else(|| AppStateError::ChangeNotFound(change_id.clone()))?;
+            if undone.contains(change_id) {
+                return Err(AppStateError::ChangeAlreadyUndone(change_id.clone()));
+            }
+            if !change.needs_review {
+                return Err(AppStateError::ChangeNotPendingReview(change_id.clone()));
+            }
+            groups
+                .entry(change.turn_id.clone())
+                .or_default()
+                .push(change_id.clone());
+        }
+
+        let accepted_ids = groups
+            .values()
+            .flat_map(|ids| ids.iter().cloned())
+            .collect::<Vec<_>>();
+        if accepted_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.repository
+            .append(StoredEvent::new(
+                thread_id,
+                None,
+                StoredEventKind::ChangesAccepted {
+                    change_ids: accepted_ids,
+                },
+            ))
+            .await?;
+        Ok(groups.into_iter().collect())
+    }
 }
 
 fn active_turn_items(events: &[StoredEvent], turn_id: &str) -> Vec<(String, AgentItemType)> {
@@ -1889,6 +1953,8 @@ pub enum AppStateError {
     ChangeNotFound(String),
     #[error("change was already undone: {0}")]
     ChangeAlreadyUndone(String),
+    #[error("change does not need review: {0}")]
+    ChangeNotPendingReview(String),
     #[error(
         "undo audit failed: {storage_error}; restoring the applied change also failed: {redo_error}"
     )]
@@ -3362,14 +3428,124 @@ mod tests {
 
         let undone = state.undo_change(&thread.id, &change.id).await.unwrap();
         assert!(undone.undone);
+        assert!(!undone.needs_review);
         assert_eq!(
             std::fs::read_to_string(workspace.path().join("review.txt")).unwrap(),
             "before\n"
         );
         let detail = state.repository().read_thread(&thread.id).await.unwrap();
         assert!(detail.changes[0].undone);
+        assert!(!detail.changes[0].needs_review);
         assert!(matches!(
             state.undo_change(&thread.id, &change.id).await,
+            Err(AppStateError::ChangeAlreadyUndone(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn accepting_changes_persists_review_state_and_is_idempotent() {
+        let data = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let state = AppState::with_workspace_and_credentials(
+            data.path(),
+            workspace.path(),
+            Arc::new(FakeCredentials::default()),
+        )
+        .unwrap();
+        let thread = state.repository().create_thread().await.unwrap();
+        let change = ChangeSet {
+            id: "reviewed-change".to_string(),
+            thread_id: thread.id.clone(),
+            turn_id: "turn-review".to_string(),
+            tool_call_id: "call-review".to_string(),
+            created_at_ms: 1,
+            files: Vec::new(),
+            undone: false,
+            needs_review: true,
+        };
+        state
+            .repository()
+            .append(StoredEvent::new(
+                &thread.id,
+                Some(change.turn_id.clone()),
+                StoredEventKind::ChangeApplied {
+                    change_set: change.clone(),
+                },
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            state
+                .accept_changes(&thread.id, std::slice::from_ref(&change.id))
+                .await
+                .unwrap(),
+            vec![(change.turn_id.clone(), vec![change.id.clone()])]
+        );
+        assert!(
+            state
+                .accept_changes(&thread.id, std::slice::from_ref(&change.id))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let detail = state.repository().read_thread(&thread.id).await.unwrap();
+        assert!(!detail.changes[0].needs_review);
+    }
+
+    #[tokio::test]
+    async fn accepting_unknown_or_undone_change_is_rejected() {
+        let data = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let state = AppState::with_workspace_and_credentials(
+            data.path(),
+            workspace.path(),
+            Arc::new(FakeCredentials::default()),
+        )
+        .unwrap();
+        let thread = state.repository().create_thread().await.unwrap();
+        assert!(matches!(
+            state
+                .accept_changes(&thread.id, &["missing-change".to_string()])
+                .await,
+            Err(AppStateError::ChangeNotFound(_))
+        ));
+        let change = ChangeSet {
+            id: "undone-change".to_string(),
+            thread_id: thread.id.clone(),
+            turn_id: "turn-review".to_string(),
+            tool_call_id: "call-review".to_string(),
+            created_at_ms: 1,
+            files: Vec::new(),
+            undone: false,
+            needs_review: true,
+        };
+        state
+            .repository()
+            .append(StoredEvent::new(
+                &thread.id,
+                Some(change.turn_id.clone()),
+                StoredEventKind::ChangeApplied {
+                    change_set: change.clone(),
+                },
+            ))
+            .await
+            .unwrap();
+        state
+            .repository()
+            .append(StoredEvent::new(
+                &thread.id,
+                Some(change.turn_id.clone()),
+                StoredEventKind::ChangeUndone {
+                    change_id: change.id.clone(),
+                },
+            ))
+            .await
+            .unwrap();
+        assert!(matches!(
+            state
+                .accept_changes(&thread.id, std::slice::from_ref(&change.id))
+                .await,
             Err(AppStateError::ChangeAlreadyUndone(_))
         ));
     }

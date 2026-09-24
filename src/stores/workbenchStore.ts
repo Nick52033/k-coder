@@ -29,6 +29,7 @@ import {
   setApprovalMode as setApprovalModeCommand,
   setReasoningEffort as setReasoningEffortCommand,
   undoChange,
+  acceptChanges as acceptChangesCommand,
   createGoal,
   getGoal,
   getPlan,
@@ -170,6 +171,7 @@ interface WorkbenchState {
   resolvePendingApproval: (resolution: ApprovalResolution) => Promise<boolean>;
   resolvePendingUserInput: (resolution: UserInputResolution) => Promise<boolean>;
   undoAppliedChange: (changeId: string) => Promise<boolean>;
+  acceptAppliedChanges: (changeIds: string[]) => Promise<boolean>;
   handleAgentEvent: (event: AgentEvent) => void;
   handleMailboxChanged: (event: ThreadMailboxChanged) => void;
   clearError: () => void;
@@ -1070,7 +1072,26 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
       const change = await undoChange(threadId, changeId);
       set((state) => ({
         changes: state.changes.map((item) =>
-          item.id === change.id ? { ...item, undone: true } : item,
+          item.id === change.id ? { ...item, undone: true, needsReview: false } : item,
+        ),
+        error: "",
+      }));
+      return true;
+    } catch (error) {
+      set({ error: errorMessage(error) });
+      return false;
+    }
+  },
+
+  acceptAppliedChanges: async (changeIds) => {
+    const threadId = get().activeThreadId;
+    if (!threadId || get().activeTurns[threadId] || !changeIds.length) return false;
+    try {
+      await acceptChangesCommand(threadId, changeIds);
+      const acceptedIds = new Set(changeIds);
+      set((state) => ({
+        changes: state.changes.map((change) =>
+          acceptedIds.has(change.id) ? { ...change, needsReview: false } : change,
         ),
         error: "",
       }));

@@ -8,7 +8,7 @@ use crate::storage::{
 pub mod memory;
 
 pub const PROTOCOL_VERSION: u32 = 1;
-pub const AGENT_EVENT_SCHEMA_VERSION: u32 = 10;
+pub const AGENT_EVENT_SCHEMA_VERSION: u32 = 11;
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -468,6 +468,10 @@ pub struct ChangeSet {
     pub created_at_ms: u64,
     pub files: Vec<ChangeFileSnapshot>,
     pub undone: bool,
+    /// Only changes created by the newer workflow require a post-turn review.
+    /// Missing values in older persisted histories therefore remain false.
+    #[serde(default)]
+    pub needs_review: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -861,6 +865,7 @@ impl AgentEvent {
             Self::UserInputResolved { .. } => TurnPhase::Planning,
             Self::ChangeApplied { .. } => TurnPhase::Executing,
             Self::ChangeUndone { .. } => TurnPhase::Executing,
+            Self::ChangesAccepted { .. } => TurnPhase::Complete,
             Self::TurnCompleted { .. } => TurnPhase::Complete,
             Self::TurnFailed { .. } => TurnPhase::Failed,
             Self::TurnCancelled { .. } => TurnPhase::Cancelled,
@@ -1010,6 +1015,11 @@ pub enum AgentEvent {
         thread_id: String,
         turn_id: String,
         change_id: String,
+    },
+    ChangesAccepted {
+        thread_id: String,
+        turn_id: String,
+        change_ids: Vec<String>,
     },
     TurnCompleted {
         thread_id: String,
@@ -1197,6 +1207,21 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn legacy_change_set_defaults_to_already_applied_review_state() {
+        let value = serde_json::json!({
+            "id": "change-legacy",
+            "threadId": "thread-1",
+            "turnId": "turn-1",
+            "toolCallId": "call-1",
+            "createdAtMs": 1,
+            "files": [],
+            "undone": false
+        });
+        let change: ChangeSet = serde_json::from_value(value).unwrap();
+        assert!(!change.needs_review);
+    }
 
     #[test]
     fn repeated_observation_loop_is_a_retryable_tool_error() {

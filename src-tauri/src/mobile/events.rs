@@ -76,6 +76,7 @@ pub fn route_event(event: &AgentEvent) -> EventRoute {
         | AgentEvent::ApprovalResolved { .. }
         | AgentEvent::ChangeApplied { .. }
         | AgentEvent::ChangeUndone { .. }
+        | AgentEvent::ChangesAccepted { .. }
         | AgentEvent::TextReset { .. }
         | AgentEvent::TurnCompleted { .. }
         | AgentEvent::TurnFailed { .. }
@@ -113,6 +114,7 @@ pub fn event_thread_id(event: &AgentEvent) -> &str {
         | AgentEvent::ApprovalResolved { thread_id, .. }
         | AgentEvent::ChangeApplied { thread_id, .. }
         | AgentEvent::ChangeUndone { thread_id, .. }
+        | AgentEvent::ChangesAccepted { thread_id, .. }
         | AgentEvent::TurnCompleted { thread_id, .. }
         | AgentEvent::TurnFailed { thread_id, .. }
         | AgentEvent::TurnCancelled { thread_id, .. }

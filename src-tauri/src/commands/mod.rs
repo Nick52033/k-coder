@@ -3912,6 +3912,36 @@ pub async fn undo_change(
     Ok(change)
 }
 
+#[tauri::command(rename_all = "camelCase")]
+pub async fn accept_changes(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    thread_id: String,
+    change_ids: Vec<String>,
+) -> CommandResult<()> {
+    if state.is_turn_active(&thread_id).await {
+        return Err(CommandError::new(
+            "turn_active",
+            "wait for the active turn to finish before accepting changes",
+        ));
+    }
+    let accepted_groups = state
+        .accept_changes(&thread_id, &change_ids)
+        .await
+        .map_err(|error| CommandError::new("change_accept", error))?;
+    for (turn_id, change_ids) in accepted_groups {
+        let _ = app.emit(
+            AGENT_EVENT_NAME,
+            AgentEventEnvelope::new(AgentEvent::ChangesAccepted {
+                thread_id: thread_id.clone(),
+                turn_id,
+                change_ids,
+            }),
+        );
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn start_command(
     state: State<'_, AppState>,
