@@ -389,6 +389,7 @@ async function migrateLegacyProviderCatalog(catalog: ProviderCatalogView) {
           model: legacy.model,
           models: legacy.models ?? [],
           endpoints: legacy.endpoints ?? [],
+          fallbackProviderIds: legacy.fallbackProviderIds ?? [],
           activate: false,
         });
         knownIds.add(legacy.id);

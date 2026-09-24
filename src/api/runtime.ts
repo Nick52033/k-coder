@@ -87,6 +87,9 @@ import type {
   MobileDeviceView,
   MobilePairingView,
   MobileStatus,
+  WechatClawbotQrLogin,
+  WechatClawbotQrLoginStatus,
+  WechatClawbotStatus,
   KnowledgeSettings,
   EmbeddingSettings,
   KnowledgeCollection,
@@ -611,6 +614,34 @@ export function setMobileCapabilities(
   capabilities: MobileCapability[],
 ): Promise<MobileStatus> {
   return invoke<MobileStatus>("mobile_set_capabilities", { capabilities });
+}
+
+export function wechatClawbotStatus(): Promise<WechatClawbotStatus> {
+  return invoke<WechatClawbotStatus>("wechat_clawbot_status");
+}
+
+export function startWechatClawbotLogin(): Promise<WechatClawbotQrLogin> {
+  return invoke<WechatClawbotQrLogin>("wechat_clawbot_start_login");
+}
+
+export function wechatClawbotLoginStatus(loginId: string): Promise<WechatClawbotQrLoginStatus> {
+  return invoke<WechatClawbotQrLoginStatus>("wechat_clawbot_login_status", { loginId });
+}
+
+export function submitWechatClawbotVerifyCode(loginId: string, verifyCode: string): Promise<void> {
+  return invoke<void>("wechat_clawbot_submit_verify_code", { loginId, verifyCode });
+}
+
+export function approveWechatClawbotSender(senderKey: string): Promise<void> {
+  return invoke<void>("wechat_clawbot_approve_sender", { senderKey });
+}
+
+export function revokeWechatClawbotSender(senderKey: string): Promise<void> {
+  return invoke<void>("wechat_clawbot_revoke_sender", { senderKey });
+}
+
+export function disconnectWechatClawbot(): Promise<WechatClawbotStatus> {
+  return invoke<WechatClawbotStatus>("wechat_clawbot_disconnect");
 }
 
 export function errorMessage(error: unknown): string {

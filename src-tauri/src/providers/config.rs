@@ -133,6 +133,8 @@ pub struct ProviderConfig {
     pub models: Vec<ProviderModelConfig>,
     #[serde(default)]
     pub endpoints: Vec<ProviderEndpointConfig>,
+    #[serde(default)]
+    pub fallback_provider_ids: Vec<String>,
 }
 
 impl ProviderConfig {
@@ -236,6 +238,29 @@ impl ProviderConfig {
         if self.endpoints.len() > 8 {
             return Err(ProviderConfigError::Invalid(
                 "a provider may contain at most 8 alternate endpoints".into(),
+            ));
+        }
+
+        let mut fallback_provider_ids = std::collections::HashSet::new();
+        for fallback_provider_id in &mut self.fallback_provider_ids {
+            *fallback_provider_id = fallback_provider_id.trim().to_string();
+            if fallback_provider_id.is_empty()
+                || fallback_provider_id.len() > 80
+                || !fallback_provider_id.chars().all(|character| {
+                    character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
+                })
+                || fallback_provider_id == &self.id
+                || !fallback_provider_ids.insert(fallback_provider_id.clone())
+            {
+                return Err(ProviderConfigError::Invalid(
+                    "fallback provider IDs must be unique, valid, and different from the primary provider"
+                        .into(),
+                ));
+            }
+        }
+        if self.fallback_provider_ids.len() > 4 {
+            return Err(ProviderConfigError::Invalid(
+                "a provider may reference at most 4 fallback providers".into(),
             ));
         }
 
@@ -357,6 +382,8 @@ pub struct SaveProviderConfigRequest {
     pub models: Vec<ProviderModelConfig>,
     #[serde(default)]
     pub endpoints: Vec<ProviderEndpointConfig>,
+    #[serde(default)]
+    pub fallback_provider_ids: Vec<String>,
     pub api_key: Option<String>,
     #[serde(default = "default_true")]
     pub activate: bool,
@@ -374,6 +401,7 @@ impl SaveProviderConfigRequest {
             model: self.model.clone(),
             models: self.models.clone(),
             endpoints: self.endpoints.clone(),
+            fallback_provider_ids: self.fallback_provider_ids.clone(),
         }
         .validate()
     }
@@ -391,6 +419,7 @@ pub struct ProviderConfigView {
     pub model: String,
     pub models: Vec<ProviderModelConfig>,
     pub endpoints: Vec<ProviderEndpointConfig>,
+    pub fallback_provider_ids: Vec<String>,
     pub has_api_key: bool,
 }
 
@@ -450,6 +479,31 @@ impl ProviderCatalog {
                 ));
             }
             providers.push(provider);
+        }
+        for provider in &providers {
+            if provider.transport == ProviderTransport::OpenAiImageGenerations
+                && !provider.fallback_provider_ids.is_empty()
+            {
+                return Err(ProviderConfigError::Invalid(format!(
+                    "image provider {} cannot have chat fallback providers",
+                    provider.id
+                )));
+            }
+            for fallback_provider_id in &provider.fallback_provider_ids {
+                let target = providers
+                    .iter()
+                    .find(|candidate| &candidate.id == fallback_provider_id)
+                    .ok_or_else(|| {
+                        ProviderConfigError::Invalid(format!(
+                            "fallback provider {fallback_provider_id} does not exist"
+                        ))
+                    })?;
+                if target.transport == ProviderTransport::OpenAiImageGenerations {
+                    return Err(ProviderConfigError::Invalid(format!(
+                        "fallback provider {fallback_provider_id} is not a chat provider"
+                    )));
+                }
+            }
         }
         self.schema_version = PROVIDER_CATALOG_SCHEMA_VERSION;
         self.providers = providers;
@@ -567,6 +621,11 @@ impl ProviderConfigStore {
         if catalog.active_provider_id.as_deref() == Some(provider_id) {
             catalog.active_provider_id = None;
         }
+        for provider in &mut catalog.providers {
+            provider
+                .fallback_provider_ids
+                .retain(|fallback_id| fallback_id != provider_id);
+        }
         self.save_catalog(&catalog.validate()?)
     }
 
@@ -656,7 +715,103 @@ mod tests {
             model: " test-model ".to_string(),
             models: Vec::new(),
             endpoints: Vec::new(),
+            fallback_provider_ids: Vec::new(),
         }
+    }
+
+    #[test]
+    fn fallback_provider_ids_are_a_persisted_backward_compatible_route() {
+        let legacy = config("https://legacy.example.com/v1");
+        let legacy_value = serde_json::to_value(&legacy).unwrap();
+        assert_eq!(legacy_value["fallbackProviderIds"], serde_json::json!([]));
+
+        let mut routed_value = legacy_value;
+        routed_value["fallbackProviderIds"] = serde_json::json!(["new-api", "secondary"]);
+        let routed: ProviderConfig = serde_json::from_value(routed_value).unwrap();
+        let stored = serde_json::to_value(routed.validate().unwrap()).unwrap();
+        assert_eq!(
+            stored["fallbackProviderIds"],
+            serde_json::json!(["new-api", "secondary"])
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_fallback_provider_references() {
+        for fallback_provider_ids in [
+            serde_json::json!(["default"]),
+            serde_json::json!(["backup", "backup"]),
+            serde_json::json!([" "]),
+            serde_json::json!(["a", "b", "c", "d", "e"]),
+        ] {
+            let mut value = serde_json::to_value(config("https://example.com/v1")).unwrap();
+            value["fallbackProviderIds"] = fallback_provider_ids;
+            let result = serde_json::from_value::<ProviderConfig>(value)
+                .unwrap()
+                .validate();
+            assert!(result.is_err(), "route should be rejected: {result:?}");
+        }
+    }
+
+    #[test]
+    fn catalog_requires_each_fallback_to_be_a_configured_chat_provider() {
+        let mut primary_value =
+            serde_json::to_value(config("https://primary.example.com/v1")).unwrap();
+        primary_value["id"] = serde_json::json!("primary");
+        primary_value["fallbackProviderIds"] = serde_json::json!(["missing"]);
+        let primary = serde_json::from_value(primary_value).unwrap();
+        let missing = ProviderCatalog {
+            schema_version: PROVIDER_CATALOG_SCHEMA_VERSION,
+            active_provider_id: Some("primary".into()),
+            providers: vec![primary],
+        };
+        assert!(missing.validate().is_err());
+
+        let mut primary_value =
+            serde_json::to_value(config("https://primary.example.com/v1")).unwrap();
+        primary_value["id"] = serde_json::json!("primary");
+        primary_value["fallbackProviderIds"] = serde_json::json!(["backup"]);
+        let primary: ProviderConfig = serde_json::from_value(primary_value).unwrap();
+        let mut backup = config("https://backup.example.com/v1");
+        backup.id = "backup".into();
+        backup.transport = ProviderTransport::OpenAiImageGenerations;
+        let image_target = ProviderCatalog {
+            schema_version: PROVIDER_CATALOG_SCHEMA_VERSION,
+            active_provider_id: Some("primary".into()),
+            providers: vec![primary, backup],
+        };
+        assert!(image_target.validate().is_err());
+    }
+
+    #[test]
+    fn deleting_a_provider_removes_it_from_saved_fallback_routes() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ProviderConfigStore::new(directory.path());
+        let mut primary_value =
+            serde_json::to_value(config("https://primary.example.com/v1")).unwrap();
+        primary_value["id"] = serde_json::json!("primary");
+        primary_value["fallbackProviderIds"] = serde_json::json!(["backup"]);
+        let primary: ProviderConfig = serde_json::from_value(primary_value).unwrap();
+        let mut backup = config("https://backup.example.com/v1");
+        backup.id = "backup".into();
+        let catalog = ProviderCatalog {
+            schema_version: PROVIDER_CATALOG_SCHEMA_VERSION,
+            active_provider_id: Some("primary".into()),
+            providers: vec![primary, backup],
+        };
+        fs::write(
+            directory.path().join("providers.json"),
+            serde_json::to_vec(&catalog).unwrap(),
+        )
+        .unwrap();
+
+        store.delete("backup").unwrap();
+        let stored: serde_json::Value =
+            serde_json::from_slice(&fs::read(directory.path().join("providers.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            stored["providers"][0]["fallbackProviderIds"],
+            serde_json::json!([])
+        );
     }
 
     #[test]

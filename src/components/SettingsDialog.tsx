@@ -49,6 +49,8 @@ import {
 } from "../api/runtime";
 import { useToast } from "./Toast";
 import {
+  ArrowDown,
+  ArrowUp,
   BarChart3,
   Bot,
   Boxes,
@@ -153,6 +155,7 @@ interface ProviderItem {
   model: string;
   models: ProviderModelConfig[];
   endpoints: ProviderEndpointConfig[];
+  fallbackProviderIds: string[];
   transport: ProviderTransport;
   hasApiKey: boolean;
   isDefault: boolean;
@@ -167,6 +170,7 @@ function providerItemFromView(provider: ProviderConfigView, activeProviderId: st
     model: provider.model,
     models: provider.models,
     endpoints: provider.endpoints,
+    fallbackProviderIds: provider.fallbackProviderIds ?? [],
     transport: provider.transport,
     hasApiKey: provider.hasApiKey,
     isDefault: provider.id === activeProviderId,
@@ -204,6 +208,7 @@ const transportOptions: Array<{ value: ProviderTransport; label: string }> = [
 
 export type SettingsSection =
   | "providers"
+  | "provider-fallback"
   | "appearance"
   | "usage"
   | "mcp"
@@ -256,6 +261,7 @@ interface SettingsDialogProps {
 
 const settingsDefinitions: SettingsDefinition[] = [
   { id: "providers", label: "模型供应商", group: "模型与用量", icon: ServerCog, available: true },
+  { id: "provider-fallback", label: "跨供应商故障切换", group: "模型与用量", icon: RefreshCw, available: true },
   { id: "usage", label: "用量追踪", group: "模型与用量", icon: BarChart3, available: true },
   { id: "mcp", label: "MCP", group: "扩展", icon: Network, available: true },
   { id: "plugins", label: "插件管理", group: "扩展", icon: Puzzle, available: true },
@@ -377,6 +383,14 @@ export function SettingsDialog({
                 onActivate={onActivateProvider}
                 onDelete={onDeleteProvider}
               />
+            ) : section === "provider-fallback" ? (
+              <ProviderFallbackSettingsPage
+                providers={providers}
+                fallbackProvider={provider}
+                activeProviderId={activeProviderId}
+                error={error}
+                onSave={onSaveProvider}
+              />
             ) : section === "appearance" ? (
               <AppearancePage themeMode={themeMode} onSelectTheme={onSelectTheme} backgroundEnabled={backgroundEnabled} backgroundOpacity={backgroundOpacity} backgroundImage={backgroundImage} onBackgroundEnabledChange={onBackgroundEnabledChange} onBackgroundOpacityChange={onBackgroundOpacityChange} onBackgroundImageChange={onBackgroundImageChange} />
             ) : section === "usage" ? (
@@ -413,6 +427,197 @@ export function SettingsDialog({
         </div>
       </section>
     </div>
+  );
+}
+
+interface ProviderFallbackSettingsPageProps {
+  providers: ProviderConfigView[];
+  fallbackProvider: ProviderConfigView | null;
+  activeProviderId: string | null;
+  error: string;
+  onSave: (request: SaveProviderConfigRequest) => Promise<boolean>;
+}
+
+function ProviderFallbackSettingsPage({
+  providers,
+  fallbackProvider,
+  activeProviderId,
+  error,
+  onSave,
+}: ProviderFallbackSettingsPageProps) {
+  const configuredProviders = providers.length > 0
+    ? providers
+    : fallbackProvider ? [fallbackProvider] : [];
+  const routableProviders = configuredProviders.filter(
+    (item) => item.transport !== "open_ai_image_generations",
+  );
+
+  return (
+    <section className="settings-page provider-fallback-page" aria-labelledby="provider-fallback-page-title">
+      <div className="settings-page-header">
+        <div>
+          <p className="settings-eyebrow">模型与用量</p>
+          <h3 id="provider-fallback-page-title">跨供应商故障切换</h3>
+        </div>
+      </div>
+
+      <p className="provider-fallback-intro">
+        勾选顺序决定尝试顺序；仅在尚无回复或工具调用时切换。New API 的渠道负载均衡由 New API 管理；这里用于在整个网关不可用时切换到另一供应商。
+      </p>
+
+      {error && <div className="settings-error" role="alert">{error}</div>}
+      <div className="provider-fallback-routes" aria-label="供应商故障切换路由">
+        {routableProviders.map((source) => (
+          <ProviderFallbackRoute
+            key={source.id}
+            provider={source}
+            configuredProviders={configuredProviders}
+            activeProviderId={activeProviderId}
+            onSave={onSave}
+          />
+        ))}
+        {routableProviders.length === 0 && (
+          <div className="provider-editor provider-editor--empty">
+            <p>添加一个对话供应商后，可在此配置备用路由。</p>
+          </div>
+        )}
+      </div>
+    </section>
+  );
+}
+
+interface ProviderFallbackRouteProps {
+  provider: ProviderConfigView;
+  configuredProviders: ProviderConfigView[];
+  activeProviderId: string | null;
+  onSave: (request: SaveProviderConfigRequest) => Promise<boolean>;
+}
+
+function ProviderFallbackRoute({
+  provider,
+  configuredProviders,
+  activeProviderId,
+  onSave,
+}: ProviderFallbackRouteProps) {
+  const toast = useToast();
+  const [fallbackProviderIds, setFallbackProviderIds] = useState<string[]>(
+    provider.fallbackProviderIds ?? [],
+  );
+  const [saving, setSaving] = useState(false);
+
+  function moveFallbackProvider(providerId: string, offset: number) {
+    setFallbackProviderIds((current) => {
+      const from = current.indexOf(providerId);
+      const to = from + offset;
+      if (from < 0 || to < 0 || to >= current.length) return current;
+      const next = [...current];
+      [next[from], next[to]] = [next[to], next[from]];
+      return next;
+    });
+  }
+
+  async function submit(event: FormEvent) {
+    event.preventDefault();
+    setSaving(true);
+    const didSave = await onSave({
+      id: provider.id,
+      kind: provider.kind,
+      transport: provider.transport,
+      name: provider.name,
+      baseUrl: provider.baseUrl,
+      model: provider.model,
+      models: provider.models,
+      endpoints: provider.endpoints,
+      fallbackProviderIds,
+      activate: provider.id === activeProviderId,
+    });
+    setSaving(false);
+    if (didSave) {
+      toast.success(`${provider.name} 的备用路由已保存`);
+    } else {
+      toast.error("保存失败，请重试");
+    }
+  }
+
+  const candidates = configuredProviders.filter(
+    (candidate) => candidate.id !== provider.id && candidate.transport !== "open_ai_image_generations",
+  );
+
+  return (
+    <form className="provider-fallback-card" onSubmit={submit}>
+      <fieldset className="provider-fallback-route" aria-label={`主供应商：${provider.name}`}>
+        <legend>
+          <span className="provider-fallback-route-name">{provider.name}</span>
+          <span className="provider-fallback-route-model">{provider.model || "未选择模型"}</span>
+        </legend>
+        <div className="provider-cross-fallback-list" role="list" aria-label={`${provider.name} 的备用供应商顺序`}>
+          {candidates.map((candidate) => {
+            const order = fallbackProviderIds.indexOf(candidate.id);
+            const selected = order >= 0;
+            const blockedByLimit = !selected && fallbackProviderIds.length >= 4;
+            return (
+              <div className="provider-cross-fallback-row" role="listitem" key={candidate.id}>
+                <label className="provider-model-option">
+                  <input
+                    type="checkbox"
+                    checked={selected}
+                    disabled={(!candidate.hasApiKey && !selected) || blockedByLimit}
+                    onChange={(event) => {
+                      setFallbackProviderIds((current) => event.target.checked
+                        ? [...current, candidate.id]
+                        : current.filter((id) => id !== candidate.id));
+                    }}
+                    aria-label={`备用供应商：${candidate.name}`}
+                  />
+                  <span>{candidate.name}</span>
+                </label>
+                <span className="provider-cross-fallback-status">
+                  {selected
+                    ? <>
+                      <span>尝试顺序 {order + 1}</span>
+                      <span>{candidate.model || "未选择模型"}</span>
+                      {!candidate.hasApiKey && <span>未配置 API Key</span>}
+                    </>
+                    : !candidate.hasApiKey
+                      ? "未配置 API Key"
+                      : blockedByLimit
+                        ? "最多 4 个备用供应商"
+                        : candidate.model}
+                </span>
+                {selected && (
+                  <div className="provider-cross-fallback-actions">
+                    <button
+                      className="icon-button"
+                      type="button"
+                      aria-label={`上移备用供应商 ${candidate.name}`}
+                      title="上移"
+                      disabled={order === 0}
+                      onClick={() => moveFallbackProvider(candidate.id, -1)}
+                    ><ArrowUp size={14} /></button>
+                    <button
+                      className="icon-button"
+                      type="button"
+                      aria-label={`下移备用供应商 ${candidate.name}`}
+                      title="下移"
+                      disabled={order === fallbackProviderIds.length - 1}
+                      onClick={() => moveFallbackProvider(candidate.id, 1)}
+                    ><ArrowDown size={14} /></button>
+                  </div>
+                )}
+              </div>
+            );
+          })}
+          {candidates.length === 0 && (
+            <div className="provider-model-empty">保存另一个对话供应商并配置 API Key 后，可在此添加备用路由。</div>
+          )}
+        </div>
+      </fieldset>
+      <footer className="provider-fallback-card-actions">
+        <button className="primary-button" type="submit" disabled={saving}>
+          <Save size={14} />{saving ? "保存中…" : `保存 ${provider.name} 路由`}
+        </button>
+      </footer>
+    </form>
   );
 }
 
@@ -660,6 +865,7 @@ function ProviderSettingsPage({
       model: "",
       models: [],
       endpoints: [],
+      fallbackProviderIds: [],
       transport: "open_ai_chat_completions",
       hasApiKey: false,
       isDefault: providers.length === 0,
@@ -727,6 +933,7 @@ function ProviderSettingsPage({
       model: updatedProvider.model,
       models: updatedProvider.models,
       endpoints: updatedProvider.endpoints,
+      fallbackProviderIds: updatedProvider.fallbackProviderIds,
       activate: updatedProvider.isDefault,
       ...(apiKey ? { apiKey } : {}),
     };
@@ -905,6 +1112,9 @@ function ProviderEditor({ providerItem, error, onSave }: ProviderEditorProps) {
   );
   const [transport, setTransport] = useState<ProviderTransport>(providerItem.transport);
   const [endpoints, setEndpoints] = useState<ProviderEndpointConfig[]>(providerItem.endpoints ?? []);
+  const [fallbackProviderIds, setFallbackProviderIds] = useState<string[]>(
+    providerItem.fallbackProviderIds ?? [],
+  );
   const [apiKey, setApiKey] = useState("");
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
@@ -970,6 +1180,7 @@ function ProviderEditor({ providerItem, error, onSave }: ProviderEditorProps) {
       model: activeModel.id.trim(),
       models: normalizedModels,
       transport,
+      fallbackProviderIds,
       hasApiKey: apiKey.trim() ? true : providerItem.hasApiKey,
     };
 
@@ -1028,7 +1239,12 @@ function ProviderEditor({ providerItem, error, onSave }: ProviderEditorProps) {
           <span>传输协议</span>
           <select
             value={transport}
-            onChange={(event) => { setTransport(event.target.value as ProviderTransport); markChanged(); }}
+            onChange={(event) => {
+              const nextTransport = event.target.value as ProviderTransport;
+              setTransport(nextTransport);
+              if (nextTransport === "open_ai_image_generations") setFallbackProviderIds([]);
+              markChanged();
+            }}
           >
             {transportOptions.map((option) => (
               <option value={option.value} key={option.value}>{option.label}</option>

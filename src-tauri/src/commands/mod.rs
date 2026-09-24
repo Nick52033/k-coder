@@ -100,6 +100,7 @@ fn ordinary_turn_soft_limits(has_active_goal: bool) -> Option<SoftTurnLimits> {
 
 pub(crate) mod mobile;
 pub(crate) mod threads;
+pub mod wechat_clawbot;
 
 async fn emit_mailbox_changed(app: &AppHandle, state: &AppState, thread_id: &str) {
     let revision = state.thread_mailbox().revision(thread_id).await;
@@ -373,6 +374,9 @@ impl EventPublisher for TauriEventPublisher {
         // 同一领域事件同时扇出给已订阅的移动端连接。桌面和手机看到的是同一份事实。
         if let Some(service) = self.app.try_state::<crate::mobile::MobileService>() {
             service.publish_event(&event);
+        }
+        if let Some(service) = self.app.try_state::<crate::channels::wechat_clawbot::service::WechatClawbotService>() {
+            service.on_agent_event(&event);
         }
     }
 }
@@ -2846,9 +2850,19 @@ pub(crate) async fn enqueue_message_turn(
     attachments: Vec<ImageAttachment>,
     workflow_id: Option<String>,
 ) -> CommandResult<TurnHandle> {
+    enqueue_message_turn_with_id(app, state, request, attachments, workflow_id, Uuid::new_v4().to_string()).await
+}
+
+pub(crate) async fn enqueue_message_turn_with_id(
+    app: AppHandle,
+    state: &AppState,
+    request: RunTurnRequest,
+    attachments: Vec<ImageAttachment>,
+    workflow_id: Option<String>,
+    turn_id: String,
+) -> CommandResult<TurnHandle> {
     preflight_requested_or_active_workflow(state, &request.thread_id, workflow_id.as_deref())
         .await?;
-    let turn_id = Uuid::new_v4().to_string();
     let thread_id = request.thread_id.clone();
     let (signal, started) = oneshot::channel();
     let handle = TurnHandle {
@@ -4629,6 +4643,7 @@ mod tests {
                     fallback: false,
                 }],
                 endpoints: Vec::new(),
+                fallback_provider_ids: Vec::new(),
                 api_key: Some("fixture-key".into()),
                 activate: true,
             })
@@ -4722,6 +4737,7 @@ mod tests {
                     fallback: false,
                 }],
                 endpoints: Vec::new(),
+                fallback_provider_ids: Vec::new(),
                 api_key: Some("fixture-key".into()),
                 activate: true,
             })

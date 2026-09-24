@@ -974,6 +974,7 @@ impl AppState {
             model: config.model,
             models: config.models,
             endpoints: config.endpoints,
+            fallback_provider_ids: config.fallback_provider_ids,
             has_api_key,
         })
     }
@@ -1058,11 +1059,13 @@ impl AppState {
     }
 
     pub fn provider_context_limit(&self) -> Result<usize, AppStateError> {
-        Ok(self
-            .provider_config
-            .load()?
-            .map(|config| config.active_model().context_window as usize)
-            .unwrap_or(crate::context::DEFAULT_CONTEXT_LIMIT))
+        let Some(config) = self.provider_config.load()? else {
+            return Ok(crate::context::DEFAULT_CONTEXT_LIMIT);
+        };
+        let configured = self.provider_config.list()?.1;
+        let route_configs = provider_route_configs(&config, &configured);
+        let available = self.available_route_configs(&config, route_configs)?;
+        Ok(provider_route_context_limit(&config, &available, false))
     }
 
     pub fn build_provider(&self) -> Result<(Arc<dyn Provider>, String, usize), AppStateError> {
@@ -1083,11 +1086,15 @@ impl AppState {
     }
 
     pub fn active_model_supports_vision(&self) -> Result<bool, AppStateError> {
-        Ok(self
-            .provider_config
-            .load()?
-            .map(|config| model_supports_vision(&config, config.active_model()))
-            .unwrap_or(false))
+        let Some(config) = self.provider_config.load()? else {
+            return Ok(false);
+        };
+        let configured = self.provider_config.list()?.1;
+        let route_configs = provider_route_configs(&config, &configured);
+        let available = self.available_route_configs(&config, route_configs)?;
+        Ok(available
+            .iter()
+            .any(|route| !provider_target_specs(route, true).is_empty()))
     }
 
     pub async fn build_provider_for_thread(
@@ -1156,7 +1163,12 @@ impl AppState {
             )));
         }
         config.model = selection.model;
-        Ok(model_supports_vision(&config, config.active_model()))
+        let configured = self.provider_config.list()?.1;
+        let route_configs = provider_route_configs(&config, &configured);
+        let available = self.available_route_configs(&config, route_configs)?;
+        Ok(available
+            .iter()
+            .any(|route| !provider_target_specs(route, true).is_empty()))
     }
 
     fn build_provider_for_capability(
@@ -1186,37 +1198,71 @@ impl AppState {
         config: ProviderConfig,
         requires_vision: bool,
     ) -> Result<(Arc<dyn Provider>, String, usize), AppStateError> {
-        let api_key = self.credentials.get_api_key(&config.id)?.ok_or_else(|| {
+        let primary_api_key = self.credentials.get_api_key(&config.id)?.ok_or_else(|| {
             AppStateError::ProviderNotConfigured("the provider API key is missing".to_string())
         })?;
         let model = config.model.clone();
-        let context_limit = config.active_model().context_window as usize;
-        let target_specs = provider_target_specs(&config, requires_vision);
-        if target_specs.is_empty() {
-            return Err(AppStateError::ProviderNotConfigured(
-                "the active model does not support image input".to_string(),
-            ));
-        }
+        let configured = self.provider_config.list()?.1;
+        let route_configs = provider_route_configs(&config, &configured);
+        let route_configs = self.available_route_configs(&config, route_configs)?;
         let mut targets = Vec::new();
-        for (base_url, target_model, label) in target_specs {
-            let mut target_config = config.clone();
-            target_config.base_url = base_url;
-            target_config.model = target_model.clone();
-            targets.push(FallbackTarget {
-                provider: Self::provider_for_config(target_config, api_key.clone())?,
-                model: target_model,
-                label,
-            });
+        let mut target_keys = std::collections::HashSet::new();
+        for route_config in &route_configs {
+            let api_key = if route_config.id == config.id {
+                primary_api_key.clone()
+            } else {
+                self.credentials
+                    .get_api_key(&route_config.id)?
+                    .expect("available route config must have an API key")
+            };
+            for (base_url, target_model, label) in
+                provider_target_specs(route_config, requires_vision)
+            {
+                if !target_keys.insert((
+                    route_config.id.clone(),
+                    base_url.clone(),
+                    target_model.clone(),
+                )) {
+                    continue;
+                }
+                let mut target_config = route_config.clone();
+                target_config.base_url = base_url;
+                target_config.model = target_model.clone();
+                let provider = Self::provider_for_config(target_config, api_key.clone())?;
+                targets.push(FallbackTarget {
+                    provider: self.rate_limits.wrap(&route_config.id, provider),
+                    model: target_model,
+                    label,
+                });
+            }
         }
+        if targets.is_empty() {
+            return Err(AppStateError::ProviderNotConfigured(if requires_vision {
+                "no configured provider route supports image input".to_string()
+            } else {
+                "no configured provider route is available".to_string()
+            }));
+        }
+        let context_limit = provider_route_context_limit(&config, &route_configs, requires_vision);
         let provider = Arc::new(FallbackProvider::new(
             targets,
             self.advanced.metrics.clone(),
         )?) as Arc<dyn Provider>;
-        Ok((
-            self.rate_limits.wrap(&config.id, provider),
-            model,
-            context_limit,
-        ))
+        Ok((provider, model, context_limit))
+    }
+
+    fn available_route_configs(
+        &self,
+        primary: &ProviderConfig,
+        route_configs: Vec<ProviderConfig>,
+    ) -> Result<Vec<ProviderConfig>, AppStateError> {
+        let mut available = Vec::with_capacity(route_configs.len());
+        for config in route_configs {
+            if config.id == primary.id || self.credentials.get_api_key(&config.id)?.is_some() {
+                available.push(config);
+            }
+        }
+        Ok(available)
     }
 
     fn provider_for_config(
@@ -1891,6 +1937,44 @@ fn provider_target_specs(
         .collect()
 }
 
+fn provider_route_configs(
+    primary: &ProviderConfig,
+    configured: &[ProviderConfig],
+) -> Vec<ProviderConfig> {
+    let mut route = vec![primary.clone()];
+    for fallback_provider_id in &primary.fallback_provider_ids {
+        if let Some(provider) = configured.iter().find(|provider| {
+            &provider.id == fallback_provider_id
+                && provider.transport != ProviderTransport::OpenAiImageGenerations
+        }) {
+            route.push(provider.clone());
+        }
+    }
+    route
+}
+
+fn provider_route_context_limit(
+    primary: &ProviderConfig,
+    route_configs: &[ProviderConfig],
+    requires_vision: bool,
+) -> usize {
+    route_configs
+        .iter()
+        .flat_map(|config| {
+            provider_target_specs(config, requires_vision)
+                .into_iter()
+                .filter_map(|(_, model_id, _)| {
+                    config
+                        .models
+                        .iter()
+                        .find(|model| model.id == model_id)
+                        .map(|model| model.context_window as usize)
+                })
+        })
+        .min()
+        .unwrap_or(primary.active_model().context_window as usize)
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum AppStateError {
     #[error(transparent)]
@@ -1979,6 +2063,81 @@ mod tests {
     #[derive(Default)]
     struct FakeCredentials {
         api_keys: StdMutex<HashMap<String, String>>,
+    }
+
+    #[test]
+    fn configured_cross_provider_route_controls_capabilities_and_context_budget() {
+        let directory = tempfile::tempdir().unwrap();
+        let credentials = Arc::new(FakeCredentials::default());
+        let state = AppState::with_credentials(directory.path(), credentials.clone()).unwrap();
+        let backup: SaveProviderConfigRequest = serde_json::from_value(serde_json::json!({
+            "id": "new-api",
+            "kind": "open_ai_compatible",
+            "transport": "open_ai_chat_completions",
+            "name": "New API",
+            "baseUrl": "https://gateway.example.com/v1",
+            "model": "vision-model",
+            "models": [{
+                "id": "vision-model",
+                "displayName": "Vision model",
+                "contextWindow": 64000,
+                "supportsVision": true,
+                "fallback": false
+            }],
+            "apiKey": "backup-key",
+            "activate": false
+        }))
+        .unwrap();
+        state.save_provider_config(backup).unwrap();
+
+        let primary: SaveProviderConfigRequest = serde_json::from_value(serde_json::json!({
+            "id": "primary",
+            "kind": "open_ai_compatible",
+            "transport": "open_ai_chat_completions",
+            "name": "Primary",
+            "baseUrl": "https://primary.example.com/v1",
+            "model": "text-model",
+            "models": [{
+                "id": "text-model",
+                "displayName": "Text model",
+                "contextWindow": 128000,
+                "supportsVision": false,
+                "fallback": false
+            }],
+            "fallbackProviderIds": ["new-api"],
+            "apiKey": "primary-key",
+            "activate": true
+        }))
+        .unwrap();
+        let saved = state.save_provider_config(primary).unwrap();
+
+        assert_eq!(
+            serde_json::to_value(saved).unwrap()["fallbackProviderIds"],
+            serde_json::json!(["new-api"])
+        );
+        assert_eq!(
+            credentials.get_api_key("primary").unwrap().as_deref(),
+            Some("primary-key")
+        );
+        assert_eq!(
+            credentials.get_api_key("new-api").unwrap().as_deref(),
+            Some("backup-key")
+        );
+        let configured = state.provider_config.list().unwrap().1;
+        let active = configured
+            .iter()
+            .find(|provider| provider.id == "primary")
+            .unwrap();
+        assert_eq!(
+            provider_route_configs(active, &configured)
+                .iter()
+                .map(|provider| provider.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["primary", "new-api"]
+        );
+        assert!(state.active_model_supports_vision().unwrap());
+        assert_eq!(state.provider_context_limit().unwrap(), 64_000);
+        assert!(state.build_vision_provider().is_ok());
     }
 
     #[tokio::test]
@@ -2305,6 +2464,7 @@ mod tests {
                     fallback: false,
                 }],
                 endpoints: Vec::new(),
+                fallback_provider_ids: Vec::new(),
                 api_key: None,
                 activate: true,
             }
@@ -2349,6 +2509,7 @@ mod tests {
                     fallback: false,
                 }],
                 endpoints: vec![],
+                fallback_provider_ids: Vec::new(),
                 api_key: None,
                 activate: true,
             }
@@ -2462,6 +2623,7 @@ mod tests {
                     },
                 ],
                 endpoints: vec![],
+                fallback_provider_ids: Vec::new(),
                 api_key: Some("super-secret".to_string()),
                 activate: true,
             })
@@ -2474,7 +2636,7 @@ mod tests {
         assert_eq!(view.models[0].id, "test-model");
         assert_eq!(view.models[0].display_name, "Test model");
         assert_eq!(view.models[0].context_window, 128_000);
-        assert_eq!(state.provider_context_limit().unwrap(), 128_000);
+        assert_eq!(state.provider_context_limit().unwrap(), 64_000);
         assert!(!serialized.contains("super-secret"));
         assert_eq!(
             credentials.get_api_key("primary").unwrap().as_deref(),
@@ -2526,6 +2688,7 @@ mod tests {
                     base_url: "https://secondary.example.com/v1".to_string(),
                     enabled: true,
                 }],
+                fallback_provider_ids: Vec::new(),
                 api_key: Some("secret".to_string()),
                 activate: true,
             })
@@ -2563,6 +2726,7 @@ mod tests {
                     model: "test-model".to_string(),
                     models: vec![],
                     endpoints: vec![],
+                    fallback_provider_ids: Vec::new(),
                     api_key: Some(format!("{id}-secret")),
                     activate,
                 })
@@ -2589,6 +2753,7 @@ mod tests {
                 model: "test-model".to_string(),
                 models: vec![],
                 endpoints: vec![],
+                fallback_provider_ids: Vec::new(),
                 api_key: None,
                 activate: false,
             })

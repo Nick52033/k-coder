@@ -633,6 +633,7 @@ export interface ProviderConfigView {
   model: string;
   models: ProviderModelConfig[];
   endpoints: ProviderEndpointConfig[];
+  fallbackProviderIds: string[];
   hasApiKey: boolean;
 }
 
@@ -651,6 +652,7 @@ export interface SaveProviderConfigRequest {
   model: string;
   models: ProviderModelConfig[];
   endpoints: ProviderEndpointConfig[];
+  fallbackProviderIds: string[];
   apiKey?: string;
   activate: boolean;
 }
@@ -1205,4 +1207,28 @@ export interface MobileStatus {
   /** 已提交、等待桌面端确认的配对请求；与 `pairing` 的生命周期无关。 */
   pendingPairings: MobilePendingPairingView[];
   devices: MobileDeviceView[];
+}
+
+export interface WechatSenderView {
+  senderKey: string;
+  approved: boolean;
+  hasThread: boolean;
+}
+
+export interface WechatClawbotStatus {
+  connected: boolean;
+  polling: boolean;
+  paused: boolean;
+  pendingSenders: WechatSenderView[];
+  approvedSenders: WechatSenderView[];
+}
+
+export interface WechatClawbotQrLogin {
+  loginId: string;
+  qrContent: string;
+}
+
+export interface WechatClawbotQrLoginStatus {
+  phase: string;
+  message: string | null;
 }

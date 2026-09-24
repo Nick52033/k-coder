@@ -6347,6 +6347,40 @@ test("switches the runtime approval mode from the composer", async ({ page }, te
   await expect(trigger).toBeFocused();
 });
 
+test("configures ordered cross-provider failover from the shared settings page", async ({ page }) => {
+  await page.goto("/");
+  await page.locator('button[aria-label="设置"]:visible').click();
+
+  await expect(page.getByRole("heading", { name: "模型供应商" })).toBeVisible();
+  await expect(page.getByRole("checkbox", { name: "备用供应商：zicc" })).toHaveCount(0);
+  await page.getByRole("button", { name: "故障切换" }).click();
+
+  await expect(page.getByRole("heading", { name: "跨供应商故障切换" })).toBeVisible();
+  await expect(page.getByText("New API 的渠道负载均衡由 New API 管理", { exact: false })).toBeVisible();
+  const openAiRoute = page.getByRole("group", { name: "主供应商：OpenAI" });
+  await expect(page.getByRole("group", { name: "主供应商：zicc" })).toBeVisible();
+  await expect(openAiRoute.getByText("gpt-4.1", { exact: true })).toBeVisible();
+  const backup = openAiRoute.getByRole("checkbox", { name: "备用供应商：zicc" });
+  const unconfigured = openAiRoute.getByRole("checkbox", { name: "备用供应商：待配置供应商" });
+  await expect(backup).toBeEnabled();
+  await expect(unconfigured).toBeDisabled();
+
+  await backup.check();
+  await expect(openAiRoute.getByText("尝试顺序 1", { exact: true })).toBeVisible();
+  await expect(openAiRoute.getByText("gpt-5.6-terra", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "保存 OpenAI 路由" }).click();
+
+  await expect.poll(() => page.evaluate(() => {
+    const request = (window as unknown as {
+      __lastProviderRequest: { id: string; fallbackProviderIds: string[] } | null;
+    }).__lastProviderRequest;
+    return request ? { id: request.id, fallbackProviderIds: request.fallbackProviderIds } : null;
+  })).toEqual({
+    id: "openai",
+    fallbackProviderIds: ["zicc"],
+  });
+});
+
 test("adds, edits, deletes, and saves structured provider models", async ({ page }) => {
   await page.goto("/");
   await page.locator('button[aria-label="设置"]:visible').click();
@@ -7561,6 +7595,25 @@ test("shows an actionable waiting state before the assistant returns its first u
   await expect(waiting).toContainText("回复会显示在这里");
   await expect(waiting.locator(".turn-waiting__elapsed")).toContainText("0s");
   await expect(waiting.getByRole("button", { name: "停止", exact: true })).toBeEnabled();
+  const waitingStyle = await waiting.evaluate((element) => {
+    const icon = element.querySelector<HTMLElement>(".turn-waiting__icon");
+    const stop = element.querySelector<HTMLElement>(".turn-waiting__stop");
+    const style = getComputedStyle(element);
+    return {
+      backgroundColor: style.backgroundColor,
+      borderRightWidth: style.borderRightWidth,
+      borderTopWidth: style.borderTopWidth,
+      iconBackgroundColor: icon ? getComputedStyle(icon).backgroundColor : null,
+      stopBackgroundColor: stop ? getComputedStyle(stop).backgroundColor : null,
+      stopBorderTopWidth: stop ? getComputedStyle(stop).borderTopWidth : null,
+    };
+  });
+  expect(waitingStyle.backgroundColor).toBe("rgba(0, 0, 0, 0)");
+  expect(waitingStyle.borderRightWidth).toBe("0px");
+  expect(waitingStyle.borderTopWidth).toBe("1px");
+  expect(waitingStyle.iconBackgroundColor).toBe("rgba(0, 0, 0, 0)");
+  expect(waitingStyle.stopBackgroundColor).toBe("rgba(0, 0, 0, 0)");
+  expect(waitingStyle.stopBorderTopWidth).toBe("0px");
   await page.screenshot({ path: testInfo.outputPath("slow-first-update-waiting-state.png"), fullPage: true });
 
   await waiting.getByRole("button", { name: "停止", exact: true }).click();

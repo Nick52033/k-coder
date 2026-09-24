@@ -1032,6 +1032,7 @@ mod tests {
             model: model.to_string(),
             models: Vec::new(),
             endpoints: Vec::new(),
+            fallback_provider_ids: Vec::new(),
         }
     }
 

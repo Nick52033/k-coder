@@ -762,6 +762,7 @@ mod tests {
             model: "step-image-edit-2".into(),
             models: Vec::new(),
             endpoints: Vec::new(),
+            fallback_provider_ids: Vec::new(),
         };
         let provider = OpenAiImageGenerationsProvider::new(config, "test-key".into())
             .expect("image provider should build");
@@ -873,6 +874,7 @@ mod tests {
             model: "gpt-image-1".into(),
             models: Vec::new(),
             endpoints: Vec::new(),
+            fallback_provider_ids: Vec::new(),
         };
         let provider = OpenAiImageGenerationsProvider::new(config, "test-key".into())
             .expect("image provider should build");
