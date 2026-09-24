@@ -48,7 +48,7 @@ pub mod query_rewrite;
 pub mod thread_operation;
 pub(crate) use input::build_user_message;
 use mailbox::TurnControl;
-use provider_history::{last_active_context_usage, provider_history};
+use provider_history::{last_active_context_usage, provider_history, provider_history_for_turn};
 
 #[cfg(test)]
 use input::{chat_to_provider, user_message};
@@ -1021,7 +1021,8 @@ impl AgentRuntime {
             }
             let events = self.repository.load(&thread_id).await?;
             let last_context_usage = last_active_context_usage(&events);
-            let provider_history = provider_history(events, self.supports_vision);
+            let provider_history =
+                provider_history_for_turn(events, self.supports_vision, Some(&turn_id));
             let mut history = provider_history.request_messages();
             if force_compaction
                 || context::needs_compaction_for_request(

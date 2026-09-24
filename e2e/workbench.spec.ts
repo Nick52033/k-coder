@@ -5238,7 +5238,8 @@ test("completes and restores an approved edit test repair workflow", async ({ pa
   await expect(liveMessage.locator(".turn-command-summary").filter({ hasText: "test failed" })).toHaveCount(1);
   await expect(liveMessage.locator(".turn-command-summary").filter({ hasText: "已运行" })).toHaveCount(1);
   await expect(liveMessage.getByText("修复完成，测试已经通过。", { exact: true })).toHaveCount(1);
-  await expect(liveMessage.locator(".changes-toggle")).toContainText("2 个文件");
+  // 两次 apply_patch 改的是同一个 src/example.ts：去重后只算 1 个文件。
+  await expect(liveMessage.locator(".changes-toggle")).toContainText("1 个文件");
 
   const persistedTimeline = [
     { type: "text", id: "progress-read", turnId: "turn-self-edit", text: "先读取目标文件。" },
@@ -5282,7 +5283,7 @@ test("completes and restores an approved edit test repair workflow", async ({ pa
   await expect(restoredMessage.locator(".turn-command-summary").filter({ hasText: "test failed" })).toHaveCount(1);
   await expect(restoredMessage.locator(".turn-command-summary").filter({ hasText: "已运行" })).toHaveCount(1);
   await expect(restoredMessage.getByText("修复完成，测试已经通过。", { exact: true })).toHaveCount(1);
-  await expect(restoredMessage.locator(".changes-toggle")).toContainText("2 个文件");
+  await expect(restoredMessage.locator(".changes-toggle")).toContainText("1 个文件");
   await restoredMessage.scrollIntoViewIfNeeded();
   await page.screenshot({ path: testInfo.outputPath("self-edit-recovery.png"), fullPage: true });
 });
@@ -6289,7 +6290,7 @@ test("adds, edits, deletes, and saves structured provider models", async ({ page
   await page.getByLabel("模型 ID 3").fill("gpt-5.6-sol");
   await page.getByLabel("显示名称 3").fill("GPT-5.6 Sol");
   await page.getByLabel("上下文长度 3").fill("200000");
-  await expect(page.getByLabel("最大输出 3")).toHaveValue("65536");
+  await expect(page.getByLabel("最大输出 3")).toHaveValue("32000");
   await expect(page.locator(".provider-model-card").nth(2).getByRole("checkbox", { name: "支持图片" })).toBeChecked();
   await page.getByLabel(/设为默认模型：GPT-5.6 Sol/).check();
 
@@ -6300,8 +6301,8 @@ test("adds, edits, deletes, and saves structured provider models", async ({ page
   await expect.poll(() => page.evaluate(() => (window as unknown as { __lastProviderRequest: { model: string } | null }).__lastProviderRequest?.model)).toBe("gpt-5.6-sol");
   const request = await page.evaluate(() => (window as unknown as { __lastProviderRequest: { models: unknown[] } }).__lastProviderRequest);
   expect(request.models).toEqual([
-    { id: "gpt-4.1", displayName: "GPT-4.1", contextWindow: 128000, maxOutputTokens: 65536, supportsVision: true, fallback: false },
-    { id: "gpt-5.6-sol", displayName: "GPT-5.6 Sol", contextWindow: 200000, maxOutputTokens: 65536, supportsVision: true, fallback: false },
+    { id: "gpt-4.1", displayName: "GPT-4.1", contextWindow: 128000, maxOutputTokens: 32000, supportsVision: true, fallback: false },
+    { id: "gpt-5.6-sol", displayName: "GPT-5.6 Sol", contextWindow: 200000, maxOutputTokens: 32000, supportsVision: true, fallback: false },
   ]);
 });
 
@@ -7700,7 +7701,7 @@ test("robot node progress stays authoritative after a turn completes", async ({ 
   await expect(progress).not.toContainText("计划未收尾");
 });
 
-test("plan progress counts every repeated file change without deduplicating paths", async ({ page }) => {
+test("plan progress and change list deduplicate repeated file changes by path", async ({ page }) => {
   await page.goto("/");
   const progress = page.locator(".plan-progress-trigger");
   await expect(progress).toHaveCount(1);
@@ -7738,13 +7739,14 @@ test("plan progress counts every repeated file change without deduplicating path
       });
     }
   });
-  await expect(progress).toContainText("3 个文件已更新");
+  // 同一路径改 3 次仍只算 1 个文件（P10-232 的不去重契约已被用户要求推翻）。
+  await expect(progress).toContainText("1 个文件已更新");
   const changeToggle = page.locator(".message-changes .changes-toggle");
-  await expect(changeToggle).toContainText("3 个文件");
+  await expect(changeToggle).toContainText("1 个文件");
   await changeToggle.click();
   const changeItems = page.locator(".message-changes .changes-list .change-file-item");
-  await expect(changeItems).toHaveCount(3);
-  await expect(page.locator(".message-changes .changes-list").getByText("src/App.css", { exact: true })).toHaveCount(3);
+  await expect(changeItems).toHaveCount(1);
+  await expect(page.locator(".message-changes .changes-list").getByText("src/App.css", { exact: true })).toHaveCount(1);
   await page.evaluate(() => {
     (window as unknown as { __emitAgentEvent: (event: unknown) => void }).__emitAgentEvent({
       schemaVersion: 1, threadId: "thread-1", turnId: "turn-1", phase: "responding",

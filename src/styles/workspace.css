@@ -201,8 +201,8 @@
    and a one-pixel jump in enhanced-animations.css. */
 [data-theme] .composer textarea:focus { transform: none; box-shadow: none; }
 .composer-controls { padding: 6px 12px 10px; gap: var(--workspace-gap); }
-.composer-options { gap: 4px; flex-wrap: wrap; }
-.composer-options .model-selector { flex-basis: 180px; min-width: 0; }
+.composer-options { gap: 2px; flex-wrap: nowrap; }
+.composer-options .model-selector { flex: 1 1 120px; min-width: 0; }
 .composer-actions::before { display: none; }
 .composer-actions { align-self: end; }
 /* Keep the model recognizable before showing its secondary provider label.

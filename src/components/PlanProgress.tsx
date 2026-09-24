@@ -329,19 +329,20 @@ export function isUnreconciledPlan(
 }
 
 function summarizeChanges(changes: ChangeSet[], turnId?: string) {
-  let files = 0;
+  const touchedPaths = new Set<string>();
   let added = 0;
   let deleted = 0;
   for (const change of changes) {
     if (change.undone || (turnId && change.turnId !== turnId)) continue;
     for (const file of change.files) {
-      files += 1;
+      // 同一路径反复修改只算一个文件；行数统计仍按每次实际 diff 累计。
+      touchedPaths.add(file.destinationPath ?? file.path);
       const stats = changeLineStats(file.unifiedDiff);
       added += stats.added;
       deleted += stats.deleted;
     }
   }
-  return { added, deleted, files };
+  return { added, deleted, files: touchedPaths.size };
 }
 
 function planStatusLabel(status: PlanStepState) {

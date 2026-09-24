@@ -1454,6 +1454,15 @@ function App() {
 
   function renderMessageChanges(ownerId: string, ownerChanges: typeof changes) {
     if (!ownerChanges.length) return null;
+    // 同一路径在多个改动项里反复修改只算一个文件；点击打开该路径最近一次的变更快照。
+    const dedupedFiles = new Map<string, { path: string; operation: string; changeId: string }>();
+    for (const change of ownerChanges) {
+      for (const file of change.files) {
+        const path = file.destinationPath ?? file.path;
+        dedupedFiles.set(path, { path, operation: file.operation, changeId: change.id });
+      }
+    }
+    const files = [...dedupedFiles.values()];
     return (
       <div className="message-changes">
         <button
@@ -1469,22 +1478,22 @@ function App() {
           }}
         >
           <span className={cn("changes-arrow", expandedChangeSets.has(ownerId) && "changes-arrow--expanded")}>▶</span>
-          <span>{ownerChanges.reduce((sum, change) => sum + change.files.length, 0)} 个文件</span>
+          <span>{files.length} 个文件</span>
         </button>
 
         {expandedChangeSets.has(ownerId) ? (
           <div className="changes-list">
-            {ownerChanges.flatMap((change) => change.files.map((file) => (
+            {files.map((file) => (
               <button
                 type="button"
-                key={`${change.id}-${file.path}`}
+                key={file.path}
                 className="change-file-item"
-                onClick={() => setSelectedChangeId(change.id)}
+                onClick={() => setSelectedChangeId(file.changeId)}
               >
                 <span className="change-file-name">{file.path}</span>
                 <span className="change-operation">{file.operation}</span>
               </button>
-            )))}
+            ))}
           </div>
         ) : null}
       </div>

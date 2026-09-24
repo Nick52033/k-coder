@@ -47,6 +47,17 @@ impl ProviderHistory {
 }
 
 pub(super) fn provider_history(events: Vec<StoredEvent>, supports_vision: bool) -> ProviderHistory {
+    provider_history_for_turn(events, supports_vision, None)
+}
+
+/// Builds provider history for a live Turn. Opaque provider context such as an OpenAI Responses
+/// encrypted reasoning item is valid only for follow-up requests within the Turn that produced
+/// it; retries and later Turns must not replay it, especially after the user switches models.
+pub(super) fn provider_history_for_turn(
+    events: Vec<StoredEvent>,
+    supports_vision: bool,
+    current_turn_id: Option<&str>,
+) -> ProviderHistory {
     let mut history = Vec::new();
     let mut summary = None;
     let mut user_context = CompactionUserContext::default();
@@ -54,6 +65,11 @@ pub(super) fn provider_history(events: Vec<StoredEvent>, supports_vision: bool) 
     let mut questions = HashMap::new();
     let mut assistant_progress = Vec::new();
     for event in events {
+        // Preserve the legacy full-history behavior for callers that are not building a live
+        // Turn. Runtime requests pass a Turn ID and only replay opaque context from that Turn.
+        let include_provider_context = current_turn_id
+            .map(|turn_id| event.turn_id.as_deref() == Some(turn_id))
+            .unwrap_or(true);
         let message = match event.kind {
             StoredEventKind::UserMessage { message } => {
                 let message = chat_to_provider(message, supports_vision);
@@ -81,9 +97,10 @@ pub(super) fn provider_history(events: Vec<StoredEvent>, supports_vision: bool) 
                     output,
                 })
             }
-            StoredEventKind::ProviderContext { provider, item } => {
+            StoredEventKind::ProviderContext { provider, item } if include_provider_context => {
                 Some(ProviderMessage::ProviderContext { provider, item })
             }
+            StoredEventKind::ProviderContext { .. } => None,
             StoredEventKind::UserInputRequested { request }
                 if request.kind == UserInputRequestKind::ModelQuestion
                     && request.thread_id == event.thread_id
@@ -301,6 +318,47 @@ mod tests {
         let rendered = serde_json::to_string(&restored.request_messages()).unwrap();
         assert!(rendered.contains("改成可点击的状态面板"));
         assert!(rendered.contains("补充 e2e 测试"));
+    }
+
+    #[test]
+    fn opaque_provider_context_is_limited_to_the_turn_that_created_it() {
+        let events = [
+            StoredEvent::new(
+                "thread",
+                Some("previous-turn".into()),
+                StoredEventKind::ProviderContext {
+                    provider: "openai_responses".into(),
+                    item: serde_json::json!({
+                        "type": "reasoning",
+                        "encrypted_content": "previous-turn-secret-payload"
+                    }),
+                },
+            ),
+            StoredEvent::new(
+                "thread",
+                Some("current-turn".into()),
+                StoredEventKind::ProviderContext {
+                    provider: "openai_responses".into(),
+                    item: serde_json::json!({
+                        "type": "reasoning",
+                        "encrypted_content": "current-turn-payload"
+                    }),
+                },
+            ),
+        ];
+
+        let messages = provider_history_for_turn(events.to_vec(), false, Some("current-turn"))
+            .request_messages();
+        let serialized = serde_json::to_string(&messages).unwrap();
+
+        assert!(serialized.contains("current-turn-payload"));
+        assert!(!serialized.contains("previous-turn-secret-payload"));
+
+        let legacy_messages = provider_history(events.to_vec(), false).request_messages();
+        let legacy_serialized = serde_json::to_string(&legacy_messages).unwrap();
+
+        assert!(legacy_serialized.contains("current-turn-payload"));
+        assert!(legacy_serialized.contains("previous-turn-secret-payload"));
     }
 
     #[test]
