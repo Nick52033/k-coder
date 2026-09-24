@@ -2552,6 +2552,94 @@ button {
   margin: 2px 0 13px;
 }
 
+.turn-waiting {
+  display: grid;
+  width: min(100%, 620px);
+  min-width: 0;
+  margin: 2px 0 18px;
+  padding: 12px;
+  grid-template-columns: 30px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  color: var(--color-ink);
+  background: color-mix(in srgb, var(--color-brand) 4%, var(--color-surface-raised));
+}
+
+.turn-waiting__icon {
+  display: grid;
+  width: 28px;
+  height: 28px;
+  place-items: center;
+  border-radius: 50%;
+  color: var(--color-brand);
+  background: color-mix(in srgb, var(--color-brand) 11%, var(--color-surface));
+}
+
+.turn-waiting__icon > svg {
+  animation: turn-tool-spin 900ms linear infinite;
+}
+
+.turn-waiting__copy {
+  min-width: 0;
+}
+
+.turn-waiting__heading {
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  align-items: baseline;
+  column-gap: 9px;
+  row-gap: 2px;
+}
+
+.turn-waiting__heading strong {
+  font-size: var(--font-size-base);
+  font-weight: var(--font-weight-semibold);
+}
+
+.turn-waiting__elapsed {
+  color: var(--color-ink-subtle);
+  font-size: var(--font-size-xs);
+}
+
+.turn-waiting__copy p {
+  margin: 3px 0 0;
+  color: var(--color-ink-muted);
+  font-size: var(--font-size-sm);
+  line-height: 1.5;
+  text-wrap: pretty;
+}
+
+.turn-waiting__stop {
+  display: inline-flex;
+  min-height: 30px;
+  padding: 0 9px;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius-sm);
+  color: var(--color-ink-muted);
+  background: var(--color-surface);
+  cursor: pointer;
+  font: inherit;
+  font-size: var(--font-size-sm);
+  transition: color var(--transition-fast), border-color var(--transition-fast), background-color var(--transition-fast);
+}
+
+.turn-waiting__stop:hover {
+  border-color: var(--color-error-border);
+  color: var(--color-error-text);
+  background: var(--color-error-bg);
+}
+
+.turn-waiting__stop:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--color-brand-ring);
+}
+
 .turn-timeline {
   display: flex;
   min-width: 0;
@@ -9213,6 +9301,7 @@ button {
 
   .turn-activity-status > svg,
   .turn-tool-running,
+  .turn-waiting__icon > svg,
   .turn-live-status > svg,
   .turn-live-status-dots i {
     animation: none;

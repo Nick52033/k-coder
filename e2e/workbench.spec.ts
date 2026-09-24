@@ -7468,6 +7468,81 @@ test("opens the embedded browser panel and keeps the page across tab switches", 
 });
 
 
+test("shows an actionable waiting state before the assistant returns its first update", async ({ page }, testInfo) => {
+  await page.addInitScript(() => localStorage.setItem("kcoder_e2e_plan", "null"));
+  await page.goto("/");
+  await expect(page.getByRole("heading", { name: "Phase 6 workbench", exact: true })).toBeVisible();
+  await page.evaluate(() => {
+    (window as unknown as { __emitAgentEvent: (event: unknown) => void }).__emitAgentEvent({
+      schemaVersion: 7,
+      threadId: "thread-1",
+      turnId: "slow-first-update",
+      type: "turn_started",
+      phase: "exploring",
+      userMessage: {
+        schemaVersion: 1,
+        id: "slow-first-update-user",
+        role: "user",
+        content: [{ type: "text", text: "请分析这个任务" }],
+        createdAtMs: Date.now(),
+      },
+    });
+  });
+
+  const waiting = page.locator(".turn-waiting");
+  await expect(waiting).toBeVisible();
+  await expect(waiting).toContainText("正在理解你的请求");
+  await expect(waiting).toContainText("回复会显示在这里");
+  await expect(waiting.locator(".turn-waiting__elapsed")).toContainText("0s");
+  await expect(waiting.getByRole("button", { name: "停止", exact: true })).toBeEnabled();
+  await page.screenshot({ path: testInfo.outputPath("slow-first-update-waiting-state.png"), fullPage: true });
+
+  await waiting.getByRole("button", { name: "停止", exact: true }).click();
+  await expect(waiting).toContainText("正在停止");
+  await expect(waiting.getByRole("button", { name: "停止", exact: true })).toHaveCount(0);
+  await expect.poll(() => page.evaluate(() => (
+    window as unknown as { __invoked: string[] }
+  ).__invoked.filter((command) => command === "turn_interrupt").length)).toBe(1);
+});
+
+test("replaces the waiting state with the first streamed assistant content", async ({ page }) => {
+  await page.addInitScript(() => localStorage.setItem("kcoder_e2e_plan", "null"));
+  await page.goto("/");
+  await expect(page.getByRole("heading", { name: "Phase 6 workbench", exact: true })).toBeVisible();
+  await page.evaluate(() => {
+    const emit = (window as unknown as { __emitAgentEvent: (event: unknown) => void }).__emitAgentEvent;
+    emit({
+      schemaVersion: 7,
+      threadId: "thread-1",
+      turnId: "slow-first-output",
+      type: "turn_started",
+      phase: "exploring",
+      userMessage: {
+        schemaVersion: 1,
+        id: "slow-first-output-user",
+        role: "user",
+        content: [{ type: "text", text: "检查这个问题" }],
+        createdAtMs: Date.now(),
+      },
+    });
+  });
+  await expect(page.locator(".turn-waiting")).toBeVisible();
+
+  await page.evaluate(() => {
+    (window as unknown as { __emitAgentEvent: (event: unknown) => void }).__emitAgentEvent({
+      schemaVersion: 4,
+      threadId: "thread-1",
+      turnId: "slow-first-output",
+      type: "text_delta",
+      phase: "responding",
+      itemId: "slow-first-output-assistant",
+      delta: "已找到需要检查的内容。",
+    });
+  });
+  await expect(page.locator(".turn-waiting")).toHaveCount(0);
+  await expect(page.getByText("已找到需要检查的内容。", { exact: true })).toBeVisible();
+});
+
 test("rate limit waiting and all child states are visible with only one wait call", async ({ page }, testInfo) => {
   await page.goto("/");
   await expect(page.getByRole("heading", { name: "Phase 6 workbench", exact: true })).toBeVisible();

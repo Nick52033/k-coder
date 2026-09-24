@@ -64,7 +64,7 @@ import { ApprovalModeSelector } from "./components/ApprovalModeSelector";
 import { ReasoningSelector } from "./components/ReasoningSelector";
 import { SubagentSummary } from "./SubagentSummary";
 import { buildSubagentTurnIndex } from "./lib/subagent";
-import { ConversationTurnActivity, isVisibleConversationTimelineItem } from "./components/ConversationActivity";
+import { ConversationTurnActivity, TurnWaitingIndicator, isVisibleConversationTimelineItem } from "./components/ConversationActivity";
 import { MarkdownContent } from "./components/MarkdownContent";
 import { ImagePreviewDialog } from "./components/ImagePreviewDialog";
 import { BrandMark } from "./components/BrandMark";
@@ -1418,7 +1418,13 @@ function App() {
     || orphanTurnIds.length > 0
     || Boolean(plan?.steps.length)
     || Boolean(pendingApproval)
-    || Boolean(pendingUserInput);
+    || Boolean(pendingUserInput)
+    || currentThreadBusy;
+  const currentTurnHasConversationEntry = Boolean(currentThreadTurnId && (
+    displayMessages.some((message) => message.role === "assistant" && message.turnId === currentThreadTurnId)
+      || orphanTurnIds.includes(currentThreadTurnId)
+      || steeredTurnIds.has(currentThreadTurnId)
+  ));
 
   function renderOrphanTurn(turnId: string) {
     return (
@@ -1444,6 +1450,8 @@ function App() {
               retryAtMs={activityStatus?.retryAtMs}
               subagentTaskIndex={subagentTaskIndex}
               onFocusSubagent={focusSubagent}
+              onStop={turnId === currentThreadTurnId ? () => void stopTurn() : undefined}
+              cancelling={turnId === currentThreadTurnId && currentThreadCancelling}
             />
           </div>
         </article>
@@ -1602,6 +1610,8 @@ function App() {
             retryAtMs={activityStatus?.retryAtMs}
             subagentTaskIndex={subagentTaskIndex}
             onFocusSubagent={focusSubagent}
+            onStop={segment.turnId === currentThreadTurnId ? () => void stopTurn() : undefined}
+            cancelling={segment.turnId === currentThreadTurnId && currentThreadCancelling}
           />
           {hasFallbackText ? (
             <div className="message-content">{renderMessageText(assistantMessage!.text)}</div>
@@ -1674,6 +1684,8 @@ function App() {
                   retryAtMs={activityStatus?.retryAtMs}
                   subagentTaskIndex={subagentTaskIndex}
                   onFocusSubagent={focusSubagent}
+                  onStop={turnId === currentThreadTurnId ? () => void stopTurn() : undefined}
+                  cancelling={turnId === currentThreadTurnId && currentThreadCancelling}
                 />
                 {!steeredAttemptSegment && !attemptTimeline.length && assistantMessage?.text ? (
                   <div className="message-content">{renderMessageText(assistantMessage.text)}</div>
@@ -2620,6 +2632,8 @@ function App() {
                           retryAtMs={activityStatus?.retryAtMs}
                           subagentTaskIndex={subagentTaskIndex}
                           onFocusSubagent={focusSubagent}
+                          onStop={message.turnId === currentThreadTurnId ? () => void stopTurn() : undefined}
+                          cancelling={message.turnId === currentThreadTurnId && currentThreadCancelling}
                         />
                       )}
                       {!messageTimeline.length && (message.text || (message.status === "streaming" && !messageActivityStatus)) ? <div className="message-content">
@@ -2654,6 +2668,22 @@ function App() {
               })}
 
               {unanchoredOrphanTurnIds.map(renderOrphanTurn)}
+
+              {currentThreadBusy && !currentTurnHasConversationEntry ? (
+                <article className="message message--assistant message--activity-only">
+                  <div className="message-body">
+                    <div className="message-role">k-Coder</div>
+                    <TurnWaitingIndicator
+                      activityStatus={activityStatus?.turnId === currentThreadTurnId ? activityStatus.status : null}
+                      activitySinceMs={activityStatus?.sinceMs}
+                      streamRetry={activityStatus?.streamRetry ?? null}
+                      retryAtMs={activityStatus?.retryAtMs}
+                      onStop={() => void stopTurn()}
+                      cancelling={currentThreadCancelling}
+                    />
+                  </div>
+                </article>
+              ) : null}
 
               {plan?.steps.length && !planIsAttached && !planIsAttachedToOrphan && !planIsAttachedToRetryGroup ? (
                 <article className="message message--assistant message--activity-only">

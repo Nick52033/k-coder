@@ -45,6 +45,88 @@ const HIDDEN_PROCESS_EVENT_KINDS = new Set<TimelineEventKind>([
   "approval_requested",
   "approval_resolved",
 ]);
+
+export function TurnWaitingIndicator({
+  activityStatus = null,
+  activitySinceMs,
+  streamRetry = null,
+  retryAtMs,
+  onStop,
+  cancelling = false,
+}: {
+  activityStatus?: AgentActivityStatus | null;
+  activitySinceMs?: number;
+  streamRetry?: { attempt: number; maxAttempts: number } | null;
+  retryAtMs?: number;
+  onStop?: () => void;
+  cancelling?: boolean;
+}) {
+  const [mountedAtMs] = useState(() => Date.now());
+  const copy = activityStatus ? {
+    rate_limited: {
+      title: "正在等待模型恢复",
+      detail: "模型服务暂时限流，k-Coder 会在冷却后自动重试。",
+    },
+    thinking: {
+      title: "正在理解你的请求",
+      detail: "任务还在处理中，回复会显示在这里。你可以继续补充要求。",
+    },
+    responding: {
+      title: "正在生成回复",
+      detail: "模型还在组织内容，结果会在这里逐步显示。",
+    },
+    running_tool: {
+      title: "正在处理操作",
+      detail: "当前操作完成后，k-Coder 会继续回复。",
+    },
+    awaiting_approval: {
+      title: "等待你确认",
+      detail: "确认卡片会显示在这段对话中。",
+    },
+    finalizing: {
+      title: "正在整理结果",
+      detail: "正在收尾，完成后会把结果显示在这里。",
+    },
+  }[activityStatus] : {
+    title: "正在执行",
+    detail: "模型正在处理你的请求，回复会显示在这里。",
+  };
+
+  return (
+    <div className="turn-waiting" role="status" aria-live="polite">
+      <span className="turn-waiting__icon" aria-hidden="true">
+        <LoaderCircle size={17} />
+      </span>
+      <div className="turn-waiting__copy">
+        <div className="turn-waiting__heading">
+          <strong>{cancelling ? "正在停止" : copy.title}</strong>
+          <span className="turn-waiting__elapsed" aria-hidden="true">
+            {cancelling ? "等待运行时结束当前操作" : activityStatus === "rate_limited"
+              ? <>
+                <RetryWaitingLabel retryAtMs={retryAtMs} />
+                <span aria-hidden="true"> · </span>
+                <ActivityStatusLabel label="已等待" hint={null} sinceMs={activitySinceMs ?? mountedAtMs} />
+              </>
+              : <ActivityStatusLabel
+                label="已等待"
+                hint={null}
+                sinceMs={activitySinceMs ?? mountedAtMs}
+                streamRetry={streamRetry}
+              />}
+          </span>
+        </div>
+        <p>{cancelling ? "停止请求已发送，当前操作结束后会更新状态。" : copy.detail}</p>
+      </div>
+      {onStop && !cancelling ? (
+        <button className="turn-waiting__stop" type="button" onClick={onStop}>
+          <CircleX size={14} aria-hidden="true" />
+          <span>停止</span>
+        </button>
+      ) : null}
+    </div>
+  );
+}
+
 export const ConversationTurnActivity = memo(function ConversationTurnActivity({
   activities,
   timeline = [],
@@ -64,6 +146,8 @@ export const ConversationTurnActivity = memo(function ConversationTurnActivity({
   failureError,
   subagentTaskIndex,
   onFocusSubagent,
+  onStop,
+  cancelling = false,
 }: {
   activities: ToolActivity[];
   timeline?: TurnTimelineItem[];
@@ -88,6 +172,8 @@ export const ConversationTurnActivity = memo(function ConversationTurnActivity({
   /** Maps a subagent id to its 1-based `taskN` label within the active thread. */
   subagentTaskIndex?: Record<string, number>;
   onFocusSubagent?: (agentId: string) => void;
+  onStop?: () => void;
+  cancelling?: boolean;
 }) {
   const paced = usePacedTimeline(timeline, streaming, initialTextVisible);
   const visuallyStreaming = streaming || paced.settling;
@@ -95,7 +181,7 @@ export const ConversationTurnActivity = memo(function ConversationTurnActivity({
     ? paced.timeline.filter((item) => item.type !== "event" || !isTerminalEvent(item.kind))
     : paced.timeline;
 
-  if (!activities.length && !timeline.length && !plan?.steps.length && !activityStatus) return null;
+  if (!activities.length && !timeline.length && !plan?.steps.length && !activityStatus && !streaming) return null;
 
   const finalResponse = !visuallyStreaming && finalMessageId
     ? visibleTimeline.find((item): item is Extract<TurnTimelineItem, { type: "text" }> => item.type === "text" && item.id === finalMessageId)
@@ -118,6 +204,19 @@ export const ConversationTurnActivity = memo(function ConversationTurnActivity({
       || timelineHasTools
       || processItems.some((item) => item.type === "text" || item.type === "event"),
   );
+  const hasVisibleProgress = hasPublicProgress || hasDisplayableReasoning || Boolean(plan?.steps.length);
+  if (visuallyStreaming && !hasVisibleProgress && !terminalEvent) {
+    return (
+      <TurnWaitingIndicator
+        activityStatus={activityStatus}
+        activitySinceMs={activitySinceMs}
+        streamRetry={streamRetry}
+        retryAtMs={retryAtMs}
+        onStop={onStop}
+        cancelling={cancelling}
+      />
+    );
+  }
   const showReasoningUnavailableNotice = Boolean(
     visuallyStreaming
       && activityStatus === "thinking"

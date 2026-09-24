@@ -280,9 +280,12 @@ pub(super) fn classify_event_error(
                     | "server_overloaded"
                     | "service_unavailable"
                     | "temporarily_unavailable"
+                    | "stream_read_error"
             )
         });
-    let transient_message = normalized_message.contains("overloaded")
+    let transient_message = normalized_message.contains("stream_read_error")
+        || normalized_message.contains("stream read error")
+        || normalized_message.contains("overloaded")
         || normalized_message.contains("temporarily unavailable")
         || normalized_message.contains("server is busy")
         || normalized_message.contains("servers are busy");
@@ -406,6 +409,19 @@ mod tests {
             ),
             ProviderError::InvalidResponse(_)
         ));
+    }
+
+    #[test]
+    fn classifies_stream_read_errors_as_transient_provider_failures() {
+        for (message, code) in [
+            ("stream_read_error", None),
+            ("upstream stream read error", None),
+            ("upstream stream failed", Some("stream_read_error")),
+        ] {
+            let error = classify_event_error(message.into(), code, None);
+            assert!(matches!(&error, ProviderError::Unavailable(_)));
+            assert!(error.is_transient());
+        }
     }
 
     #[test]
