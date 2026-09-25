@@ -1,4 +1,0 @@
-interface:
-  display_name: "Record & Replay"
-  short_description: "Record and replay local browser workflows through audited Playwright commands"
-  default_prompt: "录制我的本地浏览器操作，并生成工作区内可复跑的 Playwright 脚本"
