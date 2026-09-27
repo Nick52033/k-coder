@@ -470,6 +470,7 @@ function App() {
     initialize,
     createThread,
     selectThread,
+    reloadWorkflows,
     loadOlderHistory,
     sendMessage,
     retryLastTurn,
@@ -3008,6 +3009,7 @@ function App() {
             <ComposerAddMenu onOpenSettings={openSettingsSection} />
             <span className="composer-quick-actions-divider" aria-hidden="true" />
             <WorkflowSelector
+              threadId={activeThreadId}
               definitions={workflows}
               run={workflowRun}
               selectedWorkflowId={selectedWorkflowId}
@@ -3328,6 +3330,7 @@ function App() {
           provider={providerConfig}
           providers={providerConfigs}
           activeThreadId={activeThreadId}
+          activeThreadIsStandalone={Boolean(activeThreadIsStandalone)}
           goal={goal}
           workflows={workflows}
           workflowRun={workflowRun}
@@ -3347,6 +3350,7 @@ function App() {
           onDeleteProvider={deleteProvider}
           onCreateGoal={createActiveGoal}
           onTransitionGoal={transitionActiveGoal}
+          onWorkflowsChanged={() => activeThreadId ? reloadWorkflows(activeThreadId) : Promise.resolve()}
         />
       )}
       {!pendingApproval && selectedChange && (

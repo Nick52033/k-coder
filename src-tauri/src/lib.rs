@@ -1,7 +1,6 @@
 pub mod advanced;
 pub mod agent;
 pub mod app_state;
-pub mod channels;
 pub mod commands;
 pub mod context;
 pub mod entities;
@@ -118,14 +117,6 @@ pub fn run() {
                     .knowledge()
                     .attach_logger(app_state.logger().clone());
             }
-            let wechat_service = channels::wechat_clawbot::service::WechatClawbotService::new(
-                app.handle().clone(),
-                app.state::<AppState>().repository().projection(),
-            )
-            .map_err(|error| std::io::Error::other(error.to_string()))?;
-            app.manage(wechat_service);
-            app.state::<channels::wechat_clawbot::service::WechatClawbotService>()
-                .restore_on_startup();
             // 移动网关：设备登记表和本机证书都放在应用数据目录下。
             let mobile_service = mobile::MobileService::new(
                 app.handle().clone(),
@@ -215,6 +206,12 @@ pub fn run() {
             commands::create_goal,
             commands::transition_goal,
             commands::list_builtin_workflows,
+            commands::list_workflows,
+            commands::list_managed_workflows,
+            commands::save_workflow_draft,
+            commands::publish_workflow_draft,
+            commands::duplicate_workflow_as_draft,
+            commands::delete_workflow_draft,
             commands::get_workflow_skill_readiness,
             commands::get_workflow_run,
             commands::cancel_workflow_run,
@@ -311,6 +308,7 @@ pub fn run() {
             commands::delete_user_rule,
             commands::plugin_overview,
             commands::set_plugin_enabled,
+            commands::install_plugin,
             commands::delete_plugin,
             commands::mcp_config,
             commands::save_mcp_config,
@@ -358,13 +356,6 @@ pub fn run() {
             commands::mobile::mobile_revoke_device,
             commands::mobile::mobile_remove_device,
             commands::mobile::mobile_set_capabilities,
-            commands::wechat_clawbot::wechat_clawbot_status,
-            commands::wechat_clawbot::wechat_clawbot_start_login,
-            commands::wechat_clawbot::wechat_clawbot_login_status,
-            commands::wechat_clawbot::wechat_clawbot_submit_verify_code,
-            commands::wechat_clawbot::wechat_clawbot_approve_sender,
-            commands::wechat_clawbot::wechat_clawbot_revoke_sender,
-            commands::wechat_clawbot::wechat_clawbot_disconnect,
             commands::start_command,
             commands::command_status,
             commands::read_command_output,

@@ -11,9 +11,9 @@ use crate::advanced::{
     BrowserArtifact, BrowserAuditEvent, BrowserSettings, CancelWorkflowRunRequest,
     CreateGoalRequest, DocumentContent, EvaluationReport, GoalTransitionRequest, GoalView,
     MetricsSnapshot, PlanStepState, PlanUpdateRequest, PlanView, RepositorySearchIndex,
-    SearchResult, WorkflowDefinitionView, WorkflowRunState, WorkflowRunView,
-    WorkflowSkillReadinessView, extract_document, extract_document_data_url,
-    run_recorded_evaluation,
+    SearchResult, WorkflowDefinitionRecord, WorkflowDefinitionView, WorkflowDraftRequest,
+    WorkflowRunState, WorkflowRunView, WorkflowSkillReadinessView, WorkflowStore, extract_document,
+    extract_document_data_url, run_recorded_evaluation,
 };
 use crate::agent::mailbox::{MailboxTurn, MailboxTurnKind, QueuedTurnSteerError};
 use crate::agent::query_rewrite::ModelQueryRewriter;
@@ -30,7 +30,9 @@ use crate::execution::{
     CommandSessionView, OutputPage, PtyOutputPage, PtySessionView, StartCommandRequest,
     StartPtyRequest,
 };
-use crate::extensions::{ExtensionOverview, McpConfigView, SaveUserRuleRequest, UserRulesView};
+use crate::extensions::{
+    ExtensionOverview, ExtensionService, McpConfigView, SaveUserRuleRequest, UserRulesView,
+};
 use crate::knowledge::retrieval::{RewriteHints, SearchOptions};
 use crate::knowledge::{
     AddSourceRequest, EmbeddingConnectionTest, EmbeddingSettings, KNOWLEDGE_PROGRESS_EVENT_NAME,
@@ -57,7 +59,7 @@ use crate::protocol::memory::{
 };
 use crate::protocol::{
     AgentEvent, AgentEventEnvelope, AgentMode, ApprovalMode, ApprovalResolution, ChangeSet,
-    ImageAttachment, MessageRole, PROTOCOL_VERSION, PatchPreview, PluginOverview,
+    ImageAttachment, MessageRole, PROTOCOL_VERSION, PatchPreview, PluginOverview, PluginScope,
     QueuedTurnSteerRequest, ReasoningEffort, RuntimeStatus, ThreadForkRequest,
     ThreadHistorySnapshot, ThreadMailboxChanged, ThreadMailboxSnapshot, ThreadModelSelectionResult,
     ThreadRollbackRequest, TokenUsage, TurnHandle, TurnState, TurnSteerRequest, TurnSteerResponse,
@@ -100,7 +102,6 @@ fn ordinary_turn_soft_limits(has_active_goal: bool) -> Option<SoftTurnLimits> {
 
 pub(crate) mod mobile;
 pub(crate) mod threads;
-pub mod wechat_clawbot;
 
 async fn emit_mailbox_changed(app: &AppHandle, state: &AppState, thread_id: &str) {
     let revision = state.thread_mailbox().revision(thread_id).await;
@@ -237,18 +238,34 @@ fn normalize_workflow_id(workflow_id: Option<&str>) -> CommandResult<Option<&str
 async fn require_workflow_skill_preflight(
     state: &AppState,
     workflow_id: &str,
+    extensions: Option<&ExtensionService>,
+    scope_key: Option<&str>,
 ) -> CommandResult<()> {
-    let readiness = state
-        .get_workflow_skill_readiness(workflow_id)
-        .await
-        .map_err(|error| {
-            CommandError::new("workflow_skill_preflight_failed", error).with_details(
-                serde_json::json!({
-                    "workflowId": workflow_id,
-                    "ready": false,
-                }),
-            )
-        })?;
+    let readiness = match extensions {
+        Some(extensions) => state
+            .advanced()
+            .workflows
+            .skill_readiness_for_scope(workflow_id, scope_key, extensions)
+            .map_err(|error| {
+                CommandError::new("workflow_skill_preflight_failed", error).with_details(
+                    serde_json::json!({
+                        "workflowId": workflow_id,
+                        "ready": false,
+                    }),
+                )
+            })?,
+        None => state
+            .get_workflow_skill_readiness(workflow_id)
+            .await
+            .map_err(|error| {
+                CommandError::new("workflow_skill_preflight_failed", error).with_details(
+                    serde_json::json!({
+                        "workflowId": workflow_id,
+                        "ready": false,
+                    }),
+                )
+            })?,
+    };
     if readiness.ready {
         return Ok(());
     }
@@ -279,7 +296,31 @@ async fn preflight_requested_or_active_workflow(
             .map(|run| run.workflow_id)
     });
     if let Some(workflow_id) = workflow_id {
-        require_workflow_skill_preflight(state, &workflow_id).await?;
+        let workspace = state
+            .resolve_thread_workspace(thread_id)
+            .await
+            .map_err(|error| CommandError::new("workspace_mismatch", error))?;
+        let workspace_turn = match workspace.as_deref() {
+            Some(workspace) => Some(
+                state
+                    .prepare_workspace_turn(workspace)
+                    .await
+                    .map_err(|error| CommandError::new("extensions", error))?,
+            ),
+            None => None,
+        };
+        let scope_key = workspace
+            .as_deref()
+            .map(WorkflowStore::project_scope_key)
+            .transpose()
+            .map_err(|error| CommandError::new("workflow_scope", error))?;
+        require_workflow_skill_preflight(
+            state,
+            &workflow_id,
+            workspace_turn.as_ref().map(|context| &context.extensions),
+            scope_key.as_deref(),
+        )
+        .await?;
     }
     Ok(())
 }
@@ -375,9 +416,6 @@ impl EventPublisher for TauriEventPublisher {
         if let Some(service) = self.app.try_state::<crate::mobile::MobileService>() {
             service.publish_event(&event);
         }
-        if let Some(service) = self.app.try_state::<crate::channels::wechat_clawbot::service::WechatClawbotService>() {
-            service.on_agent_event(&event);
-        }
     }
 }
 
@@ -460,6 +498,7 @@ fn subagent_context(
     model: String,
     context_limit: usize,
     tools: crate::tools::ToolRegistry,
+    workspace_root: std::path::PathBuf,
     publishers: SubagentPublishers,
 ) -> SubagentExecutionContext {
     SubagentExecutionContext {
@@ -468,7 +507,7 @@ fn subagent_context(
         model,
         context_limit,
         tools,
-        workspace_root: state.workspace_root(),
+        workspace_root,
         approvals: state.approvals(),
         approval_mode: state.approval_mode(),
         reasoning_effort: state.reasoning_effort(),
@@ -604,9 +643,10 @@ fn live_runtime_instruction_provider(
     mode_instructions: String,
     tool_names: Vec<String>,
     retry_continuation: bool,
+    workspace_extensions: Option<ExtensionService>,
 ) -> Arc<dyn RuntimeInstructionProvider> {
     let advanced = state.advanced();
-    let extensions = state.extension_service();
+    let extensions = workspace_extensions.unwrap_or_else(|| state.extension_service());
     let memory = state.memory();
     let logger = state.logger();
     Arc::new(move || {
@@ -1116,16 +1156,137 @@ pub fn list_builtin_workflows(
     Ok(state.advanced().workflows.definitions())
 }
 
+async fn require_workflow_project_scope(
+    state: &AppState,
+    thread_id: &str,
+) -> CommandResult<String> {
+    let workspace =
+        state
+            .ensure_thread_workspace(thread_id)
+            .await
+            .map_err(|error| match error {
+                AppStateError::ThreadHasNoWorkspace(_) => {
+                    CommandError::new("standalone_thread", "workflows require a project thread")
+                }
+                error => CommandError::new("workspace_mismatch", error),
+            })?;
+    WorkflowStore::project_scope_key(&workspace)
+        .map_err(|error| CommandError::new("workflow_scope", error))
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn list_workflows(
+    state: State<'_, AppState>,
+    thread_id: String,
+) -> CommandResult<Vec<WorkflowDefinitionView>> {
+    let scope_key = require_workflow_project_scope(state.inner(), &thread_id).await?;
+    state
+        .advanced()
+        .workflows
+        .definitions_for_scope(&scope_key)
+        .map_err(|error| CommandError::new("workflow", error))
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn list_managed_workflows(
+    state: State<'_, AppState>,
+    thread_id: String,
+) -> CommandResult<Vec<WorkflowDefinitionRecord>> {
+    let scope_key = require_workflow_project_scope(state.inner(), &thread_id).await?;
+    state
+        .advanced()
+        .workflows
+        .managed_definitions(&scope_key)
+        .map_err(|error| CommandError::new("workflow", error))
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn save_workflow_draft(
+    state: State<'_, AppState>,
+    thread_id: String,
+    request: WorkflowDraftRequest,
+) -> CommandResult<WorkflowDefinitionRecord> {
+    let scope_key = require_workflow_project_scope(state.inner(), &thread_id).await?;
+    state
+        .advanced()
+        .workflows
+        .save_draft(&scope_key, request)
+        .map_err(|error| CommandError::new("workflow", error))
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn publish_workflow_draft(
+    state: State<'_, AppState>,
+    thread_id: String,
+    workflow_id: String,
+    expected_revision: u64,
+) -> CommandResult<WorkflowDefinitionRecord> {
+    let scope_key = require_workflow_project_scope(state.inner(), &thread_id).await?;
+    state
+        .advanced()
+        .workflows
+        .publish_draft(&scope_key, &workflow_id, expected_revision)
+        .map_err(|error| CommandError::new("workflow", error))
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn duplicate_workflow_as_draft(
+    state: State<'_, AppState>,
+    thread_id: String,
+    workflow_id: String,
+    name: Option<String>,
+) -> CommandResult<WorkflowDefinitionRecord> {
+    let scope_key = require_workflow_project_scope(state.inner(), &thread_id).await?;
+    state
+        .advanced()
+        .workflows
+        .duplicate_published(&scope_key, &workflow_id, name.as_deref())
+        .map_err(|error| CommandError::new("workflow", error))
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn delete_workflow_draft(
+    state: State<'_, AppState>,
+    thread_id: String,
+    workflow_id: String,
+    expected_revision: u64,
+) -> CommandResult<()> {
+    let scope_key = require_workflow_project_scope(state.inner(), &thread_id).await?;
+    state
+        .advanced()
+        .workflows
+        .delete_draft(&scope_key, &workflow_id, expected_revision)
+        .map_err(|error| CommandError::new("workflow", error))
+}
+
 #[tauri::command(rename_all = "camelCase")]
 pub async fn get_workflow_skill_readiness(
     state: State<'_, AppState>,
     workflow_id: String,
+    thread_id: Option<String>,
 ) -> CommandResult<WorkflowSkillReadinessView> {
     let workflow_id = normalize_workflow_id(Some(&workflow_id))?
         .expect("a provided workflow id is normalized or rejected");
-    state
-        .get_workflow_skill_readiness(workflow_id)
+    let Some(thread_id) = thread_id else {
+        return state
+            .get_workflow_skill_readiness(workflow_id)
+            .await
+            .map_err(|error| CommandError::new("workflow_skill_readiness", error));
+    };
+    let workspace = state
+        .ensure_thread_workspace(&thread_id)
         .await
+        .map_err(|error| CommandError::new("workspace_mismatch", error))?;
+    let scope_key = WorkflowStore::project_scope_key(&workspace)
+        .map_err(|error| CommandError::new("workflow_scope", error))?;
+    let workspace_turn = state
+        .prepare_workspace_turn(&workspace)
+        .await
+        .map_err(|error| CommandError::new("extensions", error))?;
+    state
+        .advanced()
+        .workflows
+        .skill_readiness_for_scope(workflow_id, Some(&scope_key), &workspace_turn.extensions)
         .map_err(|error| CommandError::new("workflow_skill_readiness", error))
 }
 
@@ -2438,7 +2599,20 @@ pub fn delete_provider_api_key(
 pub async fn extension_overview(
     state: State<'_, AppState>,
     refresh: bool,
+    thread_id: Option<String>,
 ) -> CommandResult<ExtensionOverview> {
+    if let Some(thread_id) = thread_id {
+        let workspace = state
+            .ensure_thread_workspace(&thread_id)
+            .await
+            .map_err(|error| CommandError::new("workspace_mismatch", error))?;
+        let workspace_turn = state
+            .prepare_workspace_turn(&workspace)
+            .await
+            .map_err(|error| CommandError::new("extensions", error))?;
+        let _ = refresh;
+        return Ok(workspace_turn.extensions.overview());
+    }
     let result = state.prepare_extensions(refresh).await;
     let mut overview = state.extension_overview();
     if let Err(error) = result {
@@ -2497,6 +2671,18 @@ pub async fn set_plugin_enabled(
 ) -> CommandResult<PluginOverview> {
     state
         .set_plugin_enabled(&plugin_id, enabled)
+        .await
+        .map_err(plugin_command_error)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn install_plugin(
+    state: State<'_, AppState>,
+    source_path: String,
+    scope: PluginScope,
+) -> CommandResult<PluginOverview> {
+    state
+        .install_plugin(&source_path, scope)
         .await
         .map_err(plugin_command_error)
 }
@@ -2850,7 +3036,15 @@ pub(crate) async fn enqueue_message_turn(
     attachments: Vec<ImageAttachment>,
     workflow_id: Option<String>,
 ) -> CommandResult<TurnHandle> {
-    enqueue_message_turn_with_id(app, state, request, attachments, workflow_id, Uuid::new_v4().to_string()).await
+    enqueue_message_turn_with_id(
+        app,
+        state,
+        request,
+        attachments,
+        workflow_id,
+        Uuid::new_v4().to_string(),
+    )
+    .await
 }
 
 pub(crate) async fn enqueue_message_turn_with_id(
@@ -3304,19 +3498,38 @@ async fn execute_turn(
                 .iter()
                 .any(|block| matches!(block, crate::protocol::ContentBlock::Image { .. }))
         });
+    let workspace_turn = match project_workspace.as_deref() {
+        Some(workspace) => Some(
+            state
+                .prepare_workspace_turn(workspace)
+                .await
+                .map_err(|error| CommandError::new("extensions", error))?,
+        ),
+        None => None,
+    };
+    let workflow_scope_key = project_workspace
+        .as_deref()
+        .map(WorkflowStore::project_scope_key)
+        .transpose()
+        .map_err(|error| CommandError::new("workflow_scope", error))?;
     if let Some(workflow_id) = workflow_preflight_id.as_deref() {
-        require_workflow_skill_preflight(state, workflow_id).await?;
-    } else if has_project {
-        state
-            .prepare_extensions(false)
-            .await
-            .map_err(|error| CommandError::new("extensions", error))?;
+        require_workflow_skill_preflight(
+            state,
+            workflow_id,
+            workspace_turn.as_ref().map(|context| &context.extensions),
+            workflow_scope_key.as_deref(),
+        )
+        .await?;
     }
     // 根据协作模式注入指令并限制可用工具
     let mode_instructions = instructions_for_mode(agent_mode).to_string();
 
     // Plan/Ask 模式下把工具限制为只读子集（借鉴 Codex 的 plan_mask）。
-    let mode_tools = tools_for_mode(state.tool_registry(), agent_mode)
+    let turn_registry = workspace_turn
+        .as_ref()
+        .map(|context| context.tool_registry.clone())
+        .unwrap_or_else(|| state.tool_registry());
+    let mode_tools = tools_for_mode(turn_registry, agent_mode)
         .map_err(|error| CommandError::new("agent_mode", error))?;
     let base_tools = if has_project {
         mode_tools
@@ -3359,7 +3572,12 @@ async fn execute_turn(
         };
         advanced
             .workflows
-            .start_or_resume(&thread_id, workflow_id, objective)
+            .start_or_resume_scoped(
+                &thread_id,
+                workflow_id,
+                objective,
+                workflow_scope_key.as_deref(),
+            )
             .map_err(|error| CommandError::new("workflow", error))?;
     }
     let turn_id = assigned_turn_id.unwrap_or_else(|| Uuid::new_v4().to_string());
@@ -3397,6 +3615,7 @@ async fn execute_turn(
             model.clone(),
             context_limit,
             base_tools.clone(),
+            workspace_root.clone(),
             SubagentPublishers::tauri(&app),
         );
         match PreparedTurnTools::with_delegation(
@@ -3427,6 +3646,9 @@ async fn execute_turn(
         mode_instructions,
         tool_names.clone(),
         false,
+        workspace_turn
+            .as_ref()
+            .map(|context| context.extensions.clone()),
     );
     let workflow_active_at_turn_start = requested_workflow_id.is_some()
         || current_workflow
@@ -3571,16 +3793,35 @@ async fn execute_retry(
         .map(|run| run.workflow_id);
     let workflow_active = active_workflow_id.is_some();
     validate_workflow_turn_context(has_project, agent_mode, false, workflow_active)?;
+    let workspace_turn = match project_workspace.as_deref() {
+        Some(workspace) => Some(
+            state
+                .prepare_workspace_turn(workspace)
+                .await
+                .map_err(|error| CommandError::new("extensions", error))?,
+        ),
+        None => None,
+    };
+    let workflow_scope_key = project_workspace
+        .as_deref()
+        .map(WorkflowStore::project_scope_key)
+        .transpose()
+        .map_err(|error| CommandError::new("workflow_scope", error))?;
     if let Some(workflow_id) = active_workflow_id.as_deref() {
-        require_workflow_skill_preflight(state, workflow_id).await?;
-    } else if has_project {
-        state
-            .prepare_extensions(false)
-            .await
-            .map_err(|error| CommandError::new("extensions", error))?;
+        require_workflow_skill_preflight(
+            state,
+            workflow_id,
+            workspace_turn.as_ref().map(|context| &context.extensions),
+            workflow_scope_key.as_deref(),
+        )
+        .await?;
     }
     let mode_instructions = instructions_for_mode(agent_mode).to_string();
-    let mode_tools = tools_for_mode(state.tool_registry(), agent_mode)
+    let turn_registry = workspace_turn
+        .as_ref()
+        .map(|context| context.tool_registry.clone())
+        .unwrap_or_else(|| state.tool_registry());
+    let mode_tools = tools_for_mode(turn_registry, agent_mode)
         .map_err(|error| CommandError::new("agent_mode", error))?;
     let base_tools = if has_project {
         mode_tools
@@ -3643,6 +3884,7 @@ async fn execute_retry(
             model.clone(),
             context_limit,
             base_tools.clone(),
+            workspace_root.clone(),
             subagent_publishers,
         );
         match PreparedTurnTools::with_delegation(
@@ -3673,6 +3915,9 @@ async fn execute_retry(
         mode_instructions,
         tool_names.clone(),
         true,
+        workspace_turn
+            .as_ref()
+            .map(|context| context.extensions.clone()),
     );
     let turn_completion_guard =
         live_turn_completion_guard(state, thread_id.clone(), &tool_names, workflow_active)
@@ -3758,8 +4003,12 @@ pub async fn create_subagent(
         .await
         .map_err(|error| CommandError::new("storage", error))?;
     require_project_thread_for_subagent(&parent.summary)?;
-    state
-        .prepare_extensions(false)
+    let workspace = state
+        .ensure_thread_workspace(&request.parent_thread_id)
+        .await
+        .map_err(|error| CommandError::new("workspace_mismatch", error))?;
+    let workspace_turn = state
+        .prepare_workspace_turn(&workspace)
         .await
         .map_err(|error| CommandError::new("extensions", error))?;
     let (provider, model, context_limit) = state
@@ -3770,7 +4019,8 @@ pub async fn create_subagent(
         provider,
         model,
         context_limit,
-        state.tool_registry(),
+        workspace_turn.tool_registry,
+        workspace,
         SubagentPublishers::tauri(&app),
     );
     state
@@ -3809,6 +4059,18 @@ pub async fn send_subagent_message(
     message: String,
     trigger_turn: Option<bool>,
 ) -> CommandResult<SubagentView> {
+    let agent = state
+        .subagents()
+        .get(&agent_id)
+        .map_err(multi_agent_command_error)?;
+    let workspace = state
+        .ensure_thread_workspace(&agent.parent_thread_id)
+        .await
+        .map_err(|error| CommandError::new("workspace_mismatch", error))?;
+    let workspace_turn = state
+        .prepare_workspace_turn(&workspace)
+        .await
+        .map_err(|error| CommandError::new("extensions", error))?;
     let (provider, model, context_limit) = state
         .build_provider()
         .map_err(|error| CommandError::new("provider_config", error))?;
@@ -3817,7 +4079,8 @@ pub async fn send_subagent_message(
         provider,
         model,
         context_limit,
-        state.tool_registry(),
+        workspace_turn.tool_registry,
+        workspace,
         SubagentPublishers::tauri(&app),
     );
     state
@@ -3834,6 +4097,18 @@ pub async fn resume_subagent(
     agent_id: String,
     message: Option<String>,
 ) -> CommandResult<SubagentView> {
+    let agent = state
+        .subagents()
+        .get(&agent_id)
+        .map_err(multi_agent_command_error)?;
+    let workspace = state
+        .ensure_thread_workspace(&agent.parent_thread_id)
+        .await
+        .map_err(|error| CommandError::new("workspace_mismatch", error))?;
+    let workspace_turn = state
+        .prepare_workspace_turn(&workspace)
+        .await
+        .map_err(|error| CommandError::new("extensions", error))?;
     let (provider, model, context_limit) = state
         .build_provider()
         .map_err(|error| CommandError::new("provider_config", error))?;
@@ -3842,7 +4117,8 @@ pub async fn resume_subagent(
         provider,
         model,
         context_limit,
-        state.tool_registry(),
+        workspace_turn.tool_registry,
+        workspace,
         SubagentPublishers::tauri(&app),
     );
     state
@@ -4476,6 +4752,7 @@ mod tests {
                 String::new(),
                 names,
                 false,
+                None,
             )
         };
         let enabled = compiler(vec!["update_plan".into()]);

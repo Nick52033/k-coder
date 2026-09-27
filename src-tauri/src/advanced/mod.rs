@@ -10,6 +10,7 @@ mod search;
 mod store;
 mod todo;
 mod workflow;
+mod workflow_definitions;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -32,11 +33,16 @@ pub use request_user_input::{
 pub use search::{RepositorySearchIndex, SearchResult};
 pub use todo::{TODO_WRITE_TOOL_NAME, TodoWriteArgs, TodoWriteToolHandler};
 pub use workflow::{
-    COMPLETE_WORKFLOW_NODE_TOOL_NAME, CancelWorkflowRunRequest, WorkflowDefinitionView,
-    WorkflowNodeCompletion, WorkflowNodeSkillReadinessView, WorkflowNodeView, WorkflowRunState,
-    WorkflowRunView, WorkflowSkillBindingDefinition, WorkflowSkillBindingKind,
-    WorkflowSkillBindingReadinessView, WorkflowSkillBindingView, WorkflowSkillReadinessBlocker,
-    WorkflowSkillReadinessStatus, WorkflowSkillReadinessView, WorkflowStore,
+    COMPLETE_WORKFLOW_NODE_TOOL_NAME, CancelWorkflowRunRequest, WorkflowDefinitionSource,
+    WorkflowDefinitionView, WorkflowNodeCompletion, WorkflowNodeSkillReadinessView,
+    WorkflowNodeView, WorkflowRunState, WorkflowRunView, WorkflowSkillBindingDefinition,
+    WorkflowSkillBindingKind, WorkflowSkillBindingReadinessView, WorkflowSkillBindingView,
+    WorkflowSkillReadinessBlocker, WorkflowSkillReadinessStatus, WorkflowSkillReadinessView,
+    WorkflowStore,
+};
+pub use workflow_definitions::{
+    WorkflowDefinitionRecord, WorkflowDefinitionStatus, WorkflowDefinitionStore,
+    WorkflowDraftRequest, WorkflowNodeDraft,
 };
 
 #[derive(Clone)]

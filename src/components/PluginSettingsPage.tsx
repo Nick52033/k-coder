@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { open } from "@tauri-apps/plugin-dialog";
 import {
   AlertCircle,
   Boxes,
@@ -11,8 +12,8 @@ import {
   Sparkles,
   Trash2,
 } from "lucide-react";
-import { deletePlugin, getPluginOverview, setPluginEnabled } from "../api/runtime";
-import type { PluginDiagnostic, PluginOverview, PluginState } from "../types/runtime";
+import { deletePlugin, getPluginOverview, installPlugin, setPluginEnabled } from "../api/runtime";
+import type { PluginDiagnostic, PluginOverview, PluginScope, PluginState } from "../types/runtime";
 import "./PluginSettingsPage.css";
 
 const stateLabels: Record<PluginState, string> = {
@@ -21,6 +22,11 @@ const stateLabels: Record<PluginState, string> = {
   degraded: "部分可用",
   blocked: "已阻止",
   invalid: "无效",
+};
+
+const scopeLabels: Record<PluginScope, string> = {
+  local: "本地",
+  project: "项目",
 };
 
 function messageFromError(error: unknown) {
@@ -72,7 +78,7 @@ export function PluginSettingsPage() {
   }, []);
 
   async function handleToggle(plugin: PluginDiagnostic, enabled: boolean) {
-    setBusyId(plugin.id);
+    setBusyId(`${plugin.scope}:${plugin.id}`);
     setError("");
     try {
       setOverview(await setPluginEnabled(plugin.id, enabled));
@@ -91,7 +97,7 @@ export function PluginSettingsPage() {
   async function handleDelete() {
     if (!pendingDelete) return;
     const plugin = pendingDelete;
-    setBusyId(plugin.id);
+    setBusyId(`${plugin.scope}:${plugin.id}`);
     setError("");
     try {
       setOverview(await deletePlugin(plugin.id));
@@ -108,6 +114,32 @@ export function PluginSettingsPage() {
     }
   }
 
+  async function handleInstall(scope: PluginScope) {
+    let selected: string | string[] | null;
+    try {
+      selected = await open({ directory: true, multiple: false, title: `选择要安装到${scopeLabels[scope]}的插件文件夹` });
+    } catch (dialogError) {
+      setError(messageFromError(dialogError));
+      return;
+    }
+    if (typeof selected !== "string" || !selected.trim()) return;
+    const busyKey = `install:${scope}`;
+    setBusyId(busyKey);
+    setError("");
+    try {
+      setOverview(await installPlugin(selected, scope));
+    } catch (installError) {
+      setError(messageFromError(installError));
+      try {
+        setOverview(await getPluginOverview(true));
+      } catch (refreshError) {
+        setError(`${messageFromError(installError)}；刷新失败：${messageFromError(refreshError)}`);
+      }
+    } finally {
+      setBusyId(null);
+    }
+  }
+
   const plugins = overview?.plugins ?? [];
 
   return (
@@ -116,27 +148,58 @@ export function PluginSettingsPage() {
         <div>
           <p className="settings-eyebrow">扩展</p>
           <h3 id="plugin-page-title">本地插件</h3>
-          <p className="plugin-page-description">为当前项目扩展技能与工具，按需启用。</p>
+          <p className="plugin-page-description">安装到本地的插件可用于所有项目，安装到项目的插件只在当前项目生效。</p>
         </div>
-        <button
-          className="plugin-icon-button"
-          type="button"
-          aria-label="刷新插件"
-          title="刷新插件"
-          disabled={loading || busyId !== null}
-          onClick={() => void load(true)}
-        >
-          {loading ? <LoaderCircle className="plugin-spin" size={16} /> : <RefreshCw size={16} />}
-          <span>刷新</span>
-        </button>
+        <div className="plugin-header-actions">
+          <button
+            className="plugin-icon-button"
+            type="button"
+            aria-label="安装到本地"
+            title="安装到本地"
+            disabled={loading || busyId !== null}
+            onClick={() => void handleInstall("local")}
+          >
+            <FolderOpen size={16} />
+            <span>安装到本地</span>
+          </button>
+          <button
+            className="plugin-icon-button"
+            type="button"
+            aria-label="安装到项目"
+            title="安装到项目"
+            disabled={loading || busyId !== null}
+            onClick={() => void handleInstall("project")}
+          >
+            <FolderOpen size={16} />
+            <span>安装到项目</span>
+          </button>
+          <button
+            className="plugin-icon-button"
+            type="button"
+            aria-label="刷新插件"
+            title="刷新插件"
+            disabled={loading || busyId !== null}
+            onClick={() => void load(true)}
+          >
+            {loading ? <LoaderCircle className="plugin-spin" size={16} /> : <RefreshCw size={16} />}
+            <span>刷新</span>
+          </button>
+        </div>
       </div>
 
-      <div className="plugin-root" title={overview?.rootPath ?? ""}>
-        <FolderOpen size={18} aria-hidden="true" />
-        <div>
-          <span className="plugin-root-label">项目插件目录</span>
-          <span className="plugin-root-path">{overview?.rootPath ?? (loading ? "正在读取插件目录..." : "插件目录读取失败")}</span>
-        </div>
+      <div className="plugin-roots">
+        {([
+          ["local", "本地插件目录", overview?.localRootPath],
+          ["project", "项目插件目录", overview?.projectRootPath ?? overview?.rootPath],
+        ] as const).map(([scope, label, path]) => (
+          <div className="plugin-root" key={scope} title={path ?? ""}>
+            <FolderOpen size={18} aria-hidden="true" />
+            <div>
+              <span className="plugin-root-label">{label}</span>
+              <span className="plugin-root-path">{path ?? (loading ? "正在读取插件目录..." : "插件目录读取失败")}</span>
+            </div>
+          </div>
+        ))}
       </div>
 
       {(error || overview?.error) && (
@@ -162,12 +225,13 @@ export function PluginSettingsPage() {
         <div className="plugin-empty">
           <div className="plugin-empty-icon"><Puzzle size={28} /></div>
           <strong>未发现插件</strong>
-          <p>将插件文件夹放入项目插件目录，然后点击刷新。</p>
+          <p>使用上方按钮选择插件文件夹，安装后可在列表中启用、禁用或卸载。</p>
         </div>
       ) : (
-        <div className="plugin-list" aria-label="本地插件列表">
+        <div className="plugin-list" aria-label="插件列表">
           {plugins.map((plugin) => {
-            const busy = busyId === plugin.id;
+            const pluginBusyId = `${plugin.scope}:${plugin.id}`;
+            const busy = busyId === pluginBusyId;
             const toggleDisabled = busyId !== null || plugin.state === "invalid";
             return (
               <article className={`plugin-row plugin-row--${plugin.state}`} key={`${plugin.id}:${plugin.path}`}>
@@ -178,6 +242,7 @@ export function PluginSettingsPage() {
                   <div className="plugin-row-heading">
                     <strong title={plugin.name}>{plugin.name}</strong>
                     {plugin.version && <span className="plugin-version">v{plugin.version}</span>}
+                    <span className="plugin-scope">{scopeLabels[plugin.scope]}</span>
                     <span className={`plugin-state plugin-state--${plugin.state}`}>
                       {stateLabels[plugin.state]}
                     </span>
@@ -221,8 +286,8 @@ export function PluginSettingsPage() {
                   <button
                     className="plugin-delete-button"
                     type="button"
-                    aria-label={`删除 ${plugin.name}`}
-                    title={plugin.deletable ? "删除插件" : "当前插件无法安全删除"}
+                    aria-label={`卸载 ${plugin.name}`}
+                    title={plugin.deletable ? "卸载插件" : "当前插件无法安全卸载"}
                     disabled={busyId !== null || !plugin.deletable}
                     onClick={() => setPendingDelete(plugin)}
                   >
@@ -244,10 +309,10 @@ export function PluginSettingsPage() {
             aria-labelledby="plugin-delete-title"
           >
             <div>
-              <h4 id="plugin-delete-title">删除插件</h4>
+              <h4 id="plugin-delete-title">卸载插件</h4>
               <strong>{pendingDelete.name}</strong>
             </div>
-            <div className="plugin-confirm-notice">将删除此插件文件夹及其中的文件。此操作无法撤销。</div>
+            <div className="plugin-confirm-notice">将卸载此插件文件夹及其中的文件。此操作无法撤销。</div>
             <p title={pendingDelete.path}>{pendingDelete.path}</p>
             <div className="plugin-confirm-actions">
               <button
@@ -264,8 +329,8 @@ export function PluginSettingsPage() {
                 disabled={busyId !== null}
                 onClick={() => void handleDelete()}
               >
-                {busyId === pendingDelete.id && <LoaderCircle className="plugin-spin" size={15} />}
-                删除
+                {busyId === `${pendingDelete.scope}:${pendingDelete.id}` && <LoaderCircle className="plugin-spin" size={15} />}
+                卸载
               </button>
             </div>
           </section>

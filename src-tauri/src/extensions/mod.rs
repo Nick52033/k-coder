@@ -19,13 +19,15 @@ use tokio_util::sync::CancellationToken;
 
 use crate::logging::StructuredLogger;
 use crate::persistence::ProjectionDb;
-use crate::protocol::{PluginOverview, PluginState, ToolDefinition, ToolResult, ToolRisk};
+use crate::protocol::{
+    PluginOverview, PluginScope, PluginState, ToolDefinition, ToolResult, ToolRisk,
+};
 use crate::tools::{ToolContext, ToolError, ToolHandler, ToolHookRunner};
 
 use self::hooks::{HookConfig, HookPipeline};
 use self::mcp::{McpSecretStore, McpServerConfig};
 use self::plugins::PluginHost;
-pub use self::plugins::plugin_root_for_workspace;
+pub use self::plugins::{plugin_root_for_local, plugin_root_for_workspace};
 
 const MAX_INSTRUCTION_FILE_BYTES: usize = 256 * 1024;
 const MAX_RUNTIME_INSTRUCTION_BYTES: usize = 48 * 1024;
@@ -1040,7 +1042,8 @@ impl ExtensionService {
     ) -> Self {
         let audit_path = data_root.join("extension-audit.jsonl");
         let audit = load_audit(&audit_path);
-        let plugins = PluginHost::new(projection.clone());
+        let plugins =
+            PluginHost::with_local_root(projection.clone(), plugin_root_for_local(&data_root));
         Self {
             data_root,
             builtin_skills_root,
@@ -1058,6 +1061,36 @@ impl ExtensionService {
             audit_path,
             user_rules_lock: Arc::new(Mutex::new(())),
             plugins,
+        }
+    }
+
+    /// Creates an isolated runtime view for one project workspace while sharing host-owned
+    /// settings, credentials, audit history, and user-rule serialization with the app service.
+    /// Workspace instructions, Skills, overview, and plugin lifecycle state remain private to
+    /// this instance so simultaneous project Turns cannot overwrite each other's context.
+    pub(crate) fn workspace_runtime_fork(&self) -> Self {
+        let audit = self.audit.clone();
+        let audit_snapshot = audit.lock().expect("audit lock poisoned").clone();
+        Self {
+            data_root: self.data_root.clone(),
+            builtin_skills_root: self.builtin_skills_root.clone(),
+            projection: self.projection.clone(),
+            secrets: self.secrets.clone(),
+            logger: self.logger.clone(),
+            overview: Arc::new(RwLock::new(ExtensionOverview {
+                schema_version: 1,
+                audit: audit_snapshot,
+                ..ExtensionOverview::default()
+            })),
+            instructions: Arc::new(RwLock::new(Vec::new())),
+            skills: Arc::new(RwLock::new(Vec::new())),
+            audit,
+            audit_path: self.audit_path.clone(),
+            user_rules_lock: self.user_rules_lock.clone(),
+            plugins: PluginHost::with_local_root(
+                self.projection.clone(),
+                plugin_root_for_local(&self.data_root),
+            ),
         }
     }
 
@@ -1613,6 +1646,28 @@ impl ExtensionService {
         Ok(result?)
     }
 
+    pub fn install_plugin(
+        &self,
+        workspace: &Path,
+        source: &Path,
+        scope: PluginScope,
+    ) -> Result<PluginOverview, ExtensionError> {
+        self.plugins.set_workspace(workspace);
+        let result = self.plugins.install(source, scope);
+        self.record_auto_disabled_plugins();
+        self.record(
+            "plugin_installed",
+            "plugin",
+            &source.to_string_lossy(),
+            result.is_ok(),
+            match scope {
+                PluginScope::Local => "installed locally",
+                PluginScope::Project => "installed in project",
+            },
+        );
+        Ok(result?)
+    }
+
     fn record_auto_disabled_plugins(&self) {
         for plugin_id in self.plugins.take_auto_disabled_ids() {
             self.record(
@@ -1906,23 +1961,23 @@ impl ExtensionService {
                 let remove = audit.len() - MAX_AUDIT_RECORDS;
                 audit.drain(..remove);
             }
-        }
-        if self
-            .audit_path
-            .metadata()
-            .is_ok_and(|metadata| metadata.len() >= MAX_AUDIT_BYTES)
-        {
-            let previous = self.audit_path.with_extension("jsonl.1");
-            let _ = fs::remove_file(&previous);
-            let _ = fs::rename(&self.audit_path, previous);
-        }
-        if let Ok(mut file) = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.audit_path)
-        {
-            let _ = serde_json::to_writer(&mut file, &record);
-            let _ = file.write_all(b"\n");
+            if self
+                .audit_path
+                .metadata()
+                .is_ok_and(|metadata| metadata.len() >= MAX_AUDIT_BYTES)
+            {
+                let previous = self.audit_path.with_extension("jsonl.1");
+                let _ = fs::remove_file(&previous);
+                let _ = fs::rename(&self.audit_path, previous);
+            }
+            if let Ok(mut file) = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&self.audit_path)
+            {
+                let _ = serde_json::to_writer(&mut file, &record);
+                let _ = file.write_all(b"\n");
+            }
         }
         let _ = self.logger.log(
             if success { "info" } else { "error" },

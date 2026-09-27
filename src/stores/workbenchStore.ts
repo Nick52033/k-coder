@@ -37,6 +37,7 @@ import {
   cancelWorkflowRun as cancelWorkflowRunCommand,
   getWorkflowRun,
   listBuiltinWorkflows,
+  listWorkflows,
 } from "../api/runtime";
 import type {
   AgentEvent,
@@ -136,6 +137,7 @@ interface WorkbenchState {
   goal: GoalView | null;
   workflows: WorkflowDefinitionView[];
   workflowRun: WorkflowRunView | null;
+  reloadWorkflows: (threadId: string) => Promise<void>;
   todos: Map<string, TodoItem[]>; // key: threadId
   historyNextCursor: string | null;
   historyLoading: boolean;
@@ -510,6 +512,8 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
       const selection = defaultProvider
         ? await selectThreadModelCommand(createdThread.id, defaultProvider.id, defaultProvider.model).catch(() => null)
         : null;
+      const workflows = await listWorkflows(createdThread.id)
+        .catch(() => listBuiltinWorkflows().catch(() => []));
       const thread = selection
         ? { ...createdThread, modelSelection: selection.selection }
         : createdThread;
@@ -534,6 +538,7 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
         plan: null,
         goal: null,
         workflowRun: null,
+        workflows,
         historyNextCursor: null,
         historyLoading: false,
         error: "",
@@ -573,18 +578,20 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
         plan: null,
         goal: null,
         workflowRun: null,
+        workflows: state.workflows.filter((workflow) => workflow.source !== "custom"),
         historyNextCursor: null,
         historyLoading: false,
         messageQueue: state.messageQueue.filter((message) => message.threadId !== threadId),
       };
     });
     try {
-      const [history, plan, goal, workflowRun, mailbox] = await Promise.all([
+      const [history, plan, goal, workflowRun, mailbox, workflows] = await Promise.all([
         readThreadHistory(threadId).catch(() => null),
         getPlan(threadId),
         getGoal(threadId),
         getWorkflowRun(threadId),
         readThreadMailbox(threadId).catch(() => null),
+        listWorkflows(threadId).catch(() => listBuiltinWorkflows().catch(() => [])),
       ]);
       const detail = history ? null : await readThread(threadId);
       if (get().activeThreadId !== threadId) return;
@@ -672,6 +679,7 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
         plan,
         goal,
         workflowRun,
+        workflows,
         activeTurns,
         restoredActiveTurns,
         cancellingTurns,
@@ -693,6 +701,11 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
       if (hydrationBuffers.get(threadId)?.token === token) hydrationBuffers.delete(threadId);
       if (get().activeThreadId === threadId) set({ loading: false });
     }
+  },
+
+  reloadWorkflows: async (threadId) => {
+    const workflows = await listWorkflows(threadId);
+    if (get().activeThreadId === threadId) set({ workflows });
   },
 
   loadOlderHistory: async () => {

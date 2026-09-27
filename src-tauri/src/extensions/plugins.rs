@@ -15,8 +15,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::persistence::ProjectionDb;
 use crate::protocol::{
-    PluginComponentSummary, PluginDiagnostic, PluginOverview, PluginState, ToolDefinition,
-    ToolResult, ToolRisk,
+    PluginComponentSummary, PluginDiagnostic, PluginOverview, PluginScope, PluginState,
+    ToolDefinition, ToolResult, ToolRisk,
 };
 use crate::tools::{ToolContext, ToolError, ToolHandler};
 
@@ -37,6 +37,21 @@ const MAX_PLUGIN_RESOURCE_ENTRIES: usize = 4096;
 const MAX_PLUGIN_CATALOG_BYTES: usize = 24 * 1024;
 const MAX_PLUGIN_MCP_BYTES: usize = 1024 * 1024;
 const MAX_PLUGIN_MCP_SERVERS: usize = 128;
+const MAX_PLUGIN_INSTALL_ENTRIES: usize = 8192;
+const MAX_PLUGIN_INSTALL_BYTES: u64 = 64 * 1024 * 1024;
+
+impl PluginScope {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::Project => "project",
+        }
+    }
+
+    fn setting_segment(self) -> &'static str {
+        self.label()
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum PluginError {
@@ -118,6 +133,7 @@ pub(super) struct ResolvedPluginSkill {
 #[derive(Debug, Clone)]
 struct IndexedPlugin {
     root: PathBuf,
+    scope: PluginScope,
     activation_revision: u64,
     diagnostic: PluginDiagnostic,
     skills: HashMap<String, IndexedSkill>,
@@ -143,6 +159,8 @@ struct PluginActivation {
 #[derive(Clone)]
 pub struct PluginHost {
     root: Arc<RwLock<Option<PathBuf>>>,
+    local_root: Option<PathBuf>,
+    workspace_key: Arc<RwLock<Option<String>>>,
     projection: ProjectionDb,
     index: Arc<RwLock<HashMap<String, IndexedPlugin>>>,
     deletion_targets: Arc<RwLock<HashMap<String, PathBuf>>>,
@@ -166,10 +184,14 @@ impl PluginHost {
             overview: Arc::new(RwLock::new(PluginOverview {
                 schema_version: PLUGIN_OVERVIEW_SCHEMA_VERSION,
                 root_path: String::new(),
+                local_root_path: String::new(),
+                project_root_path: String::new(),
                 plugins: Vec::new(),
                 error: None,
             })),
             root: Arc::new(RwLock::new(None)),
+            local_root: None,
+            workspace_key: Arc::new(RwLock::new(None)),
             projection,
             index: Arc::new(RwLock::new(HashMap::new())),
             deletion_targets: Arc::new(RwLock::new(HashMap::new())),
@@ -181,23 +203,54 @@ impl PluginHost {
         }
     }
 
-    /// Binds the local plugin root to the active workspace. The root is
-    /// `<workspace>/.k-coder/plugins`; local plugins are project scoped and sit
-    /// next to the project level skills, rules and MCP configuration. Returns
-    /// `true` when the bound root changed, which invalidates the cached
+    pub fn with_local_root(projection: ProjectionDb, local_root: PathBuf) -> Self {
+        let mut host = Self::new(projection);
+        host.local_root = Some(local_root);
+        host
+    }
+
+    /// Binds the project plugin root to the active workspace. The root is
+    /// `<workspace>/.k-coder/plugins`; the machine-wide root remains unchanged.
+    /// Returns `true` when the bound root changed, which invalidates the cached
     /// overview of the previous project.
     pub fn set_workspace(&self, workspace: &Path) -> bool {
         let root = plugin_root_for_workspace(workspace);
+        let workspace_key = workspace_scope_key(workspace);
         let mut guard = self.root.write().expect("plugin root lock poisoned");
-        if guard.as_deref() == Some(root.as_path()) {
+        if guard.as_deref() == Some(root.as_path())
+            && self
+                .workspace_key
+                .read()
+                .expect("plugin workspace key lock poisoned")
+                .as_deref()
+                == Some(workspace_key.as_str())
+        {
             return false;
         }
         *guard = Some(root.clone());
+        *self
+            .workspace_key
+            .write()
+            .expect("plugin workspace key lock poisoned") = Some(workspace_key);
+        self.known_ids
+            .write()
+            .expect("plugin id lock poisoned")
+            .retain(|key| key.starts_with("local|"));
         drop(guard);
         self.overview
             .write()
             .expect("plugin overview lock poisoned")
             .root_path = user_facing_path(&root);
+        self.overview
+            .write()
+            .expect("plugin overview lock poisoned")
+            .project_root_path = user_facing_path(&root);
+        if let Some(local_root) = &self.local_root {
+            self.overview
+                .write()
+                .expect("plugin overview lock poisoned")
+                .local_root_path = user_facing_path(local_root);
+        }
         true
     }
 
@@ -205,13 +258,93 @@ impl PluginHost {
         self.root.read().expect("plugin root lock poisoned").clone()
     }
 
-    fn empty_overview(&self, root_path: String) -> PluginOverview {
-        PluginOverview {
-            schema_version: PLUGIN_OVERVIEW_SCHEMA_VERSION,
-            root_path,
-            plugins: Vec::new(),
-            error: None,
+    fn current_workspace_key(&self) -> Option<String> {
+        self.workspace_key
+            .read()
+            .expect("plugin workspace key lock poisoned")
+            .clone()
+    }
+
+    fn root_for_scope(&self, scope: PluginScope) -> Option<PathBuf> {
+        match scope {
+            PluginScope::Local => self.local_root.clone(),
+            PluginScope::Project => self.current_root(),
         }
+    }
+
+    fn setting_key(&self, scope: PluginScope, plugin_id: &str) -> Result<String, PluginError> {
+        match scope {
+            PluginScope::Local => Ok(format!("extension/plugin/local/{plugin_id}")),
+            PluginScope::Project => self
+                .current_workspace_key()
+                .map(|workspace_key| {
+                    format!("extension/plugin/project/{workspace_key}/{plugin_id}")
+                })
+                .ok_or_else(|| {
+                    PluginError::Config("project plugin root is not bound to a workspace".into())
+                }),
+        }
+    }
+
+    fn legacy_setting_key(plugin_id: &str) -> String {
+        format!("extension/plugin/{plugin_id}")
+    }
+
+    fn setting_enabled(&self, scope: PluginScope, plugin_id: &str) -> Result<bool, PluginError> {
+        let key = self.setting_key(scope, plugin_id)?;
+        if let Some(value) = self
+            .projection
+            .setting(&key)
+            .map_err(|error| PluginError::Config(error.to_string()))?
+        {
+            return Ok(value == "true");
+        }
+        if scope == PluginScope::Project {
+            return Ok(self
+                .projection
+                .setting(&Self::legacy_setting_key(plugin_id))
+                .map_err(|error| PluginError::Config(error.to_string()))?
+                .is_some_and(|value| value == "true"));
+        }
+        Ok(false)
+    }
+
+    fn persist_enabled(
+        &self,
+        scope: PluginScope,
+        plugin_id: &str,
+        enabled: bool,
+    ) -> Result<(), PluginError> {
+        let value = if enabled { "true" } else { "false" };
+        let key = self.setting_key(scope, plugin_id)?;
+        self.projection
+            .set_setting(&key, value)
+            .map_err(|error| PluginError::Config(error.to_string()))?;
+        // Keep the old project key in sync so existing installations and older
+        // clients continue to observe the same toggle state while migrating.
+        if scope == PluginScope::Project {
+            self.projection
+                .set_setting(&Self::legacy_setting_key(plugin_id), value)
+                .map_err(|error| PluginError::Config(error.to_string()))?;
+        }
+        Ok(())
+    }
+
+    fn delete_enabled_setting(
+        &self,
+        scope: PluginScope,
+        plugin_id: &str,
+    ) -> Result<(), PluginError> {
+        let key = self.setting_key(scope, plugin_id)?;
+        self.projection
+            .delete_setting(&key)
+            .map_err(|error| PluginError::Config(error.to_string()))?;
+        if scope == PluginScope::Project {
+            self.projection
+                .delete_setting(&Self::legacy_setting_key(plugin_id))
+                .map_err(|error| PluginError::Config(error.to_string()))?;
+        }
+        Ok(())
     }
 
     pub fn scan(&self) -> Result<PluginOverview, PluginError> {
@@ -225,53 +358,40 @@ impl PluginHost {
     }
 
     fn scan_inner(&self) -> Result<PluginOverview, PluginError> {
-        let root = match self.current_root() {
-            Some(root) => root,
-            None => {
-                self.reset_runtime_state();
-                let overview = self.empty_overview(String::new());
-                *self
-                    .overview
-                    .write()
-                    .expect("plugin overview lock poisoned") = overview.clone();
-                return Ok(overview);
-            }
-        };
-        if !plugin_root_present(&root)? {
-            // The active project simply has no plugin directory yet. Drop every
-            // capability of the previous workspace but keep the persisted enable
-            // intent, so switching back does not silently disable plugins.
+        let project_root = self.current_root();
+        let local_root = self.local_root.clone();
+        let project_root_path = project_root
+            .as_deref()
+            .map(user_facing_path)
+            .unwrap_or_default();
+        let local_root_path = local_root
+            .as_deref()
+            .map(user_facing_path)
+            .unwrap_or_default();
+        let mut roots = Vec::new();
+        let mut local_present = false;
+        let mut project_present = false;
+        if let Some(root) = local_root.as_deref()
+            && plugin_root_present(root)?
+        {
+            local_present = true;
+            roots.push((PluginScope::Local, root.to_path_buf()));
+        }
+        if let Some(root) = project_root.as_deref()
+            && plugin_root_present(root)?
+        {
+            project_present = true;
+            roots.push((PluginScope::Project, root.to_path_buf()));
+        }
+        if roots.is_empty() {
             self.reset_runtime_state();
-            let overview = self.empty_overview(user_facing_path(&root));
-            *self
-                .overview
-                .write()
-                .expect("plugin overview lock poisoned") = overview.clone();
-            return Ok(overview);
-        }
-        if self.host_failed.load(Ordering::Acquire) {
-            self.reset_missing_enabled(&HashSet::new())?;
-        }
-        let mut candidates = Vec::new();
-        for entry in fs::read_dir(&root).map_err(|error| PluginError::Io(error.to_string()))? {
-            let path = entry
-                .map_err(|error| PluginError::Io(error.to_string()))?
-                .path();
-            if is_plugin_candidate(&path) {
-                candidates.push(path);
-            }
-        }
-        candidates.sort();
-        if candidates.len() > MAX_PLUGIN_CANDIDATES {
-            self.reset_runtime_state();
-            self.reset_missing_enabled(&HashSet::new())?;
             let overview = PluginOverview {
                 schema_version: PLUGIN_OVERVIEW_SCHEMA_VERSION,
-                root_path: user_facing_path(&root),
+                root_path: project_root_path.clone(),
+                local_root_path,
+                project_root_path,
                 plugins: Vec::new(),
-                error: Some(format!(
-                    "local plugin root contains more than {MAX_PLUGIN_CANDIDATES} candidates"
-                )),
+                error: None,
             };
             *self
                 .overview
@@ -280,24 +400,59 @@ impl PluginHost {
             return Ok(overview);
         }
 
+        let mut candidates = Vec::<(PluginScope, PathBuf)>::new();
+        for (scope, root) in &roots {
+            let mut root_candidates = Vec::new();
+            for entry in fs::read_dir(root).map_err(|error| PluginError::Io(error.to_string()))? {
+                let path = entry
+                    .map_err(|error| PluginError::Io(error.to_string()))?
+                    .path();
+                if is_plugin_candidate(&path) {
+                    root_candidates.push(path);
+                }
+            }
+            root_candidates.sort();
+            if root_candidates.len() > MAX_PLUGIN_CANDIDATES {
+                self.reset_runtime_state();
+                let overview = PluginOverview {
+                    schema_version: PLUGIN_OVERVIEW_SCHEMA_VERSION,
+                    root_path: project_root_path.clone(),
+                    local_root_path: local_root_path.clone(),
+                    project_root_path: project_root_path.clone(),
+                    plugins: Vec::new(),
+                    error: Some(format!(
+                        "{} plugin root contains more than {MAX_PLUGIN_CANDIDATES} candidates",
+                        scope.label()
+                    )),
+                };
+                *self
+                    .overview
+                    .write()
+                    .expect("plugin overview lock poisoned") = overview.clone();
+                return Ok(overview);
+            }
+            candidates.extend(root_candidates.into_iter().map(|path| (*scope, path)));
+        }
+
         let mut diagnostics = Vec::with_capacity(candidates.len());
         let mut valid = Vec::with_capacity(candidates.len());
-        let mut candidate_paths = HashMap::<String, Vec<PathBuf>>::new();
-        for path in candidates {
-            match self.load_candidate(&path) {
+        let mut candidate_paths = HashMap::<String, Vec<(PluginScope, PathBuf)>>::new();
+        for (scope, path) in candidates {
+            match self.load_candidate(&path, scope) {
                 Ok(plugin) => {
                     candidate_paths
                         .entry(plugin.diagnostic.id.to_ascii_lowercase())
                         .or_default()
-                        .push(path);
+                        .push((scope, path));
                     valid.push(plugin);
                 }
                 Err((manifest, error)) => {
-                    let diagnostic = invalid_diagnostic(&path, manifest.as_ref(), false, error);
+                    let diagnostic =
+                        invalid_diagnostic(&path, manifest.as_ref(), scope, false, error);
                     candidate_paths
                         .entry(diagnostic.id.to_ascii_lowercase())
                         .or_default()
-                        .push(path);
+                        .push((scope, path));
                     diagnostics.push(diagnostic);
                 }
             }
@@ -339,7 +494,8 @@ impl PluginHost {
                 next_index.remove(&diagnostic.id);
                 continue;
             }
-            if let Some(path) = paths.first()
+            if let Some((scope, path)) = paths.first()
+                && let Some(root) = self.root_for_scope(*scope)
                 && let Ok(target) = safe_plugin_deletion_target(&root, path)
             {
                 diagnostic.deletable = true;
@@ -351,7 +507,30 @@ impl PluginHost {
                 .cmp(&right.name)
                 .then_with(|| left.path.cmp(&right.path))
         });
-        let current_ids = next_index.keys().cloned().collect::<HashSet<_>>();
+        let mut current_ids = next_index
+            .values()
+            .map(|plugin| plugin_state_key(plugin.diagnostic.scope, &plugin.diagnostic.id))
+            .collect::<HashSet<_>>();
+        if !local_present {
+            current_ids.extend(
+                self.known_ids
+                    .read()
+                    .expect("plugin id lock poisoned")
+                    .iter()
+                    .filter(|key| key.starts_with("local|"))
+                    .cloned(),
+            );
+        }
+        if !project_present {
+            current_ids.extend(
+                self.known_ids
+                    .read()
+                    .expect("plugin id lock poisoned")
+                    .iter()
+                    .filter(|key| key.starts_with("project|"))
+                    .cloned(),
+            );
+        }
         self.reset_missing_enabled(&current_ids)?;
         self.sync_activations(&next_index);
         *self.index.write().expect("plugin index lock poisoned") = next_index;
@@ -362,7 +541,9 @@ impl PluginHost {
 
         let overview = PluginOverview {
             schema_version: PLUGIN_OVERVIEW_SCHEMA_VERSION,
-            root_path: user_facing_path(&root),
+            root_path: project_root_path.clone(),
+            local_root_path,
+            project_root_path,
             plugins: diagnostics,
             error: None,
         };
@@ -396,6 +577,15 @@ impl PluginHost {
                 .current_root()
                 .map(|root| user_facing_path(&root))
                 .unwrap_or_default(),
+            local_root_path: self
+                .local_root
+                .as_deref()
+                .map(user_facing_path)
+                .unwrap_or_default(),
+            project_root_path: self
+                .current_root()
+                .map(|root| user_facing_path(&root))
+                .unwrap_or_default(),
             plugins: Vec::new(),
             error: Some(error.to_string()),
         };
@@ -421,6 +611,7 @@ impl PluginHost {
     fn load_candidate(
         &self,
         path: &Path,
+        scope: PluginScope,
     ) -> Result<IndexedPlugin, (Option<PluginManifest>, String)> {
         if let Err(error) = ensure_no_links(path, path) {
             return Err((None, error));
@@ -468,10 +659,8 @@ impl PluginHost {
 
         let id = format!("{}@local", manifest.name);
         let enabled = self
-            .projection
-            .setting(&format!("extension/plugin/{id}"))
-            .map_err(|error| (Some(manifest.clone()), error.to_string()))?
-            .is_some_and(|value| value == "true");
+            .setting_enabled(scope, &id)
+            .map_err(|error| (Some(manifest.clone()), error.to_string()))?;
         let skills_root = match manifest.skills.as_deref() {
             Some(relative) => Some(
                 resolve_plugin_component(
@@ -575,6 +764,7 @@ impl PluginHost {
         };
         let diagnostic = PluginDiagnostic {
             id,
+            scope,
             name: manifest.name,
             version: manifest.version,
             description: manifest.description,
@@ -593,6 +783,7 @@ impl PluginHost {
         };
         Ok(IndexedPlugin {
             root: canonical_plugin_root,
+            scope,
             activation_revision,
             diagnostic,
             skills,
@@ -604,17 +795,14 @@ impl PluginHost {
     fn reset_missing_enabled(&self, current_ids: &HashSet<String>) -> Result<(), PluginError> {
         let mut known_ids = self.known_ids.write().expect("plugin id lock poisoned");
         let mut auto_disabled = Vec::new();
-        for plugin_id in known_ids.difference(current_ids) {
-            let was_enabled = self
-                .projection
-                .setting(&format!("extension/plugin/{plugin_id}"))
-                .map_err(|error| PluginError::Config(error.to_string()))?
-                .is_some_and(|value| value == "true");
-            self.projection
-                .set_setting(&format!("extension/plugin/{plugin_id}"), "false")
-                .map_err(|error| PluginError::Config(error.to_string()))?;
+        for state_key in known_ids.difference(current_ids) {
+            let Some((scope, plugin_id)) = parse_plugin_state_key(state_key) else {
+                continue;
+            };
+            let was_enabled = self.setting_enabled(scope, plugin_id)?;
+            self.persist_enabled(scope, plugin_id, false)?;
             if was_enabled {
-                auto_disabled.push(plugin_id.clone());
+                auto_disabled.push(plugin_id.to_string());
             }
         }
         *known_ids = current_ids.clone();
@@ -663,11 +851,16 @@ impl PluginHost {
     }
 
     fn activation_is_current(&self, plugin_id: &str, generation: u64) -> Result<bool, PluginError> {
-        let persisted_enabled = self
-            .projection
-            .setting(&format!("extension/plugin/{plugin_id}"))
-            .map_err(|error| PluginError::Config(error.to_string()))?
-            .is_some_and(|value| value == "true");
+        let scope = self
+            .index
+            .read()
+            .expect("plugin index lock poisoned")
+            .get(plugin_id)
+            .map(|plugin| plugin.scope);
+        let Some(scope) = scope else {
+            return Ok(false);
+        };
+        let persisted_enabled = self.setting_enabled(scope, plugin_id)?;
         if !persisted_enabled {
             return Ok(false);
         }
@@ -721,23 +914,28 @@ impl PluginHost {
             return Err(PluginError::Config("plugin id must not be empty".into()));
         }
         let overview = self.scan()?;
-        let valid = self
+        let indexed_scope = self
             .index
             .read()
             .expect("plugin index lock poisoned")
-            .contains_key(plugin_id);
-        let known = overview.plugins.iter().any(|plugin| plugin.id == plugin_id);
-        if (enabled && !valid) || (!enabled && !known) {
+            .get(plugin_id)
+            .map(|plugin| plugin.scope);
+        let diagnostic_scope = overview
+            .plugins
+            .iter()
+            .find(|plugin| plugin.id == plugin_id)
+            .map(|plugin| plugin.scope);
+        let scope = indexed_scope.or(diagnostic_scope);
+        if (enabled && indexed_scope.is_none()) || scope.is_none() {
             return Err(PluginError::Config(format!(
                 "unknown or invalid local plugin {plugin_id}"
             )));
         }
-        self.projection
-            .set_setting(
-                &format!("extension/plugin/{plugin_id}"),
-                if enabled { "true" } else { "false" },
-            )
-            .map_err(|error| PluginError::Config(error.to_string()))?;
+        self.persist_enabled(
+            scope.expect("plugin scope checked above"),
+            plugin_id,
+            enabled,
+        )?;
         if !enabled {
             self.revoke_activation(plugin_id);
         }
@@ -779,8 +977,11 @@ impl PluginHost {
             .expect("plugin index lock poisoned")
             .get(plugin_id)
             .cloned();
-        let root = self.current_root().ok_or_else(|| {
-            PluginError::Config("local plugin root is not bound to a workspace".into())
+        let root = self.root_for_scope(diagnostic.scope).ok_or_else(|| {
+            PluginError::Config(format!(
+                "{} plugin root is not bound",
+                diagnostic.scope.label()
+            ))
         })?;
         let revalidated =
             safe_plugin_deletion_target(&root, &canonical_target).map_err(PluginError::Config)?;
@@ -811,14 +1012,70 @@ impl PluginHost {
 
         fs::remove_dir_all(&canonical_target).map_err(|error| {
             PluginError::Io(format!(
-                "failed to delete local plugin {plugin_id}: {error}"
+                "failed to delete {} plugin {plugin_id}: {error}",
+                diagnostic.scope.label()
             ))
         })?;
-        let overview = self.scan();
-        self.projection
-            .delete_setting(&format!("extension/plugin/{plugin_id}"))
-            .map_err(|error| PluginError::Config(error.to_string()))?;
-        overview
+        self.delete_enabled_setting(diagnostic.scope, plugin_id)?;
+        self.scan()
+    }
+
+    /// Installs a validated plugin directory into the selected scope. The
+    /// source is copied through a temporary sibling and published with a
+    /// single rename so a failed copy cannot leave a partially discoverable
+    /// plugin behind.
+    pub fn install(
+        &self,
+        source: &Path,
+        scope: PluginScope,
+    ) -> Result<PluginOverview, PluginError> {
+        let source_plugin = self
+            .load_candidate(source, scope)
+            .map_err(|(_, error)| PluginError::Config(error))?;
+        let root = self.root_for_scope(scope).ok_or_else(|| {
+            PluginError::Config(format!("{} plugin root is not bound", scope.label()))
+        })?;
+        ensure_install_root(&root)?;
+        let target = root.join(&source_plugin.diagnostic.name);
+        if path_exists(&target)? {
+            return Err(PluginError::Config(format!(
+                "{} plugin {} is already installed",
+                scope.label(),
+                source_plugin.diagnostic.id
+            )));
+        }
+        ensure_no_links(&root, &root).map_err(PluginError::Config)?;
+        let temporary = root.join(format!(
+            ".{}-installing-{}",
+            source_plugin.diagnostic.name,
+            self.next_generation.fetch_add(1, Ordering::Relaxed)
+        ));
+        if path_exists(&temporary)? {
+            return Err(PluginError::Config(
+                "plugin installation temporary path already exists".into(),
+            ));
+        }
+        let mut budget = CopyBudget::default();
+        let copy_result = copy_plugin_tree(&source_plugin.root, &temporary, &mut budget);
+        if let Err(error) = copy_result {
+            let _ = fs::remove_dir_all(&temporary);
+            return Err(error);
+        }
+        if let Err(error) = fs::rename(&temporary, &target) {
+            let _ = fs::remove_dir_all(&temporary);
+            return Err(PluginError::Io(format!(
+                "failed to publish installed plugin: {error}"
+            )));
+        }
+        if let Err(error) = self.load_candidate(&target, scope) {
+            let _ = fs::remove_dir_all(&target);
+            return Err(PluginError::Config(error.1));
+        }
+        if let Err(error) = self.persist_enabled(scope, &source_plugin.diagnostic.id, false) {
+            let _ = fs::remove_dir_all(&target);
+            return Err(error);
+        }
+        self.scan()
     }
 
     pub fn revision(&self) -> Result<u64, PluginError> {
@@ -1124,30 +1381,28 @@ impl PluginHost {
         plugin_id: &str,
         skill_id: &str,
     ) -> Result<ResolvedPluginSkill, PluginError> {
-        if !self
-            .projection
-            .setting(&format!("extension/plugin/{plugin_id}"))
-            .map_err(|error| PluginError::Config(error.to_string()))?
-            .is_some_and(|value| value == "true")
-        {
+        let (scope, skill) = {
+            let index = self.index.read().expect("plugin index lock poisoned");
+            let plugin = index.get(plugin_id).ok_or_else(|| {
+                PluginError::Config(format!("local plugin {plugin_id} is not indexed"))
+            })?;
+            if !plugin.diagnostic.enabled {
+                return Err(PluginError::Config(format!(
+                    "local plugin {plugin_id} is not enabled"
+                )));
+            }
+            let skill = plugin.skills.get(skill_id).ok_or_else(|| {
+                PluginError::Config(format!(
+                    "plugin {plugin_id} has no indexed Skill {skill_id}"
+                ))
+            })?;
+            (plugin.scope, skill.clone())
+        };
+        if !self.setting_enabled(scope, plugin_id)? {
             return Err(PluginError::Config(format!(
                 "local plugin {plugin_id} is not enabled"
             )));
         }
-        let index = self.index.read().expect("plugin index lock poisoned");
-        let plugin = index.get(plugin_id).ok_or_else(|| {
-            PluginError::Config(format!("local plugin {plugin_id} is not indexed"))
-        })?;
-        if !plugin.diagnostic.enabled {
-            return Err(PluginError::Config(format!(
-                "local plugin {plugin_id} is not enabled"
-            )));
-        }
-        let skill = plugin.skills.get(skill_id).ok_or_else(|| {
-            PluginError::Config(format!(
-                "plugin {plugin_id} has no indexed Skill {skill_id}"
-            ))
-        })?;
         if !skill.metadata.enabled {
             return Err(PluginError::Config(format!(
                 "plugin Skill {plugin_id}/{skill_id} is disabled"
@@ -1175,17 +1430,7 @@ impl PluginHost {
     }
 
     fn read_skill(&self, plugin_id: &str, skill_name: &str) -> Result<String, ToolError> {
-        if !self
-            .projection
-            .setting(&format!("extension/plugin/{plugin_id}"))
-            .map_err(|_| ToolError::Denied("local plugin enablement cannot be verified".into()))?
-            .is_some_and(|value| value == "true")
-        {
-            return Err(ToolError::Denied(format!(
-                "local plugin {plugin_id} is not enabled"
-            )));
-        }
-        let (root, path) = {
+        let (scope, root, path) = {
             let index = self.index.read().expect("plugin index lock poisoned");
             let plugin = index.get(plugin_id).ok_or_else(|| {
                 ToolError::Denied(format!("local plugin {plugin_id} is not enabled"))
@@ -1205,25 +1450,23 @@ impl PluginHost {
                     "plugin Skill {skill_name} is disabled"
                 )));
             }
-            (plugin.root.clone(), skill.path.clone())
+            (plugin.scope, plugin.root.clone(), skill.path.clone())
         };
+        if !self
+            .setting_enabled(scope, plugin_id)
+            .map_err(|_| ToolError::Denied("local plugin enablement cannot be verified".into()))?
+        {
+            return Err(ToolError::Denied(format!(
+                "local plugin {plugin_id} is not enabled"
+            )));
+        }
         read_bounded_utf8(&root, &path, MAX_PLUGIN_TEXT_BYTES, "plugin Skill")
             .map_err(ToolError::Execution)
     }
 
     fn read_resource(&self, plugin_id: &str, raw_path: &str) -> Result<String, ToolError> {
         let key = normalize_resource_key(raw_path)?;
-        if !self
-            .projection
-            .setting(&format!("extension/plugin/{plugin_id}"))
-            .map_err(|_| ToolError::Denied("local plugin enablement cannot be verified".into()))?
-            .is_some_and(|value| value == "true")
-        {
-            return Err(ToolError::Denied(format!(
-                "local plugin {plugin_id} is not enabled"
-            )));
-        }
-        let (root, path) = {
+        let (scope, root, path) = {
             let index = self.index.read().expect("plugin index lock poisoned");
             let plugin = index.get(plugin_id).ok_or_else(|| {
                 ToolError::Denied(format!("local plugin {plugin_id} is not enabled"))
@@ -1238,8 +1481,16 @@ impl PluginHost {
                     "plugin resource {raw_path} is not in the scanned text index"
                 ))
             })?;
-            (plugin.root.clone(), path.clone())
+            (plugin.scope, plugin.root.clone(), path.clone())
         };
+        if !self
+            .setting_enabled(scope, plugin_id)
+            .map_err(|_| ToolError::Denied("local plugin enablement cannot be verified".into()))?
+        {
+            return Err(ToolError::Denied(format!(
+                "local plugin {plugin_id} is not enabled"
+            )));
+        }
         read_bounded_utf8(&root, &path, MAX_PLUGIN_TEXT_BYTES, "plugin resource")
             .map_err(ToolError::Execution)
     }
@@ -1471,6 +1722,7 @@ fn valid_plugin_name(value: &str) -> bool {
 fn invalid_diagnostic(
     path: &Path,
     manifest: Option<&PluginManifest>,
+    scope: PluginScope,
     deletable: bool,
     error: String,
 ) -> PluginDiagnostic {
@@ -1486,6 +1738,7 @@ fn invalid_diagnostic(
             .filter(|name| valid_plugin_name(name))
             .map(|name| format!("{name}@local"))
             .unwrap_or_else(|| format!("invalid:{fallback}")),
+        scope,
         name: manifest_name
             .map(|name| bounded_display_text(name, MAX_PLUGIN_INVALID_NAME_BYTES))
             .unwrap_or_else(|| fallback.clone()),
@@ -2288,12 +2541,143 @@ fn safe_plugin_deletion_target(root: &Path, path: &Path) -> Result<PathBuf, Stri
     Ok(canonical_target)
 }
 
-/// Local plugins live in the active project so that they travel with the
-/// workspace instead of the machine wide application data directory.
+#[derive(Default)]
+struct CopyBudget {
+    entries: usize,
+    bytes: u64,
+}
+
+fn copy_plugin_tree(
+    source: &Path,
+    target: &Path,
+    budget: &mut CopyBudget,
+) -> Result<(), PluginError> {
+    let metadata = fs::symlink_metadata(source)
+        .map_err(|error| PluginError::Io(format!("plugin source cannot be inspected: {error}")))?;
+    if metadata.file_type().is_symlink() || metadata_is_reparse_point(&metadata) {
+        return Err(PluginError::Config(
+            "plugin installation source must not contain symbolic links or directory junctions"
+                .into(),
+        ));
+    }
+    budget.entries = budget.entries.saturating_add(1);
+    if budget.entries > MAX_PLUGIN_INSTALL_ENTRIES {
+        return Err(PluginError::Config(format!(
+            "plugin installation contains more than {MAX_PLUGIN_INSTALL_ENTRIES} entries"
+        )));
+    }
+    if metadata.is_dir() {
+        fs::create_dir(target).map_err(|error| {
+            PluginError::Io(format!(
+                "failed to create plugin installation directory: {error}"
+            ))
+        })?;
+        let entries = fs::read_dir(source)
+            .map_err(|error| PluginError::Io(format!("plugin source cannot be read: {error}")))?;
+        for entry in entries {
+            let entry = entry.map_err(|error| {
+                PluginError::Io(format!("plugin source cannot be read: {error}"))
+            })?;
+            copy_plugin_tree(&entry.path(), &target.join(entry.file_name()), budget)?;
+        }
+        return Ok(());
+    }
+    if !metadata.is_file() {
+        return Err(PluginError::Config(
+            "plugin installation source contains an unsupported filesystem entry".into(),
+        ));
+    }
+    budget.bytes = budget.bytes.saturating_add(metadata.len());
+    if budget.bytes > MAX_PLUGIN_INSTALL_BYTES {
+        return Err(PluginError::Config(format!(
+            "plugin installation exceeds {MAX_PLUGIN_INSTALL_BYTES} bytes"
+        )));
+    }
+    fs::copy(source, target)
+        .map_err(|error| PluginError::Io(format!("failed to copy plugin file: {error}")))?;
+    Ok(())
+}
+
+fn ensure_install_root(root: &Path) -> Result<(), PluginError> {
+    let parent = root
+        .parent()
+        .ok_or_else(|| PluginError::Config("plugin root has no trusted parent".into()))?;
+    if !path_exists(parent)? {
+        let grandparent = parent.parent().ok_or_else(|| {
+            PluginError::Config("plugin root parent has no trusted ancestor".into())
+        })?;
+        ensure_existing_directory(grandparent)?;
+        fs::create_dir(parent).map_err(|error| {
+            PluginError::Io(format!("failed to create plugin root parent: {error}"))
+        })?;
+    }
+    ensure_existing_directory(parent)?;
+    if !path_exists(root)? {
+        fs::create_dir(root)
+            .map_err(|error| PluginError::Io(format!("failed to create plugin root: {error}")))?;
+    }
+    ensure_existing_directory(root)?;
+    plugin_root_present(root)?;
+    Ok(())
+}
+
+fn ensure_existing_directory(path: &Path) -> Result<(), PluginError> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
+        PluginError::Io(format!("trusted plugin path cannot be inspected: {error}"))
+    })?;
+    if metadata.file_type().is_symlink() || metadata_is_reparse_point(&metadata) {
+        return Err(PluginError::Config(format!(
+            "plugin path {} must not contain a symbolic link or directory junction",
+            user_facing_path(path)
+        )));
+    }
+    if !metadata.is_dir() {
+        return Err(PluginError::Config(format!(
+            "plugin path {} must be a directory",
+            user_facing_path(path)
+        )));
+    }
+    Ok(())
+}
+
+/// Project plugins live in the active project so that they travel with the
+/// workspace instead of the machine-wide application data directory.
 pub fn plugin_root_for_workspace(workspace: &Path) -> PathBuf {
     workspace
         .join(PLUGIN_ROOT_PARENT)
         .join(PLUGIN_ROOT_DIRECTORY)
+}
+
+/// Machine-wide plugins are stored below the application data directory and
+/// are visible from every project opened by this installation.
+pub fn plugin_root_for_local(data_root: &Path) -> PathBuf {
+    data_root.join(PLUGIN_ROOT_DIRECTORY)
+}
+
+fn workspace_scope_key(workspace: &Path) -> String {
+    let normalized = workspace
+        .canonicalize()
+        .unwrap_or_else(|_| workspace.to_path_buf());
+    let digest = Sha256::digest(normalized.to_string_lossy().as_bytes());
+    let mut output = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        let _ = write!(output, "{byte:02x}");
+    }
+    output
+}
+
+fn plugin_state_key(scope: PluginScope, plugin_id: &str) -> String {
+    format!("{}|{plugin_id}", scope.setting_segment())
+}
+
+fn parse_plugin_state_key(value: &str) -> Option<(PluginScope, &str)> {
+    let (scope, plugin_id) = value.split_once('|')?;
+    let scope = match scope {
+        "local" => PluginScope::Local,
+        "project" => PluginScope::Project,
+        _ => return None,
+    };
+    (!plugin_id.is_empty()).then_some((scope, plugin_id))
 }
 
 /// Reports whether the project plugin root can be scanned. A missing root is a
@@ -2494,11 +2878,11 @@ mod tests {
 
     use super::{
         MAX_PLUGIN_CANDIDATES, MAX_PLUGIN_RESOURCE_ENTRIES, MAX_PLUGIN_SKILLS, PluginHost,
-        plugin_root_for_workspace,
+        plugin_root_for_local, plugin_root_for_workspace,
     };
     use crate::extensions::mcp::{McpError, McpSecretStore};
     use crate::persistence::ProjectionDb;
-    use crate::protocol::PluginState;
+    use crate::protocol::{PluginScope, PluginState};
     use crate::tools::ToolContext;
 
     struct FakeSecrets(HashMap<(String, String), String>);
@@ -3893,6 +4277,158 @@ mod tests {
         assert_eq!(back.plugins.len(), 1);
         assert!(back.plugins[0].enabled);
         assert_eq!(back.plugins[0].state, PluginState::Loaded);
+    }
+
+    #[test]
+    fn discovers_local_and_project_plugins_with_independent_install_scopes() {
+        let data = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let local = plugin_root_for_local(data.path()).join("local-tools");
+        let project = plugin_root_for_workspace(workspace.path()).join("project-tools");
+        write_manifest(
+            &local,
+            json!({
+                "name": "local-tools",
+                "version": "1.0.0",
+                "description": "Machine-wide helpers"
+            }),
+        );
+        write_skill(
+            &local,
+            "local",
+            "---\nname: local\ndescription: Local\n---\n# Local\n",
+        );
+        write_manifest(
+            &project,
+            json!({
+                "name": "project-tools",
+                "version": "1.0.0",
+                "description": "Project helpers"
+            }),
+        );
+        write_skill(
+            &project,
+            "project",
+            "---\nname: project\ndescription: Project\n---\n# Project\n",
+        );
+
+        let host = PluginHost::with_local_root(
+            ProjectionDb::memory().unwrap(),
+            plugin_root_for_local(data.path()),
+        );
+        host.set_workspace(workspace.path());
+        let overview = host.scan().unwrap();
+
+        assert_eq!(overview.plugins.len(), 2);
+        assert_eq!(
+            overview.local_root_path,
+            plugin_root_for_local(data.path()).to_string_lossy()
+        );
+        assert_eq!(
+            overview.project_root_path,
+            plugin_root_for_workspace(workspace.path()).to_string_lossy()
+        );
+        assert_eq!(
+            overview
+                .plugins
+                .iter()
+                .find(|plugin| plugin.name == "local-tools")
+                .unwrap()
+                .scope,
+            PluginScope::Local
+        );
+        assert_eq!(
+            overview
+                .plugins
+                .iter()
+                .find(|plugin| plugin.name == "project-tools")
+                .unwrap()
+                .scope,
+            PluginScope::Project
+        );
+    }
+
+    #[test]
+    fn install_enable_disable_and_delete_target_the_selected_scope() {
+        let data = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let source = tempfile::tempdir().unwrap();
+        write_manifest(
+            source.path(),
+            json!({
+                "name": "portable-tools",
+                "version": "1.0.0",
+                "description": "Portable helpers"
+            }),
+        );
+        write_skill(
+            source.path(),
+            "portable",
+            "---\nname: portable\ndescription: Portable\n---\n# Portable\n",
+        );
+
+        let host = PluginHost::with_local_root(
+            ProjectionDb::memory().unwrap(),
+            plugin_root_for_local(data.path()),
+        );
+        host.set_workspace(workspace.path());
+        host.projection
+            .set_setting("extension/plugin/local/portable-tools@local", "true")
+            .unwrap();
+        host.install(source.path(), PluginScope::Local).unwrap();
+        let installed = host.scan().unwrap();
+        assert!(installed.plugins[0].enabled == false);
+        assert_eq!(installed.plugins[0].scope, PluginScope::Local);
+        assert_eq!(
+            host.projection
+                .setting("extension/plugin/local/portable-tools@local")
+                .unwrap()
+                .as_deref(),
+            Some("false")
+        );
+
+        host.set_enabled("portable-tools@local", true).unwrap();
+        assert!(host.scan().unwrap().plugins[0].enabled);
+        host.set_enabled("portable-tools@local", false).unwrap();
+        assert!(!host.scan().unwrap().plugins[0].enabled);
+
+        host.delete("portable-tools@local").unwrap();
+        assert!(host.scan().unwrap().plugins.is_empty());
+        assert!(
+            !plugin_root_for_local(data.path())
+                .join("portable-tools")
+                .exists()
+        );
+
+        let project_source = tempfile::tempdir().unwrap();
+        write_manifest(
+            project_source.path(),
+            json!({
+                "name": "project-tools",
+                "version": "1.0.0",
+                "description": "Project-only helpers"
+            }),
+        );
+        write_skill(
+            project_source.path(),
+            "project",
+            "---\nname: project\ndescription: Project\n---\n# Project\n",
+        );
+        host.install(project_source.path(), PluginScope::Project)
+            .unwrap();
+        let project_installed = host.scan().unwrap();
+        let project_plugin = project_installed
+            .plugins
+            .iter()
+            .find(|plugin| plugin.id == "project-tools@local")
+            .unwrap();
+        assert_eq!(project_plugin.scope, PluginScope::Project);
+        assert!(!project_plugin.enabled);
+        assert!(
+            plugin_root_for_workspace(workspace.path())
+                .join("project-tools")
+                .is_dir()
+        );
     }
 
     #[test]

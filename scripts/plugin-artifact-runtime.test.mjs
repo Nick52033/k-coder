@@ -4,7 +4,11 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { initialize, resolve } from './plugin-artifact-loader.mjs';
-import { ensureArtifactToolWorkspace } from '../.k-coder/plugins/presentations/skills/presentations/scripts/artifact_tool_utils.mjs';
+import { pluginFileUrl, skipWithoutPlugin, withArtifactRuntime } from './plugin-fixtures.mjs';
+
+// The presentations plugin now ships in the machine-wide local plugin root, so this
+// repository no longer carries its bundled helper; skip the helper case when absent.
+const skipHelperCase = skipWithoutPlugin('presentations');
 
 const root = process.cwd();
 const temporary = fs.mkdtempSync(path.join(root, 'docs', 'plugin-artifact-test-'));
@@ -54,16 +58,22 @@ try {
     assert.throws(() => initialize({ modules: null }), /missing/);
     assert.equal(await resolve('node:fs', {}, async specifier => specifier), 'node:fs');
   });
-  test('presentation helper validates output workspace and creates no junctions', async () => {
-    await assert.rejects(ensureArtifactToolWorkspace(path.resolve(root, '../artifact-outside')), /inside the current project/);
-    const directory = path.join(temporary, 'deck');
-    const result = await ensureArtifactToolWorkspace(directory);
-    assert.equal(result.workspaceDir, directory);
-    assert(!fs.existsSync(path.join(directory, 'node_modules')));
-    const link = path.join(temporary, 'deck-link');
-    fs.symlinkSync(directory, link, 'junction');
-    await assert.rejects(ensureArtifactToolWorkspace(path.join(link, 'child')), /links and junctions/);
-    fs.unlinkSync(link);
+  test('presentation helper validates output workspace and creates no junctions', { skip: skipHelperCase }, async () => {
+    // The helper moved with the plugin outside the workspace, so both the import and every
+    // call run under the artifact-tool module directory the launcher exports.
+    await withArtifactRuntime(async () => {
+      const { ensureArtifactToolWorkspace } = await import(pluginFileUrl('presentations', 'skills', 'presentations', 'scripts', 'artifact_tool_utils.mjs'));
+      assert(ensureArtifactToolWorkspace, 'artifact tool helper is unavailable');
+      await assert.rejects(ensureArtifactToolWorkspace(path.resolve(root, '../artifact-outside')), /inside the current project/);
+      const directory = path.join(temporary, 'deck');
+      const result = await ensureArtifactToolWorkspace(directory);
+      assert.equal(result.workspaceDir, directory);
+      assert(!fs.existsSync(path.join(directory, 'node_modules')));
+      const link = path.join(temporary, 'deck-link');
+      fs.symlinkSync(directory, link, 'junction');
+      await assert.rejects(ensureArtifactToolWorkspace(path.join(link, 'child')), /links and junctions/);
+      fs.unlinkSync(link);
+    });
   });
 } finally {
   // Deferred until node:test's queued cases finish. Only this generated directory

@@ -14,6 +14,7 @@ import type {
   SaveUserRuleRequest,
   UserRulesView,
   PluginOverview,
+  PluginScope,
   McpConfigView,
   ImageAttachment,
   ProjectRecord,
@@ -79,6 +80,8 @@ import type {
   SearchResult,
   CancelWorkflowRunRequest,
   WorkflowDefinitionView,
+  WorkflowDefinitionRecord,
+  WorkflowDraftRequest,
   WorkflowRunView,
   WorkflowSkillReadinessView,
   LogQuery,
@@ -87,9 +90,6 @@ import type {
   MobileDeviceView,
   MobilePairingView,
   MobileStatus,
-  WechatClawbotQrLogin,
-  WechatClawbotQrLoginStatus,
-  WechatClawbotStatus,
   KnowledgeSettings,
   EmbeddingSettings,
   KnowledgeCollection,
@@ -240,8 +240,37 @@ export function listBuiltinWorkflows() {
   return invoke<WorkflowDefinitionView[]>("list_builtin_workflows");
 }
 
-export function getWorkflowSkillReadiness(workflowId: string) {
-  return invoke<WorkflowSkillReadinessView>("get_workflow_skill_readiness", { workflowId });
+export function listWorkflows(threadId: string) {
+  return invoke<WorkflowDefinitionView[] | null>("list_workflows", { threadId })
+    .then((definitions) => Array.isArray(definitions) ? definitions : listBuiltinWorkflows());
+}
+
+export function listManagedWorkflows(threadId: string) {
+  return invoke<WorkflowDefinitionRecord[] | null>("list_managed_workflows", { threadId })
+    .then((records) => Array.isArray(records) ? records : []);
+}
+
+export function saveWorkflowDraft(threadId: string, request: WorkflowDraftRequest) {
+  return invoke<WorkflowDefinitionRecord>("save_workflow_draft", { threadId, request });
+}
+
+export function publishWorkflowDraft(threadId: string, workflowId: string, expectedRevision: number) {
+  return invoke<WorkflowDefinitionRecord>("publish_workflow_draft", { threadId, workflowId, expectedRevision });
+}
+
+export function duplicateWorkflowAsDraft(threadId: string, workflowId: string, name?: string) {
+  return invoke<WorkflowDefinitionRecord>("duplicate_workflow_as_draft", { threadId, workflowId, name });
+}
+
+export function deleteWorkflowDraft(threadId: string, workflowId: string, expectedRevision: number) {
+  return invoke<void>("delete_workflow_draft", { threadId, workflowId, expectedRevision });
+}
+
+export function getWorkflowSkillReadiness(workflowId: string, threadId?: string) {
+  return invoke<WorkflowSkillReadinessView>("get_workflow_skill_readiness", {
+    workflowId,
+    ...(threadId ? { threadId } : {}),
+  });
 }
 
 export function getWorkflowRun(threadId: string) {
@@ -438,12 +467,18 @@ export function searchThreads(query: string) { return invoke<ThreadSummary[]>("s
 export function renameThread(threadId: string, title: string) { return invoke<ThreadSummary>("rename_thread", { threadId, title }); }
 export function deleteThread(threadId: string) { return invoke<void>("delete_thread", { threadId }); }
 export function getUsageSummary() { return invoke<UsageSummary>("usage_summary"); }
-export function getExtensionOverview(refresh = false) { return invoke<ExtensionOverview>("extension_overview", { refresh }); }
+export function getExtensionOverview(refresh = false, threadId?: string) {
+  return invoke<ExtensionOverview>("extension_overview", {
+    refresh,
+    ...(threadId ? { threadId } : {}),
+  });
+}
 export function getUserRules(refresh = false) { return invoke<UserRulesView>("user_rules", { refresh }); }
 export function saveUserRule(request: SaveUserRuleRequest) { return invoke<UserRulesView>("save_user_rule", { request }); }
 export function deleteUserRule(id: string) { return invoke<UserRulesView>("delete_user_rule", { id }); }
 export function getPluginOverview(refresh = false) { return invoke<PluginOverview>("plugin_overview", { refresh }); }
 export function setPluginEnabled(pluginId: string, enabled: boolean) { return invoke<PluginOverview>("set_plugin_enabled", { pluginId, enabled }); }
+export function installPlugin(sourcePath: string, scope: PluginScope) { return invoke<PluginOverview>("install_plugin", { sourcePath, scope }); }
 export function deletePlugin(pluginId: string) { return invoke<PluginOverview>("delete_plugin", { pluginId }); }
 export function getMcpConfig(refresh = false) { return invoke<McpConfigView>("mcp_config", { refresh }); }
 export function saveMcpConfig(scope: "global" | "project", content: string) { return invoke<McpConfigView>("save_mcp_config", { scope, content }); }
@@ -614,34 +649,6 @@ export function setMobileCapabilities(
   capabilities: MobileCapability[],
 ): Promise<MobileStatus> {
   return invoke<MobileStatus>("mobile_set_capabilities", { capabilities });
-}
-
-export function wechatClawbotStatus(): Promise<WechatClawbotStatus> {
-  return invoke<WechatClawbotStatus>("wechat_clawbot_status");
-}
-
-export function startWechatClawbotLogin(): Promise<WechatClawbotQrLogin> {
-  return invoke<WechatClawbotQrLogin>("wechat_clawbot_start_login");
-}
-
-export function wechatClawbotLoginStatus(loginId: string): Promise<WechatClawbotQrLoginStatus> {
-  return invoke<WechatClawbotQrLoginStatus>("wechat_clawbot_login_status", { loginId });
-}
-
-export function submitWechatClawbotVerifyCode(loginId: string, verifyCode: string): Promise<void> {
-  return invoke<void>("wechat_clawbot_submit_verify_code", { loginId, verifyCode });
-}
-
-export function approveWechatClawbotSender(senderKey: string): Promise<void> {
-  return invoke<void>("wechat_clawbot_approve_sender", { senderKey });
-}
-
-export function revokeWechatClawbotSender(senderKey: string): Promise<void> {
-  return invoke<void>("wechat_clawbot_revoke_sender", { senderKey });
-}
-
-export function disconnectWechatClawbot(): Promise<WechatClawbotStatus> {
-  return invoke<WechatClawbotStatus>("wechat_clawbot_disconnect");
 }
 
 export function errorMessage(error: unknown): string {

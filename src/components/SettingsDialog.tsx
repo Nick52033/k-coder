@@ -143,6 +143,7 @@ import { toUserFacingPath, workspacePathKey } from "../lib/path";
 import { McpSettingsPage } from "./McpSettingsPage";
 import { MobileSettingsPage } from "./MobileSettingsPage";
 import { PluginSettingsPage } from "./PluginSettingsPage";
+import { WorkflowSettingsPage } from "./WorkflowSettingsPage";
 import { RuleSettingsPage } from "./RuleSettingsPage";
 import { THEME_OPTIONS, themeLabel, type ThemeId } from "../lib/theme";
 
@@ -239,6 +240,7 @@ interface SettingsDialogProps {
   providers: ProviderConfigView[];
   activeProviderId: string | null;
   activeThreadId: string | null;
+  activeThreadIsStandalone: boolean;
   goal: GoalView | null;
   workflows: WorkflowDefinitionView[];
   workflowRun: WorkflowRunView | null;
@@ -257,6 +259,7 @@ interface SettingsDialogProps {
   onDeleteProvider: (providerId: string) => Promise<boolean>;
   onCreateGoal: (objective: string, tokenBudget: number | null, timeBudgetMs: number) => Promise<boolean>;
   onTransitionGoal: (state: GoalState, reason?: string) => Promise<boolean>;
+  onWorkflowsChanged: () => Promise<void>;
 }
 
 const settingsDefinitions: SettingsDefinition[] = [
@@ -268,7 +271,7 @@ const settingsDefinitions: SettingsDefinition[] = [
   { id: "miniapps", label: "小程序", group: "扩展", icon: Boxes, available: false },
   { id: "skills", label: "Skills", group: "扩展", icon: Sparkles, available: true },
   { id: "robots", label: "机器人", group: "智能体", icon: Bot, available: true },
-  { id: "workflows", label: "Workflows", group: "智能体", icon: Workflow, available: false },
+  { id: "workflows", label: "Workflows", group: "智能体", icon: Workflow, available: true },
   { id: "knowledge", label: "知识库", group: "知识与规则", icon: Library, available: true },
   { id: "memory", label: "记忆", group: "知识与规则", icon: Brain, available: true },
   { id: "browser", label: "浏览器自动化", group: "智能体", icon: Globe2, available: true },
@@ -285,6 +288,7 @@ export function SettingsDialog({
   providers,
   activeProviderId,
   activeThreadId,
+  activeThreadIsStandalone,
   goal,
   workflows,
   workflowRun,
@@ -303,6 +307,7 @@ export function SettingsDialog({
   onDeleteProvider,
   onCreateGoal,
   onTransitionGoal,
+  onWorkflowsChanged,
 }: SettingsDialogProps) {
   const [section, setSection] = useState<SettingsSection>(initialSection);
 
@@ -409,7 +414,14 @@ export function SettingsDialog({
                 onTransition={onTransitionGoal}
               />
             ) : section === "robots" ? (
-              <RobotsPage workflows={workflows} workflowRun={workflowRun} />
+              <RobotsPage workflows={workflows.filter((workflow) => workflow.source !== "custom")} workflowRun={workflowRun} />
+            ) : section === "workflows" ? (
+              <WorkflowSettingsPage
+                key={`${activeThreadId ?? "no-thread"}:${activeThreadIsStandalone ? "standalone" : "project"}`}
+                threadId={activeThreadId}
+                projectAvailable={Boolean(activeThreadId) && !activeThreadIsStandalone}
+                onPublished={onWorkflowsChanged}
+              />
             ) : section === "mcp" ? (
               <McpSettingsPage />
             ) : section === "plugins" ? (

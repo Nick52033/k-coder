@@ -4,6 +4,7 @@ import { getWorkflowSkillReadiness } from "../api/runtime";
 import type { WorkflowDefinitionView, WorkflowRunView, WorkflowSkillReadinessView } from "../types/runtime";
 
 interface WorkflowSelectorProps {
+  threadId: string | null;
   definitions: WorkflowDefinitionView[];
   run: WorkflowRunView | null;
   selectedWorkflowId: string | null;
@@ -14,6 +15,7 @@ interface WorkflowSelectorProps {
 }
 
 export function WorkflowSelector({
+  threadId,
   definitions,
   run,
   selectedWorkflowId,
@@ -43,7 +45,7 @@ export function WorkflowSelector({
     if (!definitions.length || standalone) return undefined;
     void Promise.all(definitions.map(async (definition) => [
       definition.id,
-      await getWorkflowSkillReadiness(definition.id),
+      await getWorkflowSkillReadiness(definition.id, threadId ?? undefined),
     ] as const))
       .then((entries) => {
         if (!disposed) setReadiness(Object.fromEntries(entries));
@@ -52,7 +54,7 @@ export function WorkflowSelector({
         if (!disposed) setReadiness({});
       });
     return () => { disposed = true; };
-  }, [definitions, standalone]);
+  }, [definitions, standalone, threadId]);
 
   return (
     <div className={`workflow-selector${compact ? " workflow-selector--compact" : ""}`} ref={rootRef}>

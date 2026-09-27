@@ -65,31 +65,24 @@ export function TurnWaitingIndicator({
   const copy = activityStatus ? {
     rate_limited: {
       title: "正在等待模型恢复",
-      detail: "模型服务暂时限流，k-Coder 会在冷却后自动重试。",
     },
     thinking: {
       title: "正在理解你的请求",
-      detail: "任务还在处理中，回复会显示在这里。你可以继续补充要求。",
     },
     responding: {
       title: "正在生成回复",
-      detail: "模型还在组织内容，结果会在这里逐步显示。",
     },
     running_tool: {
       title: "正在处理操作",
-      detail: "当前操作完成后，k-Coder 会继续回复。",
     },
     awaiting_approval: {
       title: "等待你确认",
-      detail: "确认卡片会显示在这段对话中。",
     },
     finalizing: {
       title: "正在整理结果",
-      detail: "正在收尾，完成后会把结果显示在这里。",
     },
   }[activityStatus] : {
     title: "正在执行",
-    detail: "模型正在处理你的请求，回复会显示在这里。",
   };
 
   return (
@@ -100,8 +93,8 @@ export function TurnWaitingIndicator({
       <div className="turn-waiting__copy">
         <div className="turn-waiting__heading">
           <strong>{cancelling ? "正在停止" : copy.title}</strong>
-          <span className="turn-waiting__elapsed" aria-hidden="true">
-            {cancelling ? "等待运行时结束当前操作" : activityStatus === "rate_limited"
+          {!cancelling ? <span className="turn-waiting__elapsed" aria-hidden="true">
+            {activityStatus === "rate_limited"
               ? <>
                 <RetryWaitingLabel retryAtMs={retryAtMs} />
                 <span aria-hidden="true"> · </span>
@@ -113,9 +106,8 @@ export function TurnWaitingIndicator({
                 sinceMs={activitySinceMs ?? mountedAtMs}
                 streamRetry={streamRetry}
               />}
-          </span>
+          </span> : null}
         </div>
-        <p>{cancelling ? "停止请求已发送，当前操作结束后会更新状态。" : copy.detail}</p>
       </div>
       {onStop && !cancelling ? (
         <button className="turn-waiting__stop" type="button" onClick={onStop}>

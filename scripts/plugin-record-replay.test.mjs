@@ -13,6 +13,7 @@ import {
   record,
   resolveWorkspacePath,
 } from "./plugin-record-replay.mjs";
+import { findPluginFile, skipWithoutPlugin } from "./plugin-fixtures.mjs";
 
 const workspace = path.resolve(import.meta.dirname, "..");
 
@@ -214,9 +215,15 @@ test("recording inspection rejects literal password input", () => {
   );
 });
 
-test('imported workflows normalize tools, resolve supplied variables and refuse login replay', async () => {
+test('imported workflows normalize tools, resolve supplied variables and refuse login replay', { skip: skipWithoutPlugin('record-replay') }, async () => {
   const relative = `.tmp/plugin-record-replay-${randomUUID()}`;
-  const readWorkflow = async name => JSON.parse(await fs.readFile(path.join(workspace, '.k-coder/plugins/record-replay/workflows', `${name}.workflow.json`), 'utf8'));
+  // The record-replay plugin now lives in the machine-wide local plugin root, so its
+  // workflow fixtures are resolved from there instead of a workspace-relative path.
+  const readWorkflow = async name => {
+    const workflowPath = findPluginFile('record-replay', 'workflows', `${name}.workflow.json`);
+    if (!workflowPath) throw new Error(`record-replay workflow fixture is missing: ${name}`);
+    return JSON.parse(await fs.readFile(workflowPath, 'utf8'));
+  };
   try {
     const baidu = await readWorkflow('百度搜索关键词');
     const output = await compileWorkflow({workspace, workflow: baidu, variables: {keyword: 'plugin validation'}, output: `${relative}/baidu.json`});

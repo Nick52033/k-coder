@@ -409,12 +409,27 @@ fn deltas_of(frames: &[Value]) -> Vec<String> {
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread")]
-async fn running_turn_streams_text_deltas_to_the_subscribed_connection() {
+async fn running_project_turn_survives_desktop_workspace_switch() {
     let harness = Harness::start(
         FakeProvider::text(&["Hello", " from", " fake"]),
         ToolRegistry::read_only(),
     )
     .await;
+    let bound_workspace = harness
+        .state
+        .ensure_thread_workspace(&harness.thread_id)
+        .await
+        .expect("project thread must bind to its original workspace");
+    let desktop_workspace = TempDir::new().expect("second desktop workspace");
+    harness
+        .state
+        .switch_workspace(desktop_workspace.path())
+        .await
+        .expect("desktop workspace should switch");
+    assert_eq!(
+        harness.state.workspace_root(),
+        desktop_workspace.path().canonicalize().unwrap()
+    );
     harness.connect_and_subscribe().await;
 
     let response = harness
@@ -469,6 +484,20 @@ async fn running_turn_streams_text_deltas_to_the_subscribed_connection() {
 
     harness.wait_for_idle().await;
     assert_eq!(harness.provider.requests().len(), 1);
+    assert_eq!(
+        harness
+            .state
+            .ensure_thread_workspace(&harness.thread_id)
+            .await
+            .unwrap(),
+        bound_workspace,
+        "mobile use must keep the thread bound to its original project"
+    );
+    assert_eq!(
+        harness.state.workspace_root(),
+        desktop_workspace.path().canonicalize().unwrap(),
+        "mobile use must not change the desktop's selected workspace"
+    );
 }
 
 // ---------------------------------------------------------------------------

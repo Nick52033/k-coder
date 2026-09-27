@@ -180,19 +180,28 @@ pub async fn compact_thread(
     let workspace_root = project_workspace
         .clone()
         .unwrap_or_else(|| state.workspace_root());
+    let workspace_turn = match project_workspace.as_deref() {
+        Some(workspace) => Some(
+            state
+                .prepare_workspace_turn(workspace)
+                .await
+                .map_err(|error| CommandError::new("extensions", error))?,
+        ),
+        None => None,
+    };
     let context_limit = state
         .provider_context_limit()
         .map_err(|error| CommandError::new("provider_config", error))?;
+    let tools = match workspace_turn {
+        Some(context) => context.tool_registry,
+        None => state
+            .tool_registry()
+            .restricted_to(&[])
+            .map_err(|error| CommandError::new("workspace_tools", error))?,
+    };
     let runtime = AgentRuntime::with_tools_and_approvals(
         state.runtime_repository(),
-        if project_workspace.is_some() {
-            state.tool_registry()
-        } else {
-            state
-                .tool_registry()
-                .restricted_to(&[])
-                .map_err(|error| CommandError::new("workspace_tools", error))?
-        },
+        tools,
         workspace_root,
         state.approvals(),
     )

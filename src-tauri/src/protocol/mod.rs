@@ -352,6 +352,19 @@ pub enum ToolRisk {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+pub enum PluginScope {
+    Local,
+    Project,
+}
+
+impl Default for PluginScope {
+    fn default() -> Self {
+        Self::Project
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum PluginState {
     Disabled,
     Loaded,
@@ -373,6 +386,8 @@ pub struct PluginComponentSummary {
 #[serde(rename_all = "camelCase")]
 pub struct PluginDiagnostic {
     pub id: String,
+    #[serde(default)]
+    pub scope: PluginScope,
     pub name: String,
     pub version: String,
     pub description: String,
@@ -389,7 +404,12 @@ pub struct PluginDiagnostic {
 #[serde(rename_all = "camelCase")]
 pub struct PluginOverview {
     pub schema_version: u32,
+    #[serde(default)]
     pub root_path: String,
+    #[serde(default)]
+    pub local_root_path: String,
+    #[serde(default)]
+    pub project_root_path: String,
     pub plugins: Vec<PluginDiagnostic>,
     pub error: Option<String>,
 }
@@ -1377,6 +1397,7 @@ mod tests {
             root_path: r"D:\code\k-coder\.k-coder\plugins".into(),
             plugins: vec![PluginDiagnostic {
                 id: "review-tools@local".into(),
+                scope: PluginScope::Project,
                 name: "review-tools".into(),
                 version: "1.2.3".into(),
                 description: "Review helpers".into(),
@@ -1393,6 +1414,8 @@ mod tests {
                 warnings: vec!["Apps are not supported".into()],
                 error: None,
             }],
+            local_root_path: String::new(),
+            project_root_path: r"D:\code\k-coder\.k-coder\plugins".into(),
             error: None,
         };
 

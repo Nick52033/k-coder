@@ -103,6 +103,7 @@ export interface UserRulesView { schemaVersion: number; path: string; rules: Use
 export interface McpConfigDocumentView { scope: "global" | "project"; path: string; exists: boolean; content: string; error: string | null; }
 export interface McpConfigView { schemaVersion: number; global: McpConfigDocumentView; project: McpConfigDocumentView; overview: ExtensionOverview; }
 export type PluginState = "disabled" | "loaded" | "degraded" | "blocked" | "invalid";
+export type PluginScope = "local" | "project";
 export interface PluginComponentSummary {
   skillCount: number;
   mcpServerCount: number;
@@ -111,6 +112,7 @@ export interface PluginComponentSummary {
 }
 export interface PluginDiagnostic {
   id: string;
+  scope: PluginScope;
   name: string;
   version: string;
   description: string;
@@ -125,6 +127,8 @@ export interface PluginDiagnostic {
 export interface PluginOverview {
   schemaVersion: number;
   rootPath: string;
+  localRootPath: string;
+  projectRootPath: string;
   plugins: PluginDiagnostic[];
   error: string | null;
 }
@@ -739,10 +743,14 @@ export interface WorkflowNodeView {
   localSkillBindings: WorkflowSkillBindingView[];
   pluginSkillBindings: WorkflowSkillBindingView[];
 }
+export type WorkflowDefinitionSource = "builtin" | "custom";
+export type WorkflowDefinitionStatus = "draft" | "published" | "deleted";
 export interface WorkflowDefinitionView {
   schemaVersion: number;
   definitionVersion: number;
   id: string;
+  source: WorkflowDefinitionSource;
+  status: WorkflowDefinitionStatus;
   name: string;
   description: string;
   /** 机器人级 System Prompt，内置定义只读，界面仅展示。 */
@@ -752,6 +760,32 @@ export interface WorkflowDefinitionView {
   uniqueSkillCount: number;
   skillCatalog: WorkflowSkillBindingView[];
   nodes: WorkflowNodeView[];
+}
+export interface WorkflowNodeDraft {
+  id: string;
+  title: string;
+  description: string;
+  instructions: string;
+  completionCriteria: string;
+  skillIds: string[];
+}
+export interface WorkflowDraftRequest {
+  workflowId?: string | null;
+  expectedRevision?: number | null;
+  name: string;
+  description: string;
+  nodes: WorkflowNodeDraft[];
+}
+export interface WorkflowDefinitionRecord {
+  schemaVersion: number;
+  id: string;
+  name: string;
+  description: string;
+  status: WorkflowDefinitionStatus;
+  revision: number;
+  nodes: WorkflowNodeDraft[];
+  createdAtMs: number;
+  updatedAtMs: number;
 }
 export interface WorkflowNodeCompletion {
   nodeId: string;
@@ -765,6 +799,7 @@ export interface WorkflowRunView {
   id: string;
   threadId: string;
   workflowId: string;
+  workflowScopeKey?: string;
   objective: string;
   state: WorkflowRunState;
   currentNodeId: string | null;
@@ -1207,28 +1242,4 @@ export interface MobileStatus {
   /** 已提交、等待桌面端确认的配对请求；与 `pairing` 的生命周期无关。 */
   pendingPairings: MobilePendingPairingView[];
   devices: MobileDeviceView[];
-}
-
-export interface WechatSenderView {
-  senderKey: string;
-  approved: boolean;
-  hasThread: boolean;
-}
-
-export interface WechatClawbotStatus {
-  connected: boolean;
-  polling: boolean;
-  paused: boolean;
-  pendingSenders: WechatSenderView[];
-  approvedSenders: WechatSenderView[];
-}
-
-export interface WechatClawbotQrLogin {
-  loginId: string;
-  qrContent: string;
-}
-
-export interface WechatClawbotQrLoginStatus {
-  phase: string;
-  message: string | null;
 }

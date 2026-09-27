@@ -201,6 +201,52 @@ test("文本分片逐条呈现，且只续写同一个气泡节点", async ({ pa
   expect(consoleErrors).toEqual([]);
 });
 
+test("助手消息渲染 Markdown，并将原始 HTML 保持为文本", async ({ page }) => {
+  const gateway = new FakeGateway();
+  await openChat(page, gateway);
+
+  gateway.emit({
+    type: "turn_started",
+    threadId: "t1",
+    turnId: "turn-markdown",
+    userMessage: userMessage("总结结果"),
+  });
+  gateway.emit({
+    type: "text_delta",
+    threadId: "t1",
+    turnId: "turn-markdown",
+    itemId: "item-markdown",
+    delta: [
+      "# 执行结果",
+      "先看 **重点**，再运行 `pnpm build`。",
+      "",
+      "- 已完成",
+      "- [ ] 待确认",
+      "[文档](https://example.com)",
+      "[危险链接](javascript:alert)",
+      "",
+      "```html",
+      "<script>alert(1)</script>",
+      "```",
+      "",
+      "<img src=x onerror=alert(1)>",
+    ].join("\n"),
+  });
+
+  const bubble = page.locator("#timeline .bubble.agent");
+  await expect(bubble.locator("h1")).toHaveText("执行结果");
+  await expect(bubble.locator("strong")).toHaveText("重点");
+  await expect(bubble.locator("code").first()).toHaveText("pnpm build");
+  await expect(bubble.locator("ul li")).toHaveCount(2);
+  await expect(bubble.locator("input[type=checkbox]")).toBeDisabled();
+  await expect(bubble.locator("a")).toHaveCount(1);
+  await expect(bubble.locator("a")).toHaveAttribute("href", "https://example.com/");
+  await expect(bubble).toContainText("危险链接");
+  await expect(bubble.locator("pre code")).toHaveText("<script>alert(1)</script>");
+  await expect(bubble.locator("script, img")).toHaveCount(0);
+  await expect(bubble).toContainText("<img src=x onerror=alert(1)>");
+});
+
 test("Turn 结束后已流出的正文仍然保留且不重复", async ({ page }) => {
   const gateway = new FakeGateway();
   await openChat(page, gateway);

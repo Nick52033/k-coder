@@ -2583,34 +2583,35 @@ button {
 }
 
 .turn-waiting__copy {
+  overflow: hidden;
   min-width: 0;
 }
 
 .turn-waiting__heading {
   display: flex;
+  overflow: hidden;
   min-width: 0;
-  flex-wrap: wrap;
+  flex-wrap: nowrap;
   align-items: baseline;
-  column-gap: 9px;
-  row-gap: 2px;
+  gap: 8px;
 }
 
 .turn-waiting__heading strong {
+  overflow: hidden;
+  min-width: 0;
+  text-overflow: ellipsis;
   font-size: var(--font-size-base);
   font-weight: var(--font-weight-semibold);
+  white-space: nowrap;
 }
 
 .turn-waiting__elapsed {
+  min-width: 0;
+  overflow: hidden;
   color: var(--color-ink-subtle);
   font-size: var(--font-size-xs);
-}
-
-.turn-waiting__copy p {
-  margin: 3px 0 0;
-  color: var(--color-ink-muted);
-  font-size: var(--font-size-sm);
-  line-height: 1.5;
-  text-wrap: pretty;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .turn-waiting__stop {

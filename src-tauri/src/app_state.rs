@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
+use sha2::{Digest, Sha256};
 use tokio::sync::{Mutex, Notify};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -18,7 +19,7 @@ use crate::execution::{BundledTools, CommandRuntime, ExecutionError, NativePtyRu
 use crate::extensions::mcp::OsMcpSecretStore;
 use crate::extensions::{
     ExtensionError, ExtensionOverview, ExtensionService, McpConfigView, SaveUserRuleRequest,
-    UserRulesView, plugin_root_for_workspace,
+    UserRulesView, plugin_root_for_local, plugin_root_for_workspace,
 };
 use crate::knowledge::KnowledgeService;
 use crate::logging::StructuredLogger;
@@ -29,9 +30,9 @@ use crate::persistence::ProjectionDb;
 use crate::policy::{ApprovalManager, UserInputManager};
 use crate::protocol::{
     AgentItemStatus, AgentItemType, ApprovalAction, ApprovalMode, ApprovalResolution, ChangeSet,
-    HistorySortDirection, PluginOverview, ReasoningEffort, ThreadHistorySnapshot, ThreadItemsPage,
-    ThreadModelSelectionResult, ThreadTurnsPage, TurnItemsView, TurnState, UserInputAction,
-    UserInputResolution,
+    HistorySortDirection, PluginOverview, PluginScope, ReasoningEffort, ThreadHistorySnapshot,
+    ThreadItemsPage, ThreadModelSelectionResult, ThreadTurnsPage, TurnItemsView, TurnState,
+    UserInputAction, UserInputResolution,
 };
 use crate::providers::{
     AnthropicMessagesProvider, CredentialError, CredentialStore, DeepSeekChatCompletionsProvider,
@@ -101,6 +102,7 @@ pub struct AppState {
     recovery_lock: Mutex<()>,
     extensions: ExtensionService,
     extension_workspace: Mutex<Option<(PathBuf, u64)>>,
+    workspace_turn_contexts: Mutex<HashMap<PathBuf, Arc<Mutex<CachedWorkspaceTurn>>>>,
     subagents: MultiAgentCoordinator,
     advanced: AdvancedServices,
     knowledge: KnowledgeService,
@@ -121,6 +123,24 @@ struct ActiveTurn {
     turn_id: String,
     cancellation: CancellationToken,
     control: Arc<TurnControl>,
+}
+
+struct CachedWorkspaceTurn {
+    extensions: ExtensionService,
+    revision: Option<u64>,
+    tool_registry: Option<ToolRegistry>,
+}
+
+pub struct PreparedWorkspaceTurn {
+    workspace_root: PathBuf,
+    pub tool_registry: ToolRegistry,
+    pub extensions: ExtensionService,
+}
+
+impl PreparedWorkspaceTurn {
+    pub fn workspace_root(&self) -> &Path {
+        &self.workspace_root
+    }
 }
 
 impl AppState {
@@ -306,6 +326,7 @@ impl AppState {
             recovery_lock: Mutex::new(()),
             extensions,
             extension_workspace: Mutex::new(None),
+            workspace_turn_contexts: Mutex::new(HashMap::new()),
             subagents,
             advanced,
             knowledge,
@@ -435,6 +456,87 @@ impl AppState {
             .read()
             .expect("tool registry lock poisoned")
             .clone()
+    }
+
+    /// Prepares an isolated tool and extension runtime for a project's canonical workspace.
+    /// The cache is keyed by the persisted thread workspace, so mobile Turns can operate on
+    /// another project without changing the desktop's globally selected workspace.
+    pub async fn prepare_workspace_turn(
+        &self,
+        workspace: &Path,
+    ) -> Result<PreparedWorkspaceTurn, AppStateError> {
+        let workspace = workspace
+            .canonicalize()
+            .map_err(|error| AppStateError::Workspace(error.to_string()))?;
+        if !workspace.is_dir() {
+            return Err(AppStateError::Workspace(format!(
+                "workspace root {} is not a directory",
+                workspace.display()
+            )));
+        }
+
+        let cached = {
+            let mut contexts = self.workspace_turn_contexts.lock().await;
+            contexts
+                .entry(workspace.clone())
+                .or_insert_with(|| {
+                    Arc::new(Mutex::new(CachedWorkspaceTurn {
+                        extensions: self.extensions.workspace_runtime_fork(),
+                        revision: None,
+                        tool_registry: None,
+                    }))
+                })
+                .clone()
+        };
+        let mut cached = cached.lock().await;
+        let revision = cached.extensions.revision(&workspace)?;
+        if cached.revision != Some(revision) || cached.tool_registry.is_none() {
+            // Invalidate before loading so a failed refresh can never fall back to stale project
+            // tools or extension handlers.
+            cached.revision = None;
+            cached.tool_registry = None;
+            let command_data_root = self.workspace_command_data_root(&workspace);
+            let command_runtime = CommandRuntime::with_recovery_and_bundled_tools(
+                &workspace,
+                command_data_root,
+                self.bundled_tools.clone(),
+            )?;
+            let (advanced_handlers, advanced_risks) = self.advanced.tool_handlers(&workspace);
+            let (structured_handlers, structured_risks) =
+                structured_knowledge_tools(self.knowledge(), self.entities());
+            let base_registry = ToolRegistry::workspace_tools_with_execution(
+                self.patch_service.clone(),
+                command_runtime,
+            )
+            .with_additional_handlers(structured_handlers, structured_risks)?
+            .with_additional_handlers(advanced_handlers, advanced_risks)?;
+            let prepared = cached
+                .extensions
+                .prepare(&workspace, CancellationToken::new())
+                .await?;
+            let registry =
+                base_registry.with_extensions(prepared.handlers, prepared.risks, prepared.hooks)?;
+            cached.revision = Some(revision);
+            cached.tool_registry = Some(registry);
+        }
+        Ok(PreparedWorkspaceTurn {
+            workspace_root: workspace,
+            tool_registry: cached
+                .tool_registry
+                .as_ref()
+                .expect("workspace turn registry is prepared")
+                .clone(),
+            extensions: cached.extensions.clone(),
+        })
+    }
+
+    fn workspace_command_data_root(&self, workspace: &Path) -> PathBuf {
+        let digest = Sha256::digest(workspace.to_string_lossy().as_bytes());
+        let key = digest
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        self.data_root.join("workspace-command-runtimes").join(key)
     }
 
     pub fn advanced(&self) -> AdvancedServices {
@@ -751,6 +853,12 @@ impl AppState {
                 root_path: plugin_root_for_workspace(workspace)
                     .to_string_lossy()
                     .into_owned(),
+                local_root_path: plugin_root_for_local(&self.data_root)
+                    .to_string_lossy()
+                    .into_owned(),
+                project_root_path: plugin_root_for_workspace(workspace)
+                    .to_string_lossy()
+                    .into_owned(),
                 plugins: Vec::new(),
                 error: None,
             })
@@ -764,6 +872,18 @@ impl AppState {
         let workspace = self.workspace_root();
         self.extensions
             .set_plugin_enabled(&workspace, plugin_id, enabled)?;
+        self.prepare_extensions(true).await?;
+        Ok(self.extensions.plugin_overview(&workspace, false)?)
+    }
+
+    pub async fn install_plugin(
+        &self,
+        source_path: &str,
+        scope: PluginScope,
+    ) -> Result<PluginOverview, AppStateError> {
+        let workspace = self.workspace_root();
+        self.extensions
+            .install_plugin(&workspace, Path::new(source_path), scope)?;
         self.prepare_extensions(true).await?;
         Ok(self.extensions.plugin_overview(&workspace, false)?)
     }
@@ -1340,18 +1460,12 @@ impl AppState {
         expected_workspace: &Path,
         _operation_guard: &ThreadOperationGuard,
     ) -> Result<(CancellationToken, Arc<TurnControl>), AppStateError> {
+        self.validate_turn_workspace_binding(thread_id, expected_workspace)
+            .await?;
         let _recovery_guard = self.recovery_lock.lock().await;
         let mut active_turns = self.active_turns.lock().await;
         if active_turns.contains_key(thread_id) {
             return Err(AppStateError::TurnAlreadyActive(thread_id.to_string()));
-        }
-        let current_workspace = self.workspace_root();
-        if current_workspace != expected_workspace {
-            return Err(AppStateError::ThreadWorkspaceMismatch {
-                thread_id: thread_id.to_string(),
-                expected: expected_workspace.to_path_buf(),
-                actual: current_workspace,
-            });
         }
         let cancellation = CancellationToken::new();
         let control = TurnControl::new();
@@ -1367,6 +1481,77 @@ impl AppState {
         // Start the idle clock over: a Turn is now in flight, so maintenance must not be scheduled.
         self.mark_maintenance_busy().await;
         Ok((cancellation, control))
+    }
+
+    async fn validate_turn_workspace_binding(
+        &self,
+        thread_id: &str,
+        requested_workspace: &Path,
+    ) -> Result<(), AppStateError> {
+        let requested_workspace = requested_workspace
+            .canonicalize()
+            .map_err(|error| AppStateError::Workspace(error.to_string()))?;
+        let current_workspace = self.workspace_root();
+        let detail = match self.repository.read_thread(thread_id).await {
+            Ok(detail) => detail,
+            // Compatibility turns without a persisted conversation remain restricted to the
+            // active workspace. Real project threads below use their host-persisted binding.
+            Err(StorageError::NotFound(_)) => {
+                if requested_workspace != current_workspace {
+                    return Err(AppStateError::ThreadWorkspaceMismatch {
+                        thread_id: thread_id.to_string(),
+                        expected: current_workspace,
+                        actual: requested_workspace,
+                    });
+                }
+                return Ok(());
+            }
+            Err(error) => return Err(error.into()),
+        };
+
+        if detail.summary.in_project {
+            let bound_workspace = match detail.summary.workspace_path {
+                Some(path) => {
+                    let recorded_workspace = PathBuf::from(path);
+                    let canonical_workspace = recorded_workspace
+                        .canonicalize()
+                        .map_err(|error| AppStateError::Workspace(error.to_string()))?;
+                    if canonical_workspace != recorded_workspace {
+                        return Err(AppStateError::Workspace(format!(
+                            "bound workspace path {} no longer resolves to its recorded canonical path",
+                            recorded_workspace.display()
+                        )));
+                    }
+                    canonical_workspace
+                }
+                None => {
+                    self.repository
+                        .bind_thread_workspace(thread_id, &current_workspace)
+                        .await?;
+                    current_workspace
+                }
+            };
+            if !bound_workspace.is_dir() {
+                return Err(AppStateError::Workspace(format!(
+                    "bound workspace {} is not a directory",
+                    bound_workspace.display()
+                )));
+            }
+            if requested_workspace != bound_workspace {
+                return Err(AppStateError::ThreadWorkspaceMismatch {
+                    thread_id: thread_id.to_string(),
+                    expected: bound_workspace,
+                    actual: requested_workspace,
+                });
+            }
+        } else if requested_workspace != current_workspace {
+            return Err(AppStateError::ThreadWorkspaceMismatch {
+                thread_id: thread_id.to_string(),
+                expected: current_workspace,
+                actual: requested_workspace,
+            });
+        }
+        Ok(())
     }
 
     pub async fn fork_thread(
@@ -1437,19 +1622,24 @@ impl AppState {
                 .await?;
             return Ok(Some(current_workspace));
         };
-        let bound_workspace = PathBuf::from(&bound_path).canonicalize().map_err(|error| {
+        let recorded_workspace = PathBuf::from(&bound_path);
+        let bound_workspace = recorded_workspace.canonicalize().map_err(|error| {
             AppStateError::Workspace(format!(
                 "bound workspace {bound_path} cannot be resolved: {error}"
             ))
         })?;
-        if bound_workspace != current_workspace {
-            return Err(AppStateError::ThreadWorkspaceMismatch {
-                thread_id: thread_id.to_string(),
-                expected: bound_workspace,
-                actual: current_workspace,
-            });
+        if bound_workspace != recorded_workspace {
+            return Err(AppStateError::Workspace(format!(
+                "bound workspace path {bound_path} no longer resolves to its recorded canonical path"
+            )));
         }
-        Ok(Some(current_workspace))
+        if !bound_workspace.is_dir() {
+            return Err(AppStateError::Workspace(format!(
+                "bound workspace {} is not a directory",
+                bound_workspace.display()
+            )));
+        }
+        Ok(Some(bound_workspace))
     }
 
     pub async fn ensure_thread_workspace(&self, thread_id: &str) -> Result<PathBuf, AppStateError> {
@@ -2013,9 +2203,7 @@ pub enum AppStateError {
     ThreadOperationBusy(String),
     #[error("thread mailbox is not empty for {0}")]
     ThreadMailboxNotEmpty(String),
-    #[error(
-        "thread {thread_id} belongs to workspace {expected}, but the active workspace is {actual}"
-    )]
+    #[error("thread {thread_id} is bound to workspace {expected}, but the turn requested {actual}")]
     ThreadWorkspaceMismatch {
         thread_id: String,
         expected: PathBuf,
@@ -3244,10 +3432,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn binds_legacy_threads_and_rejects_a_different_active_workspace() {
+    async fn binds_legacy_threads_and_keeps_their_workspace_after_switching_active_workspace() {
         let data = tempfile::tempdir().unwrap();
         let first = tempfile::tempdir().unwrap();
         let second = tempfile::tempdir().unwrap();
+        std::fs::write(first.path().join("AGENTS.md"), "RULE-FIRST-ONLY").unwrap();
+        std::fs::write(second.path().join("AGENTS.md"), "RULE-SECOND-ONLY").unwrap();
         let state = AppState::with_workspace_and_credentials(
             data.path(),
             first.path(),
@@ -3271,15 +3461,52 @@ mod tests {
         );
 
         state.switch_workspace(second.path()).await.unwrap();
+        assert_eq!(
+            state.ensure_thread_workspace(&thread.id).await.unwrap(),
+            bound
+        );
+        let project_context = state.prepare_workspace_turn(&bound).await.unwrap();
+        assert_eq!(project_context.workspace_root(), bound);
+        let project_instructions = project_context
+            .extensions
+            .runtime_instructions("inspect this project")
+            .unwrap();
+        assert!(project_instructions.contains("RULE-FIRST-ONLY"));
+        assert!(!project_instructions.contains("RULE-SECOND-ONLY"));
+        assert!(
+            project_context
+                .tool_registry
+                .definition_names()
+                .iter()
+                .any(|name| name == "run_command")
+        );
+        let desktop_workspace = state.workspace_root();
+        let desktop_context = state
+            .prepare_workspace_turn(&desktop_workspace)
+            .await
+            .unwrap();
+        let desktop_instructions = desktop_context
+            .extensions
+            .runtime_instructions("inspect this project")
+            .unwrap();
+        assert!(desktop_instructions.contains("RULE-SECOND-ONLY"));
+        assert!(!desktop_instructions.contains("RULE-FIRST-ONLY"));
+        assert_eq!(
+            state.workspace_root(),
+            second.path().canonicalize().unwrap()
+        );
         assert!(matches!(
-            state.ensure_thread_workspace(&thread.id).await,
+            state
+                .begin_turn_in_workspace(&thread.id, second.path())
+                .await,
             Err(AppStateError::ThreadWorkspaceMismatch { .. })
         ));
-        assert!(matches!(
-            state.begin_turn_in_workspace(&thread.id, &bound).await,
-            Err(AppStateError::ThreadWorkspaceMismatch { .. })
-        ));
-        assert!(!state.is_turn_active(&thread.id).await);
+        state
+            .begin_turn_in_workspace(&thread.id, &bound)
+            .await
+            .unwrap();
+        assert!(state.is_turn_active(&thread.id).await);
+        state.finish_turn(&thread.id).await;
     }
 
     #[tokio::test]

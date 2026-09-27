@@ -398,9 +398,12 @@ test.beforeEach(async ({ page }) => {
     let pluginOverview = {
       schemaVersion: 1,
       rootPath: pluginRootPath,
+      localRootPath: "C:\\Users\\demo\\AppData\\Local\\k-coder\\plugins",
+      projectRootPath: pluginRootPath,
       plugins: [
         {
           id: "review-tools@local",
+          scope: "project",
           name: "review-tools",
           version: "1.2.3",
           description: "Review the workspace with indexed guidance",
@@ -414,6 +417,7 @@ test.beforeEach(async ({ page }) => {
         },
         {
           id: "ready-tools@local",
+          scope: "project",
           name: "ready-tools",
           version: "2.0.0",
           description: "Ready plugin",
@@ -427,6 +431,7 @@ test.beforeEach(async ({ page }) => {
         },
         {
           id: "partial-tools@local",
+          scope: "project",
           name: "partial-tools",
           version: "1.0.0",
           description: "Skill available while Apps remain unsupported",
@@ -440,6 +445,7 @@ test.beforeEach(async ({ page }) => {
         },
         {
           id: "blocked-tools@local",
+          scope: "project",
           name: "blocked-tools",
           version: "1.0.0",
           description: "Runtime dependency is unavailable",
@@ -453,6 +459,7 @@ test.beforeEach(async ({ page }) => {
         },
         {
           id: "invalid:broken-package",
+          scope: "project",
           name: "broken-package",
           version: "",
           description: "",
@@ -996,6 +1003,32 @@ test.beforeEach(async ({ page }) => {
                     error: null,
                   }
                 : plugin),
+            };
+            return pluginOverview;
+          }
+          if (command === "install_plugin") {
+            const scope = args?.scope === "local" ? "local" : "project";
+            const sourcePath = String(args?.sourcePath ?? "selected-plugin");
+            const pluginId = `installed-${scope}@local`;
+            pluginOverview = {
+              ...pluginOverview,
+              plugins: [
+                ...pluginOverview.plugins,
+                {
+                  id: pluginId,
+                  scope,
+                  name: `installed-${scope}`,
+                  version: "1.0.0",
+                  description: `Installed from ${sourcePath}`,
+                  path: `${scope === "local" ? pluginOverview.localRootPath : pluginOverview.projectRootPath}\\installed-${scope}`,
+                  enabled: false,
+                  state: "disabled",
+                  deletable: true,
+                  components: { skillCount: 0, mcpServerCount: 0, mcpToolCount: 0, unsupportedCount: 0 },
+                  warnings: [],
+                  error: null,
+                },
+              ],
             };
             return pluginOverview;
           }
@@ -2511,7 +2544,28 @@ test("manages local plugins from backend facts", async ({ page }, testInfo) => {
   await expect.poll(() => page.evaluate(() => (
     window as unknown as { __invocationArgs: Record<string, unknown> }
   ).__invocationArgs.plugin_overview)).toEqual({ refresh: true });
-  await expect(settings.locator(".plugin-root")).toContainText(/\.k-coder\\plugins/);
+  await expect(settings.getByTitle("D:\\code\\k-coder\\.k-coder\\plugins", { exact: true })).toContainText(/\.k-coder\\plugins/);
+
+  await page.evaluate(() => localStorage.setItem("kcoder_e2e_attachment_dialog_paths", JSON.stringify("D:\\plugins\\portable")));
+  await settings.getByRole("button", { name: "安装到本地" }).click();
+  await expect.poll(() => page.evaluate(() => (
+    window as unknown as { __invocationArgs: Record<string, unknown> }
+  ).__invocationArgs.install_plugin)).toEqual({
+    sourcePath: "D:\\plugins\\portable",
+    scope: "local",
+  });
+  await expect(settings.locator(".plugin-row").filter({ hasText: "installed-local" })).toBeVisible();
+
+  await page.evaluate(() => localStorage.setItem("kcoder_e2e_attachment_dialog_paths", JSON.stringify("D:\\plugins\\project")));
+  await settings.getByRole("button", { name: "安装到项目" }).click();
+  await expect.poll(() => page.evaluate(() => (
+    window as unknown as { __invocationArgs: Record<string, unknown> }
+  ).__invocationArgs.install_plugin)).toEqual({
+    sourcePath: "D:\\plugins\\project",
+    scope: "project",
+  });
+  await expect(settings.locator(".plugin-row").filter({ hasText: "installed-project" })).toBeVisible();
+
   for (const state of ["未启用", "已加载", "部分可用", "已阻止", "无效"]) {
     await expect(settings.getByText(state, { exact: true }).first()).toBeVisible();
   }
@@ -2529,8 +2583,8 @@ test("manages local plugins from backend facts", async ({ page }, testInfo) => {
   await expect(review.getByRole("checkbox", { name: "启用 review-tools" })).toBeChecked();
   await expect(review.getByText("已加载", { exact: true })).toBeVisible();
 
-  await review.getByRole("button", { name: "删除 review-tools" }).click();
-  const confirm = page.getByRole("dialog", { name: "删除插件" });
+  await review.getByRole("button", { name: "卸载 review-tools" }).click();
+  const confirm = page.getByRole("dialog", { name: "卸载插件" });
   await expect(confirm.getByText("review-tools", { exact: true })).toBeVisible();
   // 破坏性实心按钮的填充与前景是两个独立角色，任何主题下都必须能读懂。
   await expect.poll(() => confirm.locator(".danger-button").evaluate((element) => {
@@ -2547,8 +2601,8 @@ test("manages local plugins from backend facts", async ({ page }, testInfo) => {
     window as unknown as { __invoked: string[] }
   ).__invoked.filter((command) => command === "delete_plugin").length)).toBe(0);
 
-  await review.getByRole("button", { name: "删除 review-tools" }).click();
-  await page.getByRole("dialog", { name: "删除插件" }).getByRole("button", { name: "删除", exact: true }).click();
+  await review.getByRole("button", { name: "卸载 review-tools" }).click();
+  await page.getByRole("dialog", { name: "卸载插件" }).getByRole("button", { name: "卸载", exact: true }).click();
   await expect.poll(() => page.evaluate(() => (
     window as unknown as { __invocationArgs: Record<string, unknown> }
   ).__invocationArgs.delete_plugin)).toEqual({ pluginId: "review-tools@local" });
@@ -7592,7 +7646,8 @@ test("shows an actionable waiting state before the assistant returns its first u
   const waiting = page.locator(".turn-waiting");
   await expect(waiting).toBeVisible();
   await expect(waiting).toContainText("正在理解你的请求");
-  await expect(waiting).toContainText("回复会显示在这里");
+  await expect(waiting.locator(".turn-waiting__copy p")).toHaveCount(0);
+  await expect(waiting.locator(".turn-waiting__heading")).toHaveCSS("flex-wrap", "nowrap");
   await expect(waiting.locator(".turn-waiting__elapsed")).toContainText("0s");
   await expect(waiting.getByRole("button", { name: "停止", exact: true })).toBeEnabled();
   const waitingStyle = await waiting.evaluate((element) => {
