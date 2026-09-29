@@ -474,7 +474,10 @@ function ProviderFallbackSettingsPage({
       </div>
 
       <p className="provider-fallback-intro">
-        勾选顺序决定尝试顺序；仅在尚无回复或工具调用时切换。New API 的渠道负载均衡由 New API 管理；这里用于在整个网关不可用时切换到另一供应商。
+        遇到可切换的故障时，k-Coder 会按下方顺序尝试备用供应商。主供应商已开始回复或调用工具后，本轮不会再切换。
+      </p>
+      <p className="provider-fallback-gateway-note">
+        使用 New API 时，网关内部渠道由 New API 管理；这里配置的是网关整体不可用时接手的供应商。
       </p>
 
       {error && <div className="settings-error" role="alert">{error}</div>}
@@ -516,6 +519,7 @@ function ProviderFallbackRoute({
     provider.fallbackProviderIds ?? [],
   );
   const [saving, setSaving] = useState(false);
+  const [isPickingFallbacks, setIsPickingFallbacks] = useState(false);
 
   function moveFallbackProvider(providerId: string, offset: number) {
     setFallbackProviderIds((current) => {
@@ -557,74 +561,108 @@ function ProviderFallbackRoute({
 
   return (
     <form className="provider-fallback-card" onSubmit={submit}>
-      <fieldset className="provider-fallback-route" aria-label={`主供应商：${provider.name}`}>
-        <legend>
+      <header className="provider-fallback-card-heading">
+        <div className="provider-fallback-route-source">
           <span className="provider-fallback-route-name">{provider.name}</span>
           <span className="provider-fallback-route-model">{provider.model || "未选择模型"}</span>
+        </div>
+        <span className="provider-fallback-primary-label">首选供应商</span>
+      </header>
+      <fieldset className="provider-fallback-route" aria-label={`备用供应商顺序：${provider.name}`}>
+        <legend>
+          <span>故障时按顺序尝试</span>
+          <span className="provider-fallback-count">{fallbackProviderIds.length}/4</span>
         </legend>
-        <div className="provider-cross-fallback-list" role="list" aria-label={`${provider.name} 的备用供应商顺序`}>
-          {candidates.map((candidate) => {
-            const order = fallbackProviderIds.indexOf(candidate.id);
-            const selected = order >= 0;
-            const blockedByLimit = !selected && fallbackProviderIds.length >= 4;
-            return (
-              <div className="provider-cross-fallback-row" role="listitem" key={candidate.id}>
-                <label className="provider-model-option">
-                  <input
-                    type="checkbox"
-                    checked={selected}
-                    disabled={(!candidate.hasApiKey && !selected) || blockedByLimit}
-                    onChange={(event) => {
-                      setFallbackProviderIds((current) => event.target.checked
-                        ? [...current, candidate.id]
-                        : current.filter((id) => id !== candidate.id));
-                    }}
-                    aria-label={`备用供应商：${candidate.name}`}
-                  />
-                  <span>{candidate.name}</span>
-                </label>
-                <span className="provider-cross-fallback-status">
-                  {selected
-                    ? <>
-                      <span>尝试顺序 {order + 1}</span>
-                      <span>{candidate.model || "未选择模型"}</span>
-                      {!candidate.hasApiKey && <span>未配置 API Key</span>}
-                    </>
-                    : !candidate.hasApiKey
-                      ? "未配置 API Key"
-                      : blockedByLimit
-                        ? "最多 4 个备用供应商"
-                        : candidate.model}
-                </span>
-                {selected && (
-                  <div className="provider-cross-fallback-actions">
+        {fallbackProviderIds.length === 0 ? (
+          <div className="provider-fallback-empty-route">
+            <span>尚未设置备用供应商</span>
+            <small>可切换的故障发生时，本轮会直接结束。</small>
+          </div>
+        ) : (
+          <ol className="provider-fallback-selected-list" aria-label={`${provider.name} 的备用供应商尝试顺序`}>
+            {fallbackProviderIds.map((id, index) => {
+              const candidate = candidates.find((item) => item.id === id);
+              if (!candidate) return null;
+              return (
+                <li className="provider-fallback-selected" key={id}>
+                  <span className="provider-fallback-order" aria-label={`第 ${index + 1} 顺位`}>{index + 1}</span>
+                  <span className="provider-fallback-selected-details">
+                    <strong>{candidate.name}</strong>
+                    <span>{candidate.model || "未选择模型"}</span>
+                  </span>
+                  {!candidate.hasApiKey && <span className="provider-fallback-missing-key">未配置 API Key</span>}
+                  <div className="provider-fallback-order-actions">
                     <button
-                      className="icon-button"
+                      className="provider-fallback-order-button"
                       type="button"
                       aria-label={`上移备用供应商 ${candidate.name}`}
                       title="上移"
-                      disabled={order === 0}
+                      disabled={index === 0}
                       onClick={() => moveFallbackProvider(candidate.id, -1)}
-                    ><ArrowUp size={14} /></button>
+                    ><ArrowUp size={15} /></button>
                     <button
-                      className="icon-button"
+                      className="provider-fallback-order-button"
                       type="button"
                       aria-label={`下移备用供应商 ${candidate.name}`}
                       title="下移"
-                      disabled={order === fallbackProviderIds.length - 1}
+                      disabled={index === fallbackProviderIds.length - 1}
                       onClick={() => moveFallbackProvider(candidate.id, 1)}
-                    ><ArrowDown size={14} /></button>
+                    ><ArrowDown size={15} /></button>
                   </div>
-                )}
-              </div>
-            );
-          })}
-          {candidates.length === 0 && (
-            <div className="provider-model-empty">保存另一个对话供应商并配置 API Key 后，可在此添加备用路由。</div>
-          )}
-        </div>
+                </li>
+              );
+            })}
+          </ol>
+        )}
+        {candidates.length > 0 && (
+          <button
+            className="provider-fallback-add"
+            type="button"
+            aria-expanded={isPickingFallbacks}
+            onClick={() => setIsPickingFallbacks((current) => !current)}
+          >
+            <Plus size={15} aria-hidden="true" />
+            {isPickingFallbacks ? "收起供应商列表" : "添加备用供应商"}
+          </button>
+        )}
+        {isPickingFallbacks && (
+          <div className="provider-fallback-picker" role="group" aria-label={`为 ${provider.name} 选择备用供应商`}>
+            <p className="provider-fallback-help">选中的供应商会追加到路由末尾；最多 4 个，没有 API Key 的供应商不能启用。</p>
+            <div className="provider-fallback-candidates">
+              {candidates.map((candidate) => {
+                const selected = fallbackProviderIds.includes(candidate.id);
+                const blockedByLimit = !selected && fallbackProviderIds.length >= 4;
+                return (
+                  <label className="provider-fallback-candidate" key={candidate.id}>
+                    <input
+                      type="checkbox"
+                      checked={selected}
+                      disabled={(!candidate.hasApiKey && !selected) || blockedByLimit}
+                      onChange={(event) => {
+                        setFallbackProviderIds((current) => event.target.checked
+                          ? [...current, candidate.id]
+                          : current.filter((id) => id !== candidate.id));
+                      }}
+                      aria-label={`备用供应商：${candidate.name}`}
+                    />
+                    <span className="provider-fallback-candidate-details">
+                      <strong>{candidate.name}</strong>
+                      <small>{candidate.model || "未选择模型"}</small>
+                    </span>
+                    <span className="provider-fallback-candidate-status">
+                      {selected ? `备用 ${fallbackProviderIds.indexOf(candidate.id) + 1}`
+                        : !candidate.hasApiKey ? "先配置 API Key"
+                          : blockedByLimit ? "已达 4 个上限" : "可添加"}
+                    </span>
+                  </label>
+                );
+              })}
+            </div>
+          </div>
+        )}
       </fieldset>
       <footer className="provider-fallback-card-actions">
+        <span>修改仅在保存后生效</span>
         <button className="primary-button" type="submit" disabled={saving}>
           <Save size={14} />{saving ? "保存中…" : `保存 ${provider.name} 路由`}
         </button>

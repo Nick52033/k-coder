@@ -141,7 +141,9 @@ pub enum ProviderEvent {
     },
     ModelSelected {
         provider: String,
+        provider_name: String,
         model: String,
+        fallback_position: Option<u32>,
     },
     Completed,
 }

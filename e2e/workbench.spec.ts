@@ -398,6 +398,7 @@ test.beforeEach(async ({ page }) => {
     let pluginOverview = {
       schemaVersion: 1,
       rootPath: pluginRootPath,
+      builtinRootPath: "D:\\code\\k-coder\\plugins",
       localRootPath: "C:\\Users\\demo\\AppData\\Local\\k-coder\\plugins",
       projectRootPath: pluginRootPath,
       plugins: [
@@ -680,6 +681,26 @@ test.beforeEach(async ({ page }) => {
             };
           }
           if (command === "get_provider_catalog") return providerCatalog;
+          if (command === "select_thread_model") {
+            const providerId = String(args?.providerId ?? "");
+            const model = String(args?.model ?? "");
+            (window as unknown as { __lastThreadModelSelection: { providerId: string; model: string } | null })
+              .__lastThreadModelSelection = { providerId, model };
+            if (args?.updateDefault !== false) {
+              providerCatalog = {
+                ...providerCatalog,
+                activeProviderId: providerId,
+                providers: providerCatalog.providers.map((provider) => provider.id === providerId
+                  ? { ...provider, model }
+                  : provider),
+              };
+            }
+            return {
+              schemaVersion: 1,
+              selection: { providerId, model },
+              catalog: providerCatalog,
+            };
+          }
           if (command === "list_builtin_workflows") return workflowDefinitions;
           if (command === "get_workflow_skill_readiness") {
             const workflow = workflowDefinitions.find((item) => item.id === args?.workflowId);
@@ -1209,6 +1230,7 @@ test.beforeEach(async ({ page }) => {
       __runTurnCalls: runTurnCalls,
       __lastProviderRequest: null,
       __lastActivatedProvider: null,
+      __lastThreadModelSelection: null,
       __lastApprovalMode: null,
       __registeredTauriEvents: tauriEventCallbackIds,
       __emitTauriEvent: (event: string, payload: unknown) => {
@@ -3666,6 +3688,87 @@ test("copies the user message text with the copy button", async ({ page, context
   expect(overlaps).toBe(false);
 });
 
+test("navigates between user prompts and preserves their bookmarks", async ({ page }, testInfo) => {
+  await page.emulateMedia({ reducedMotion: "reduce" });
+  await page.goto("/");
+  await expect(page.getByRole("heading", { name: "Phase 6 workbench" })).toBeVisible();
+
+  const longReply = Array.from(
+    { length: 48 },
+    (_, index) => `第一轮助手回复第 ${index + 1} 段，用来让后续请求位于当前视口之外。`,
+  ).join("\n\n");
+  await page.evaluate((reply) => {
+    localStorage.setItem("kcoder_e2e_thread_detail", JSON.stringify({
+      schemaVersion: 1,
+      summary: { schemaVersion: 1, id: "thread-1", title: "Phase 6 workbench", createdAtMs: 1, updatedAtMs: 4, archived: false },
+      messages: [
+        { schemaVersion: 1, id: "anchor-user-1", role: "user", content: [{ type: "text", text: "检查第一轮问题" }], createdAtMs: 1 },
+        { schemaVersion: 1, id: "anchor-assistant-1", role: "assistant", content: [{ type: "text", text: reply }], createdAtMs: 2 },
+        { schemaVersion: 1, id: "anchor-user-2", role: "user", content: [{ type: "text", text: "找到这个对话，看下这个报错" }], createdAtMs: 3 },
+        { schemaVersion: 1, id: "anchor-assistant-2", role: "assistant", content: [{ type: "text", text: "找到了：这是第二轮请求对应的回复预览。" }], createdAtMs: 4 },
+      ],
+      messageTurnIds: { "anchor-assistant-1": "turn-anchor-1", "anchor-assistant-2": "turn-anchor-2" },
+      lastTurn: { turnId: "turn-anchor-2", state: "completed", error: null },
+      toolActivities: [], turnTimeline: [], approvals: [], changes: [],
+    }));
+  }, longReply);
+  await page.reload();
+
+  const navigator = page.getByRole("navigation", { name: "用户消息导航" });
+  await expect(navigator).toBeVisible();
+  const anchors = page.locator(".conversation-message-anchor");
+  await expect(anchors).toHaveCount(2);
+  const messageArea = page.locator(".message-area");
+  const initialScrollTop = await messageArea.evaluate((element) => element.scrollTop);
+  expect(initialScrollTop).toBeGreaterThan(0);
+  await messageArea.evaluate((element) => {
+    element.scrollTop = element.scrollHeight;
+    element.dispatchEvent(new Event("scroll"));
+  });
+  await expect(navigator.locator(".conversation-message-anchor__preview")).toHaveCount(0);
+
+  const firstAnchor = anchors.nth(0);
+  const firstMarker = firstAnchor.getByRole("button", { name: /跳转到用户消息：检查第一轮问题/ });
+  await firstMarker.focus();
+  await expect(firstAnchor.locator(".conversation-message-anchor__preview")).toHaveText("检查第一轮问题");
+  await firstAnchor.getByRole("button", { name: "收藏这条消息" }).focus();
+  await expect(firstAnchor.locator(".conversation-message-anchor__preview")).toBeVisible();
+  await firstMarker.blur();
+  await firstAnchor.locator(".conversation-message-anchor__bookmark").blur();
+  await expect(navigator.locator(".conversation-message-anchor__preview")).toHaveCount(0);
+  await firstMarker.hover();
+  await expect(firstAnchor.locator(".conversation-message-anchor__preview")).toHaveText("检查第一轮问题");
+  await expect(firstAnchor.locator(".conversation-message-anchor__preview")).not.toContainText("第一轮助手回复");
+  const markerTops = await anchors.locator(".conversation-message-anchor__marker").evaluateAll((markers) =>
+    markers.map((marker) => marker.getBoundingClientRect().top),
+  );
+  expect(Math.abs(markerTops[1] - markerTops[0])).toBeLessThanOrEqual(56);
+  const firstMarkerBounds = await firstMarker.boundingBox();
+  expect(firstMarkerBounds?.height).toBeLessThanOrEqual(6);
+  expect(firstMarkerBounds?.width).toBeGreaterThanOrEqual(8);
+  const previewBounds = await firstAnchor.locator(".conversation-message-anchor__preview").boundingBox();
+  expect(previewBounds).not.toBeNull();
+  expect(Math.abs((previewBounds!.y + previewBounds!.height / 2) - (firstMarkerBounds!.y + firstMarkerBounds!.height / 2))).toBeLessThanOrEqual(40);
+  await page.screenshot({ path: testInfo.outputPath("message-anchor-preview.png"), fullPage: false });
+  await firstAnchor.getByRole("button", { name: "收藏这条消息" }).click();
+  await expect(firstAnchor.getByRole("button", { name: "取消收藏这条消息" })).toHaveAttribute("aria-pressed", "true");
+
+  await firstAnchor.getByRole("button", { name: /跳转到用户消息：检查第一轮问题/ }).click();
+  await expect.poll(() => messageArea.evaluate((element) => element.scrollTop)).toBeLessThan(initialScrollTop);
+  const firstMessageTop = await page.locator('[data-message-id="anchor-user-1"]').evaluate((element) => element.getBoundingClientRect().top);
+  const areaBounds = await messageArea.boundingBox();
+  expect(areaBounds).not.toBeNull();
+  expect(firstMessageTop).toBeGreaterThan(areaBounds!.y);
+  expect(firstMessageTop).toBeLessThan(areaBounds!.y + areaBounds!.height);
+
+  await anchors.nth(1).getByRole("button", { name: /跳转到用户消息：找到这个对话/ }).click();
+  await expect.poll(() => messageArea.evaluate((element) => element.scrollTop)).toBeGreaterThan(0);
+  await page.reload();
+  const restoredFirstAnchor = page.locator(".conversation-message-anchor").first();
+  await restoredFirstAnchor.getByRole("button", { name: /跳转到用户消息：检查第一轮问题/ }).hover();
+  await expect(restoredFirstAnchor.getByRole("button", { name: "取消收藏这条消息" })).toHaveAttribute("aria-pressed", "true");
+});
+
 test("wakes workspace files with @ and enabled Skills with /", async ({ page }) => {
   await page.goto("/");
   const composer = page.getByRole("textbox", { name: "消息" });
@@ -3752,6 +3855,41 @@ test("paces streamed text and preserves timeline order before tools and completi
   await expect(liveMessage.locator(".turn-execution--live")).toHaveCount(0);
   await expect(liveMessage.locator(".turn-final-response").getByText("流式终点", { exact: true })).toBeVisible();
   await expect(liveMessage.getByText("执行了 1.8s", { exact: true })).toBeVisible();
+});
+
+test("clears failed provider attempt drafts before retry output", async ({ page }) => {
+  await page.goto("/");
+  const emit = (event: Record<string, unknown>) => page.evaluate((payload) => {
+    (window as unknown as { __emitAgentEvent: (value: unknown) => void }).__emitAgentEvent(payload);
+  }, event);
+  const base = { schemaVersion: 11, threadId: "thread-1", turnId: "turn-provider-retry-reset" };
+  const assistantItemId = "assistant-provider-retry";
+  const reasoningItemId = "reasoning-provider-retry";
+  const failedText = "失败尝试的临时正文";
+  const recoveredText = "恢复后的正文";
+  const failedReasoning = "已确认失败尝试的临时摘要需要清理。";
+  const recoveredReasoning = "已确认重试连接恢复并继续回答。";
+
+  await emit({ ...base, type: "turn_started", phase: "exploring" });
+  await emit({ ...base, type: "text_delta", phase: "responding", itemId: assistantItemId, delta: failedText });
+  await emit({ ...base, type: "reasoning_summary_delta", phase: "planning", itemId: reasoningItemId, delta: failedReasoning });
+
+  const liveMessage = page.locator(".message--assistant").last();
+  await expect(liveMessage.getByText(failedText, { exact: true })).toBeVisible();
+  const reasoning = liveMessage.locator(".turn-reasoning");
+  await expect(reasoning.locator(".turn-reasoning-segment")).toContainText(failedReasoning);
+
+  await emit({ ...base, type: "text_reset", phase: "planning", itemId: assistantItemId });
+  await emit({ ...base, type: "text_reset", phase: "planning", itemId: reasoningItemId });
+  await expect(liveMessage.getByText(failedText, { exact: true })).toHaveCount(0);
+  await expect(reasoning).toHaveCount(0);
+
+  await emit({ ...base, type: "text_delta", phase: "responding", itemId: assistantItemId, delta: recoveredText });
+  await emit({ ...base, type: "reasoning_summary_delta", phase: "planning", itemId: reasoningItemId, delta: recoveredReasoning });
+  await expect(liveMessage.getByText(recoveredText, { exact: true })).toBeVisible();
+  await expect(liveMessage.locator(".turn-reasoning .turn-reasoning-segment")).toContainText(recoveredReasoning);
+  await expect(liveMessage.getByText(failedText, { exact: true })).toHaveCount(0);
+  await expect(liveMessage.getByText(failedReasoning, { exact: true })).toHaveCount(0);
 });
 
 test("shows elapsed time, reconnect progress, and reasoning hint in the live status line", async ({ page }) => {
@@ -5683,6 +5821,63 @@ test("keeps retry attempts in one assistant reply before and after recovery", as
   await page.screenshot({ path: testInfo.outputPath("retry-group-restored.png"), fullPage: true });
 });
 
+test("does not add a second waiting row when a retry timeline is already grouped", async ({ page }) => {
+  const failedDetail = {
+    schemaVersion: 1,
+    summary: { schemaVersion: 1, id: "thread-1", title: "Retry waiting ownership", createdAtMs: 1, updatedAtMs: 2, archived: false },
+    messages: [{ schemaVersion: 1, id: "retry-waiting-user", role: "user", content: [{ type: "text", text: "继续处理这个问题" }], createdAtMs: 1 }],
+    messageTurnIds: {},
+    // The history projection can know the retry's user-message ownership before
+    // the live assistant placeholder reaches displayMessages.
+    turnUserMessageIds: {
+      "turn-failed": "retry-waiting-user",
+      "turn-retry-1": "retry-waiting-user",
+    },
+    lastTurn: { turnId: "turn-failed", state: "failed", error: "provider failed" },
+    toolActivities: [],
+    turnTimeline: [{
+      type: "event",
+      itemId: "turn-failed-event",
+      turnId: "turn-failed",
+      kind: "turn_failed",
+      title: "Turn 已失败",
+      detail: "provider failed",
+      durationMs: 120,
+    }],
+    approvals: [],
+    userInputs: [],
+    changes: [],
+    todos: [],
+    lastUsage: null,
+  };
+  await page.addInitScript((detail) => {
+    localStorage.setItem("kcoder_e2e_hold_retry", "true");
+    localStorage.setItem("kcoder_e2e_thread_detail", JSON.stringify(detail));
+  }, failedDetail);
+  await page.goto("/");
+
+  const failedExecution = page.locator(".message--activity-only .turn-execution--failed");
+  await failedExecution.locator(":scope > summary").click();
+  await failedExecution.getByRole("button", { name: "重试", exact: true }).click();
+  await expect.poll(() => page.evaluate(() => (
+    window as unknown as { __invoked: string[] }
+  ).__invoked.filter((command) => command === "turn_retry").length)).toBe(1);
+
+  // The retry's activity arrives before its assistant placeholder in this
+  // projection. It is still grouped with the failed attempt by turnUserMessageIds.
+  await page.evaluate(() => {
+    const emit = (window as unknown as { __emitAgentEvent: (event: unknown) => void }).__emitAgentEvent;
+    const base = { schemaVersion: 1, threadId: "thread-1", turnId: "turn-retry-1", phase: "responding" };
+    emit({ ...base, type: "activity_status_changed", status: "responding" });
+    emit({ ...base, type: "text_delta", itemId: "retry-waiting-progress", delta: "重试正在继续。" });
+  });
+
+  await expect(page.locator(".message--retry-group")).toHaveCount(1);
+  await expect(page.locator(".message-retry-attempt[data-turn-id=\"turn-retry-1\"]")).toContainText("重试正在继续。", { exact: true });
+  await expect(page.locator(".turn-execution--live")).toHaveCount(1);
+  await expect(page.locator(".turn-waiting")).toHaveCount(0);
+});
+
 test("restores a pending user question after reopening the thread", async ({ page }) => {
   await page.addInitScript(() => {
     localStorage.setItem("kcoder_theme", "dark");
@@ -6284,14 +6479,20 @@ test("switches providers and models from the composer footer", async ({ page }, 
   await page.getByRole("option", { name: /GPT-4 Omni.*gpt-4o/ }).click();
   await expect(selector).toContainText("GPT-4 Omni");
   await expect(selector.locator("em")).toHaveText("gpt-4o");
-  await expect.poll(() => page.evaluate(() => (window as unknown as { __invoked: string[] }).__invoked.includes("save_provider_config"))).toBe(true);
+  await expect.poll(() => page.evaluate(() =>
+    (window as unknown as { __lastThreadModelSelection: { providerId: string; model: string } | null })
+      .__lastThreadModelSelection,
+  )).toEqual({ providerId: "openai", model: "gpt-4o" });
 
   await selector.click();
   await providerOptions.getByRole("button", { name: /zicc/ }).click();
   await expect(selector).toContainText("zicc");
   await expect(selector).toContainText("gpt-5.6-terra");
   await expect(selector.locator("em")).toHaveCount(0);
-  await expect.poll(() => page.evaluate(() => (window as unknown as { __lastActivatedProvider: string | null }).__lastActivatedProvider)).toBe("zicc");
+  await expect.poll(() => page.evaluate(() =>
+    (window as unknown as { __lastThreadModelSelection: { providerId: string; model: string } | null })
+      .__lastThreadModelSelection,
+  )).toEqual({ providerId: "zicc", model: "gpt-5.6-terra" });
 
   await selector.press("ArrowDown");
   await expect(page.getByRole("listbox", { name: "可用模型" })).toBeVisible();
@@ -6302,6 +6503,56 @@ test("switches providers and models from the composer footer", async ({ page }, 
   await page.keyboard.press("Escape");
   await expect(page.getByRole("listbox", { name: "可用模型" })).toBeHidden();
   await expect(selector).toBeFocused();
+});
+
+test("shows the actual fallback route while keeping the selected model unchanged", async ({ page }, testInfo) => {
+  await page.goto("/");
+  const composer = page.locator(".composer");
+  const selector = composer.getByRole("button", { name: "选择模型" });
+  const fallbackStatus = composer.locator(".composer-fallback-status");
+  await expect(selector).toContainText("OpenAI");
+  await expect(selector).toContainText("GPT-4.1");
+
+  const emit = (type: string, extra: Record<string, unknown> = {}) => page.evaluate(({ eventType, fields }) => {
+    (window as unknown as { __emitAgentEvent: (event: unknown) => void }).__emitAgentEvent({
+      schemaVersion: 12,
+      type: eventType,
+      phase: "exploring",
+      threadId: "thread-1",
+      turnId: "fallback-route-turn",
+      ...fields,
+    });
+  }, { eventType: type, fields: extra });
+
+  await emit("turn_started", { userMessage: null });
+  await emit("provider_route_selected", {
+    provider: "zicc",
+    model: "gpt-5.6-terra",
+    fallbackPosition: 1,
+  });
+  await expect(fallbackStatus).toContainText("本轮使用备用供应商：zicc / gpt-5.6-terra（顺位 1）");
+  await expect(fallbackStatus).toHaveAttribute("title", /主模型选择保持不变/);
+  await expect(selector).toContainText("OpenAI");
+  await expect(selector).toContainText("GPT-4.1");
+  await page.screenshot({ path: testInfo.outputPath(`fallback-route-${testInfo.project.name}.png`), fullPage: true });
+
+  await emit("provider_route_selected", {
+    provider: "OpenAI",
+    model: "gpt-4.1",
+    fallbackPosition: null,
+  });
+  await expect(fallbackStatus).toHaveCount(0);
+  await expect(selector).toContainText("OpenAI");
+  await expect(selector).toContainText("GPT-4.1");
+
+  await emit("provider_route_selected", {
+    provider: "zicc",
+    model: "gpt-5.6-terra",
+    fallbackPosition: 1,
+  });
+  await expect(fallbackStatus).toBeVisible();
+  await emit("turn_cancelled", { startedAtMs: 0, completedAtMs: 1, durationMs: 1 });
+  await expect(fallbackStatus).toHaveCount(0);
 });
 
 test("switches the runtime approval mode from the composer", async ({ page }, testInfo) => {
@@ -6410,18 +6661,22 @@ test("configures ordered cross-provider failover from the shared settings page",
   await page.getByRole("button", { name: "故障切换" }).click();
 
   await expect(page.getByRole("heading", { name: "跨供应商故障切换" })).toBeVisible();
-  await expect(page.getByText("New API 的渠道负载均衡由 New API 管理", { exact: false })).toBeVisible();
-  const openAiRoute = page.getByRole("group", { name: "主供应商：OpenAI" });
-  await expect(page.getByRole("group", { name: "主供应商：zicc" })).toBeVisible();
-  await expect(openAiRoute.getByText("gpt-4.1", { exact: true })).toBeVisible();
+  await expect(page.getByText("网关内部渠道由 New API 管理", { exact: false })).toBeVisible();
+  const openAiRoute = page.getByRole("group", { name: "备用供应商顺序：OpenAI" });
+  await expect(page.getByRole("group", { name: "备用供应商顺序：zicc" })).toBeVisible();
+  await expect(page.locator(".provider-fallback-route-model").filter({ hasText: "gpt-4.1" })).toBeVisible();
+  await expect(openAiRoute.getByText("尚未设置备用供应商")).toBeVisible();
+  await expect(openAiRoute.getByText("本轮会直接结束", { exact: false })).toBeVisible();
+  await openAiRoute.getByRole("button", { name: "添加备用供应商" }).click();
   const backup = openAiRoute.getByRole("checkbox", { name: "备用供应商：zicc" });
   const unconfigured = openAiRoute.getByRole("checkbox", { name: "备用供应商：待配置供应商" });
   await expect(backup).toBeEnabled();
   await expect(unconfigured).toBeDisabled();
 
   await backup.check();
-  await expect(openAiRoute.getByText("尝试顺序 1", { exact: true })).toBeVisible();
-  await expect(openAiRoute.getByText("gpt-5.6-terra", { exact: true })).toBeVisible();
+  await expect(openAiRoute.getByRole("list", { name: "OpenAI 的备用供应商尝试顺序" }).getByText("zicc", { exact: true })).toBeVisible();
+  await expect(openAiRoute.getByRole("list", { name: "OpenAI 的备用供应商尝试顺序" }).getByText("gpt-5.6-terra", { exact: true })).toBeVisible();
+  await expect(openAiRoute.getByText("1/4", { exact: true })).toBeVisible();
   await page.getByRole("button", { name: "保存 OpenAI 路由" }).click();
 
   await expect.poll(() => page.evaluate(() => {
@@ -8074,7 +8329,7 @@ async function installRuntimeLogFixture(page: import('@playwright/test').Page) {
   await page.evaluate(() => {
     const internals = (window as unknown as { __TAURI_INTERNALS__: { invoke: (command: string, args?: Record<string, unknown>) => Promise<unknown> } }).__TAURI_INTERNALS__;
     const original = internals.invoke;
-    const state = { clearCount: 0, failClear: false, cleared: false, readCount: 0 };
+    const state = { clearCount: 0, failClear: false, cleared: false, readCount: 0, searchQueries: [] as string[] };
     Object.assign(window, { runtimeLogTest: state });
     internals.invoke = async (command, args) => {
       if (command === 'clear_logs') {
@@ -8093,8 +8348,15 @@ async function installRuntimeLogFixture(page: import('@playwright/test').Page) {
             { timestampMs: 1750000000001, level: 'error', event: 'tool_failed', fields: { threadId: 'thread-2', tool: 'apply_patch', itemStatus: 'failed', output: 'patch conflicts with the workspace: chunk for src/App.css matched 0 locations instead of exactly one' }, threadId: 'thread-2', threadTitle: '来源对话 B' },
             { timestampMs: 1750000000002, level: 'error', event: 'legacy_failed', fields: {}, threadId: 'deleted-thread', threadTitle: null },
             { timestampMs: 1750000000003, level: 'error', event: 'runtime_failed', fields: {}, threadId: null, threadTitle: null },
+            { timestampMs: 1750000000004, level: 'error', event: 'tool_failed', fields: { threadId: 'thread-3', tool: 'read_file', itemStatus: 'failed', output: 'invalid tool arguments: startLine must be within the available range' }, threadId: 'thread-3', threadTitle: '来源对话 C' },
           ];
-        const filtered = records.filter(r => (!args?.level || r.level === args.level) && (!args?.event || r.event === args.event));
+        const search = typeof args?.search === 'string' ? args.search.trim().toLowerCase() : '';
+        if (search) state.searchQueries.push(search);
+        const filtered = records.filter(r =>
+          (!args?.level || r.level === args.level)
+          && (!args?.event || r.event === args.event)
+          && (!search || r.event.toLowerCase().includes(search) || JSON.stringify(r.fields).toLowerCase().includes(search))
+        );
         return { records: filtered, total: filtered.length };
       }
       return original(command, args);
@@ -8112,7 +8374,7 @@ test('runtime logs show two levels, original conversation sources and confirmed 
   if (viewport) await page.setViewportSize(viewport);
   const dialog = page.getByRole('dialog', { name: '本地运行日志' });
   await expect(dialog.getByLabel('级别').locator('option')).toHaveText(['全部级别', 'Info', 'Error']);
-  await expect(dialog.locator('.log-row')).toHaveCount(4);
+  await expect(dialog.locator('.log-row')).toHaveCount(5);
   await expect(dialog.locator('.log-time').first()).not.toContainText('Invalid');
   // 后端已把 fields 收敛到主要信息，失败原因应整行读完，而不是截断成省略号。
   const toolFailureFields = dialog.locator('.log-fields').filter({ hasText: 'patch conflicts' });
@@ -8120,16 +8382,16 @@ test('runtime logs show two levels, original conversation sources and confirmed 
   await expect(toolFailureFields).toContainText('instead of exactly one');
   expect(await toolFailureFields.innerText()).not.toContain('…');
   await expect(dialog.locator('.log-source')).toHaveText([
-    '来源：应用运行时（无关联对话）', '来源：对话名称不可用 （deleted-thread）', '来源：来源对话 B （thread-2）',
+    '来源：来源对话 C （thread-3）', '来源：应用运行时（无关联对话）', '来源：对话名称不可用 （deleted-thread）', '来源：来源对话 B （thread-2）',
   ]);
   await dialog.getByRole('button', { name: '清理日志', exact: true }).click();
   await expect(dialog.getByRole('group', { name: '确认清理运行日志' })).toBeVisible();
   await dialog.getByRole('button', { name: '取消', exact: true }).click();
-  await expect(dialog.locator('.log-row')).toHaveCount(4);
+  await expect(dialog.locator('.log-row')).toHaveCount(5);
   await expect.poll(() => page.evaluate(() => (window as any).runtimeLogTest.clearCount)).toBe(0);
   await dialog.getByLabel('级别').selectOption('error');
   await dialog.getByRole('button', { name: '刷新', exact: true }).click();
-  await expect(dialog.locator('.log-row')).toHaveCount(3);
+  await expect(dialog.locator('.log-row')).toHaveCount(4);
   await dialog.getByRole('button', { name: '清理日志', exact: true }).click();
   await dialog.getByRole('button', { name: '确认清理', exact: true }).click();
   await expect(dialog).toContainText('历史运行日志已清理');
@@ -8141,6 +8403,25 @@ test('runtime logs show two levels, original conversation sources and confirmed 
   expect(await dialog.evaluate(el => el.scrollWidth <= el.clientWidth)).toBe(true);
 });
 
+test('runtime logs search error text as well as event names', async ({ page }) => {
+  await page.goto('/');
+  await installRuntimeLogFixture(page);
+  const viewport = page.viewportSize();
+  await page.setViewportSize({ width: 1280, height: 820 });
+  await page.getByTitle('查看本地运行日志').click();
+  if (viewport) await page.setViewportSize(viewport);
+
+  const dialog = page.getByRole('dialog', { name: '本地运行日志' });
+  const search = dialog.getByLabel('事件 / 内容');
+  await search.fill('INVALID TOOL ARGUMENTS');
+  await search.press('Enter');
+
+  await expect(dialog.locator('.log-row')).toHaveCount(1);
+  await expect(dialog.locator('.log-event')).toHaveText('tool_failed');
+  await expect(dialog.locator('.log-fields')).toContainText('startLine must be within the available range');
+  await expect.poll(() => page.evaluate(() => (window as any).runtimeLogTest.searchQueries)).toEqual(['invalid tool arguments']);
+});
+
 test('runtime log cleanup failure preserves records and permits retry', async ({ page }) => {
   await page.goto('/');
   await installRuntimeLogFixture(page);
@@ -8150,12 +8431,12 @@ test('runtime log cleanup failure preserves records and permits retry', async ({
   await page.getByTitle('查看本地运行日志').click();
   if (viewport) await page.setViewportSize(viewport);
   const dialog = page.getByRole('dialog', { name: '本地运行日志' });
-  await expect(dialog.locator('.log-row')).toHaveCount(4);
+  await expect(dialog.locator('.log-row')).toHaveCount(5);
   await page.evaluate(() => { (window as any).runtimeLogTest.failClear = true; });
   await dialog.getByRole('button', { name: '清理日志', exact: true }).click();
   await dialog.getByRole('button', { name: '确认清理', exact: true }).click();
   await expect(dialog.getByRole('alert')).toContainText('日志文件暂时不可写');
-  await expect(dialog.locator('.log-row')).toHaveCount(4);
+  await expect(dialog.locator('.log-row')).toHaveCount(5);
   await page.evaluate(() => { (window as any).runtimeLogTest.failClear = false; });
   await dialog.getByRole('button', { name: '确认清理', exact: true }).click();
   await expect(dialog.locator('.log-row')).toHaveCount(1);

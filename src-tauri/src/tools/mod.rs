@@ -600,6 +600,7 @@ impl Workspace {
         relative: &str,
         expected_kind: WorkspaceEntryKind,
     ) -> Result<PathBuf, ToolError> {
+        let directory_shaped = relative.ends_with('/') || relative.ends_with('\\');
         let relative = Path::new(relative);
         let display_path = relative.to_string_lossy().replace('\\', "/");
         if relative.is_absolute()
@@ -626,8 +627,15 @@ impl Workspace {
                 let suggestion = sibling_path_suggestion(&self.root, relative, expected_kind)
                     .map(|value| format!(" Possible existing path: {value}."))
                     .unwrap_or_default();
+                let directory_hint = if expected_kind == WorkspaceEntryKind::File
+                    && directory_shaped
+                {
+                    " The path ends with a directory separator, so it looks like a directory; read_file requires one exact file path."
+                } else {
+                    ""
+                };
                 return Err(ToolError::InvalidArguments(format!(
-                    "workspace {} path {display_path:?} does not exist.{suggestion} Use list_directory on the parent directory or search_repository before retrying.",
+                    "workspace {} path {display_path:?} does not exist.{directory_hint}{suggestion} Use list_directory on the parent directory or search_repository before retrying.",
                     expected_kind.noun()
                 )));
             }
@@ -895,7 +903,7 @@ const COMMAND_CANCEL_GRACE_MS: u64 = 2_000;
 const IGNORED_NAMES: &[&str] = &[".git", "node_modules", "target", "dist", "build"];
 const WORKSPACE_RELATIVE_PATH_DESCRIPTION: &str = "Exact workspace-relative path only. Use '.' for the workspace root. Absolute paths, parent traversal, directories/files in the wrong tool, and wildcard patterns are rejected.";
 const DIRECTORY_PATH_DESCRIPTION: &str = "Existing workspace-relative directory path only. Use '.' for the workspace root. Absolute paths, files, guessed paths, and wildcards are rejected.";
-const FILE_PATH_DESCRIPTION: &str = "Existing workspace-relative regular file path only. Absolute paths, directories, guessed paths, and wildcards are rejected; discover the exact path with list_directory or search_repository first.";
+const FILE_PATH_DESCRIPTION: &str = "Existing workspace-relative regular file path only. Absolute paths, directories, paths ending with a directory separator, guessed paths, and wildcards are rejected; discover the exact path with list_directory or search_repository first.";
 
 struct ListDirectoryTool;
 
@@ -1001,7 +1009,7 @@ impl ToolHandler for ReadFileTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "read_file".to_string(),
-            description: "Read a bounded text range from one existing regular file inside the current workspace. The path must be an exact workspace-relative file path: directories, guessed names, and wildcard patterns are rejected. Use list_directory or search_repository first. Prefer startLine/lineCount for code inspection; startLine/endLine is also accepted as an inclusive compatibility range. When a line-range field is present, the line range takes precedence and offset/limit are ignored; otherwise offset/limit remain available for byte-precise reads."
+            description: "Read a bounded text range from one existing regular file inside the current workspace. The path must be an exact workspace-relative file path: directories, paths ending with a directory separator, guessed names, and wildcard patterns are rejected. Use list_directory or search_repository first. For code inspection, use startLine with lineCount. startLine/endLine remains accepted for compatibility when lineCount is absent. If both lineCount and endLine are provided, lineCount takes precedence. Any line-range field takes precedence over offset/limit; otherwise offset/limit remain available for byte-precise reads."
                 .to_string(),
             input_schema: json!({
                 "type": "object",
@@ -1010,8 +1018,8 @@ impl ToolHandler for ReadFileTool {
                     "offset": { "type": "integer", "minimum": 0, "description": "Zero-based byte offset. Ignored when startLine or lineCount is present." },
                     "limit": { "type": "integer", "minimum": 1, "maximum": MAX_READ_BYTES, "description": "Maximum bytes for a byte-range read. Ignored when startLine or lineCount is present." },
                     "startLine": { "type": "integer", "minimum": 1, "description": "One-based starting line. Takes precedence over offset/limit." },
-                    "lineCount": { "type": "integer", "minimum": 1, "maximum": MAX_READ_LINES, "description": "Maximum lines to return. Takes precedence over offset/limit." },
-                    "endLine": { "type": "integer", "minimum": 1, "description": "One-based inclusive ending line for the compatibility startLine/endLine range. Takes precedence over lineCount when both are present." }
+                    "lineCount": { "type": "integer", "minimum": 1, "maximum": MAX_READ_LINES, "description": "Preferred maximum number of lines to return. Takes precedence over endLine and offset/limit." },
+                    "endLine": { "type": "integer", "minimum": 1, "description": "Compatibility-only one-based inclusive ending line. Used only when lineCount is absent." }
                 },
                 "required": ["path"],
                 "additionalProperties": false
@@ -1065,7 +1073,9 @@ impl ToolHandler for ReadFileTool {
                     "startLine must be within the decoded text (1..={total_lines})"
                 )));
             }
-            let line_count = if let Some(end_line) = requested_end_line {
+            let line_count = if let Some(line_count) = requested_line_count {
+                line_count
+            } else if let Some(end_line) = requested_end_line {
                 if end_line < start_line {
                     return Err(ToolError::InvalidArguments(
                         "endLine must be greater than or equal to startLine".to_string(),
@@ -1073,7 +1083,7 @@ impl ToolHandler for ReadFileTool {
                 }
                 end_line.saturating_sub(start_line).saturating_add(1)
             } else {
-                requested_line_count.unwrap_or(DEFAULT_READ_LINES)
+                DEFAULT_READ_LINES
             };
             if line_count > MAX_READ_LINES {
                 return Err(ToolError::InvalidArguments(format!(
@@ -1164,7 +1174,7 @@ impl ToolHandler for ApplyPatchTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "apply_patch".to_string(),
-            description: "Propose a strict multi-file patch for user review. The patch must use '*** Begin Patch', Add/Update/Delete File headers, optional '*** Move to', '@@' hunks, and '*** End Patch'. Never place a patch only in assistant text."
+            description: "Propose a strict multi-file patch for user review. Use '*** Begin Patch' and '*** End Patch', Add/Update/Delete File headers, optional '*** Move to', and '@@' hunks. Every Update File must contain at least one hunk unless it has a Move to destination; every hunk must contain at least one '+' addition or '-' removal, with context lines starting with a space. Omit unchanged files and empty or context-only hunks. If syntax validation fails, use the returned file/hunk location to correct the patch before retrying; do not resend it unchanged. Never place a patch only in assistant text."
                 .to_string(),
             input_schema: json!({
                 "type": "object",
@@ -2751,6 +2761,21 @@ mod tests {
         assert!(!missing_file.contains("src/module"));
         assert!(missing_file.contains("list_directory"));
 
+        let directory_shaped_file = registry
+            .dispatch(
+                &context(workspace.path()),
+                "read_file",
+                json!({ "path": "src/unknown/" }),
+                CancellationToken::new(),
+            )
+            .await;
+        let Err(ToolError::InvalidArguments(directory_shaped_file)) = directory_shaped_file else {
+            panic!("a directory-shaped missing file should be a recoverable argument error");
+        };
+        assert!(directory_shaped_file.contains("directory separator"));
+        assert!(directory_shaped_file.contains("read_file requires one exact file path"));
+        assert!(directory_shaped_file.contains("list_directory"));
+
         let missing_nested_file = registry
             .dispatch(
                 &context(workspace.path()),
@@ -2921,6 +2946,27 @@ mod tests {
         assert_eq!(compatibility_lines.metadata["startLine"], 2);
         assert_eq!(compatibility_lines.metadata["endLine"], 3);
         assert_eq!(compatibility_lines.metadata["linesReturned"], 2);
+
+        let preferred_line_count = registry
+            .dispatch(
+                &context(workspace.path()),
+                "read_file",
+                json!({
+                    "path": "lines.txt",
+                    "startLine": 2,
+                    "endLine": 1,
+                    "lineCount": 2,
+                    "offset": 0,
+                    "limit": 1
+                }),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(preferred_line_count.output, lines.output);
+        assert_eq!(preferred_line_count.metadata["startLine"], 2);
+        assert_eq!(preferred_line_count.metadata["endLine"], 3);
+        assert_eq!(preferred_line_count.metadata["linesReturned"], 2);
 
         let reversed = registry
             .dispatch(
@@ -3182,6 +3228,17 @@ mod tests {
             .await;
         assert!(matches!(result, Err(ToolError::Denied(_))));
         assert!(!workspace.path().join("added.txt").exists());
+    }
+
+    #[test]
+    fn apply_patch_description_explains_hunk_repair() {
+        let description = ApplyPatchTool {
+            service: PatchService::new(),
+        }
+        .definition()
+        .description;
+        assert!(description.contains("empty or context-only hunks"));
+        assert!(description.contains("file/hunk location"));
     }
 
     #[tokio::test]

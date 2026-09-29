@@ -578,6 +578,7 @@ export function readLogs(query: LogQuery = {}): Promise<LogQueryResult> {
     limit: query.limit,
     level: query.level,
     event: query.event,
+    search: query.search,
     afterTimestampMs: query.afterTimestampMs,
   });
 }

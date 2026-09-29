@@ -8,7 +8,7 @@ use crate::storage::{
 pub mod memory;
 
 pub const PROTOCOL_VERSION: u32 = 1;
-pub const AGENT_EVENT_SCHEMA_VERSION: u32 = 11;
+pub const AGENT_EVENT_SCHEMA_VERSION: u32 = 12;
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -353,6 +353,7 @@ pub enum ToolRisk {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PluginScope {
+    Builtin,
     Local,
     Project,
 }
@@ -406,6 +407,8 @@ pub struct PluginOverview {
     pub schema_version: u32,
     #[serde(default)]
     pub root_path: String,
+    #[serde(default)]
+    pub builtin_root_path: String,
     #[serde(default)]
     pub local_root_path: String,
     #[serde(default)]
@@ -849,7 +852,8 @@ impl AgentEvent {
         match self {
             Self::TurnStarted { .. }
             | Self::ProviderRetryWaiting { .. }
-            | Self::ProviderStreamRetry { .. } => TurnPhase::Exploring,
+            | Self::ProviderStreamRetry { .. }
+            | Self::ProviderRouteSelected { .. } => TurnPhase::Exploring,
             Self::TurnSteered { .. } => TurnPhase::Exploring,
             Self::TurnRejected { .. } => TurnPhase::Failed,
             Self::ActivityStatusChanged { status, .. } => match status {
@@ -915,6 +919,14 @@ pub enum AgentEvent {
         attempt: u32,
         max_attempts: u32,
     },
+    /// The route chosen for a Provider request; `None` marks the primary route.
+    ProviderRouteSelected {
+        thread_id: String,
+        turn_id: String,
+        provider: String,
+        model: String,
+        fallback_position: Option<u32>,
+    },
     TurnStarted {
         thread_id: String,
         turn_id: String,
@@ -954,8 +966,9 @@ pub enum AgentEvent {
         item_id: String,
         delta: String,
     },
-    /// 瞬时清空尚未落盘的流式正文；收尾请求复用同一个 assistant item 时使用。
-    /// 该事件不写入 JSONL，刷新恢复仍以最终 AssistantMessage 为准。
+    /// 瞬时清空当前 Provider 尝试尚未落盘的流式草稿。
+    /// `itemId` 可以是助手正文或安全推理摘要 item；该事件不写入 JSONL，
+    /// 刷新恢复仍以最终持久化事实为准。
     TextReset {
         thread_id: String,
         turn_id: String,
@@ -1395,6 +1408,7 @@ mod tests {
         let overview = PluginOverview {
             schema_version: 1,
             root_path: r"D:\code\k-coder\.k-coder\plugins".into(),
+            builtin_root_path: r"D:\code\Nick\k-coder\plugins".into(),
             plugins: vec![PluginDiagnostic {
                 id: "review-tools@local".into(),
                 scope: PluginScope::Project,
@@ -1422,6 +1436,7 @@ mod tests {
         let value = serde_json::to_value(overview).expect("plugin overview should serialize");
 
         assert_eq!(value["schemaVersion"], 1);
+        assert_eq!(value["builtinRootPath"], r"D:\code\Nick\k-coder\plugins");
         assert_eq!(value["plugins"][0]["state"], "degraded");
         assert_eq!(value["plugins"][0]["components"]["skillCount"], 1);
         assert_eq!(value["plugins"][0]["components"]["mcpToolCount"], 2);
@@ -1464,6 +1479,33 @@ mod tests {
         assert_eq!(value["startedAtMs"], 10);
         assert_eq!(value["completedAtMs"], 25);
         assert_eq!(value["durationMs"], 15);
+    }
+
+    #[test]
+    fn provider_route_selection_exposes_fallback_and_primary_routes() {
+        let fallback = AgentEventEnvelope::new(AgentEvent::ProviderRouteSelected {
+            thread_id: "thread-1".into(),
+            turn_id: "turn-1".into(),
+            provider: "zicc".into(),
+            model: "gpt-5.6-terra".into(),
+            fallback_position: Some(1),
+        });
+        let fallback = serde_json::to_value(fallback).unwrap();
+        assert_eq!(fallback["schemaVersion"], AGENT_EVENT_SCHEMA_VERSION);
+        assert_eq!(fallback["type"], "provider_route_selected");
+        assert_eq!(fallback["provider"], "zicc");
+        assert_eq!(fallback["model"], "gpt-5.6-terra");
+        assert_eq!(fallback["fallbackPosition"], 1);
+
+        let primary = AgentEventEnvelope::new(AgentEvent::ProviderRouteSelected {
+            thread_id: "thread-1".into(),
+            turn_id: "turn-1".into(),
+            provider: "OpenAI".into(),
+            model: "gpt-4.1".into(),
+            fallback_position: None,
+        });
+        let primary = serde_json::to_value(primary).unwrap();
+        assert_eq!(primary["fallbackPosition"], serde_json::Value::Null);
     }
 
     #[test]
@@ -1619,7 +1661,7 @@ mod tests {
     }
 
     #[test]
-    fn assistant_text_reset_is_a_versioned_transient_event() {
+    fn streaming_item_reset_is_a_versioned_transient_event() {
         let event = AgentEventEnvelope::new(AgentEvent::TextReset {
             thread_id: "thread-1".into(),
             turn_id: "turn-1".into(),

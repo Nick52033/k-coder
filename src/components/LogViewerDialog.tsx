@@ -43,7 +43,7 @@ function summarizeFields(fields: unknown): string {
 
 export function LogViewerDialog({ onClose }: LogViewerDialogProps) {
   const [level, setLevel] = useState<LogLevel | "">("");
-  const [event, setEvent] = useState("");
+  const [search, setSearch] = useState("");
   const [limit, setLimit] = useState(200);
   const [records, setRecords] = useState<LogRecord[]>([]);
   const [total, setTotal] = useState(0);
@@ -61,7 +61,7 @@ export function LogViewerDialog({ onClose }: LogViewerDialogProps) {
     try {
       const result = await readLogs({
         level: level || undefined,
-        event: event.trim() || undefined,
+        search: search.trim() || undefined,
         limit,
       });
       setRecords(result.records);
@@ -88,7 +88,7 @@ export function LogViewerDialog({ onClose }: LogViewerDialogProps) {
       setTotal(0);
       setConfirmClear(false);
       setNotice("历史运行日志已清理，保留本次清理记录；新日志会继续记录。");
-      const result = await readLogs({ level: level || undefined, event: event.trim() || undefined, limit });
+      const result = await readLogs({ level: level || undefined, search: search.trim() || undefined, limit });
       setRecords(result.records);
       setTotal(result.total);
     } catch (reason) {
@@ -159,15 +159,15 @@ export function LogViewerDialog({ onClose }: LogViewerDialogProps) {
             </select>
           </label>
           <label className="log-viewer-field log-viewer-field--grow">
-            <span>事件</span>
+            <span>事件 / 内容</span>
             <input
               type="text"
-              value={event}
+              value={search}
               maxLength={120}
-              placeholder="按事件名过滤，如 turn_failed"
-              onChange={(event) => setEvent(event.target.value)}
-              onKeyDown={(event) => {
-                if (event.key === "Enter") void load();
+              placeholder="搜索事件名或报错内容，如 invalid tool arguments"
+              onChange={(event) => setSearch(event.target.value)}
+              onKeyDown={(keyboardEvent) => {
+                if (keyboardEvent.key === "Enter") void load();
               }}
             />
           </label>

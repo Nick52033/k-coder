@@ -1000,6 +1000,7 @@ pub struct PreparedExtensions {
 pub struct ExtensionService {
     data_root: PathBuf,
     builtin_skills_root: Option<PathBuf>,
+    builtin_plugins_root: Option<PathBuf>,
     projection: ProjectionDb,
     secrets: Arc<dyn McpSecretStore>,
     logger: StructuredLogger,
@@ -1040,13 +1041,35 @@ impl ExtensionService {
         secrets: Arc<dyn McpSecretStore>,
         logger: StructuredLogger,
     ) -> Self {
+        Self::with_builtin_skills_and_plugins(
+            data_root,
+            builtin_skills_root,
+            None,
+            projection,
+            secrets,
+            logger,
+        )
+    }
+
+    pub fn with_builtin_skills_and_plugins(
+        data_root: PathBuf,
+        builtin_skills_root: Option<PathBuf>,
+        builtin_plugins_root: Option<PathBuf>,
+        projection: ProjectionDb,
+        secrets: Arc<dyn McpSecretStore>,
+        logger: StructuredLogger,
+    ) -> Self {
         let audit_path = data_root.join("extension-audit.jsonl");
         let audit = load_audit(&audit_path);
-        let plugins =
-            PluginHost::with_local_root(projection.clone(), plugin_root_for_local(&data_root));
+        let plugins = PluginHost::with_roots(
+            projection.clone(),
+            builtin_plugins_root.clone(),
+            Some(plugin_root_for_local(&data_root)),
+        );
         Self {
             data_root,
             builtin_skills_root,
+            builtin_plugins_root,
             projection,
             secrets,
             logger,
@@ -1074,6 +1097,7 @@ impl ExtensionService {
         Self {
             data_root: self.data_root.clone(),
             builtin_skills_root: self.builtin_skills_root.clone(),
+            builtin_plugins_root: self.builtin_plugins_root.clone(),
             projection: self.projection.clone(),
             secrets: self.secrets.clone(),
             logger: self.logger.clone(),
@@ -1087,9 +1111,10 @@ impl ExtensionService {
             audit,
             audit_path: self.audit_path.clone(),
             user_rules_lock: self.user_rules_lock.clone(),
-            plugins: PluginHost::with_local_root(
+            plugins: PluginHost::with_roots(
                 self.projection.clone(),
-                plugin_root_for_local(&self.data_root),
+                self.builtin_plugins_root.clone(),
+                Some(plugin_root_for_local(&self.data_root)),
             ),
         }
     }
@@ -1661,6 +1686,7 @@ impl ExtensionService {
             &source.to_string_lossy(),
             result.is_ok(),
             match scope {
+                PluginScope::Builtin => "built-in plugin installation requested",
                 PluginScope::Local => "installed locally",
                 PluginScope::Project => "installed in project",
             },

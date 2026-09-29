@@ -37,6 +37,7 @@ export interface ConversationProjectionState {
     /** Provider 流中断后的自动重试进度；下一次状态事件到达时清除。 */
     streamRetry?: { attempt: number; maxAttempts: number };
   } | null;
+  providerFallback: { turnId: string; provider: string; model: string; position: number } | null;
   pendingApproval: ApprovalRequest | null;
   pendingApprovals: ApprovalRequest[];
   pendingUserInput: UserInputRequest | null;
@@ -169,6 +170,7 @@ export function reduceAgentEvent(
           activeTurnId: event.turnId,
           activeTurnThreadId: event.threadId,
           lastTurn: { turnId: event.turnId, state: "streaming", error: null },
+          providerFallback: null,
           pendingApproval: null,
           pendingApprovals: [],
           activityStatus: nextActivityStatus(state, event.turnId, "thinking"),
@@ -264,9 +266,21 @@ export function reduceAgentEvent(
     case "provider_stream_retry":
       return {
         state: {
+          providerFallback: null,
           activityStatus: nextActivityStatus(state, event.turnId, "thinking", {
             streamRetry: { attempt: event.attempt, maxAttempts: event.maxAttempts },
           }),
+        },
+      };
+    case "provider_route_selected":
+      return {
+        state: {
+          providerFallback: event.fallbackPosition === null ? null : {
+            turnId: event.turnId,
+            provider: event.provider,
+            model: event.model,
+            position: event.fallbackPosition,
+          },
         },
       };
     case "activity_status_changed":
@@ -301,11 +315,15 @@ export function reduceAgentEvent(
     case "text_reset":
       return {
         state: {
-          turnTimeline: state.turnTimeline.map((item) => item.type === "text"
-            && item.turnId === event.turnId
-            && item.id === event.itemId
-            ? { ...item, text: "" }
-            : item),
+          turnTimeline: state.turnTimeline
+            .filter((item) => !(item.type === "reasoning"
+              && item.turnId === event.turnId
+              && item.itemId === event.itemId))
+            .map((item) => item.type === "text"
+              && item.turnId === event.turnId
+              && item.id === event.itemId
+              ? { ...item, text: "" }
+              : item),
         },
       };
     case "reasoning_summary_delta": {
@@ -695,6 +713,7 @@ export function reduceAgentEvent(
           activeTurnId: null,
           activeTurnThreadId: null,
           activityStatus: null,
+          providerFallback: null,
           pendingApproval: null,
           pendingApprovals: [],
           pendingUserInput: null,
@@ -722,6 +741,7 @@ export function reduceAgentEvent(
           activeTurnId: null,
           activeTurnThreadId: null,
           activityStatus: null,
+          providerFallback: null,
           pendingApproval: null,
           pendingApprovals: [],
           pendingUserInput: null,
@@ -756,6 +776,7 @@ export function reduceAgentEvent(
           activeTurnId: null,
           activeTurnThreadId: null,
           activityStatus: null,
+          providerFallback: null,
           pendingApproval: null,
           pendingApprovals: [],
           pendingUserInput: null,

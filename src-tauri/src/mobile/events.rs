@@ -66,6 +66,7 @@ pub fn route_event(event: &AgentEvent) -> EventRoute {
         AgentEvent::TurnStarted { .. }
         | AgentEvent::TurnSteered { .. }
         | AgentEvent::TurnRejected { .. }
+        | AgentEvent::ProviderRouteSelected { .. }
         | AgentEvent::ItemStarted { .. }
         | AgentEvent::ItemCompleted { .. }
         | AgentEvent::ContextCompacted { .. }
@@ -94,6 +95,7 @@ pub fn event_thread_id(event: &AgentEvent) -> &str {
     match event {
         AgentEvent::ProviderRetryWaiting { thread_id, .. }
         | AgentEvent::ProviderStreamRetry { thread_id, .. }
+        | AgentEvent::ProviderRouteSelected { thread_id, .. }
         | AgentEvent::TurnStarted { thread_id, .. }
         | AgentEvent::TurnSteered { thread_id, .. }
         | AgentEvent::TurnRejected { thread_id, .. }
@@ -583,6 +585,25 @@ impl EventHub {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_route_selection_is_forwarded_as_a_critical_state_change() {
+        let event = AgentEvent::ProviderRouteSelected {
+            thread_id: "thread-1".into(),
+            turn_id: "turn-1".into(),
+            provider: "zicc".into(),
+            model: "gpt-5.6-terra".into(),
+            fallback_position: Some(1),
+        };
+        assert_eq!(event_thread_id(&event), "thread-1");
+        assert_eq!(
+            route_event(&event),
+            EventRoute {
+                priority: EventPriority::Critical,
+                forward: true,
+            }
+        );
+    }
     use crate::protocol::{
         AgentEvent, AgentEventEnvelope, ApprovalRequest, ChatMessage, ContentBlock, MessageRole,
         ToolCall, ToolResult, TurnPhase,

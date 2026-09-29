@@ -103,7 +103,7 @@ export interface UserRulesView { schemaVersion: number; path: string; rules: Use
 export interface McpConfigDocumentView { scope: "global" | "project"; path: string; exists: boolean; content: string; error: string | null; }
 export interface McpConfigView { schemaVersion: number; global: McpConfigDocumentView; project: McpConfigDocumentView; overview: ExtensionOverview; }
 export type PluginState = "disabled" | "loaded" | "degraded" | "blocked" | "invalid";
-export type PluginScope = "local" | "project";
+export type PluginScope = "builtin" | "local" | "project";
 export interface PluginComponentSummary {
   skillCount: number;
   mcpServerCount: number;
@@ -127,6 +127,7 @@ export interface PluginDiagnostic {
 export interface PluginOverview {
   schemaVersion: number;
   rootPath: string;
+  builtinRootPath: string;
   localRootPath: string;
   projectRootPath: string;
   plugins: PluginDiagnostic[];
@@ -1056,6 +1057,7 @@ export type AgentEvent =
   | (EventBase & { type: "item_completed"; itemId: string; itemType: AgentItemType; status: AgentItemStatus })
   | (EventBase & { type: "provider_retry_waiting"; retryAtMs: number })
   | (EventBase & { type: "provider_stream_retry"; attempt: number; maxAttempts: number })
+  | (EventBase & { type: "provider_route_selected"; provider: string; model: string; fallbackPosition: number | null })
   | (EventBase & { type: "activity_status_changed"; status: AgentActivityStatus })
   | (EventBase & { type: "text_delta"; itemId: string; delta: string })
   | (EventBase & { type: "text_reset"; itemId: string })
@@ -1188,6 +1190,7 @@ export interface LogQuery {
   limit?: number;
   level?: LogLevel;
   event?: string;
+  search?: string;
   afterTimestampMs?: number;
 }
 

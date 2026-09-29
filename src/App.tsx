@@ -32,6 +32,7 @@ import {
   Pin,
   PinOff,
   Plus,
+  RefreshCw,
   ScrollText,
   Search,
   Settings,
@@ -108,6 +109,7 @@ import { ProjectSelector } from "./components/ProjectSelector";
 import { WorkflowControl } from "./components/WorkflowControl";
 import { WorkflowSelector } from "./components/WorkflowSelector";
 import { ScheduledTasksPage } from "./components/ScheduledTasksPage";
+import { ConversationMessageNavigator } from "./components/ConversationMessageNavigator";
 import { findComposerTrigger, type ComposerTrigger } from "./lib/composerTrigger";
 import { workspacePathKey, workspacePathsEqual } from "./lib/path";
 import { THEME_STORAGE_KEY, isDarkResolvedTheme, parseThemePreference, resolveTheme, type ThemeId } from "./lib/theme";
@@ -418,6 +420,7 @@ function App() {
   const [reviewingChangeIds, setReviewingChangeIds] = useState<Set<string>>(new Set());
   const [queueExpanded, setQueueExpanded] = useState(false);
   const messageAreaRef = useRef<HTMLDivElement>(null);
+  const messageStageRef = useRef<HTMLDivElement>(null);
   const composerContainerRef = useRef<HTMLFormElement>(null);
   const composerRef = useRef<HTMLTextAreaElement>(null);
   const modeMenuRef = useRef<HTMLDivElement>(null);
@@ -448,6 +451,7 @@ function App() {
     turnTimeline,
     turnUserMessageIds,
     activityStatus,
+    providerFallback,
     pendingApproval,
     pendingApprovals,
     pendingUserInput,
@@ -519,6 +523,10 @@ function App() {
   const displayMessages = useMemo(
     () => reconcileConversationMessages(messages, turnTimeline),
     [messages, turnTimeline],
+  );
+  const hasMessageNavigator = useMemo(
+    () => displayMessages.filter((message) => message.role === "user").length >= 2,
+    [displayMessages],
   );
   const currentThreadQueue = messageQueue.filter((message) => message.threadId === activeThreadId);
   const pendingQueueCount = currentThreadQueue.filter((message) => message.status === "pending").length;
@@ -1427,6 +1435,13 @@ function App() {
     displayMessages.some((message) => message.role === "assistant" && message.turnId === currentThreadTurnId)
       || orphanTurnIds.includes(currentThreadTurnId)
       || steeredTurnIds.has(currentThreadTurnId)
+      // A retry can already be rendered through its retry group or timeline
+      // before the live assistant placeholder is merged into displayMessages.
+      // In that window the global waiting fallback must not mount a second
+      // status row for the same active Turn.
+      || groupedRetryTurnIds.has(currentThreadTurnId)
+      || timelineByTurn.has(currentThreadTurnId)
+      || planTurnId === currentThreadTurnId
   ));
 
   function renderOrphanTurn(turnId: string) {
@@ -2606,7 +2621,12 @@ function App() {
           </div>
         </div>
 
-        <div className={cn("message-area", hasConversationContent && "message-area--populated")} ref={messageAreaRef}>
+        <div className="conversation-message-stage" ref={messageStageRef}>
+        <div className={cn(
+          "message-area",
+          hasConversationContent && "message-area--populated",
+          hasMessageNavigator && "message-area--with-navigator",
+        )} ref={messageAreaRef}>
           {loading && !hasConversationContent ? (
             <div className="empty-thread"><Activity className="spin" size={24} /><p>正在读取会话</p></div>
           ) : hasConversationContent ? (
@@ -2664,7 +2684,10 @@ function App() {
                 return (
                   <Fragment key={message.role === "assistant" && message.turnId ? `assistant-turn-${message.turnId}` : message.id}>
                   {leadingSteeredSegments.map(renderSteeredTurnSegment)}
-                  <article className={cn("message", `message--${message.role}`, message.status === "streaming" && "message--streaming")}>
+                  <article
+                    className={cn("message", `message--${message.role}`, message.status === "streaming" && "message--streaming")}
+                    data-message-id={message.id}
+                  >
                     <div className="message-body">
                       <div className="message-role">
                         {message.role === "user" ? "你" : "k-Coder"}
@@ -2853,6 +2876,16 @@ function App() {
               </button>
             </div>
           )}
+        </div>
+        {hasMessageNavigator ? (
+          <ConversationMessageNavigator
+            key={activeThreadId ?? "new-thread"}
+            threadId={activeThreadId}
+            messages={displayMessages}
+            scrollerRef={messageAreaRef}
+            stageRef={messageStageRef}
+          />
+        ) : null}
         </div>
 
         {(workspaceError || error) && (
@@ -3078,6 +3111,17 @@ function App() {
             />
           )}
           <div className="composer-footer">
+            {providerFallback?.turnId === currentThreadTurnId && (
+              <div
+                className="composer-fallback-status"
+                role="status"
+                title={`本轮正在使用备用供应商：${providerFallback.provider} / ${providerFallback.model}。主模型选择保持不变。`}
+                aria-label={`本轮使用备用供应商 ${providerFallback.position}：${providerFallback.provider}，模型 ${providerFallback.model}。首选模型选择保持不变。`}
+              >
+                <RefreshCw size={12} aria-hidden="true" />
+                <span>本轮使用备用供应商：{providerFallback.provider} / {providerFallback.model}（顺位 {providerFallback.position}）。主模型选择保持不变。</span>
+              </div>
+            )}
             <div className="composer-controls">
               <div className="composer-options">
                 <ProjectSelector

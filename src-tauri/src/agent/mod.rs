@@ -63,7 +63,23 @@ const MAX_IDENTICAL_TOOL_CALLS: usize = 2;
 const MAX_TOOL_FAILURE_OUTPUT_BYTES: usize = 4 * 1024;
 const PROGRESS_CHECK_WINDOW: usize = 5;
 const MAX_NO_PROGRESS_WINDOWS: usize = 3;
+/// Allow a model a couple of chances to repair one patch problem, then stop
+/// instead of spending the rest of a Turn rereading files and producing more
+/// variants of the same invalid patch.
+const MAX_REPEATED_APPLY_PATCH_FAILURES: usize = 3;
+/// A failed patch may be followed by a few targeted reads, but a model must
+/// eventually either produce a successful patch or let the Turn fail. This
+/// bound is independent of the global progress snapshot because varied reads
+/// can otherwise keep that snapshot changing forever.
+const MAX_APPLY_PATCH_RECOVERY_ROUNDS: usize = 6;
 const MAX_PROTOCOL_RETRIES: usize = 5;
+const DEFAULT_TRANSIENT_RETRY_DELAYS: [Duration; 5] = [
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+    Duration::from_secs(4),
+    Duration::from_secs(8),
+    Duration::from_secs(16),
+];
 /// Provider 流式响应的 idle 超时：每个事件之间最长静默时间。
 /// 超过即判定流已死亡，未产生输出时自动重试并向界面发布重连事件；
 /// 已有输出则失败而不是无限挂起。参考 codex 的 5 分钟默认。
@@ -234,6 +250,85 @@ impl ProgressSnapshot {
     }
 }
 
+#[derive(Debug, Default)]
+struct ApplyPatchFailureTracker {
+    signature: Option<String>,
+    count: usize,
+}
+
+impl ApplyPatchFailureTracker {
+    fn observe(&mut self, call: &ToolCall, result: &ToolResult) -> usize {
+        let signature = apply_patch_failure_signature(call, result);
+        if self.signature.as_deref() == Some(signature.as_str()) {
+            self.count = self.count.saturating_add(1);
+        } else {
+            self.signature = Some(signature);
+            self.count = 1;
+        }
+        self.count
+    }
+
+    fn reset(&mut self) {
+        self.signature = None;
+        self.count = 0;
+    }
+
+    fn is_active(&self) -> bool {
+        self.count > 0
+    }
+}
+
+fn apply_patch_failure_signature(call: &ToolCall, result: &ToolResult) -> String {
+    let output = result.output.to_ascii_lowercase();
+    let category = [
+        "patch syntax is invalid",
+        "patch path is denied",
+        "patch conflicts with the workspace",
+        "patch exceeds a safety limit",
+        "patch i/o failed",
+        "approval_",
+        "tool execution denied",
+    ]
+    .into_iter()
+    .find(|prefix| output.starts_with(prefix))
+    .unwrap_or("apply_patch failure");
+    let targets = call
+        .arguments
+        .get("patch")
+        .and_then(Value::as_str)
+        .map(apply_patch_targets)
+        .filter(|targets| !targets.is_empty())
+        .map(|targets| targets.join("|"))
+        .unwrap_or_else(|| "<unknown target>".to_string());
+    format!("{category}:{targets}")
+}
+
+fn apply_patch_targets(patch: &str) -> Vec<String> {
+    patch
+        .lines()
+        .filter_map(|line| {
+            ["*** Add File: ", "*** Update File: ", "*** Delete File: "]
+                .into_iter()
+                .find_map(|prefix| line.strip_prefix(prefix))
+        })
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(|path| {
+            if cfg!(windows) {
+                path.to_ascii_lowercase()
+            } else {
+                path.to_string()
+            }
+        })
+        .collect()
+}
+
+fn repeated_apply_patch_guidance(count: usize) -> String {
+    format!(
+        "\n\n[apply_patch recovery] This patch failure has repeated {count} times for the same error class and target. Do not resend the same patch shape. Re-read the exact target region, then rebuild the smallest valid patch; every Update File needs an @@ hunk and every hunk needs a + addition or - removal."
+    )
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct RunTurnRequest {
@@ -399,11 +494,7 @@ impl AgentRuntime {
             reasoning_effort: ReasoningEffort::default(),
             supports_vision: false,
             logger: None,
-            transient_retry_delays: vec![
-                Duration::from_secs(1),
-                Duration::from_secs(2),
-                Duration::from_secs(4),
-            ],
+            transient_retry_delays: DEFAULT_TRANSIENT_RETRY_DELAYS.into(),
             stream_idle_timeout: DEFAULT_STREAM_IDLE_TIMEOUT,
         }
     }
@@ -879,6 +970,8 @@ impl AgentRuntime {
         // 进展检测变量
         let mut no_progress_count = 0usize;
         let mut last_snapshot: Option<ProgressSnapshot> = None;
+        let mut apply_patch_failures = ApplyPatchFailureTracker::default();
+        let mut apply_patch_recovery_rounds = 0usize;
 
         let mut iteration = 0usize;
         loop {
@@ -895,6 +988,24 @@ impl AgentRuntime {
                     &publisher,
                 )
                 .await?;
+            }
+            if apply_patch_failures.is_active() {
+                if apply_patch_recovery_rounds >= MAX_APPLY_PATCH_RECOVERY_ROUNDS {
+                    return self
+                        .finish_failed(
+                            &thread_id,
+                            &turn_id,
+                            format!(
+                                "apply_patch_loop: apply_patch 失败后连续 {} 个模型轮次仍未成功写入，已停止本轮；请根据最后一次诊断重新读取目标区域并构造一个有效补丁。",
+                                MAX_APPLY_PATCH_RECOVERY_ROUNDS
+                            ),
+                            &publisher,
+                        )
+                        .await;
+                }
+                // Count only Provider rounds after the failed patch has been returned
+                // to the model, so the failure itself does not consume a recovery turn.
+                apply_patch_recovery_rounds = apply_patch_recovery_rounds.saturating_add(1);
             }
             if self
                 .max_provider_calls
@@ -1249,6 +1360,12 @@ impl AgentRuntime {
                                 "protocolRetries": protocol_retry_count,
                                 "outputAlreadyStarted": false,
                             }));
+                        } else if error.is_transient() {
+                            turn_error.details = Some(transient_retry_details(
+                                transient_retry_count,
+                                self.transient_retry_delays.len(),
+                                false,
+                            ));
                         }
                         // 重试已耗尽或不可重试：只有真实 HTTP 错误（4xx/5xx）才写本地
                         // 运行日志，网络抖动与取消不写。
@@ -1274,6 +1391,9 @@ impl AgentRuntime {
                 let mut iteration_usage_details_inner = TokenUsageDetails::default();
                 let mut iteration_provider_inner = None::<String>;
                 let mut iteration_model_inner = Some(request.model.clone());
+                let mut completed_reasoning_summaries_inner = Vec::<(String, String)>::new();
+                let mut provider_contexts_inner = Vec::<(String, Value)>::new();
+                let mut provider_context_bytes_inner = 0usize;
                 let mut attempt_had_output = false;
                 let completed_inner = loop {
                     let event = tokio::select! {
@@ -1456,33 +1576,7 @@ impl AgentRuntime {
                                     )
                                     .await;
                             }
-                            self.repository
-                                .append(StoredEvent::new(
-                                    &thread_id,
-                                    Some(turn_id.clone()),
-                                    StoredEventKind::ReasoningSummary {
-                                        item_id: item_id.clone(),
-                                        summary: summary.clone(),
-                                    },
-                                ))
-                                .await?;
-                            publisher.publish(AgentEventEnvelope::new(
-                                AgentEvent::ReasoningSummaryCompleted {
-                                    thread_id: thread_id.clone(),
-                                    turn_id: turn_id.clone(),
-                                    item_id: item_id.clone(),
-                                    summary,
-                                },
-                            ));
-                            self.complete_item(
-                                &thread_id,
-                                &turn_id,
-                                &item_id,
-                                AgentItemType::Reasoning,
-                                AgentItemStatus::Completed,
-                                &publisher,
-                            )
-                            .await?;
+                            completed_reasoning_summaries_inner.push((item_id.clone(), summary.clone()));
                         }
                         Some(Ok(ProviderEvent::ToolCall { call })) => {
                             attempt_had_output = true;
@@ -1496,7 +1590,9 @@ impl AgentRuntime {
                                     AgentRuntimeError::InvalidInput(error.to_string())
                                 })?
                                 .len();
-                            if provider_context_bytes.saturating_add(item_bytes)
+                            if provider_context_bytes
+                                .saturating_add(provider_context_bytes_inner)
+                                .saturating_add(item_bytes)
                                 > MAX_PROVIDER_CONTEXT_BYTES
                             {
                                 return self
@@ -1510,19 +1606,22 @@ impl AgentRuntime {
                                     )
                                     .await;
                             }
-                            provider_context_bytes =
-                                provider_context_bytes.saturating_add(item_bytes);
-                            self.repository
-                                .append(StoredEvent::new(
-                                    &thread_id,
-                                    Some(turn_id.clone()),
-                                    StoredEventKind::ProviderContext { provider, item },
-                                ))
-                                .await?;
+                            provider_context_bytes_inner =
+                                provider_context_bytes_inner.saturating_add(item_bytes);
+                            provider_contexts_inner.push((provider, item));
                         }
-                        Some(Ok(ProviderEvent::ModelSelected { provider, model })) => {
+                        Some(Ok(ProviderEvent::ModelSelected { provider, provider_name, model, fallback_position })) => {
                             iteration_provider_inner = Some(provider);
-                            iteration_model_inner = Some(model);
+                            iteration_model_inner = Some(model.clone());
+                            publisher.publish(AgentEventEnvelope::new(
+                                AgentEvent::ProviderRouteSelected {
+                                    thread_id: thread_id.clone(),
+                                    turn_id: turn_id.clone(),
+                                    provider: provider_name,
+                                    model,
+                                    fallback_position,
+                                },
+                            ));
                         }
                         Some(Ok(event @ ProviderEvent::Usage { .. }))
                         | Some(Ok(event @ ProviderEvent::DetailedUsage { .. })) => {
@@ -1629,15 +1728,12 @@ impl AgentRuntime {
                                 .await?;
                             }
 
-                            let transient_stream_error =
-                                error.is_transient() && !attempt_had_output;
-                            let retry_delay = if transient_stream_error {
+                            let retry_delay = if error.is_transient() {
                                 self.transient_retry_delays
                                     .get(transient_retry_count)
                                     .copied()
                                     .map(|delay| (error.rate_limit_delay().unwrap_or(delay), true))
                             } else if is_retryable_protocol_stream_error(&error)
-                                && !attempt_had_output
                                 && protocol_retry_count < MAX_PROTOCOL_RETRIES
                             {
                                 Some((protocol_retry_delay(protocol_retry_count), false))
@@ -1645,7 +1741,39 @@ impl AgentRuntime {
                                 None
                             };
                             if let Some((delay, transient)) = retry_delay {
-                            if error.rate_limit_delay().is_some() {
+                                if attempt_had_output {
+                                    // A retry starts a fresh provider attempt. Clear the
+                                    // uncommitted draft first so the UI does not concatenate the
+                                    // failed prefix with the recovered response. Reasoning items
+                                    // use the same transient reset event with their own IDs.
+                                    publisher.publish(AgentEventEnvelope::new(AgentEvent::TextReset {
+                                        thread_id: thread_id.clone(),
+                                        turn_id: turn_id.clone(),
+                                        item_id: assistant_item_id.clone(),
+                                    }));
+                                    let mut reasoning_item_ids =
+                                        reasoning_summary_bytes.keys().cloned().collect::<Vec<_>>();
+                                    reasoning_item_ids.sort();
+                                    for item_id in reasoning_item_ids {
+                                        publisher.publish(AgentEventEnvelope::new(
+                                            AgentEvent::TextReset {
+                                                thread_id: thread_id.clone(),
+                                                turn_id: turn_id.clone(),
+                                                item_id: item_id.clone(),
+                                            },
+                                        ));
+                                        self.complete_item(
+                                            &thread_id,
+                                            &turn_id,
+                                            &item_id,
+                                            AgentItemType::Reasoning,
+                                            AgentItemStatus::Failed,
+                                            &publisher,
+                                        )
+                                        .await?;
+                                    }
+                                }
+                                if error.rate_limit_delay().is_some() {
                                 self.record_rate_limit_retry(&thread_id, &turn_id, &error, delay, transient_retry_count + 1);
                                 publisher.publish(AgentEventEnvelope::new(AgentEvent::ProviderRetryWaiting {
                                     thread_id: thread_id.clone(), turn_id: turn_id.clone(),
@@ -1678,9 +1806,7 @@ impl AgentRuntime {
                                 continue 'retry_loop;
                             }
 
-                            let message = if error.is_transient()
-                                && transient_retry_count > 0
-                            {
+                            let message = if error.is_transient() && transient_retry_count > 0 {
                                 format!(
                                     "{} (已自动重试 {} 次)",
                                     error, transient_retry_count
@@ -1698,6 +1824,12 @@ impl AgentRuntime {
                                     "protocolRetries": protocol_retry_count,
                                     "outputAlreadyStarted": attempt_had_output,
                                 }));
+                            } else if error.is_transient() {
+                                turn_error.details = Some(transient_retry_details(
+                                    transient_retry_count,
+                                    self.transient_retry_delays.len(),
+                                    attempt_had_output,
+                                ));
                             }
                             self.record_http_failure(
                                 &thread_id,
@@ -1750,6 +1882,51 @@ impl AgentRuntime {
                         &publisher,
                     )
                     .await?;
+                }
+                if matches!(completed_inner, Some(true)) {
+                    // Only commit provider-owned items after the stream reached its terminal
+                    // completion marker. A retry after a partial stream must not leave the
+                    // failed attempt's reasoning/context in durable history.
+                    for (item_id, summary) in completed_reasoning_summaries_inner {
+                        self.repository
+                            .append(StoredEvent::new(
+                                &thread_id,
+                                Some(turn_id.clone()),
+                                StoredEventKind::ReasoningSummary {
+                                    item_id: item_id.clone(),
+                                    summary: summary.clone(),
+                                },
+                            ))
+                            .await?;
+                        publisher.publish(AgentEventEnvelope::new(
+                            AgentEvent::ReasoningSummaryCompleted {
+                                thread_id: thread_id.clone(),
+                                turn_id: turn_id.clone(),
+                                item_id: item_id.clone(),
+                                summary,
+                            },
+                        ));
+                        self.complete_item(
+                            &thread_id,
+                            &turn_id,
+                            &item_id,
+                            AgentItemType::Reasoning,
+                            AgentItemStatus::Completed,
+                            &publisher,
+                        )
+                        .await?;
+                    }
+                    for (provider, item) in provider_contexts_inner {
+                        self.repository
+                            .append(StoredEvent::new(
+                                &thread_id,
+                                Some(turn_id.clone()),
+                                StoredEventKind::ProviderContext { provider, item },
+                            ))
+                            .await?;
+                    }
+                    provider_context_bytes = provider_context_bytes
+                        .saturating_add(provider_context_bytes_inner);
                 }
                 response = response_inner;
                 response_images = response_images_inner;
@@ -2085,6 +2262,41 @@ impl AgentRuntime {
                     result = failure_result(reason.clone());
                     item_status = AgentItemStatus::Failed;
                     stop_reason = Some(reason);
+                }
+
+                if call.name == "apply_patch" {
+                    if result.success {
+                        // A successful patch changes the workspace and makes the previous
+                        // failure class stale. Let the model start a fresh repair attempt.
+                        apply_patch_failures.reset();
+                        apply_patch_recovery_rounds = 0;
+                    } else {
+                        let failure_count = apply_patch_failures.observe(&call, &result);
+                        if failure_count == MAX_REPEATED_APPLY_PATCH_FAILURES.saturating_sub(1)
+                        {
+                            result
+                                .output
+                                .push_str(&repeated_apply_patch_guidance(failure_count));
+                        } else if failure_count >= MAX_REPEATED_APPLY_PATCH_FAILURES {
+                            let targets = call
+                                .arguments
+                                .get("patch")
+                                .and_then(Value::as_str)
+                                .map(apply_patch_targets)
+                                .filter(|targets| !targets.is_empty())
+                                .map(|targets| targets.join(", "))
+                                .unwrap_or_else(|| "<unknown target>".to_string());
+                            let reason = format!(
+                                "apply_patch_loop: the same apply_patch error for {targets} repeated {failure_count} times; stopped this Turn. Re-read the target and construct one valid patch before retrying."
+                            );
+                            result.output.push_str(&format!("\n\n{reason}"));
+                            item_status = AgentItemStatus::Failed;
+                            stop_reason = Some(reason);
+                        }
+                        // A recovery note must stay within the same bounded tool-result
+                        // contract as the original diagnostic.
+                        result = bound_tool_result(result);
+                    }
                 }
 
                 if call.name == COMPLETE_WORKFLOW_NODE_TOOL_NAME && result.success {
@@ -3157,6 +3369,10 @@ impl AgentRuntime {
                     "threadId": thread_id,
                     "turnId": turn_id,
                     "message": message,
+                    "errorCode": &error.code,
+                    "category": error.category,
+                    "retryable": error.retryable,
+                    "details": error.details.clone(),
                 }),
             );
         }
@@ -3533,6 +3749,18 @@ fn is_retryable_protocol_stream_error(error: &ProviderError) -> bool {
     message.contains("incomplete tool call")
         || message.contains("invalid json arguments")
         || message.contains("returned invalid json")
+}
+
+fn transient_retry_details(
+    retry_count: usize,
+    max_retries: usize,
+    output_already_started: bool,
+) -> Value {
+    json!({
+        "transientRetries": retry_count,
+        "maxTransientRetries": max_retries,
+        "outputAlreadyStarted": output_already_started,
+    })
 }
 
 fn protocol_retry_delay(retry_count: usize) -> Duration {
@@ -6671,6 +6899,7 @@ mod tests {
                 limit: None,
                 level: None,
                 event: Some("provider_rate_limited".into()),
+                search: None,
                 after_timestamp_ms: None,
             })
             .unwrap();
@@ -6726,6 +6955,7 @@ mod tests {
                 limit: None,
                 level: Some("error".into()),
                 event: Some("tool_failed".into()),
+                search: None,
                 after_timestamp_ms: None,
             })
             .unwrap();
@@ -6794,6 +7024,7 @@ mod tests {
                 limit: None,
                 level: None,
                 event: Some("tool_failed".into()),
+                search: None,
                 after_timestamp_ms: None,
             })
             .unwrap();
@@ -6833,6 +7064,7 @@ mod tests {
                 limit: None,
                 level: Some("error".into()),
                 event: Some("provider_http_failed".into()),
+                search: None,
                 after_timestamp_ms: None,
             })
             .unwrap();
@@ -6894,6 +7126,7 @@ mod tests {
                 limit: None,
                 level: Some("error".into()),
                 event: Some("provider_http_failed".into()),
+                search: None,
                 after_timestamp_ms: None,
             })
             .unwrap();
@@ -6942,6 +7175,7 @@ mod tests {
                 limit: None,
                 level: Some("error".into()),
                 event: Some("provider_http_failed".into()),
+                search: None,
                 after_timestamp_ms: None,
             })
             .unwrap();
@@ -7016,6 +7250,7 @@ mod tests {
                     limit: None,
                     level: None,
                     event: Some("provider_http_failed".into()),
+                    search: None,
                     after_timestamp_ms: None,
                 })
                 .unwrap();
@@ -7088,6 +7323,7 @@ mod tests {
                     limit: None,
                     level: None,
                     event: Some("provider_rate_limited".into()),
+                    search: None,
                     after_timestamp_ms: None,
                 })
                 .unwrap();
@@ -7360,6 +7596,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn runtime_defaults_to_five_exponential_transient_retries() {
+        let (_directory, _repository, runtime, _thread_id) = runtime_fixture().await;
+
+        assert_eq!(
+            runtime.transient_retry_delays,
+            vec![
+                Duration::from_secs(1),
+                Duration::from_secs(2),
+                Duration::from_secs(4),
+                Duration::from_secs(8),
+                Duration::from_secs(16),
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn transient_pre_stream_retry_exhaustion_preserves_the_http_failure() {
         let (directory, _repository, runtime, thread_id) = runtime_fixture().await;
         let metrics = RuntimeMetrics::new(directory.path()).unwrap();
@@ -7527,41 +7779,106 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn transient_stream_error_after_output_is_not_retried() {
-        let (_directory, _repository, runtime, thread_id) = runtime_fixture().await;
+    async fn transient_stream_error_after_reasoning_output_retries_then_succeeds() {
+        let (_directory, repository, runtime, thread_id) = runtime_fixture().await;
         let provider = Arc::new(FakeProvider::script(vec![
             vec![
-                Ok(ProviderEvent::TextDelta {
-                    delta: "partial".into(),
+                Ok(ProviderEvent::ReasoningSummaryDelta {
+                    item_id: "partial-reasoning".into(),
+                    delta: "partial reasoning".into(),
                 }),
                 Err(ProviderError::Unavailable("servers overloaded".into())),
             ],
             vec![
+                Ok(ProviderEvent::ReasoningSummaryDelta {
+                    item_id: "partial-reasoning".into(),
+                    delta: "recovered reasoning".into(),
+                }),
+                Ok(ProviderEvent::ReasoningSummaryCompleted {
+                    item_id: "partial-reasoning".into(),
+                    summary: "recovered reasoning".into(),
+                }),
                 Ok(ProviderEvent::TextDelta {
-                    delta: "must not run".into(),
+                    delta: "recovered after reasoning".into(),
                 }),
                 Ok(ProviderEvent::Completed),
             ],
         ]));
 
+        let publisher = Arc::new(RecordingPublisher::default());
         let outcome = runtime
             .with_transient_retry_delays(vec![Duration::from_millis(1); 3])
             .run_turn(
                 provider.clone(),
                 "gpt-5".into(),
                 RunTurnRequest {
-                    thread_id,
-                    input: "do not replay emitted output".into(),
+                    thread_id: thread_id.clone(),
+                    input: "retry after a partial reasoning stream".into(),
                     agent_mode: None,
                 },
                 CancellationToken::new(),
-                Arc::new(RecordingPublisher::default()),
+                publisher.clone(),
             )
             .await
             .unwrap();
 
-        assert_eq!(outcome.state, TurnState::Failed);
-        assert_eq!(provider.requests().len(), 1);
+        assert_eq!(outcome.state, TurnState::Completed);
+        assert_eq!(provider.requests().len(), 2);
+        assert!(
+            publisher
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| matches!(
+                    &event.event,
+                    AgentEvent::TextReset { item_id, .. } if item_id == "partial-reasoning"
+                ))
+        );
+        assert_eq!(
+            publisher
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|event| matches!(
+                    &event.event,
+                    AgentEvent::ReasoningSummaryCompleted { item_id, summary, .. }
+                        if item_id == "partial-reasoning" && summary == "recovered reasoning"
+                ))
+                .count(),
+            1
+        );
+        let events = repository.load(&thread_id).await.unwrap();
+        assert!(events.iter().any(|event| matches!(
+            &event.kind,
+            StoredEventKind::AssistantMessage { message } if message.text() == "recovered after reasoning"
+        )));
+        assert!(!events.iter().any(|event| matches!(
+            &event.kind,
+            StoredEventKind::ReasoningSummary { item_id, summary }
+                if item_id == "partial-reasoning" && summary == "partial reasoning"
+        )));
+        assert!(events.iter().any(|event| matches!(
+            &event.kind,
+            StoredEventKind::ReasoningSummary { item_id, summary }
+                if item_id == "partial-reasoning" && summary == "recovered reasoning"
+        )));
+        let reasoning_lifecycle_statuses = events
+            .iter()
+            .filter_map(|event| match &event.kind {
+                StoredEventKind::ItemCompleted {
+                    item_id,
+                    item_type: AgentItemType::Reasoning,
+                    status,
+                } if item_id == "partial-reasoning" => Some(*status),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            reasoning_lifecycle_statuses,
+            vec![AgentItemStatus::Failed, AgentItemStatus::Completed]
+        );
     }
 
     /// 每个 outcome 是一组先行事件 + 是否在之后永久挂起（模拟流静默卡死）。
@@ -7660,15 +7977,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stream_idle_timeout_after_output_fails_without_replay() {
+    async fn stream_idle_timeout_after_output_retries_then_succeeds() {
         let (_directory, _repository, runtime, thread_id) = runtime_fixture().await;
         let publisher = Arc::new(RecordingPublisher::default());
-        let provider = Arc::new(IdleStreamProvider::new(vec![(
-            vec![Ok(ProviderEvent::TextDelta {
-                delta: "partial".into(),
-            })],
-            true,
-        )]));
+        let provider = Arc::new(IdleStreamProvider::new(vec![
+            (
+                vec![Ok(ProviderEvent::TextDelta {
+                    delta: "partial".into(),
+                })],
+                true,
+            ),
+            (
+                vec![
+                    Ok(ProviderEvent::TextDelta {
+                        delta: "recovered".into(),
+                    }),
+                    Ok(ProviderEvent::Completed),
+                ],
+                false,
+            ),
+        ]));
 
         let outcome = runtime
             .with_stream_idle_timeout(Duration::from_millis(20))
@@ -7678,7 +8006,7 @@ mod tests {
                 "gpt-5".into(),
                 RunTurnRequest {
                     thread_id,
-                    input: "do not replay a stalled partial response".into(),
+                    input: "retry a stalled partial response".into(),
                     agent_mode: None,
                 },
                 CancellationToken::new(),
@@ -7687,16 +8015,19 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(outcome.state, TurnState::Failed);
-        assert_eq!(provider.requests().len(), 1);
-        let error = outcome.error.expect("stalled stream should fail the turn");
-        assert!(error.contains("idle timeout"));
+        assert_eq!(outcome.state, TurnState::Completed);
+        assert_eq!(provider.requests().len(), 2);
         let events = publisher.events.lock().unwrap();
         assert!(
-            !events
+            events
                 .iter()
                 .any(|event| matches!(event.event, AgentEvent::ProviderStreamRetry { .. })),
-            "output already started must not publish retry events"
+            "output already started should still publish retry events"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event.event, AgentEvent::TextReset { .. }))
         );
     }
 
@@ -7705,7 +8036,7 @@ mod tests {
         let (directory, _repository, runtime, thread_id) = runtime_fixture().await;
         let metrics = RuntimeMetrics::new(directory.path()).unwrap();
         let provider = Arc::new(FakeProvider::script(
-            (0..4)
+            (0..6)
                 .map(|attempt| {
                     vec![Err(ProviderError::Unavailable(format!(
                         "servers overloaded on attempt {}",
@@ -7714,10 +8045,11 @@ mod tests {
                 })
                 .collect(),
         ));
+        let publisher = Arc::new(RecordingPublisher::default());
 
         let outcome = runtime
             .with_metrics(metrics.clone())
-            .with_transient_retry_delays(vec![Duration::from_millis(1); 3])
+            .with_transient_retry_delays(vec![Duration::from_millis(1); 5])
             .run_turn(
                 provider.clone(),
                 "gpt-5".into(),
@@ -7727,7 +8059,7 @@ mod tests {
                     agent_mode: None,
                 },
                 CancellationToken::new(),
-                Arc::new(RecordingPublisher::default()),
+                publisher.clone(),
             )
             .await
             .unwrap();
@@ -7736,13 +8068,28 @@ mod tests {
         let error = outcome
             .error
             .expect("the failed turn should retain an error");
-        assert!(error.contains("servers overloaded on attempt 4"));
-        assert!(error.contains("已自动重试 3 次"));
-        assert_eq!(provider.requests().len(), 4);
+        assert!(error.contains("servers overloaded on attempt 6"));
+        assert!(error.contains("已自动重试 5 次"));
+        assert_eq!(provider.requests().len(), 6);
         let snapshot = metrics.snapshot().unwrap();
-        assert_eq!(snapshot.provider_calls, 4);
-        assert_eq!(snapshot.provider_failures, 4);
-        assert_eq!(snapshot.retry_count, 3);
+        assert_eq!(snapshot.provider_calls, 6);
+        assert_eq!(snapshot.provider_failures, 6);
+        assert_eq!(snapshot.retry_count, 5);
+        let retry_attempts = publisher
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|event| match &event.event {
+                AgentEvent::ProviderStreamRetry {
+                    attempt,
+                    max_attempts,
+                    ..
+                } => Some((*attempt, *max_attempts)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(retry_attempts, vec![(1, 5), (2, 5), (3, 5), (4, 5), (5, 5)]);
     }
 
     #[tokio::test]
@@ -7963,7 +8310,9 @@ mod tests {
         let provider = Arc::new(FakeProvider::script(vec![vec![
             Ok(ProviderEvent::ModelSelected {
                 provider: "openai".into(),
+                provider_name: "OpenAI".into(),
                 model: "gpt-test".into(),
+                fallback_position: None,
             }),
             Ok(ProviderEvent::DetailedUsage {
                 usage: TokenUsage {
@@ -8885,6 +9234,37 @@ mod tests {
         }
     }
 
+    #[test]
+    fn apply_patch_failure_tracker_groups_error_details_by_target_and_resets() {
+        let first =
+            patch_call("*** Begin Patch\n*** Update File: src/lib.rs\n@@\n context\n*** End Patch");
+        let second = patch_call(
+            "*** Begin Patch\n*** Update File: src/lib.rs\n@@\n context changed\n*** End Patch",
+        );
+        let other_target = patch_call(
+            "*** Begin Patch\n*** Update File: src/other.rs\n@@\n context\n*** End Patch",
+        );
+        let first_result = failure_result(
+            "patch syntax is invalid: \"src/lib.rs\": update hunk 1 at patch line 3 has no additions or removals"
+                .into(),
+        );
+        let second_result = failure_result(
+            "patch syntax is invalid: \"src/lib.rs\": update hunk 1 at patch line 4 has no additions or removals"
+                .into(),
+        );
+        let other_result = failure_result(
+            "patch syntax is invalid: \"src/other.rs\": update hunk 1 at patch line 3 has no additions or removals"
+                .into(),
+        );
+        let mut tracker = ApplyPatchFailureTracker::default();
+
+        assert_eq!(tracker.observe(&first, &first_result), 1);
+        assert_eq!(tracker.observe(&second, &second_result), 2);
+        assert_eq!(tracker.observe(&other_target, &other_result), 1);
+        tracker.reset();
+        assert_eq!(tracker.observe(&first, &first_result), 1);
+    }
+
     async fn editing_runtime(
         workspace: &Path,
         timeout: Duration,
@@ -8905,6 +9285,166 @@ mod tests {
             approvals.clone(),
         );
         (repository, runtime, approvals, thread.id)
+    }
+
+    #[tokio::test]
+    async fn stops_repeated_apply_patch_syntax_failures_after_actionable_retries() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("file.txt"), "before\n").unwrap();
+        std::fs::write(directory.path().join("other.txt"), "one\ntwo\n").unwrap();
+        let (repository, runtime, _approvals, thread_id) =
+            editing_runtime(directory.path(), Duration::from_secs(1)).await;
+        let runtime = runtime.with_approval_mode(ApprovalMode::FullAccess);
+        let patch_one = "*** Begin Patch\n*** Update File: file.txt\n@@\n before\n*** End Patch";
+        let patch_two =
+            "*** Begin Patch\n*** Update File: file.txt\n@@\n before changed\n*** End Patch";
+        let patch_three = "*** Begin Patch\n*** Update File: file.txt\n@@\n*** End Patch";
+        let read_other = |id: &str| ToolCall {
+            id: id.to_string(),
+            name: "read_file".to_string(),
+            arguments: json!({
+                "path": "other.txt",
+                "startLine": 1,
+                "lineCount": 1
+            }),
+            metadata: json!({}),
+        };
+        let provider = Arc::new(FakeProvider::script(vec![
+            vec![
+                Ok(ProviderEvent::ToolCall {
+                    call: patch_call_with_id("bad-1", patch_one),
+                }),
+                Ok(ProviderEvent::Completed),
+            ],
+            vec![
+                Ok(ProviderEvent::ToolCall {
+                    call: read_other("read-1"),
+                }),
+                Ok(ProviderEvent::Completed),
+            ],
+            vec![
+                Ok(ProviderEvent::ToolCall {
+                    call: patch_call_with_id("bad-2", patch_two),
+                }),
+                Ok(ProviderEvent::Completed),
+            ],
+            vec![
+                Ok(ProviderEvent::ToolCall {
+                    call: read_other("read-2"),
+                }),
+                Ok(ProviderEvent::Completed),
+            ],
+            vec![
+                Ok(ProviderEvent::ToolCall {
+                    call: patch_call_with_id("bad-3", patch_three),
+                }),
+                Ok(ProviderEvent::Completed),
+            ],
+        ]));
+
+        let outcome = runtime
+            .run_turn(
+                provider.clone(),
+                "fake".to_string(),
+                RunTurnRequest {
+                    thread_id: thread_id.clone(),
+                    input: "repair the file".to_string(),
+                    agent_mode: None,
+                },
+                CancellationToken::new(),
+                Arc::new(RecordingPublisher::default()),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.state, TurnState::Failed);
+        let error = outcome.error.unwrap();
+        assert!(error.contains("apply_patch_loop"));
+        assert!(error.contains("file.txt"));
+        assert_eq!(provider.requests().len(), 5);
+        let patch_results = repository
+            .load(&thread_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter_map(|event| match event.kind {
+                StoredEventKind::ToolResult { name, result, .. } if name == "apply_patch" => {
+                    Some(result)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(patch_results.len(), 3);
+        assert!(patch_results[1].output.contains("[apply_patch recovery]"));
+        assert!(patch_results[2].output.contains("apply_patch_loop"));
+    }
+
+    #[tokio::test]
+    async fn bounds_patch_recovery_when_reads_keep_changing_without_a_success() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("file.txt"),
+            (1..=20)
+                .map(|line| format!("line {line}\n"))
+                .collect::<String>(),
+        )
+        .unwrap();
+        let (_repository, runtime, _approvals, thread_id) =
+            editing_runtime(directory.path(), Duration::from_secs(1)).await;
+        let runtime = runtime.with_approval_mode(ApprovalMode::FullAccess);
+        let invalid_patch =
+            "*** Begin Patch\n*** Update File: file.txt\n@@\n context only\n*** End Patch";
+        let mut scripts = vec![vec![
+            Ok(ProviderEvent::ToolCall {
+                call: patch_call_with_id("bad-patch", invalid_patch),
+            }),
+            Ok(ProviderEvent::Completed),
+        ]];
+        for index in 0..(MAX_APPLY_PATCH_RECOVERY_ROUNDS + 1) {
+            scripts.push(vec![
+                Ok(ProviderEvent::ToolCall {
+                    call: ToolCall {
+                        id: format!("read-{index}"),
+                        name: "read_file".into(),
+                        arguments: json!({
+                            "path": "file.txt",
+                            "startLine": index + 1,
+                            "lineCount": 1,
+                        }),
+                        metadata: json!({}),
+                    },
+                }),
+                Ok(ProviderEvent::Completed),
+            ]);
+        }
+        let provider = Arc::new(FakeProvider::script(scripts));
+
+        let outcome = runtime
+            .run_turn(
+                provider.clone(),
+                "fake".into(),
+                RunTurnRequest {
+                    thread_id,
+                    input: "repair the file".into(),
+                    agent_mode: None,
+                },
+                CancellationToken::new(),
+                Arc::new(RecordingPublisher::default()),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.state, TurnState::Failed);
+        assert!(
+            outcome
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("连续 6 个模型轮次"))
+        );
+        assert_eq!(
+            provider.requests().len(),
+            MAX_APPLY_PATCH_RECOVERY_ROUNDS + 1
+        );
     }
 
     #[tokio::test]

@@ -157,6 +157,7 @@ pub struct LogQuery {
     pub limit: Option<usize>,
     pub level: Option<String>,
     pub event: Option<String>,
+    pub search: Option<String>,
     pub after_timestamp_ms: Option<u64>,
 }
 
@@ -198,6 +199,12 @@ impl StructuredLogger {
 
         let level_filter = query.level.as_ref().map(|value| value.to_lowercase());
         let event_filter = query.event.as_ref().map(|value| value.to_lowercase());
+        let search_filter = query
+            .search
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_lowercase);
         let limit = query.limit.unwrap_or(200).min(2000);
 
         let mut records: Vec<LogRecord> = Vec::new();
@@ -241,6 +248,20 @@ impl StructuredLogger {
                         .unwrap_or_default()
                         .to_lowercase();
                     if record_event != *event {
+                        continue;
+                    }
+                }
+                if let Some(search) = &search_filter {
+                    let record_event = value
+                        .get("event")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_lowercase();
+                    let searchable_fields =
+                        redact(value.get("fields").cloned().unwrap_or(Value::Null));
+                    if !record_event.contains(search)
+                        && !value_contains_case_insensitive(&searchable_fields, search)
+                    {
                         continue;
                     }
                 }
@@ -328,6 +349,19 @@ fn redact(value: Value) -> Value {
         ),
         Value::Array(values) => Value::Array(values.into_iter().map(redact).collect()),
         other => other,
+    }
+}
+
+fn value_contains_case_insensitive(value: &Value, search: &str) -> bool {
+    match value {
+        Value::String(text) => text.to_lowercase().contains(search),
+        Value::Array(values) => values
+            .iter()
+            .any(|value| value_contains_case_insensitive(value, search)),
+        Value::Object(values) => values
+            .values()
+            .any(|value| value_contains_case_insensitive(value, search)),
+        _ => false,
     }
 }
 
@@ -420,8 +454,95 @@ mod tests {
             limit: None,
             level: None,
             event: None,
+            search: None,
             after_timestamp_ms: None,
         }
+    }
+
+    #[test]
+    fn searches_error_content_case_insensitively_across_rotations_before_limiting() {
+        let data = tempfile::tempdir().unwrap();
+        let logger = StructuredLogger::new(data.path()).unwrap();
+        let older_failure = json!({
+            "timestampMs": 1,
+            "level": "error",
+            "event": "tool_failed",
+            "fields": {
+                "output": "invalid tool arguments: startLine must be within the available range"
+            }
+        });
+        fs::write(
+            logger.path.with_extension("jsonl.1"),
+            format!("{older_failure}\n"),
+        )
+        .unwrap();
+        for index in 0..205 {
+            logger
+                .log(
+                    "info",
+                    "heartbeat",
+                    json!({"message": format!("tick {index}")}),
+                )
+                .unwrap();
+        }
+
+        let result = logger
+            .read_logs(LogQuery {
+                search: Some("INVALID TOOL ARGUMENTS".into()),
+                limit: Some(1),
+                ..query()
+            })
+            .unwrap();
+
+        assert_eq!(result.total, 1);
+        assert_eq!(result.records.len(), 1);
+        assert_eq!(result.records[0].event, "tool_failed");
+        assert!(
+            result.records[0].fields["output"]
+                .as_str()
+                .unwrap()
+                .contains("invalid tool arguments")
+        );
+    }
+
+    #[test]
+    fn searches_nested_fields_and_event_names_without_matching_redacted_secrets() {
+        let data = tempfile::tempdir().unwrap();
+        let logger = StructuredLogger::new(data.path()).unwrap();
+        logger
+            .log(
+                "error",
+                "tool_failed",
+                json!({
+                    "arguments": {"patch": "*** Begin Patch"},
+                    "output": "Patch syntax is invalid",
+                    "apiKey": "sk-test-secret-value",
+                }),
+            )
+            .unwrap();
+
+        let nested = logger
+            .read_logs(LogQuery {
+                search: Some("begin patch".into()),
+                ..query()
+            })
+            .unwrap();
+        let event = logger
+            .read_logs(LogQuery {
+                search: Some("TOOL_FAIL".into()),
+                ..query()
+            })
+            .unwrap();
+        let secret = logger
+            .read_logs(LogQuery {
+                search: Some("sk-test-secret-value".into()),
+                ..query()
+            })
+            .unwrap();
+
+        assert_eq!(nested.total, 1);
+        assert_eq!(event.total, 1);
+        assert_eq!(secret.total, 0);
     }
 
     #[test]

@@ -25,6 +25,7 @@ const stateLabels: Record<PluginState, string> = {
 };
 
 const scopeLabels: Record<PluginScope, string> = {
+  builtin: "内置",
   local: "本地",
   project: "项目",
 };
@@ -148,7 +149,7 @@ export function PluginSettingsPage() {
         <div>
           <p className="settings-eyebrow">扩展</p>
           <h3 id="plugin-page-title">本地插件</h3>
-          <p className="plugin-page-description">安装到本地的插件可用于所有项目，安装到项目的插件只在当前项目生效。</p>
+          <p className="plugin-page-description">内置插件随应用安装并始终启用；安装到本地的插件可用于所有项目，安装到项目的插件只在当前项目生效。</p>
         </div>
         <div className="plugin-header-actions">
           <button
@@ -189,6 +190,7 @@ export function PluginSettingsPage() {
 
       <div className="plugin-roots">
         {([
+          ["builtin", "内置插件目录", overview?.builtinRootPath],
           ["local", "本地插件目录", overview?.localRootPath],
           ["project", "项目插件目录", overview?.projectRootPath ?? overview?.rootPath],
         ] as const).map(([scope, label, path]) => (
@@ -232,7 +234,7 @@ export function PluginSettingsPage() {
           {plugins.map((plugin) => {
             const pluginBusyId = `${plugin.scope}:${plugin.id}`;
             const busy = busyId === pluginBusyId;
-            const toggleDisabled = busyId !== null || plugin.state === "invalid";
+            const toggleDisabled = busyId !== null || plugin.state === "invalid" || plugin.scope === "builtin";
             return (
               <article className={`plugin-row plugin-row--${plugin.state}`} key={`${plugin.id}:${plugin.path}`}>
                 <div className="plugin-row-icon" aria-hidden="true">
@@ -273,7 +275,10 @@ export function PluginSettingsPage() {
                   )}
                 </div>
                 <div className="plugin-row-actions">
-                  <label className="plugin-switch" title={toggleDisabled ? "此插件不能启用" : undefined}>
+                  <label
+                    className="plugin-switch"
+                    title={plugin.scope === "builtin" ? "内置插件始终启用" : toggleDisabled ? "此插件不能启用" : undefined}
+                  >
                     <input
                       type="checkbox"
                       aria-label={`启用 ${plugin.name}`}

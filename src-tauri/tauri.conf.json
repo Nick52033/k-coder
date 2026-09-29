@@ -32,6 +32,7 @@
     "targets": "all",
     "resources": {
       "../src/resources/skills/": "skills/",
+      "../plugins/": "plugins/",
       "../src/resources/tools/windows-x86_64/": "tools/"
     },
     "icon": [

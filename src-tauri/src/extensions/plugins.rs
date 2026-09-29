@@ -43,8 +43,16 @@ const MAX_PLUGIN_INSTALL_BYTES: u64 = 64 * 1024 * 1024;
 impl PluginScope {
     fn label(self) -> &'static str {
         match self {
+            Self::Builtin => "builtin",
             Self::Local => "local",
             Self::Project => "project",
+        }
+    }
+
+    fn id_suffix(self) -> &'static str {
+        match self {
+            Self::Builtin => "builtin",
+            Self::Local | Self::Project => "local",
         }
     }
 
@@ -159,6 +167,7 @@ struct PluginActivation {
 #[derive(Clone)]
 pub struct PluginHost {
     root: Arc<RwLock<Option<PathBuf>>>,
+    builtin_root: Option<PathBuf>,
     local_root: Option<PathBuf>,
     workspace_key: Arc<RwLock<Option<String>>>,
     projection: ProjectionDb,
@@ -180,17 +189,30 @@ pub struct PreparedPluginExtensions {
 
 impl PluginHost {
     pub fn new(projection: ProjectionDb) -> Self {
+        Self::with_roots(projection, None, None)
+    }
+
+    pub fn with_roots(
+        projection: ProjectionDb,
+        builtin_root: Option<PathBuf>,
+        local_root: Option<PathBuf>,
+    ) -> Self {
         Self {
             overview: Arc::new(RwLock::new(PluginOverview {
                 schema_version: PLUGIN_OVERVIEW_SCHEMA_VERSION,
                 root_path: String::new(),
+                builtin_root_path: builtin_root
+                    .as_deref()
+                    .map(user_facing_path)
+                    .unwrap_or_default(),
                 local_root_path: String::new(),
                 project_root_path: String::new(),
                 plugins: Vec::new(),
                 error: None,
             })),
             root: Arc::new(RwLock::new(None)),
-            local_root: None,
+            builtin_root,
+            local_root,
             workspace_key: Arc::new(RwLock::new(None)),
             projection,
             index: Arc::new(RwLock::new(HashMap::new())),
@@ -204,9 +226,11 @@ impl PluginHost {
     }
 
     pub fn with_local_root(projection: ProjectionDb, local_root: PathBuf) -> Self {
-        let mut host = Self::new(projection);
-        host.local_root = Some(local_root);
-        host
+        Self::with_roots(projection, None, Some(local_root))
+    }
+
+    pub fn with_builtin_root(projection: ProjectionDb, builtin_root: PathBuf) -> Self {
+        Self::with_roots(projection, Some(builtin_root), None)
     }
 
     /// Binds the project plugin root to the active workspace. The root is
@@ -251,6 +275,12 @@ impl PluginHost {
                 .expect("plugin overview lock poisoned")
                 .local_root_path = user_facing_path(local_root);
         }
+        if let Some(builtin_root) = &self.builtin_root {
+            self.overview
+                .write()
+                .expect("plugin overview lock poisoned")
+                .builtin_root_path = user_facing_path(builtin_root);
+        }
         true
     }
 
@@ -267,6 +297,7 @@ impl PluginHost {
 
     fn root_for_scope(&self, scope: PluginScope) -> Option<PathBuf> {
         match scope {
+            PluginScope::Builtin => self.builtin_root.clone(),
             PluginScope::Local => self.local_root.clone(),
             PluginScope::Project => self.current_root(),
         }
@@ -274,6 +305,9 @@ impl PluginHost {
 
     fn setting_key(&self, scope: PluginScope, plugin_id: &str) -> Result<String, PluginError> {
         match scope {
+            PluginScope::Builtin => Err(PluginError::Config(format!(
+                "built-in plugin {plugin_id} has no persisted enablement setting"
+            ))),
             PluginScope::Local => Ok(format!("extension/plugin/local/{plugin_id}")),
             PluginScope::Project => self
                 .current_workspace_key()
@@ -291,6 +325,9 @@ impl PluginHost {
     }
 
     fn setting_enabled(&self, scope: PluginScope, plugin_id: &str) -> Result<bool, PluginError> {
+        if scope == PluginScope::Builtin {
+            return Ok(true);
+        }
         let key = self.setting_key(scope, plugin_id)?;
         if let Some(value) = self
             .projection
@@ -315,6 +352,11 @@ impl PluginHost {
         plugin_id: &str,
         enabled: bool,
     ) -> Result<(), PluginError> {
+        if scope == PluginScope::Builtin {
+            return Err(PluginError::Config(format!(
+                "built-in plugin {plugin_id} is always enabled"
+            )));
+        }
         let value = if enabled { "true" } else { "false" };
         let key = self.setting_key(scope, plugin_id)?;
         self.projection
@@ -335,6 +377,9 @@ impl PluginHost {
         scope: PluginScope,
         plugin_id: &str,
     ) -> Result<(), PluginError> {
+        if scope == PluginScope::Builtin {
+            return Ok(());
+        }
         let key = self.setting_key(scope, plugin_id)?;
         self.projection
             .delete_setting(&key)
@@ -358,8 +403,13 @@ impl PluginHost {
     }
 
     fn scan_inner(&self) -> Result<PluginOverview, PluginError> {
+        let builtin_root = self.builtin_root.clone();
         let project_root = self.current_root();
         let local_root = self.local_root.clone();
+        let builtin_root_path = builtin_root
+            .as_deref()
+            .map(user_facing_path)
+            .unwrap_or_default();
         let project_root_path = project_root
             .as_deref()
             .map(user_facing_path)
@@ -369,8 +419,15 @@ impl PluginHost {
             .map(user_facing_path)
             .unwrap_or_default();
         let mut roots = Vec::new();
+        let mut builtin_present = false;
         let mut local_present = false;
         let mut project_present = false;
+        if let Some(root) = builtin_root.as_deref()
+            && plugin_root_present(root)?
+        {
+            builtin_present = true;
+            roots.push((PluginScope::Builtin, root.to_path_buf()));
+        }
         if let Some(root) = local_root.as_deref()
             && plugin_root_present(root)?
         {
@@ -388,6 +445,7 @@ impl PluginHost {
             let overview = PluginOverview {
                 schema_version: PLUGIN_OVERVIEW_SCHEMA_VERSION,
                 root_path: project_root_path.clone(),
+                builtin_root_path,
                 local_root_path,
                 project_root_path,
                 plugins: Vec::new(),
@@ -417,6 +475,7 @@ impl PluginHost {
                 let overview = PluginOverview {
                     schema_version: PLUGIN_OVERVIEW_SCHEMA_VERSION,
                     root_path: project_root_path.clone(),
+                    builtin_root_path: builtin_root_path.clone(),
                     local_root_path: local_root_path.clone(),
                     project_root_path: project_root_path.clone(),
                     plugins: Vec::new(),
@@ -470,7 +529,7 @@ impl PluginHost {
                 plugin.diagnostic.state = PluginState::Invalid;
                 plugin.diagnostic.deletable = false;
                 plugin.diagnostic.error = Some(format!(
-                    "duplicate local plugin id {}; every conflicting directory is disabled",
+                    "duplicate plugin id {}; every conflicting directory is disabled",
                     plugin.diagnostic.id
                 ));
                 diagnostics.push(plugin.diagnostic);
@@ -488,7 +547,7 @@ impl PluginHost {
                 diagnostic.state = PluginState::Invalid;
                 diagnostic.deletable = false;
                 diagnostic.error = Some(format!(
-                    "duplicate local plugin id {}; every conflicting directory is disabled",
+                    "duplicate plugin id {}; every conflicting directory is disabled",
                     diagnostic.id
                 ));
                 next_index.remove(&diagnostic.id);
@@ -498,8 +557,10 @@ impl PluginHost {
                 && let Some(root) = self.root_for_scope(*scope)
                 && let Ok(target) = safe_plugin_deletion_target(&root, path)
             {
-                diagnostic.deletable = true;
-                next_deletion_targets.insert(diagnostic.id.clone(), target);
+                if *scope != PluginScope::Builtin {
+                    diagnostic.deletable = true;
+                    next_deletion_targets.insert(diagnostic.id.clone(), target);
+                }
             }
         }
         diagnostics.sort_by(|left, right| {
@@ -531,6 +592,16 @@ impl PluginHost {
                     .cloned(),
             );
         }
+        if !builtin_present {
+            current_ids.extend(
+                self.known_ids
+                    .read()
+                    .expect("plugin id lock poisoned")
+                    .iter()
+                    .filter(|key| key.starts_with("builtin|"))
+                    .cloned(),
+            );
+        }
         self.reset_missing_enabled(&current_ids)?;
         self.sync_activations(&next_index);
         *self.index.write().expect("plugin index lock poisoned") = next_index;
@@ -542,6 +613,7 @@ impl PluginHost {
         let overview = PluginOverview {
             schema_version: PLUGIN_OVERVIEW_SCHEMA_VERSION,
             root_path: project_root_path.clone(),
+            builtin_root_path,
             local_root_path,
             project_root_path,
             plugins: diagnostics,
@@ -576,6 +648,11 @@ impl PluginHost {
             root_path: self
                 .current_root()
                 .map(|root| user_facing_path(&root))
+                .unwrap_or_default(),
+            builtin_root_path: self
+                .builtin_root
+                .as_deref()
+                .map(user_facing_path)
                 .unwrap_or_default(),
             local_root_path: self
                 .local_root
@@ -657,7 +734,7 @@ impl PluginHost {
         validate_known_unsupported_component_paths(&canonical_plugin_root, &manifest)
             .map_err(|error| (Some(manifest.clone()), error))?;
 
-        let id = format!("{}@local", manifest.name);
+        let id = format!("{}@{}", manifest.name, scope.id_suffix());
         let enabled = self
             .setting_enabled(scope, &id)
             .map_err(|error| (Some(manifest.clone()), error.to_string()))?;
@@ -771,7 +848,7 @@ impl PluginHost {
             path: user_facing_path(path),
             enabled,
             state,
-            deletable: true,
+            deletable: scope != PluginScope::Builtin,
             components: PluginComponentSummary {
                 skill_count: skills.len(),
                 mcp_server_count: mcp_servers.len(),
@@ -799,6 +876,9 @@ impl PluginHost {
             let Some((scope, plugin_id)) = parse_plugin_state_key(state_key) else {
                 continue;
             };
+            if scope == PluginScope::Builtin {
+                continue;
+            }
             let was_enabled = self.setting_enabled(scope, plugin_id)?;
             self.persist_enabled(scope, plugin_id, false)?;
             if was_enabled {
@@ -928,7 +1008,12 @@ impl PluginHost {
         let scope = indexed_scope.or(diagnostic_scope);
         if (enabled && indexed_scope.is_none()) || scope.is_none() {
             return Err(PluginError::Config(format!(
-                "unknown or invalid local plugin {plugin_id}"
+                "unknown or invalid plugin {plugin_id}"
+            )));
+        }
+        if scope == Some(PluginScope::Builtin) {
+            return Err(PluginError::Config(format!(
+                "built-in plugin {plugin_id} is always enabled"
             )));
         }
         self.persist_enabled(
@@ -950,6 +1035,11 @@ impl PluginHost {
             .find(|plugin| plugin.id == plugin_id)
             .cloned()
             .ok_or_else(|| PluginError::Config(format!("unknown local plugin {plugin_id}")))?;
+        if diagnostic.scope == PluginScope::Builtin {
+            return Err(PluginError::Config(format!(
+                "built-in plugin {plugin_id} cannot be deleted"
+            )));
+        }
         if diagnostic.enabled {
             return Err(PluginError::Config(format!(
                 "disable local plugin {plugin_id} before deletion"
@@ -1003,7 +1093,7 @@ impl PluginHost {
                 serde_json::from_str(&manifest_content).map_err(|error| {
                     PluginError::Config(format!("plugin manifest JSON is invalid: {error}"))
                 })?;
-            if format!("{}@local", manifest.name) != plugin_id {
+            if format!("{}@{}", manifest.name, diagnostic.scope.id_suffix()) != plugin_id {
                 return Err(PluginError::Config(
                     "plugin deletion target changed since discovery".into(),
                 ));
@@ -1017,6 +1107,14 @@ impl PluginHost {
             ))
         })?;
         self.delete_enabled_setting(diagnostic.scope, plugin_id)?;
+        // A successfully deleted plugin is no longer a known candidate. Remove
+        // its lifecycle key before rescanning so `reset_missing_enabled` does
+        // not recreate a persisted `false` setting for the directory we just
+        // deleted.
+        self.known_ids
+            .write()
+            .expect("plugin id lock poisoned")
+            .remove(&plugin_state_key(diagnostic.scope, plugin_id));
         self.scan()
     }
 
@@ -1029,6 +1127,12 @@ impl PluginHost {
         source: &Path,
         scope: PluginScope,
     ) -> Result<PluginOverview, PluginError> {
+        if scope == PluginScope::Builtin {
+            return Err(PluginError::Config(
+                "built-in plugins are shipped with the application and cannot be installed at runtime"
+                    .into(),
+            ));
+        }
         let source_plugin = self
             .load_candidate(source, scope)
             .map_err(|(_, error)| PluginError::Config(error))?;
@@ -1736,7 +1840,7 @@ fn invalid_diagnostic(
     PluginDiagnostic {
         id: manifest_name
             .filter(|name| valid_plugin_name(name))
-            .map(|name| format!("{name}@local"))
+            .map(|name| format!("{name}@{}", scope.id_suffix()))
             .unwrap_or_else(|| format!("invalid:{fallback}")),
         scope,
         name: manifest_name
@@ -1751,7 +1855,7 @@ fn invalid_diagnostic(
         path: user_facing_path(path),
         enabled: false,
         state: PluginState::Invalid,
-        deletable,
+        deletable: deletable && scope != PluginScope::Builtin,
         components: PluginComponentSummary::default(),
         warnings: Vec::new(),
         error: Some(error),
@@ -2673,6 +2777,7 @@ fn plugin_state_key(scope: PluginScope, plugin_id: &str) -> String {
 fn parse_plugin_state_key(value: &str) -> Option<(PluginScope, &str)> {
     let (scope, plugin_id) = value.split_once('|')?;
     let scope = match scope {
+        "builtin" => PluginScope::Builtin,
         "local" => PluginScope::Local,
         "project" => PluginScope::Project,
         _ => return None,
@@ -2911,6 +3016,12 @@ mod tests {
         plugin_host_with(workspace, ProjectionDb::memory().unwrap())
     }
 
+    fn builtin_plugin_host(builtin_root: &Path) -> (PluginHost, ProjectionDb) {
+        let projection = ProjectionDb::memory().unwrap();
+        let host = PluginHost::with_builtin_root(projection.clone(), builtin_root.to_path_buf());
+        (host, projection)
+    }
+
     fn write_manifest(plugin_root: &Path, value: serde_json::Value) {
         let manifest_dir = plugin_root.join(".codex-plugin");
         fs::create_dir_all(&manifest_dir).unwrap();
@@ -2986,6 +3097,93 @@ mod tests {
         assert_eq!(overview.plugins[0].state, PluginState::Disabled);
         assert!(!overview.plugins[0].enabled);
         assert!(overview.plugins[0].deletable);
+    }
+
+    #[test]
+    fn builtin_plugins_are_enabled_read_only_and_do_not_create_settings() {
+        let builtin_root = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let plugin = builtin_root.path().join("bundled-tools");
+        write_manifest(
+            &plugin,
+            json!({
+                "name": "bundled-tools",
+                "version": "1.0.0",
+                "description": "Bundled helpers"
+            }),
+        );
+        write_skill(
+            &plugin,
+            "review",
+            "---\nname: review\ndescription: Review\n---\n# Review\n",
+        );
+
+        let (host, projection) = builtin_plugin_host(builtin_root.path());
+        host.set_workspace(workspace.path());
+        let overview = host.scan().unwrap();
+        let plugin = &overview.plugins[0];
+
+        assert_eq!(
+            overview.builtin_root_path,
+            builtin_root.path().to_string_lossy()
+        );
+        assert_eq!(plugin.id, "bundled-tools@builtin");
+        assert_eq!(plugin.scope, PluginScope::Builtin);
+        assert!(plugin.enabled);
+        assert_eq!(plugin.state, PluginState::Loaded);
+        assert!(!plugin.deletable);
+        assert!(
+            projection
+                .setting("extension/plugin/builtin/bundled-tools@builtin")
+                .unwrap()
+                .is_none()
+        );
+
+        let error = host
+            .set_enabled("bundled-tools@builtin", false)
+            .unwrap_err();
+        assert!(error.to_string().contains("always enabled"));
+        let error = host.delete("bundled-tools@builtin").unwrap_err();
+        assert!(error.to_string().contains("cannot be deleted"));
+        let error = host
+            .install(Path::new(&plugin.path), PluginScope::Builtin)
+            .unwrap_err();
+        assert!(error.to_string().contains("cannot be installed"));
+    }
+
+    #[test]
+    fn repository_plugins_are_discovered_as_enabled_builtins() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../plugins");
+        if !root.is_dir() {
+            return;
+        }
+        let host = PluginHost::with_builtin_root(ProjectionDb::memory().unwrap(), root);
+        let overview = host.scan().unwrap();
+        let expected = [
+            "browser",
+            "computer-use",
+            "documents",
+            "presentations",
+            "record-replay",
+            "sites",
+            "spreadsheets",
+            "superpowers",
+        ];
+
+        for name in expected {
+            let plugin = overview
+                .plugins
+                .iter()
+                .find(|plugin| plugin.name == name)
+                .unwrap_or_else(|| panic!("repository plugin {name} was not discovered"));
+            assert_eq!(plugin.scope, PluginScope::Builtin);
+            assert!(plugin.enabled, "repository plugin {name} should be enabled");
+            assert!(
+                !plugin.deletable,
+                "repository plugin {name} should be read-only"
+            );
+            assert_ne!(plugin.state, PluginState::Invalid);
+        }
     }
 
     #[test]

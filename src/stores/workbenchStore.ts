@@ -122,6 +122,7 @@ interface WorkbenchState {
     sinceMs?: number;
     streamRetry?: { attempt: number; maxAttempts: number };
   } | null;
+  providerFallback: { turnId: string; provider: string; model: string; position: number } | null;
   pendingApproval: ApprovalRequest | null;
   pendingApprovals: ApprovalRequest[];
   pendingUserInput: UserInputRequest | null;
@@ -424,6 +425,7 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
   turnTimeline: [],
   turnUserMessageIds: {},
   activityStatus: null,
+  providerFallback: null,
   pendingApproval: null,
   pendingApprovals: [],
   pendingUserInput: null,
@@ -529,6 +531,7 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
         turnTimeline: [],
         turnUserMessageIds: {},
         activityStatus: null,
+        providerFallback: null,
         pendingApproval: null,
         pendingApprovals: [],
         pendingUserInput: null,
@@ -569,6 +572,7 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
         turnTimeline: [],
         turnUserMessageIds: {},
         activityStatus: null,
+        providerFallback: null,
         pendingApproval: null,
         pendingApprovals: [],
         pendingUserInput: null,
@@ -1225,6 +1229,7 @@ export const useWorkbenchStore = create<WorkbenchState>((set, get) => ({
       turnTimeline: [],
       turnUserMessageIds: {},
       activityStatus: null,
+      providerFallback: null,
       contextUsage: null,
       error: recoveryError,
       loading: false,

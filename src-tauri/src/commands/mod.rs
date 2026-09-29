@@ -1041,12 +1041,14 @@ pub async fn read_logs(
     limit: Option<usize>,
     level: Option<String>,
     event: Option<String>,
+    search: Option<String>,
     after_timestamp_ms: Option<u64>,
 ) -> Result<LogQueryResult, CommandError> {
     let query = LogQuery {
         limit,
         level,
         event,
+        search,
         after_timestamp_ms,
     };
     state

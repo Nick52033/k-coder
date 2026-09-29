@@ -84,6 +84,7 @@ pub struct AppState {
     rate_limits: crate::providers::RateLimitRegistry,
     credentials: Arc<dyn CredentialStore>,
     data_root: PathBuf,
+    builtin_plugins_root: Option<PathBuf>,
     workspace_root: RwLock<PathBuf>,
     tool_registry: RwLock<ToolRegistry>,
     patch_service: PatchService,
@@ -157,6 +158,7 @@ impl AppState {
             Arc::new(OsCredentialStore::new()),
             Some(builtin_skills_root.as_ref().to_path_buf()),
             None,
+            None,
         )
     }
 
@@ -170,6 +172,22 @@ impl AppState {
             Arc::new(OsCredentialStore::new()),
             Some(builtin_skills_root.as_ref().to_path_buf()),
             bundled_tools_root,
+            None,
+        )
+    }
+
+    pub fn new_with_builtin_resources_and_plugins(
+        data_root: impl AsRef<Path>,
+        builtin_skills_root: impl AsRef<Path>,
+        bundled_tools_root: Option<PathBuf>,
+        builtin_plugins_root: impl AsRef<Path>,
+    ) -> Result<Self, AppStateError> {
+        Self::with_credentials_and_builtin_skills(
+            data_root,
+            Arc::new(OsCredentialStore::new()),
+            Some(builtin_skills_root.as_ref().to_path_buf()),
+            bundled_tools_root,
+            Some(builtin_plugins_root.as_ref().to_path_buf()),
         )
     }
 
@@ -177,7 +195,7 @@ impl AppState {
         data_root: impl AsRef<Path>,
         credentials: Arc<dyn CredentialStore>,
     ) -> Result<Self, AppStateError> {
-        Self::with_credentials_and_builtin_skills(data_root, credentials, None, None)
+        Self::with_credentials_and_builtin_skills(data_root, credentials, None, None, None)
     }
 
     fn with_credentials_and_builtin_skills(
@@ -185,6 +203,7 @@ impl AppState {
         credentials: Arc<dyn CredentialStore>,
         builtin_skills_root: Option<PathBuf>,
         bundled_tools_root: Option<PathBuf>,
+        builtin_plugins_root: Option<PathBuf>,
     ) -> Result<Self, AppStateError> {
         let data_root = data_root.as_ref().to_path_buf();
         let fallback =
@@ -203,6 +222,7 @@ impl AppState {
             credentials,
             builtin_skills_root,
             bundled_tools_root,
+            builtin_plugins_root,
         )
     }
 
@@ -217,6 +237,7 @@ impl AppState {
             credentials,
             None,
             None,
+            None,
         )
     }
 
@@ -226,6 +247,7 @@ impl AppState {
         credentials: Arc<dyn CredentialStore>,
         builtin_skills_root: Option<PathBuf>,
         bundled_tools_root: Option<PathBuf>,
+        builtin_plugins_root: Option<PathBuf>,
     ) -> Result<Self, AppStateError> {
         let data_root = data_root.as_ref().to_path_buf();
         let workspace_root = workspace_root
@@ -271,9 +293,11 @@ impl AppState {
             .unwrap_or_default();
         let logger = StructuredLogger::new(&data_root)
             .map_err(|error| AppStateError::Logging(error.to_string()))?;
-        let extensions = ExtensionService::with_builtin_skills(
+        let builtin_plugins_root_for_state = builtin_plugins_root.clone();
+        let extensions = ExtensionService::with_builtin_skills_and_plugins(
             data_root.clone(),
             builtin_skills_root,
+            builtin_plugins_root,
             repository.projection(),
             Arc::new(OsMcpSecretStore::new()),
             logger.clone(),
@@ -308,6 +332,7 @@ impl AppState {
             rate_limits: crate::providers::RateLimitRegistry::default(),
             credentials,
             data_root: data_root.clone(),
+            builtin_plugins_root: builtin_plugins_root_for_state,
             workspace_root: RwLock::new(workspace_root),
             tool_registry: RwLock::new(tool_registry),
             patch_service,
@@ -853,6 +878,11 @@ impl AppState {
                 root_path: plugin_root_for_workspace(workspace)
                     .to_string_lossy()
                     .into_owned(),
+                builtin_root_path: self
+                    .builtin_plugins_root
+                    .as_deref()
+                    .map(|path| path.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
                 local_root_path: plugin_root_for_local(&self.data_root)
                     .to_string_lossy()
                     .into_owned(),
@@ -1327,7 +1357,7 @@ impl AppState {
         let route_configs = self.available_route_configs(&config, route_configs)?;
         let mut targets = Vec::new();
         let mut target_keys = std::collections::HashSet::new();
-        for route_config in &route_configs {
+        for (route_position, route_config) in route_configs.iter().enumerate() {
             let api_key = if route_config.id == config.id {
                 primary_api_key.clone()
             } else {
@@ -1353,6 +1383,8 @@ impl AppState {
                     provider: self.rate_limits.wrap(&route_config.id, provider),
                     model: target_model,
                     label,
+                    provider_name: route_config.name.clone(),
+                    fallback_position: (route_position > 0).then_some(route_position as u32),
                 });
             }
         }
@@ -2757,6 +2789,7 @@ mod tests {
                 limit: None,
                 level: None,
                 event: None,
+                search: None,
                 after_timestamp_ms: None,
             })
             .await

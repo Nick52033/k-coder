@@ -210,6 +210,7 @@ pub fn parse_patch(patch: &str) -> Result<PatchDocument, PatchError> {
             )));
         }
         let header = lines[index];
+        let file_header_line = index + 1;
         let (kind, path) = if let Some(path) = header.strip_prefix("*** Add File: ") {
             (FilePatchKind::Add, path)
         } else if let Some(path) = header.strip_prefix("*** Update File: ") {
@@ -267,13 +268,17 @@ pub fn parse_patch(patch: &str) -> Result<PatchDocument, PatchError> {
                 }
             }
             FilePatchKind::Update => {
+                let mut hunk_number = 0usize;
                 while index + 1 < lines.len() && !is_file_header(lines[index]) {
                     if !lines[index].starts_with("@@") {
                         return Err(PatchError::InvalidSyntax(format!(
-                            "update hunk at line {} must start with '@@'",
-                            index + 1
+                            "{path:?}: update hunk {} at patch line {} must start with '@@'; add an '@@' hunk header before the context, '+' additions, or '-' removals",
+                            hunk_number.saturating_add(1),
+                            index + 1,
                         )));
                     }
+                    hunk_number += 1;
+                    let hunk_header_line = index + 1;
                     index += 1;
                     let mut hunk_lines = Vec::new();
                     while index + 1 < lines.len()
@@ -287,8 +292,8 @@ pub fn parse_patch(patch: &str) -> Result<PatchDocument, PatchError> {
                             Some(b'-') => (HunkLineKind::Remove, &line[1..]),
                             _ => {
                                 return Err(PatchError::InvalidSyntax(format!(
-                                    "hunk line {} must start with space, '+' or '-'",
-                                    index + 1
+                                    "{path:?}: update hunk {hunk_number} at patch line {} must start with a space, '+' or '-'; prefix context with a space or make the changed line a '+' addition or '-' removal",
+                                    index + 1,
                                 )));
                             }
                         };
@@ -303,17 +308,16 @@ pub fn parse_patch(patch: &str) -> Result<PatchDocument, PatchError> {
                             .iter()
                             .any(|line| line.kind != HunkLineKind::Context)
                     {
-                        return Err(PatchError::InvalidSyntax(
-                            "each update hunk must contain an addition or removal".to_string(),
-                        ));
+                        return Err(PatchError::InvalidSyntax(format!(
+                            "{path:?}: update hunk {hunk_number} at patch line {hunk_header_line} has no additions or removals; remove it or include a '+' addition or '-' removal"
+                        )));
                     }
                     hunks.push(PatchHunk { lines: hunk_lines });
                 }
                 if hunks.is_empty() && move_to.is_none() {
-                    return Err(PatchError::InvalidSyntax(
-                        "update operation requires at least one hunk or a move destination"
-                            .to_string(),
-                    ));
+                    return Err(PatchError::InvalidSyntax(format!(
+                        "{path:?}: update file has no hunk at patch line {file_header_line}; add an '@@' hunk containing at least one '+' addition or '-' removal, or add a '*** Move to: ...' destination"
+                    )));
                 }
             }
         }
@@ -1122,6 +1126,40 @@ mod tests {
             parse_patch("*** Add File: a\n+x"),
             Err(PatchError::InvalidSyntax(_))
         ));
+    }
+
+    #[test]
+    fn identifies_context_only_update_hunk_in_syntax_error() {
+        let patch = "*** Begin Patch\n*** Update File: src/protocol/mod.rs\n@@\n enum Scope {\n*** End Patch";
+        assert_eq!(
+            parse_patch(patch),
+            Err(PatchError::InvalidSyntax(
+                "\"src/protocol/mod.rs\": update hunk 1 at patch line 3 has no additions or removals; remove it or include a '+' addition or '-' removal".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn identifies_empty_and_malformed_update_hunks_with_repair_locations() {
+        let empty_hunk = "*** Begin Patch\n*** Update File: src/protocol/mod.rs\n@@\n*** End Patch";
+        let error = parse_patch(empty_hunk).unwrap_err().to_string();
+        assert!(error.contains("src/protocol/mod.rs"));
+        assert!(error.contains("update hunk 1"));
+        assert!(error.contains("patch line 3"));
+        assert!(error.contains("remove it or include a '+' addition or '-' removal"));
+
+        let malformed_line = "*** Begin Patch\n*** Update File: src/protocol/mod.rs\n@@\n enum Scope {\nBuiltin,\n*** End Patch";
+        let error = parse_patch(malformed_line).unwrap_err().to_string();
+        assert!(error.contains("src/protocol/mod.rs"));
+        assert!(error.contains("update hunk 1"));
+        assert!(error.contains("patch line 5"));
+        assert!(error.contains("prefix context with a space"));
+
+        let missing_hunk = "*** Begin Patch\n*** Update File: src/protocol/mod.rs\n*** End Patch";
+        let error = parse_patch(missing_hunk).unwrap_err().to_string();
+        assert!(error.contains("src/protocol/mod.rs"));
+        assert!(error.contains("patch line 2"));
+        assert!(error.contains("add an '@@' hunk"));
     }
 
     #[tokio::test]

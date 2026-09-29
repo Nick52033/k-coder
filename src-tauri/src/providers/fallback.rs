@@ -12,7 +12,11 @@ use crate::advanced::RuntimeMetrics;
 pub struct FallbackTarget {
     pub provider: Arc<dyn Provider>,
     pub model: String,
+    /// Label for a specific endpoint or route within the provider.
     pub label: String,
+    /// Stable user-facing provider name, independent of endpoint labels.
+    pub provider_name: String,
+    pub fallback_position: Option<u32>,
 }
 
 pub struct FallbackProvider {
@@ -112,7 +116,9 @@ impl Provider for FallbackProvider {
                 }
                 yield Ok(ProviderEvent::ModelSelected {
                     provider: target.label.clone(),
+                    provider_name: target.provider_name.clone(),
                     model: target.model.clone(),
+                    fallback_position: target.fallback_position,
                 });
 
                 let mut attempt_had_output = false;
@@ -253,7 +259,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn transient_pre_stream_failure_uses_the_next_target_and_records_it() {
+    async fn provider_route_selection_uses_the_next_target_and_reports_its_identity() {
         let directory = tempfile::tempdir().unwrap();
         let metrics = RuntimeMetrics::new(directory.path()).unwrap();
         let first_calls = Arc::new(AtomicUsize::new(0));
@@ -270,6 +276,8 @@ mod tests {
                     }),
                     model: "primary".into(),
                     label: "primary".into(),
+                    provider_name: "Primary Provider".into(),
+                    fallback_position: None,
                 },
                 FallbackTarget {
                     provider: Arc::new(FixedProvider {
@@ -277,7 +285,9 @@ mod tests {
                         error: None,
                     }),
                     model: "fallback".into(),
-                    label: "fallback".into(),
+                    label: "fallback-channel".into(),
+                    provider_name: "Backup Provider".into(),
+                    fallback_position: Some(1),
                 },
             ],
             metrics.clone(),
@@ -296,8 +306,8 @@ mod tests {
             .unwrap();
         assert!(matches!(
             stream.next().await,
-            Some(Ok(ProviderEvent::ModelSelected { provider, model }))
-                if provider == "fallback" && model == "fallback"
+            Some(Ok(ProviderEvent::ModelSelected { provider, provider_name, model, fallback_position: Some(1) }))
+                if provider == "fallback-channel" && provider_name == "Backup Provider" && model == "fallback"
         ));
         assert_eq!(first_calls.load(Ordering::SeqCst), 1);
         assert_eq!(second_calls.load(Ordering::SeqCst), 1);
@@ -357,6 +367,8 @@ mod tests {
             }),
             model: model.into(),
             label: label.into(),
+            provider_name: label.into(),
+            fallback_position: None,
         }
     }
 
@@ -394,7 +406,7 @@ mod tests {
             matches!(events.next().await, Some(Ok(ProviderEvent::ModelSelected { provider, .. })) if provider == "primary")
         );
         assert!(
-            matches!(events.next().await, Some(Ok(ProviderEvent::ModelSelected { provider, model })) if provider == "backup" && model == "backup-model")
+            matches!(events.next().await, Some(Ok(ProviderEvent::ModelSelected { provider, model, .. })) if provider == "backup" && model == "backup-model")
         );
         assert_eq!(first_calls.load(Ordering::SeqCst), 1);
         assert_eq!(second_calls.load(Ordering::SeqCst), 1);
@@ -605,6 +617,8 @@ mod tests {
                     }),
                     model: "primary".into(),
                     label: "primary".into(),
+                    provider_name: "Primary Provider".into(),
+                    fallback_position: None,
                 },
                 stream_target(
                     second_calls.clone(),

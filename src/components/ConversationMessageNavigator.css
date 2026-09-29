@@ -1,0 +1,147 @@
+.conversation-message-navigator {
+  position: absolute;
+  z-index: 4;
+  inset: 0;
+  overflow: visible;
+  pointer-events: none;
+}
+
+.conversation-message-navigator__rail {
+  position: absolute;
+  left: 8px;
+  width: 1px;
+  border-radius: 1px;
+  background: var(--color-border);
+  opacity: 0.55;
+}
+
+.conversation-message-anchor {
+  position: absolute;
+  left: 1px;
+  width: 20px;
+  height: 0;
+  pointer-events: auto;
+}
+
+.conversation-message-anchor__marker {
+  display: block;
+  position: absolute;
+  top: -2px;
+  left: 0;
+  width: 12px;
+  min-width: 0;
+  min-height: 0;
+  height: 4px;
+  padding: 0;
+  border: 0;
+  border-radius: 999px;
+  background: var(--color-ink-faint);
+  cursor: pointer;
+  opacity: 0.68;
+  transition: height var(--transition-fast), opacity var(--transition-fast), background-color var(--transition-fast);
+}
+
+.conversation-message-anchor__marker:hover,
+.conversation-message-anchor__marker:focus-visible,
+.conversation-message-anchor__marker.is-active {
+  height: 6px;
+  background: var(--color-brand);
+  opacity: 1;
+}
+
+.conversation-message-anchor__marker.is-bookmarked {
+  background: var(--color-item-active-text);
+  opacity: 1;
+}
+
+.conversation-message-anchor__marker:focus-visible {
+  outline: 2px solid var(--color-brand-ring);
+  outline-offset: 2px;
+}
+
+.conversation-message-anchor__preview {
+  position: absolute;
+  left: 24px;
+  width: min(320px, calc(100vw - 56px));
+  max-height: 72px;
+  padding: 10px 11px;
+  overflow: hidden;
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+  color: var(--color-ink);
+  background: var(--color-surface-raised);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.14);
+  pointer-events: auto;
+}
+
+.conversation-message-anchor__heading {
+  display: flex;
+  min-width: 0;
+  align-items: flex-start;
+  gap: 8px;
+}
+
+.conversation-message-anchor__heading strong {
+  display: -webkit-box;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--color-ink);
+  font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-semibold);
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+.conversation-message-anchor__bookmark {
+  display: grid;
+  width: 22px;
+  height: 22px;
+  flex: 0 0 auto;
+  margin: -3px -4px 0 auto;
+  padding: 0;
+  place-items: center;
+  border: 0;
+  border-radius: 5px;
+  color: var(--color-ink-muted);
+  background: transparent;
+  cursor: pointer;
+}
+
+.conversation-message-anchor__bookmark:hover,
+.conversation-message-anchor__bookmark:focus-visible {
+  color: var(--color-ink);
+  background: var(--color-surface-hover);
+}
+
+.conversation-message-anchor__bookmark:focus-visible {
+  outline: 2px solid var(--color-brand-ring);
+  outline-offset: 1px;
+}
+
+.conversation-message-anchor__bookmark.is-saved {
+  color: var(--color-brand);
+}
+
+.conversation-message-anchor__bookmark.is-saved svg {
+  fill: currentColor;
+}
+
+@media (max-width: 520px) {
+  .conversation-message-navigator__rail {
+    left: 7px;
+  }
+
+  .conversation-message-anchor__preview {
+    width: min(290px, calc(100vw - 44px));
+    padding: 9px 10px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .conversation-message-anchor__marker,
+  .conversation-message-anchor__bookmark {
+    transition: none;
+  }
+}

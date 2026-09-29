@@ -52,6 +52,17 @@ fn builtin_skills_root(resource_dir: &Path) -> PathBuf {
     select_builtin_skills_root(resource_dir, development_root.as_deref())
 }
 
+fn builtin_plugins_root(resource_dir: &Path) -> PathBuf {
+    #[cfg(debug_assertions)]
+    let development_root = Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../plugins"));
+    #[cfg(not(debug_assertions))]
+    let development_root: Option<PathBuf> = None;
+
+    development_root
+        .filter(|root| root.is_dir())
+        .unwrap_or_else(|| resource_dir.join("plugins"))
+}
+
 #[cfg(windows)]
 fn bundled_tools_root(_resource_dir: &Path) -> Option<PathBuf> {
     #[cfg(debug_assertions)]
@@ -101,10 +112,12 @@ pub fn run() {
             let resource_dir = app.path().resource_dir()?;
             let builtin_skills_root = builtin_skills_root(&resource_dir);
             let bundled_tools_root = bundled_tools_root(&resource_dir);
-            let state = AppState::new_with_builtin_resources(
+            let builtin_plugins_root = builtin_plugins_root(&resource_dir);
+            let state = AppState::new_with_builtin_resources_and_plugins(
                 data_root,
                 builtin_skills_root,
                 bundled_tools_root,
+                builtin_plugins_root,
             )
             .map_err(|error| std::io::Error::other(error.to_string()))?;
             app.manage(state);

@@ -5605,6 +5605,7 @@ mod tests {
                 limit: Some(50),
                 level: None,
                 event: None,
+                search: None,
                 after_timestamp_ms: None,
             })
             .unwrap();

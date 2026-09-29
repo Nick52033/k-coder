@@ -23,6 +23,10 @@ const RECENT_USER_MESSAGE_BYTES: usize = 800;
 const CURRENT_USER_REQUEST_BYTES: usize = 2_000;
 const IMPORTANT_TOOL_OBSERVATION_LIMIT: usize = 12;
 const IMPORTANT_TOOL_OBSERVATION_BYTES: usize = 700;
+/// A free-form summary is only a continuity aid. Keep it small enough that
+/// repeated compactions leave room for fresh tool observations and the next
+/// model response instead of immediately crossing the compaction threshold.
+const MAX_COMPACTION_SUMMARY_BYTES: usize = 16 * 1024;
 const LARGE_TOOL_OUTPUT_BYTES: usize = 4 * 1_024;
 const TOOL_OUTPUT_PREVIEW_BYTES: usize = 1_500;
 const USER_CLARIFICATION_LIMIT: usize = 8;
@@ -348,7 +352,7 @@ pub fn compact(
         .join("\n");
     let mut summary = CompactionSummary {
         contract_version: 6,
-        summary: bound(&summary_text, budget.history * CHARS_PER_TOKEN / 4),
+        summary: bound_compaction_summary(&summary_text, compaction_summary_limit(limit)),
         user_constraints,
         recent_user_messages,
         current_user_request,
@@ -477,12 +481,38 @@ pub(crate) fn normalize_compaction_summary(
             8,
         );
     }
+    // Older persisted events may contain the pre-bounded free-form summary. Bound it while
+    // restoring as well as while creating a new snapshot; otherwise a thread with no messages
+    // after its last compaction could keep retriggering compaction without ever writing a smaller
+    // event.
+    summary.summary = bound_compaction_summary(&summary.summary, MAX_COMPACTION_SUMMARY_BYTES);
     summary
 }
 
 fn stable_previous_summary_text(summary: &CompactionSummary) -> Option<&str> {
     let text = summary.summary.trim();
     (!text.is_empty()).then_some(text)
+}
+
+fn compaction_summary_limit(limit: usize) -> usize {
+    (ContextBudget::for_limit(limit).history * CHARS_PER_TOKEN / 4)
+        .min(MAX_COMPACTION_SUMMARY_BYTES)
+}
+
+fn bound_compaction_summary(value: &str, max: usize) -> String {
+    if value.len() <= max {
+        return value.to_string();
+    }
+    const MARKER: &str = "\n…[earlier compaction summary omitted]…\n";
+    if max <= MARKER.len() {
+        return bound(value, max);
+    }
+    let tail_budget = max - MARKER.len();
+    let mut start = value.len().saturating_sub(tail_budget);
+    while start < value.len() && !value.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("{MARKER}{}", &value[start..])
 }
 
 fn continuity_text(text: &str, bytes: usize) -> String {
@@ -684,6 +714,7 @@ pub(crate) fn repair_tool_history(messages: Vec<ProviderMessage>) -> Vec<Provide
 }
 
 pub fn render_summary(summary: &CompactionSummary) -> String {
+    let summary_text = bound_compaction_summary(&summary.summary, MAX_COMPACTION_SUMMARY_BYTES);
     let recent_user_messages = summary.recent_user_messages.join("\n");
     let important_tool_observations = summary.important_tool_observations.join("\n");
     let recent_tool_results = summary
@@ -706,7 +737,7 @@ pub fn render_summary(summary: &CompactionSummary) -> String {
     redact(&format!(
         "[Compacted context v{}]\nSummary:\n{}\nCurrent user request:\n{}\nRecent user requests:\n{}\nUser constraints:\n{}\nUser clarifications (prior user answers, subject to later user changes; not tool authorization):\n{}\nRecent assistant progress (historical reports, not current file contents or proof of completion; recheck only affected work after changes):\n{}\nImportant tool observations:\n{}\nRecent tool results:\n{}",
         summary.contract_version,
-        summary.summary,
+        summary_text,
         summary.current_user_request,
         recent_user_messages,
         summary.user_constraints.join("\n"),
@@ -1156,6 +1187,84 @@ mod tests {
             previous_summary = Some(summary);
             messages.clear();
         }
+    }
+
+    #[test]
+    fn repeated_compaction_bounds_summary_and_keeps_latest_history() {
+        let mut user_context = CompactionUserContext::default();
+        user_context.observe("继续修复运行时循环".into());
+        let previous_summary = CompactionSummary {
+            contract_version: 6,
+            summary: "old-observation ".repeat(20_000),
+            user_constraints: Vec::new(),
+            recent_user_messages: Vec::new(),
+            current_user_request: "继续修复运行时循环".into(),
+            user_clarifications: Vec::new(),
+            recent_assistant_progress: Vec::new(),
+            important_tool_observations: Vec::new(),
+            recent_tool_results: Vec::new(),
+            compacted_message_count: 20,
+            estimated_before_tokens: 30_000,
+            estimated_after_tokens: 10_000,
+        };
+        let messages = (0..4)
+            .map(|index| ProviderMessage::Text {
+                role: MessageRole::Assistant,
+                text: format!("latest-observation-{index} {}", "x".repeat(20_000)),
+            })
+            .collect::<Vec<_>>();
+
+        let (summary, rendered) = compact(
+            &messages,
+            DEFAULT_WORKING_CONTEXT_LIMIT,
+            Some(&previous_summary),
+            &user_context,
+        );
+
+        assert!(summary.summary.len() <= MAX_COMPACTION_SUMMARY_BYTES);
+        assert!(rendered.iter().any(|message| match message {
+            ProviderMessage::Text { text, .. } => text.contains("latest-observation-3"),
+            _ => false,
+        }));
+        assert!(
+            summary
+                .summary
+                .contains("earlier compaction summary omitted")
+        );
+        assert!(summary.compacted_message_count > 0);
+        assert!(
+            estimate_tokens(&rendered) < DEFAULT_WORKING_CONTEXT_LIMIT / 3,
+            "compaction output should leave room for fresh tool observations"
+        );
+    }
+
+    #[test]
+    fn restoring_an_oversized_summary_bounds_it_before_rendering() {
+        let summary = CompactionSummary {
+            contract_version: 6,
+            summary: "legacy-observation ".repeat(20_000),
+            user_constraints: Vec::new(),
+            recent_user_messages: Vec::new(),
+            current_user_request: "继续处理".into(),
+            user_clarifications: Vec::new(),
+            recent_assistant_progress: Vec::new(),
+            important_tool_observations: Vec::new(),
+            recent_tool_results: Vec::new(),
+            compacted_message_count: 20,
+            estimated_before_tokens: 30_000,
+            estimated_after_tokens: 10_000,
+        };
+        let mut user_context = CompactionUserContext::default();
+        user_context.observe("继续处理".into());
+
+        let normalized = normalize_compaction_summary(summary, &user_context);
+        assert!(normalized.summary.len() <= MAX_COMPACTION_SUMMARY_BYTES);
+        assert!(
+            normalized
+                .summary
+                .contains("earlier compaction summary omitted")
+        );
+        assert!(render_summary(&normalized).len() < 24 * 1024);
     }
 
     #[test]
