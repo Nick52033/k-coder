@@ -96,6 +96,7 @@ impl QueryRewriter for ModelQueryRewriter {
                 },
             ],
             tools: vec![],
+            empty_response_attempts: 0,
         };
         let mut stream = tokio::time::timeout(
             self.timeout,

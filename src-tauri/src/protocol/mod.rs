@@ -417,6 +417,62 @@ pub struct PluginOverview {
     pub error: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MarketplaceSourceKind {
+    Http,
+    Git,
+    LocalDirectory,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginSourceKind {
+    Github,
+    Git,
+    Url,
+    Directory,
+}
+
+/// 已添加的插件市场来源。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginMarketplaceView {
+    pub id: String,
+    pub label: String,
+    pub source_kind: MarketplaceSourceKind,
+    pub source_display: String,
+    pub entry_count: usize,
+    /// 单个市场清单加载失败时仅影响该市场，不阻止其他市场展示。
+    pub error: Option<String>,
+}
+
+/// 市场清单中的可安装插件条目。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginMarketplaceEntryView {
+    pub marketplace_id: String,
+    pub name: String,
+    pub description: String,
+    pub version: String,
+    pub source_kind: PluginSourceKind,
+    pub source_display: String,
+    #[serde(default)]
+    pub dependencies: Vec<String>,
+    /// 当前已安装到哪些作用域；由后端发现事实推导，界面据此显示已安装。
+    #[serde(default)]
+    pub installed_scopes: Vec<PluginScope>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginMarketplaceOverview {
+    pub schema_version: u32,
+    pub marketplaces: Vec<PluginMarketplaceView>,
+    pub entries: Vec<PluginMarketplaceEntryView>,
+    pub error: Option<String>,
+}
+
 #[derive(Debug, Default, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ApprovalMode {

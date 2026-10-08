@@ -120,6 +120,7 @@ mod tests {
             reasoning_effort: Default::default(),
             messages: vec![],
             tools: vec![],
+            empty_response_attempts: 0,
         }
     }
 

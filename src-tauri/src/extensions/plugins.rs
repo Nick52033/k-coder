@@ -1810,7 +1810,7 @@ fn path_entry_exists(path: &Path) -> bool {
     fs::symlink_metadata(path).is_ok()
 }
 
-fn valid_plugin_name(value: &str) -> bool {
+pub(super) fn valid_plugin_name(value: &str) -> bool {
     let mut bytes = value.bytes();
     let Some(first) = bytes.next() else {
         return false;

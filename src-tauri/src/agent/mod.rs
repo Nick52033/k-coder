@@ -73,6 +73,14 @@ const MAX_REPEATED_APPLY_PATCH_FAILURES: usize = 3;
 /// can otherwise keep that snapshot changing forever.
 const MAX_APPLY_PATCH_RECOVERY_ROUNDS: usize = 6;
 const MAX_PROTOCOL_RETRIES: usize = 5;
+/// Provider 流正常完成但没有任何可见输出（无正文、无图片、无工具调用，只有
+/// reasoning 或无内容）时的有界自动重试次数。参考 Codex：这类空响应不是致命
+/// 错误——先重试，仍为空则以宿主说明正常收尾，不把 Turn 判为失败。
+/// 与 `crate::providers::EMPTY_COMPLETION_FAILOVER_AFTER` 同源：同一路由上重试到
+/// 这个次数仍为空时，`FallbackProvider` 会自动接管到备用供应商，而不是把第
+/// 三次空完成当作成功返回。
+const MAX_EMPTY_RESPONSE_RETRIES: usize =
+    crate::providers::EMPTY_COMPLETION_FAILOVER_AFTER as usize;
 const DEFAULT_TRANSIENT_RETRY_DELAYS: [Duration; 5] = [
     Duration::from_secs(1),
     Duration::from_secs(2),
@@ -84,15 +92,19 @@ const DEFAULT_TRANSIENT_RETRY_DELAYS: [Duration; 5] = [
 /// 超过即判定流已死亡，未产生输出时自动重试并向界面发布重连事件；
 /// 已有输出则失败而不是无限挂起。参考 codex 的 5 分钟默认。
 const DEFAULT_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
-pub const DEFAULT_SOFT_TURN_PROVIDER_CALLS: u32 = 100;
-pub const DEFAULT_SOFT_TURN_TOTAL_TOKENS: u64 = 5_000_000;
+/// 普通、无活动 Goal 的根 Turn 每段人工续跑确认门槛。这是暂停阈值而不是能力上限：
+/// 到达任一边界后进入 `turn_continuation` 等待用户确认，获批即重置本段计数。
+/// 沿革：`P10-114` 由 30 次提高到 100 次，`P10-266` 再由 100 次提高到 300 次
+/// （机器人工作流等长 Turn 每 100 次弹一次确认，打断对话体验）。
+pub const DEFAULT_SOFT_TURN_PROVIDER_CALLS: u32 = 300;
+pub const DEFAULT_SOFT_TURN_TOTAL_TOKENS: u64 = 15_000_000;
 // Tool execution and provider latency alone must not interrupt an authorized turn.
 pub const DEFAULT_SOFT_TURN_DURATION_MS: Option<u64> = None;
 /// A hard cumulative cap prevents repeated continuation approvals from turning one
 /// Turn into an unbounded model/tool loop. ZCode 的普通 Turn 不设调用次数硬上限，
 /// loop 边界完全由上下文自动压缩与无进展检测承担；k-Coder 保留该背扑但放宽到 10 个
 /// 软额度段，让真实边界仍是「每段人工续跑确认 + 无进展检测 + 自动压缩」。
-pub const DEFAULT_HARD_TURN_PROVIDER_CALLS: u32 = 1_000;
+pub const DEFAULT_HARD_TURN_PROVIDER_CALLS: u32 = 3_000;
 
 const TURN_CONTINUATION_TOOL_CALL_ID: &str = "runtime-turn-continuation";
 const TURN_CONTINUE: &str = "continue";
@@ -947,6 +959,7 @@ impl AgentRuntime {
 
         let mut total_usage = TokenUsage::default();
         let mut has_usage = false;
+        let mut last_provider: Option<String> = None;
         let mut provider_call_index = 0u32;
         let mut provider_context_bytes = 0usize;
         let mut last_call_signature = None::<String>;
@@ -966,6 +979,10 @@ impl AgentRuntime {
         // reconciliation request. This lets the terminal TurnCompleted event replace
         // the temporary draft in the live timeline instead of leaving two answers.
         let mut plan_reconciliation_item_id = None::<String>;
+        // Route the provider actually answered on, and whether a mid-turn takeover
+        // invalidated the opaque provider context replayed from earlier attempts.
+        let mut active_route: Option<(String, String)> = None;
+        let mut route_context_stale = false;
 
         // 进展检测变量
         let mut no_progress_count = 0usize;
@@ -1135,6 +1152,12 @@ impl AgentRuntime {
             let provider_history =
                 provider_history_for_turn(events, self.supports_vision, Some(&turn_id));
             let mut history = provider_history.request_messages();
+            if route_context_stale {
+                // A route takeover makes the old route's opaque context (encrypted
+                // reasoning and friends) unusable: never replay it to the route that
+                // took over, in this attempt or in the ones this Turn still runs.
+                history.retain(|message| !matches!(message, ProviderMessage::ProviderContext { .. }));
+            }
             if force_compaction
                 || context::needs_compaction_for_request(
                     &history,
@@ -1223,12 +1246,15 @@ impl AgentRuntime {
                     },
                 );
             }
-            let request = ProviderRequest {
+            let mut request = ProviderRequest {
                 schema_version: PROTOCOL_VERSION,
                 model: model.clone(),
                 reasoning_effort: self.reasoning_effort,
                 messages: history,
                 tools: tool_definitions.clone(),
+                // 每次尝试前按本路由已经容忍的空完成次数刷新；达到阈值时
+                // FallbackProvider 接管到备用供应商。
+                empty_response_attempts: 0,
             };
             publisher.publish(AgentEventEnvelope::new(AgentEvent::ActivityStatusChanged {
                 thread_id: thread_id.clone(),
@@ -1237,6 +1263,7 @@ impl AgentRuntime {
             }));
             let mut transient_retry_count = 0usize;
             let mut protocol_retry_count = 0usize;
+            let mut empty_response_retries = 0usize;
 
             // 声明需要在重试循环外部的变量
             let mut response = String::new();
@@ -1273,6 +1300,9 @@ impl AgentRuntime {
                 let call_index = provider_call_index;
                 provider_call_index = provider_call_index.saturating_add(1);
                 let provider_started = std::time::Instant::now();
+                // 同一路由上已容忍的空完成次数：到阈值就让 FallbackProvider
+                // 接管，而不是把又一次空完成当成功返回给上层。
+                request.empty_response_attempts = empty_response_retries as u32;
                 let stream_result = tokio::select! {
                     _ = provider_cancellation.cancelled() => Err(ProviderError::Cancelled),
                     stream = provider.stream(request.clone(), provider_cancellation.clone()) => stream,
@@ -1611,7 +1641,45 @@ impl AgentRuntime {
                             provider_contexts_inner.push((provider, item));
                         }
                         Some(Ok(ProviderEvent::ModelSelected { provider, provider_name, model, fallback_position })) => {
-                            iteration_provider_inner = Some(provider);
+                            let route = (provider.clone(), model.clone());
+                            // 同一条流里换路由 = 上一个路由连续空完成后 FallbackProvider
+                            // 接管。旧路由的不透明上下文（encrypted reasoning 等）对
+                            // 新路由无效：不提交、不重放，并给新路由一份完整的空响应预算。
+                            let took_over_route =
+                                active_route.as_ref() != Some(&route) && active_route.is_some();
+                            active_route = Some(route);
+                            if took_over_route {
+                                route_context_stale = true;
+                                provider_contexts_inner.clear();
+                                provider_context_bytes_inner = 0;
+                                completed_reasoning_summaries_inner.clear();
+                                empty_response_retries = 0;
+                                request.messages.retain(|message| {
+                                    !matches!(message, ProviderMessage::ProviderContext { .. })
+                                });
+                                self.reset_failed_attempt_drafts(
+                                    &thread_id,
+                                    &turn_id,
+                                    &assistant_item_id,
+                                    &reasoning_summary_bytes,
+                                    &publisher,
+                                )
+                                .await?;
+                                if let Some(logger) = &self.logger {
+                                    let _ = logger.log(
+                                        "info",
+                                        "provider_empty_response_takeover",
+                                        serde_json::json!({
+                                            "threadId": thread_id,
+                                            "turnId": turn_id,
+                                            "fromProvider": last_provider.clone().unwrap_or_default(),
+                                            "toProvider": provider,
+                                        }),
+                                    );
+                                }
+                            }
+                            iteration_provider_inner = Some(provider.clone());
+                            last_provider = Some(provider);
                             iteration_model_inner = Some(model.clone());
                             publisher.publish(AgentEventEnvelope::new(
                                 AgentEvent::ProviderRouteSelected {
@@ -1883,6 +1951,43 @@ impl AgentRuntime {
                     )
                     .await?;
                 }
+                // Provider 正常完成但没有任何可见输出（只有 reasoning 或无内容）：
+                // 先有界自动重试，失败尝试的 reasoning 草稿不进入历史，也不在
+                // 界面上与恢复后的响应拼接。重试仍为空时在循环外按宿主说明收尾。
+                if matches!(completed_inner, Some(true))
+                    && pending_tool_calls_inner.is_empty()
+                    && response_inner.trim().is_empty()
+                    && response_images_inner.is_empty()
+                    && empty_response_retries < MAX_EMPTY_RESPONSE_RETRIES
+                {
+                    empty_response_retries += 1;
+                    if attempt_had_output {
+                        self.reset_failed_attempt_drafts(
+                            &thread_id,
+                            &turn_id,
+                            &assistant_item_id,
+                            &reasoning_summary_bytes,
+                            &publisher,
+                        )
+                        .await?;
+                    }
+                    self.record_provider_retry();
+                    if let Some(logger) = &self.logger {
+                        let _ = logger.log(
+                            "info",
+                            "provider_empty_response_retry",
+                            serde_json::json!({
+                                "threadId": thread_id,
+                                "turnId": turn_id,
+                                "attempt": empty_response_retries,
+                                "maxAttempts": MAX_EMPTY_RESPONSE_RETRIES,
+                                "provider": iteration_provider_inner.clone().unwrap_or_default(),
+                                "model": iteration_model_inner.clone().unwrap_or_default(),
+                            }),
+                        );
+                    }
+                    continue 'retry_loop;
+                }
                 if matches!(completed_inner, Some(true)) {
                     // Only commit provider-owned items after the stream reached its terminal
                     // completion marker. A retry after a partial stream must not leave the
@@ -1983,12 +2088,31 @@ impl AgentRuntime {
             }
             // AI 完成输出后的处理
             if pending_tool_calls.is_empty() {
-                if response.is_empty() && response_images.is_empty() {
+                if response.trim().is_empty() && response_images.is_empty() {
+                    // Provider 完成但没有任何可见输出，且自动重试已耗尽：参考 Codex
+                    // 对空响应的处理，不把本轮判为失败，而是以宿主说明正常收尾。
+                    // 本轮已执行的工具结果照常留在历史，用户可以直接继续或重试。
+                    if let Some(logger) = &self.logger {
+                        let _ = logger.log(
+                            "error",
+                            "turn_empty_response",
+                            serde_json::json!({
+                                "threadId": thread_id,
+                                "turnId": turn_id,
+                                "emptyResponseRetries": empty_response_retries,
+                                "provider": last_provider.clone().unwrap_or_default(),
+                                "model": request.model.clone(),
+                            }),
+                        );
+                    }
                     return self
-                        .finish_failed(
+                        .finish_completed(
                             &thread_id,
                             &turn_id,
-                            "provider completed without text or a tool call".to_string(),
+                            &assistant_item_id,
+                            empty_response_message(empty_response_retries),
+                            Vec::new(),
+                            has_usage.then_some(total_usage),
                             &publisher,
                         )
                         .await;
@@ -3522,6 +3646,43 @@ impl AgentRuntime {
         Ok(())
     }
 
+    /// Reset the live timeline after a provider attempt produced no usable
+    /// answer: the assistant draft is cleared and any uncommitted reasoning item
+    /// is marked failed, so the recovered response never splices onto it.
+    async fn reset_failed_attempt_drafts(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+        assistant_item_id: &str,
+        reasoning_summary_bytes: &HashMap<String, usize>,
+        publisher: &Arc<dyn EventPublisher>,
+    ) -> Result<(), AgentRuntimeError> {
+        publisher.publish(AgentEventEnvelope::new(AgentEvent::TextReset {
+            thread_id: thread_id.to_string(),
+            turn_id: turn_id.to_string(),
+            item_id: assistant_item_id.to_string(),
+        }));
+        let mut reasoning_item_ids = reasoning_summary_bytes.keys().cloned().collect::<Vec<_>>();
+        reasoning_item_ids.sort();
+        for item_id in reasoning_item_ids {
+            publisher.publish(AgentEventEnvelope::new(AgentEvent::TextReset {
+                thread_id: thread_id.to_string(),
+                turn_id: turn_id.to_string(),
+                item_id: item_id.clone(),
+            }));
+            self.complete_item(
+                thread_id,
+                turn_id,
+                &item_id,
+                AgentItemType::Reasoning,
+                AgentItemStatus::Failed,
+                publisher,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
     async fn complete_active_items(
         &self,
         thread_id: &str,
@@ -4021,6 +4182,18 @@ fn vision_unsupported_message(model: &str) -> String {
     }
 }
 
+/// Provider 正常完成但没有任何可见输出时的收尾文案。参考 Codex 对空响应的
+/// 处理：这不是致命错误，用宿主说明替代失败卡片，告诉用户可以继续或重试。
+fn empty_response_message(retries: usize) -> String {
+    let mut message =
+        String::from("本轮模型没有返回任何内容：既没有回复正文，也没有调用工具，已正常结束本轮。");
+    if retries > 0 {
+        message.push_str(&format!("（已自动重试 {retries} 次，仍为空响应。）"));
+    }
+    message.push_str("请重试或继续提问；若该模型频繁出现，建议在设置中切换模型。");
+    message
+}
+
 fn outcome(
     thread_id: &str,
     turn_id: &str,
@@ -4055,6 +4228,7 @@ mod tests {
     use super::*;
     use crate::protocol::{ToolDefinition, ToolRisk, UserInputAnswer};
     use crate::providers::testing::FakeProvider;
+    use crate::providers::{FallbackProvider, FallbackTarget};
     use crate::storage::{JsonlThreadRepository, TurnTimelineItem};
     use crate::tools::ToolHandler;
 
@@ -4995,6 +5169,423 @@ mod tests {
                 .filter(|event| matches!(event.kind, StoredEventKind::UserMessage { .. }))
                 .count(),
             2
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_response_retries_then_completes_with_a_host_notice() {
+        let (_directory, repository, runtime, thread_id) = runtime_fixture().await;
+        // 脚本只有一项，请求索引越界后复用最后一项：每次请求都只完成、不产出内容。
+        let provider = Arc::new(FakeProvider::script(vec![vec![Ok(
+            ProviderEvent::Completed,
+        )]]));
+        let publisher = Arc::new(RecordingPublisher::default());
+
+        let outcome = runtime
+            .run_turn(
+                provider.clone(),
+                "fake-model".into(),
+                RunTurnRequest {
+                    thread_id: thread_id.clone(),
+                    input: "介绍一下你自己".into(),
+                    agent_mode: None,
+                },
+                CancellationToken::new(),
+                publisher.clone(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.state, TurnState::Completed);
+        assert_eq!(outcome.error, None);
+        // 首次请求加两次空响应自动重试。
+        assert_eq!(provider.requests().len(), 3);
+        let published = publisher.events.lock().unwrap();
+        assert_eq!(
+            published
+                .iter()
+                .filter(|event| matches!(&event.event, AgentEvent::TurnCompleted { .. }))
+                .count(),
+            1
+        );
+        assert!(
+            !published
+                .iter()
+                .any(|event| matches!(&event.event, AgentEvent::TurnFailed { .. }))
+        );
+        drop(published);
+        let assistant_texts = repository
+            .load(&thread_id)
+            .await
+            .unwrap()
+            .iter()
+            .filter_map(|event| match &event.kind {
+                StoredEventKind::AssistantMessage { message } => Some(message.visible_text()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(assistant_texts.len(), 1);
+        assert!(assistant_texts[0].contains("没有返回任何内容"));
+        assert!(assistant_texts[0].contains("已自动重试 2 次"));
+    }
+
+    #[tokio::test]
+    async fn empty_response_recovers_on_retry_without_leaking_the_notice() {
+        let (_directory, repository, runtime, thread_id) = runtime_fixture().await;
+        let provider = Arc::new(FakeProvider::script(vec![
+            vec![Ok(ProviderEvent::Completed)],
+            vec![
+                Ok(ProviderEvent::TextDelta {
+                    delta: "重试后的正常回答。".into(),
+                }),
+                Ok(ProviderEvent::Completed),
+            ],
+        ]));
+        let publisher = Arc::new(RecordingPublisher::default());
+
+        let outcome = runtime
+            .run_turn(
+                provider.clone(),
+                "fake-model".into(),
+                RunTurnRequest {
+                    thread_id: thread_id.clone(),
+                    input: "介绍一下你自己".into(),
+                    agent_mode: None,
+                },
+                CancellationToken::new(),
+                publisher.clone(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.state, TurnState::Completed);
+        assert_eq!(provider.requests().len(), 2);
+        let published = publisher.events.lock().unwrap();
+        assert_eq!(
+            published
+                .iter()
+                .filter(|event| matches!(&event.event, AgentEvent::TurnCompleted { .. }))
+                .count(),
+            1
+        );
+        assert!(
+            !published
+                .iter()
+                .any(|event| matches!(&event.event, AgentEvent::TurnFailed { .. }))
+        );
+        drop(published);
+        let assistant_texts = repository
+            .load(&thread_id)
+            .await
+            .unwrap()
+            .iter()
+            .filter_map(|event| match &event.kind {
+                StoredEventKind::AssistantMessage { message } => Some(message.visible_text()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(assistant_texts, vec!["重试后的正常回答。"]);
+    }
+
+    #[tokio::test]
+    async fn empty_response_retry_discards_the_failed_attempt_reasoning() {
+        let (_directory, repository, runtime, thread_id) = runtime_fixture().await;
+        // 第一次请求只产出 reasoning 摘要后完成，第二次请求给出正文：
+        // 失败尝试的推理草稿必须被重置，不拼接到恢复后的响应上。
+        let provider = Arc::new(FakeProvider::script(vec![
+            vec![
+                Ok(ProviderEvent::ReasoningSummaryDelta {
+                    item_id: "reasoning-draft".into(),
+                    delta: "先思考一下。".into(),
+                }),
+                Ok(ProviderEvent::ReasoningSummaryCompleted {
+                    item_id: "reasoning-draft".into(),
+                    summary: "先思考一下。".into(),
+                }),
+                Ok(ProviderEvent::Completed),
+            ],
+            vec![
+                Ok(ProviderEvent::TextDelta {
+                    delta: "重试后的回答。".into(),
+                }),
+                Ok(ProviderEvent::Completed),
+            ],
+        ]));
+        let publisher = Arc::new(RecordingPublisher::default());
+
+        let outcome = runtime
+            .run_turn(
+                provider,
+                "fake-model".into(),
+                RunTurnRequest {
+                    thread_id: thread_id.clone(),
+                    input: "介绍一下你自己".into(),
+                    agent_mode: None,
+                },
+                CancellationToken::new(),
+                publisher.clone(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.state, TurnState::Completed);
+        let published = publisher.events.lock().unwrap();
+        assert!(
+            published.iter().any(|event| matches!(
+                &event.event,
+                AgentEvent::TextReset { item_id, .. } if item_id == "reasoning-draft"
+            )),
+            "失败尝试的 reasoning 项必须被重置"
+        );
+        assert!(
+            published.iter().any(|event| matches!(
+                &event.event,
+                AgentEvent::ItemCompleted {
+                    item_id,
+                    item_type: AgentItemType::Reasoning,
+                    status: AgentItemStatus::Failed,
+                    ..
+                } if item_id == "reasoning-draft"
+            )),
+            "失败尝试的 reasoning 项必须以 failed 收尾"
+        );
+        assert!(
+            !published.iter().any(|event| matches!(
+                &event.event,
+                AgentEvent::ReasoningSummaryCompleted { item_id, .. } if item_id == "reasoning-draft"
+            )),
+            "失败尝试的 reasoning 摘要不得作为完成项发布"
+        );
+        drop(published);
+        let stored = repository.load(&thread_id).await.unwrap();
+        let assistant_texts = stored
+            .iter()
+            .filter_map(|event| match &event.kind {
+                StoredEventKind::AssistantMessage { message } => Some(message.visible_text()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(assistant_texts, vec!["重试后的回答。"]);
+        assert!(
+            !stored
+                .iter()
+                .any(|event| matches!(&event.kind, StoredEventKind::ReasoningSummary { .. })),
+            "失败尝试的 reasoning 摘要不得进入历史"
+        );
+    }
+
+    /// 阶跃星辰式的空完成：只回一条 reasoning 上下文，然后 response.completed，
+    /// 没有任何正文、图片或工具调用。
+    fn stepfun_style_empty_completion() -> Vec<Result<ProviderEvent, ProviderError>> {
+        vec![
+            Ok(ProviderEvent::ProviderContext {
+                provider: "openai_responses".into(),
+                item: serde_json::json!({
+                    "type": "reasoning",
+                    "id": "b3ce601bb4fc7d19",
+                    "content": [{ "type": "reasoning_text", "text": "let me check the file" }],
+                }),
+            }),
+            Ok(ProviderEvent::Completed),
+        ]
+    }
+
+    #[tokio::test]
+    async fn empty_response_exhausts_the_route_budget_then_the_fallback_takes_over() {
+        let (_directory, repository, runtime, thread_id) = runtime_fixture().await;
+        // 主路由每次请求都空完成；备用路由给出正常正文。
+        let primary = Arc::new(FakeProvider::script(vec![
+            stepfun_style_empty_completion(),
+            stepfun_style_empty_completion(),
+            stepfun_style_empty_completion(),
+        ]));
+        let backup = Arc::new(FakeProvider::script(vec![vec![
+            Ok(ProviderEvent::TextDelta {
+                delta: "备用供应商的回答。".into(),
+            }),
+            Ok(ProviderEvent::Completed),
+        ]]));
+        let metrics_directory = tempfile::tempdir().unwrap();
+        let provider = Arc::new(
+            FallbackProvider::new(
+                vec![
+                    FallbackTarget {
+                        provider: primary.clone(),
+                        model: "primary-model".into(),
+                        label: "primary".into(),
+                        provider_name: "Primary".into(),
+                        fallback_position: None,
+                    },
+                    FallbackTarget {
+                        provider: backup.clone(),
+                        model: "backup-model".into(),
+                        label: "backup".into(),
+                        provider_name: "Backup".into(),
+                        fallback_position: Some(1),
+                    },
+                ],
+                crate::advanced::RuntimeMetrics::new(metrics_directory.path()).unwrap(),
+            )
+            .unwrap(),
+        );
+        let publisher = Arc::new(RecordingPublisher::default());
+
+        let outcome = runtime
+            .run_turn(
+                provider,
+                "primary-model".into(),
+                RunTurnRequest {
+                    thread_id: thread_id.clone(),
+                    input: "介绍一下你自己".into(),
+                    agent_mode: None,
+                },
+                CancellationToken::new(),
+                publisher.clone(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.state, TurnState::Completed);
+        assert_eq!(outcome.error, None);
+        // 主路由先用完自己的空响应重试预算（首次 + 2 次重试），备用路由才接管。
+        assert_eq!(primary.requests().len(), 3);
+        assert_eq!(backup.requests().len(), 1);
+        // 第三次下发到主路由的请求必须带着已容忍的空完成次数，否则不会接管。
+        assert_eq!(
+            primary.requests()[2].empty_response_attempts,
+            crate::providers::EMPTY_COMPLETION_FAILOVER_AFTER
+        );
+        // 主路由的不透明 context 对备用路由无效：不得进入历史，也不得回放过去。
+        let stored = repository.load(&thread_id).await.unwrap();
+        assert!(
+            !stored
+                .iter()
+                .any(|event| matches!(&event.kind, StoredEventKind::ProviderContext { .. })),
+            "失败路由的不透明 context 不得进入历史"
+        );
+        assert!(
+            !backup.requests()[0]
+                .messages
+                .iter()
+                .any(|message| matches!(message, ProviderMessage::ProviderContext { .. })),
+            "失败路由的不透明 context 不得回放给接管路由"
+        );
+        let assistant_texts = stored
+            .iter()
+            .filter_map(|event| match &event.kind {
+                StoredEventKind::AssistantMessage { message } => Some(message.visible_text()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(assistant_texts, vec!["备用供应商的回答。"]);
+        let published = publisher.events.lock().unwrap();
+        assert!(
+            published.iter().any(|event| matches!(
+                &event.event,
+                AgentEvent::ProviderRouteSelected { provider, .. } if provider == "Backup"
+            )),
+            "必须发布接管路由的选择事件"
+        );
+        assert!(
+            !published
+                .iter()
+                .any(|event| matches!(&event.event, AgentEvent::TurnFailed { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_response_takeover_keeps_the_turn_on_the_route_that_answered() {
+        let (_directory, _repository, runtime, thread_id) = runtime_fixture().await;
+        // 主路由第一次请求就空完成两次（首次 + 重试）后由备用路由回答，随后
+        // 同一轮再次请求必须继续走备用路由，不再回头打扰已失败的主路由。
+        let primary = Arc::new(FakeProvider::script(vec![
+            stepfun_style_empty_completion(),
+            stepfun_style_empty_completion(),
+        ]));
+        let backup = Arc::new(FakeProvider::script(vec![
+            vec![
+                Ok(ProviderEvent::TextDelta {
+                    delta: "先读文件。".into(),
+                }),
+                Ok(ProviderEvent::ToolCall {
+                    call: ToolCall {
+                        id: "call-1".into(),
+                        name: "read_file".into(),
+                        arguments: json!({ "path": "README.md" }),
+                        metadata: json!({}),
+                    },
+                }),
+                Ok(ProviderEvent::Completed),
+            ],
+            vec![
+                Ok(ProviderEvent::TextDelta {
+                    delta: "已读完。".into(),
+                }),
+                Ok(ProviderEvent::Completed),
+            ],
+        ]));
+        let metrics_directory = tempfile::tempdir().unwrap();
+        let provider = Arc::new(
+            FallbackProvider::new(
+                vec![
+                    FallbackTarget {
+                        provider: primary.clone(),
+                        model: "primary-model".into(),
+                        label: "primary".into(),
+                        provider_name: "Primary".into(),
+                        fallback_position: None,
+                    },
+                    FallbackTarget {
+                        provider: backup.clone(),
+                        model: "backup-model".into(),
+                        label: "backup".into(),
+                        provider_name: "Backup".into(),
+                        fallback_position: Some(1),
+                    },
+                ],
+                crate::advanced::RuntimeMetrics::new(metrics_directory.path()).unwrap(),
+            )
+            .unwrap(),
+        );
+        let publisher = Arc::new(RecordingPublisher::default());
+
+        let outcome = runtime
+            .run_turn(
+                provider,
+                "primary-model".into(),
+                RunTurnRequest {
+                    thread_id: thread_id.clone(),
+                    input: "读一下 README".into(),
+                    agent_mode: None,
+                },
+                CancellationToken::new(),
+                publisher.clone(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.state, TurnState::Completed);
+        assert_eq!(outcome.error, None);
+        // 主路由先用完自己的空响应重试预算（首次 + 2 次重试）才被接管。
+        assert_eq!(primary.requests().len(), 3);
+        assert_eq!(backup.requests().len(), 2);
+        // 工具轮之后的第二次请求仍是备用路由，且不再回放主路由的 context。
+        assert_eq!(backup.requests()[1].model, "backup-model");
+        assert!(
+            !backup.requests()[1]
+                .messages
+                .iter()
+                .any(|message| matches!(message, ProviderMessage::ProviderContext { .. })),
+            "接管后的后续请求不得回放失败路由的 context"
+        );
+        assert!(
+            !_repository
+                .load(&thread_id)
+                .await
+                .unwrap()
+                .iter()
+                .any(|event| matches!(&event.kind, StoredEventKind::ProviderContext { .. })),
+            "失败路由的 context 不得进入历史"
         );
     }
 
@@ -6593,19 +7184,19 @@ mod tests {
         let detail = repository.read_thread(&thread_id).await.unwrap();
         let question = &detail.user_inputs[0].request.questions[0].question;
         assert!(question.contains("运行 644 秒"));
-        assert!(question.contains("100 次调用 / 5000000 tokens）"));
+        assert!(question.contains("300 次调用 / 15000000 tokens）"));
     }
 
     #[test]
-    fn soft_turn_default_requests_continuation_at_100_provider_calls() {
+    fn soft_turn_default_requests_continuation_at_300_provider_calls() {
         let limits = SoftTurnLimits::default();
 
-        assert_eq!(limits.provider_calls, 100);
+        assert_eq!(limits.provider_calls, 300);
         assert_eq!(limits.total_tokens, DEFAULT_SOFT_TURN_TOTAL_TOKENS);
         assert_eq!(limits.duration_ms, DEFAULT_SOFT_TURN_DURATION_MS);
         assert!(
             !SoftTurnSegmentUsage {
-                provider_calls: 99,
+                provider_calls: 299,
                 total_tokens: 0,
                 duration_ms: 0,
             }
@@ -6613,7 +7204,7 @@ mod tests {
         );
         assert!(
             SoftTurnSegmentUsage {
-                provider_calls: 100,
+                provider_calls: 300,
                 total_tokens: 0,
                 duration_ms: 0,
             }
@@ -6622,13 +7213,13 @@ mod tests {
     }
 
     #[test]
-    fn soft_turn_default_requests_continuation_at_five_million_tokens() {
+    fn soft_turn_default_requests_continuation_at_fifteen_million_tokens() {
         let limits = SoftTurnLimits::default();
 
         assert!(
             !SoftTurnSegmentUsage {
                 provider_calls: 1,
-                total_tokens: 4_999_999,
+                total_tokens: 14_999_999,
                 duration_ms: 0,
             }
             .exceeds(limits)
@@ -6636,7 +7227,7 @@ mod tests {
         assert!(
             SoftTurnSegmentUsage {
                 provider_calls: 1,
-                total_tokens: 5_000_000,
+                total_tokens: 15_000_000,
                 duration_ms: 0,
             }
             .exceeds(limits)

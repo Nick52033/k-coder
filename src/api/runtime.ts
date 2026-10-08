@@ -14,6 +14,7 @@ import type {
   SaveUserRuleRequest,
   UserRulesView,
   PluginOverview,
+  PluginMarketplaceOverview,
   PluginScope,
   McpConfigView,
   ImageAttachment,
@@ -480,6 +481,10 @@ export function getPluginOverview(refresh = false) { return invoke<PluginOvervie
 export function setPluginEnabled(pluginId: string, enabled: boolean) { return invoke<PluginOverview>("set_plugin_enabled", { pluginId, enabled }); }
 export function installPlugin(sourcePath: string, scope: PluginScope) { return invoke<PluginOverview>("install_plugin", { sourcePath, scope }); }
 export function deletePlugin(pluginId: string) { return invoke<PluginOverview>("delete_plugin", { pluginId }); }
+export function getPluginMarketplaceOverview(refresh = false) { return invoke<PluginMarketplaceOverview>("plugin_marketplace_overview", { refresh }); }
+export function addPluginMarketplace(source: string) { return invoke<PluginMarketplaceOverview>("add_plugin_marketplace", { source }); }
+export function removePluginMarketplace(marketplaceId: string) { return invoke<PluginMarketplaceOverview>("remove_plugin_marketplace", { marketplaceId }); }
+export function installMarketplacePlugin(marketplaceId: string, entryName: string, scope: PluginScope) { return invoke<PluginOverview>("install_marketplace_plugin", { marketplaceId, entryName, scope }); }
 export function getMcpConfig(refresh = false) { return invoke<McpConfigView>("mcp_config", { refresh }); }
 export function saveMcpConfig(scope: "global" | "project", content: string) { return invoke<McpConfigView>("save_mcp_config", { scope, content }); }
 export function setExtensionEnabled(kind: "skill" | "mcp" | "hook", id: string, enabled: boolean) { return invoke<ExtensionOverview>("set_extension_enabled", { kind, id, enabled }); }

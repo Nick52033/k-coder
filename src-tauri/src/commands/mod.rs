@@ -59,11 +59,11 @@ use crate::protocol::memory::{
 };
 use crate::protocol::{
     AgentEvent, AgentEventEnvelope, AgentMode, ApprovalMode, ApprovalResolution, ChangeSet,
-    ImageAttachment, MessageRole, PROTOCOL_VERSION, PatchPreview, PluginOverview, PluginScope,
-    QueuedTurnSteerRequest, ReasoningEffort, RuntimeStatus, ThreadForkRequest,
-    ThreadHistorySnapshot, ThreadMailboxChanged, ThreadMailboxSnapshot, ThreadModelSelectionResult,
-    ThreadRollbackRequest, TokenUsage, TurnHandle, TurnState, TurnSteerRequest, TurnSteerResponse,
-    UserInputResolution,
+    ImageAttachment, MessageRole, PROTOCOL_VERSION, PatchPreview, PluginMarketplaceOverview,
+    PluginOverview, PluginScope, QueuedTurnSteerRequest, ReasoningEffort, RuntimeStatus,
+    ThreadForkRequest, ThreadHistorySnapshot, ThreadMailboxChanged, ThreadMailboxSnapshot,
+    ThreadModelSelectionResult, ThreadRollbackRequest, TokenUsage, TurnHandle, TurnState,
+    TurnSteerRequest, TurnSteerResponse, UserInputResolution,
 };
 use crate::providers::{
     ProviderConfigView, ProviderEvent, ProviderMessage, ProviderRequest, SaveProviderConfigRequest,
@@ -2560,6 +2560,7 @@ pub async fn test_provider_connection(
             text: "Reply with OK.".into(),
         }],
         tools: vec![],
+        empty_response_attempts: 0,
     };
     let mut stream = tokio::time::timeout(
         std::time::Duration::from_secs(20),
@@ -2696,6 +2697,51 @@ pub async fn delete_plugin(
 ) -> CommandResult<PluginOverview> {
     state
         .delete_plugin(&plugin_id)
+        .await
+        .map_err(plugin_command_error)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn plugin_marketplace_overview(
+    state: State<'_, AppState>,
+    refresh: bool,
+) -> CommandResult<PluginMarketplaceOverview> {
+    // 市场清单每次调用都重新获取；refresh 只保留以对齐其他总览命令的调用约定。
+    let _ = refresh;
+    Ok(state.marketplace_overview().await)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn add_plugin_marketplace(
+    state: State<'_, AppState>,
+    source: String,
+) -> CommandResult<PluginMarketplaceOverview> {
+    state
+        .add_marketplace(&source)
+        .await
+        .map_err(plugin_command_error)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn remove_plugin_marketplace(
+    state: State<'_, AppState>,
+    marketplace_id: String,
+) -> CommandResult<PluginMarketplaceOverview> {
+    state
+        .remove_marketplace(&marketplace_id)
+        .await
+        .map_err(plugin_command_error)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub async fn install_marketplace_plugin(
+    state: State<'_, AppState>,
+    marketplace_id: String,
+    entry_name: String,
+    scope: PluginScope,
+) -> CommandResult<PluginOverview> {
+    state
+        .install_marketplace_plugin(&marketplace_id, &entry_name, scope)
         .await
         .map_err(plugin_command_error)
 }

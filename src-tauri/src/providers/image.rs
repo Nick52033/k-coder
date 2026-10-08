@@ -545,6 +545,7 @@ mod tests {
                 text: "采菊东篱下，悠然见南山".into(),
             }],
             tools: vec![],
+            empty_response_attempts: 0,
         };
         let image_request = ImageGenerationRequest {
             model: request.model.clone(),
@@ -604,6 +605,7 @@ mod tests {
                 },
             ],
             tools: vec![],
+            empty_response_attempts: 0,
         };
 
         let image_request = OpenAiImageGenerationsProvider::request_from_provider(&request)
@@ -775,6 +777,7 @@ mod tests {
                 text: "山居秋暝".into(),
             }],
             tools: Vec::new(),
+            empty_response_attempts: 0,
         };
         let mut stream = provider
             .stream(request, CancellationToken::new())
@@ -906,6 +909,7 @@ mod tests {
                 },
             ],
             tools: Vec::new(),
+            empty_response_attempts: 0,
         };
         let mut stream = provider
             .stream(request, CancellationToken::new())

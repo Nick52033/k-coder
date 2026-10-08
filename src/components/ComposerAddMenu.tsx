@@ -1,14 +1,13 @@
 import { useEffect, useId, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import {
-  Boxes,
   Menu,
   Network,
   Puzzle,
   Workflow,
 } from "lucide-react";
 
-type AddSettingsSection = "plugins" | "mcp" | "miniapps" | "workflows";
+type AddSettingsSection = "plugins" | "mcp" | "workflows";
 
 interface ComposerAddMenuProps {
   onOpenSettings: (section: AddSettingsSection) => void;
@@ -129,7 +128,6 @@ export function ComposerAddMenu({
         >
           <AddMenuItem icon={<Puzzle size={17} />} label="添加插件" onClick={() => runAction(() => onOpenSettings("plugins"))} />
           <AddMenuItem icon={<Network size={17} />} label="添加 MCP" onClick={() => runAction(() => onOpenSettings("mcp"))} />
-          <AddMenuItem icon={<Boxes size={17} />} label="添加小程序" onClick={() => runAction(() => onOpenSettings("miniapps"))} />
           <AddMenuItem icon={<Workflow size={17} />} label="添加 Workflow" onClick={() => runAction(() => onOpenSettings("workflows"))} />
         </div>,
         document.body,

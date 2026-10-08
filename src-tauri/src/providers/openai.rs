@@ -1046,6 +1046,7 @@ mod tests {
             reasoning_effort,
             messages,
             tools: Vec::new(),
+            empty_response_attempts: 0,
         }
     }
 

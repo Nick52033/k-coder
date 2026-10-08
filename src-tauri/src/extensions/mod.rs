@@ -1,4 +1,5 @@
 pub mod hooks;
+pub mod marketplace;
 pub mod mcp;
 pub mod plugins;
 
@@ -20,11 +21,15 @@ use tokio_util::sync::CancellationToken;
 use crate::logging::StructuredLogger;
 use crate::persistence::ProjectionDb;
 use crate::protocol::{
-    PluginOverview, PluginScope, PluginState, ToolDefinition, ToolResult, ToolRisk,
+    PluginMarketplaceEntryView, PluginMarketplaceOverview, PluginMarketplaceView, PluginOverview,
+    PluginScope, PluginState, ToolDefinition, ToolResult, ToolRisk,
 };
 use crate::tools::{ToolContext, ToolError, ToolHandler, ToolHookRunner};
 
 use self::hooks::{HookConfig, HookPipeline};
+use self::marketplace::{
+    MARKETPLACE_SCHEMA_VERSION, MarketplaceClient, MarketplaceSource, MarketplaceStore,
+};
 use self::mcp::{McpSecretStore, McpServerConfig};
 use self::plugins::PluginHost;
 pub use self::plugins::{plugin_root_for_local, plugin_root_for_workspace};
@@ -59,6 +64,8 @@ pub enum ExtensionError {
     Mcp(#[from] mcp::McpError),
     #[error(transparent)]
     Plugin(#[from] plugins::PluginError),
+    #[error(transparent)]
+    Marketplace(#[from] marketplace::MarketplaceError),
     #[error("extension tool registration failed: {0}")]
     Tool(String),
 }
@@ -1011,6 +1018,7 @@ pub struct ExtensionService {
     audit_path: PathBuf,
     user_rules_lock: Arc<Mutex<()>>,
     plugins: PluginHost,
+    marketplaces: Arc<MarketplaceStore>,
 }
 
 fn skill_is_selected(lower_input: &str, skill: &LoadedSkill) -> bool {
@@ -1061,6 +1069,7 @@ impl ExtensionService {
     ) -> Self {
         let audit_path = data_root.join("extension-audit.jsonl");
         let audit = load_audit(&audit_path);
+        let marketplaces = Arc::new(MarketplaceStore::new(&data_root));
         let plugins = PluginHost::with_roots(
             projection.clone(),
             builtin_plugins_root.clone(),
@@ -1084,6 +1093,7 @@ impl ExtensionService {
             audit_path,
             user_rules_lock: Arc::new(Mutex::new(())),
             plugins,
+            marketplaces,
         }
     }
 
@@ -1116,6 +1126,7 @@ impl ExtensionService {
                 self.builtin_plugins_root.clone(),
                 Some(plugin_root_for_local(&self.data_root)),
             ),
+            marketplaces: self.marketplaces.clone(),
         }
     }
 
@@ -1692,6 +1703,206 @@ impl ExtensionService {
             },
         );
         Ok(result?)
+    }
+
+    /// 市场总览：逐个加载清单，单个市场失败只沉淀为该行的错误。
+    pub async fn marketplace_overview(&self, workspace: &Path) -> PluginMarketplaceOverview {
+        let marketplaces = self.marketplaces.list();
+        if marketplaces.is_empty() {
+            return PluginMarketplaceOverview {
+                schema_version: MARKETPLACE_SCHEMA_VERSION,
+                marketplaces: Vec::new(),
+                entries: Vec::new(),
+                error: None,
+            };
+        }
+        let installed_scopes = self.installed_plugin_scopes(workspace);
+        let client = match MarketplaceClient::new() {
+            Ok(client) => client,
+            Err(error) => {
+                return PluginMarketplaceOverview {
+                    schema_version: MARKETPLACE_SCHEMA_VERSION,
+                    marketplaces: marketplaces
+                        .iter()
+                        .map(|marketplace| PluginMarketplaceView {
+                            id: marketplace.id.clone(),
+                            label: marketplace.label.clone(),
+                            source_kind: marketplace.source.kind(),
+                            source_display: marketplace.source.display(),
+                            entry_count: 0,
+                            error: Some(error.to_string()),
+                        })
+                        .collect(),
+                    entries: Vec::new(),
+                    error: None,
+                };
+            }
+        };
+        let cancellation = CancellationToken::new();
+        let mut views = Vec::with_capacity(marketplaces.len());
+        let mut entries = Vec::new();
+        for marketplace in marketplaces {
+            let view = match marketplace::fetch_manifest(
+                &marketplace.source,
+                &client,
+                &cancellation,
+            )
+            .await
+            {
+                Ok(manifest) => {
+                    for entry in &manifest.entries {
+                        entries.push(PluginMarketplaceEntryView {
+                            marketplace_id: marketplace.id.clone(),
+                            name: entry.name.clone(),
+                            description: entry.description.clone(),
+                            version: entry.version.clone(),
+                            source_kind: entry.source.kind(),
+                            source_display: entry.source.display(),
+                            dependencies: entry.dependencies.clone(),
+                            installed_scopes: installed_scopes
+                                .get(&entry.name)
+                                .cloned()
+                                .unwrap_or_default(),
+                        });
+                    }
+                    PluginMarketplaceView {
+                        id: marketplace.id.clone(),
+                        label: marketplace.label.clone(),
+                        source_kind: marketplace.source.kind(),
+                        source_display: marketplace.source.display(),
+                        entry_count: manifest.entries.len(),
+                        error: None,
+                    }
+                }
+                Err(error) => PluginMarketplaceView {
+                    id: marketplace.id.clone(),
+                    label: marketplace.label.clone(),
+                    source_kind: marketplace.source.kind(),
+                    source_display: marketplace.source.display(),
+                    entry_count: 0,
+                    error: Some(error.to_string()),
+                },
+            };
+            views.push(view);
+        }
+        PluginMarketplaceOverview {
+            schema_version: MARKETPLACE_SCHEMA_VERSION,
+            marketplaces: views,
+            entries,
+            error: None,
+        }
+    }
+
+    fn installed_plugin_scopes(
+        &self,
+        workspace: &Path,
+    ) -> std::collections::HashMap<String, Vec<PluginScope>> {
+        let mut scopes: std::collections::HashMap<String, Vec<PluginScope>> =
+            std::collections::HashMap::new();
+        let discovered = self
+            .plugin_overview(workspace, false)
+            .ok()
+            .map(|overview| overview.plugins)
+            .unwrap_or_default();
+        for plugin in discovered {
+            if let Some((name, _)) = plugin.id.split_once('@') {
+                let entry = scopes.entry(name.to_string()).or_default();
+                if !entry.contains(&plugin.scope) {
+                    entry.push(plugin.scope);
+                }
+            }
+        }
+        scopes
+    }
+
+    /// 添加市场来源；先成功加载清单再持久化，失败的来源不会留下记录。
+    pub async fn add_marketplace(
+        &self,
+        workspace: &Path,
+        source: &str,
+    ) -> Result<PluginMarketplaceOverview, ExtensionError> {
+        let source = MarketplaceSource::from_user_input(source)?;
+        let client = MarketplaceClient::new()?;
+        let manifest =
+            marketplace::fetch_manifest(&source, &client, &CancellationToken::new()).await?;
+        let label = manifest.label.clone();
+        let added = self.marketplaces.add(source, label)?;
+        self.record(
+            "plugin_marketplace_added",
+            "marketplace",
+            &added.id,
+            true,
+            "marketplace source added",
+        );
+        Ok(self.marketplace_overview(workspace).await)
+    }
+
+    pub async fn remove_marketplace(
+        &self,
+        workspace: &Path,
+        marketplace_id: &str,
+    ) -> Result<PluginMarketplaceOverview, ExtensionError> {
+        self.marketplaces.remove(marketplace_id)?;
+        self.record(
+            "plugin_marketplace_removed",
+            "marketplace",
+            marketplace_id,
+            true,
+            "marketplace source removed",
+        );
+        Ok(self.marketplace_overview(workspace).await)
+    }
+
+    /// 从市场安装插件：解析远程源码到临时沙箱，再走与本地安装完全相同的发布路径。
+    pub async fn install_marketplace_plugin(
+        &self,
+        workspace: &Path,
+        marketplace_id: &str,
+        entry_name: &str,
+        scope: PluginScope,
+    ) -> Result<PluginOverview, ExtensionError> {
+        let marketplace = self
+            .marketplaces
+            .list()
+            .into_iter()
+            .find(|marketplace| marketplace.id == marketplace_id)
+            .ok_or_else(|| {
+                ExtensionError::Config(format!("unknown plugin marketplace {marketplace_id}"))
+            })?;
+        let client = MarketplaceClient::new()?;
+        let manifest =
+            marketplace::fetch_manifest(&marketplace.source, &client, &CancellationToken::new())
+                .await?;
+        let entry = manifest
+            .entries
+            .iter()
+            .find(|entry| entry.name == entry_name)
+            .ok_or_else(|| {
+                ExtensionError::Config(format!(
+                    "marketplace plugin {entry_name} was not found in marketplace {}",
+                    marketplace.label
+                ))
+            })?;
+        let resolved = marketplace::resolve_plugin(
+            entry,
+            &marketplace.source,
+            &client,
+            &CancellationToken::new(),
+        )
+        .await?;
+        let outcome = self.install_plugin(workspace, resolved.root(), scope);
+        self.record(
+            "plugin_marketplace_installed",
+            "plugin",
+            &format!("{}/{}", marketplace_id, entry_name),
+            outcome.is_ok(),
+            match scope {
+                PluginScope::Builtin => "marketplace plugin installation requested",
+                PluginScope::Local => "installed locally",
+                PluginScope::Project => "installed in project",
+            },
+        );
+        outcome
     }
 
     fn record_auto_disabled_plugins(&self) {

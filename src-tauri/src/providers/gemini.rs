@@ -653,6 +653,7 @@ mod tests {
                 },
             ],
             tools: vec![],
+            empty_response_attempts: 0,
         };
 
         let contents = gemini_image_contents(&request).unwrap();

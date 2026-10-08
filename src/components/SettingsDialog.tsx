@@ -214,7 +214,6 @@ export type SettingsSection =
   | "usage"
   | "mcp"
   | "plugins"
-  | "miniapps"
   | "skills"
   | "robots"
   | "workflows"
@@ -268,7 +267,6 @@ const settingsDefinitions: SettingsDefinition[] = [
   { id: "usage", label: "用量追踪", group: "模型与用量", icon: BarChart3, available: true },
   { id: "mcp", label: "MCP", group: "扩展", icon: Network, available: true },
   { id: "plugins", label: "插件管理", group: "扩展", icon: Puzzle, available: true },
-  { id: "miniapps", label: "小程序", group: "扩展", icon: Boxes, available: false },
   { id: "skills", label: "Skills", group: "扩展", icon: Sparkles, available: true },
   { id: "robots", label: "机器人", group: "智能体", icon: Bot, available: true },
   { id: "workflows", label: "Workflows", group: "智能体", icon: Workflow, available: true },
@@ -1673,7 +1671,7 @@ function RobotsPage({
   workflowRun: WorkflowRunView | null;
 }) {
   const [expandedId, setExpandedId] = useState<string | null>(
-    workflowRun?.state === "active" ? workflowRun.workflowId : workflows[0]?.id ?? null,
+    workflowRun?.state === "active" ? workflowRun.workflowId : null,
   );
   const [readiness, setReadiness] = useState<Record<string, WorkflowSkillReadinessView>>({});
   const [loading, setLoading] = useState(false);
@@ -2612,7 +2610,7 @@ function ExtensionsPage() {
   const [category, setCategory] = useState<SkillCategory | "all">("all");
   const [scope, setScope] = useState<"all" | "builtin" | "global" | "project">("all");
   const [collapsedGroups, setCollapsedGroups] = useState<ReadonlySet<string>>(
-    () => new Set(SKILL_CATEGORIES.slice(1).map((item) => item.id)),
+    () => new Set(SKILL_CATEGORIES.map((item) => item.id)),
   );
 
   async function load(refresh = false) {

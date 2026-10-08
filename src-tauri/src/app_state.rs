@@ -30,9 +30,9 @@ use crate::persistence::ProjectionDb;
 use crate::policy::{ApprovalManager, UserInputManager};
 use crate::protocol::{
     AgentItemStatus, AgentItemType, ApprovalAction, ApprovalMode, ApprovalResolution, ChangeSet,
-    HistorySortDirection, PluginOverview, PluginScope, ReasoningEffort, ThreadHistorySnapshot,
-    ThreadItemsPage, ThreadModelSelectionResult, ThreadTurnsPage, TurnItemsView, TurnState,
-    UserInputAction, UserInputResolution,
+    HistorySortDirection, PluginMarketplaceOverview, PluginOverview, PluginScope, ReasoningEffort,
+    ThreadHistorySnapshot, ThreadItemsPage, ThreadModelSelectionResult, ThreadTurnsPage,
+    TurnItemsView, TurnState, UserInputAction, UserInputResolution,
 };
 use crate::providers::{
     AnthropicMessagesProvider, CredentialError, CredentialStore, DeepSeekChatCompletionsProvider,
@@ -914,6 +914,48 @@ impl AppState {
         let workspace = self.workspace_root();
         self.extensions
             .install_plugin(&workspace, Path::new(source_path), scope)?;
+        self.prepare_extensions(true).await?;
+        Ok(self.extensions.plugin_overview(&workspace, false)?)
+    }
+
+    pub async fn marketplace_overview(&self) -> PluginMarketplaceOverview {
+        self.extensions
+            .marketplace_overview(&self.workspace_root())
+            .await
+    }
+
+    pub async fn add_marketplace(
+        &self,
+        source: &str,
+    ) -> Result<PluginMarketplaceOverview, AppStateError> {
+        let overview = self
+            .extensions
+            .add_marketplace(&self.workspace_root(), source)
+            .await?;
+        Ok(overview)
+    }
+
+    pub async fn remove_marketplace(
+        &self,
+        marketplace_id: &str,
+    ) -> Result<PluginMarketplaceOverview, AppStateError> {
+        let overview = self
+            .extensions
+            .remove_marketplace(&self.workspace_root(), marketplace_id)
+            .await?;
+        Ok(overview)
+    }
+
+    pub async fn install_marketplace_plugin(
+        &self,
+        marketplace_id: &str,
+        entry_name: &str,
+        scope: PluginScope,
+    ) -> Result<PluginOverview, AppStateError> {
+        let workspace = self.workspace_root();
+        self.extensions
+            .install_marketplace_plugin(&workspace, marketplace_id, entry_name, scope)
+            .await?;
         self.prepare_extensions(true).await?;
         Ok(self.extensions.plugin_overview(&workspace, false)?)
     }

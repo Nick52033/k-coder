@@ -34,7 +34,7 @@ pub use config::{
     ProviderModelConfig, ProviderTransport, SaveProviderConfigRequest,
 };
 pub use credentials::{CredentialError, CredentialStore, OsCredentialStore};
-pub use fallback::{FallbackProvider, FallbackTarget};
+pub use fallback::{EMPTY_COMPLETION_FAILOVER_AFTER, FallbackProvider, FallbackTarget};
 pub use gemini::GoogleGeminiProvider;
 pub use image::{
     GeneratedImage, ImageGenerationRequest, ImageResponseFormat, OpenAiImageGenerationsProvider,
@@ -53,6 +53,12 @@ pub struct ProviderRequest {
     pub reasoning_effort: ReasoningEffort,
     pub messages: Vec<ProviderMessage>,
     pub tools: Vec<ToolDefinition>,
+    /// Consecutive completions without any visible output (no text, image or
+    /// tool call) the runtime has already tolerated on the current route.
+    /// Once this reaches `EMPTY_COMPLETION_FAILOVER_AFTER` the fallback route
+    /// takes over instead of returning yet another empty completion.
+    #[serde(default)]
+    pub empty_response_attempts: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

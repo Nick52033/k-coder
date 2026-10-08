@@ -120,6 +120,7 @@ mod tests {
             reasoning_effort: crate::protocol::ReasoningEffort::default(),
             messages: Vec::new(),
             tools: Vec::new(),
+            empty_response_attempts: 0,
         }
     }
 

@@ -133,6 +133,32 @@ export interface PluginOverview {
   plugins: PluginDiagnostic[];
   error: string | null;
 }
+export type MarketplaceSourceKind = "http" | "git" | "local_directory";
+export type PluginSourceKind = "github" | "git" | "url" | "directory";
+export interface PluginMarketplaceView {
+  id: string;
+  label: string;
+  sourceKind: MarketplaceSourceKind;
+  sourceDisplay: string;
+  entryCount: number;
+  error: string | null;
+}
+export interface PluginMarketplaceEntryView {
+  marketplaceId: string;
+  name: string;
+  description: string;
+  version: string;
+  sourceKind: PluginSourceKind;
+  sourceDisplay: string;
+  dependencies: string[];
+  installedScopes: PluginScope[];
+}
+export interface PluginMarketplaceOverview {
+  schemaVersion: number;
+  marketplaces: PluginMarketplaceView[];
+  entries: PluginMarketplaceEntryView[];
+  error: string | null;
+}
 
 export type SubagentState = "queued" | "running" | "blocked" | "completed" | "failed" | "cancelled" | "timed_out";
 export interface CreateSubagentRequest {

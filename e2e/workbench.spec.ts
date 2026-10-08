@@ -1648,6 +1648,25 @@ test("restores persisted robot node progress and lists built-in definitions", as
   await page.screenshot({ path: testInfo.outputPath("builtin-robots-settings.png"), fullPage: true });
 });
 
+test("collapses built-in robots until one is expanded", async ({ page }, testInfo) => {
+  await page.goto("/");
+  await page.locator('button[aria-label="设置"]:visible').click();
+  await page.getByRole("button", { name: "机器人", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "内置机器人" })).toBeVisible();
+
+  const fullstackRobot = page.locator(".robot-row").first();
+  await expect(fullstackRobot).toContainText("全栈开发机器人");
+  await expect(fullstackRobot.locator(".robot-row-header")).toHaveAttribute("aria-expanded", "false");
+  await expect(page.locator(".robot-details")).toHaveCount(0);
+
+  await fullstackRobot.locator(".robot-row-header").click();
+  await expect(fullstackRobot.locator(".robot-row-header")).toHaveAttribute("aria-expanded", "true");
+  await expect(fullstackRobot.locator(".robot-system-prompt"))
+    .toContainText("全栈开发机器人 - 角色定义");
+  await expect(fullstackRobot.locator(".robot-skill-summary")).toContainText("9 本地技能");
+  await page.screenshot({ path: testInfo.outputPath("builtin-robots-collapsed.png"), fullPage: true });
+});
+
 test("groups Skills and locks robot-managed Skills", async ({ page }, testInfo) => {
   await page.goto("/");
   await page.locator('button[aria-label="设置"]:visible').click();
@@ -1655,6 +1674,8 @@ test("groups Skills and locks robot-managed Skills", async ({ page }, testInfo) 
 
   await expect(page.getByRole("region", { name: "需求与规划" })).toBeVisible();
   await expect(page.getByRole("region", { name: "质量与评审" })).toBeVisible();
+  await expect(page.locator("#skill-category-requirements_planning-body")).toHaveCount(0);
+  await page.getByRole("button", { name: /需求与规划/ }).click();
   const managedSkill = page.locator(".extension-row").filter({ hasText: "Robot requirements intake" });
   await expect(managedSkill.getByText("机器人必需", { exact: true })).toBeVisible();
   await expect(managedSkill.getByRole("checkbox")).toHaveCount(0);
@@ -1736,7 +1757,6 @@ test("uses composer quick actions for files, attachments, Skills, and extension 
   await expect(menu.getByRole("menuitem")).toHaveText([
     "添加插件",
     "添加 MCP",
-    "添加小程序",
     "添加 Workflow",
   ]);
   await expect(menu.getByRole("menuitem", { name: "添加插件" })).toBeFocused();
@@ -1762,8 +1782,7 @@ test("uses composer quick actions for files, attachments, Skills, and extension 
   for (const entry of [
     { menuLabel: "添加 MCP", heading: "MCP 配置", pending: false },
     { menuLabel: "添加插件", heading: "本地插件", pending: false },
-    { menuLabel: "添加小程序", heading: "小程序", pending: true },
-    { menuLabel: "添加 Workflow", heading: "Workflows", pending: true },
+    { menuLabel: "添加 Workflow", heading: "项目 Workflows", pending: false },
   ]) {
     await moreAction.click();
     await menu.getByRole("menuitem", { name: entry.menuLabel }).click();
@@ -5683,13 +5702,13 @@ test("labels the provider call hard limit and starts a new Turn", async ({ page 
       ...base,
       type: "turn_failed",
       phase: "failed",
-      message: "单个 Turn 已达到模型调用硬上限（1000 次），为防止执行循环已停止；请检查当前进展后开启新 Turn。",
+      message: "单个 Turn 已达到模型调用硬上限（3000 次），为防止执行循环已停止；请检查当前进展后开启新 Turn。",
       error: {
         code: "provider_call_limit_exceeded",
-        message: "单个 Turn 已达到模型调用硬上限（1000 次），为防止执行循环已停止；请检查当前进展后开启新 Turn。",
+        message: "单个 Turn 已达到模型调用硬上限（3000 次），为防止执行循环已停止；请检查当前进展后开启新 Turn。",
         retryable: true,
         category: "runtime",
-        details: { providerCalls: 1000, maxProviderCalls: 1000, recovery: "new_turn" },
+        details: { providerCalls: 3000, maxProviderCalls: 3000, recovery: "new_turn" },
       },
       startedAtMs: 1_000,
       completedAtMs: 201_000,
@@ -5701,7 +5720,7 @@ test("labels the provider call hard limit and starts a new Turn", async ({ page 
   await expect(failedExecution).not.toHaveAttribute("open", "");
   await failedExecution.locator(":scope > summary").click();
   await expect(failedExecution.getByText("本轮已达到安全上限", { exact: true })).toBeVisible();
-  await expect(failedExecution.getByText("单个 Turn 已达到模型调用硬上限（1000 次），为防止执行循环已停止；请检查当前进展后开启新 Turn。", { exact: true })).toBeVisible();
+  await expect(failedExecution.getByText("单个 Turn 已达到模型调用硬上限（3000 次），为防止执行循环已停止；请检查当前进展后开启新 Turn。", { exact: true })).toBeVisible();
   await expect(failedExecution.getByRole("button", { name: "开启新 Turn", exact: true })).toBeVisible();
   await expect(failedExecution.getByRole("button", { name: "重试", exact: true })).toHaveCount(0);
 
@@ -5919,7 +5938,7 @@ test("restores a pending user question after reopening the thread", async ({ pag
 });
 
 test("restores a soft turn continuation gate with direct actions", async ({ page }) => {
-  const question = "当前执行段已调用模型 100 次、累计消耗 920000 tokens、运行 480 秒。如需继续，请发送“继续”（点击“继续执行”即可）。";
+  const question = "当前执行段已调用模型 300 次、累计消耗 920000 tokens、运行 480 秒。如需继续，请发送“继续”（点击“继续执行”即可）。";
   await page.addInitScript((continuationQuestion) => {
     localStorage.setItem("kcoder_e2e_thread_detail", JSON.stringify({
       schemaVersion: 1,

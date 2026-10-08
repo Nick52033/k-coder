@@ -4,16 +4,38 @@ import {
   AlertCircle,
   Boxes,
   ChevronDown,
+  Download,
   FolderOpen,
   LoaderCircle,
+  Plus,
   Puzzle,
   RefreshCw,
   Server,
   Sparkles,
+  Store,
   Trash2,
 } from "lucide-react";
-import { deletePlugin, getPluginOverview, installPlugin, setPluginEnabled } from "../api/runtime";
-import type { PluginDiagnostic, PluginOverview, PluginScope, PluginState } from "../types/runtime";
+import {
+  addPluginMarketplace,
+  deletePlugin,
+  getPluginMarketplaceOverview,
+  getPluginOverview,
+  installMarketplacePlugin,
+  installPlugin,
+  removePluginMarketplace,
+  setPluginEnabled,
+} from "../api/runtime";
+import type {
+  MarketplaceSourceKind,
+  PluginDiagnostic,
+  PluginMarketplaceEntryView,
+  PluginMarketplaceOverview,
+  PluginMarketplaceView,
+  PluginOverview,
+  PluginScope,
+  PluginSourceKind,
+  PluginState,
+} from "../types/runtime";
 import "./PluginSettingsPage.css";
 
 const stateLabels: Record<PluginState, string> = {
@@ -28,6 +50,19 @@ const scopeLabels: Record<PluginScope, string> = {
   builtin: "内置",
   local: "本地",
   project: "项目",
+};
+
+const marketplaceSourceKindLabels: Record<MarketplaceSourceKind, string> = {
+  http: "HTTP 清单",
+  git: "Git 仓库",
+  local_directory: "本地目录",
+};
+
+const pluginSourceKindLabels: Record<PluginSourceKind, string> = {
+  github: "GitHub",
+  git: "Git",
+  url: "ZIP 下载",
+  directory: "本地目录",
 };
 
 function messageFromError(error: unknown) {
@@ -61,6 +96,9 @@ export function PluginSettingsPage() {
   const [busyId, setBusyId] = useState<string | null>(null);
   const [error, setError] = useState("");
   const [pendingDelete, setPendingDelete] = useState<PluginDiagnostic | null>(null);
+  const [marketplace, setMarketplace] = useState<PluginMarketplaceOverview | null>(null);
+  const [marketplaceLoading, setMarketplaceLoading] = useState(true);
+  const [marketplaceSource, setMarketplaceSource] = useState("");
 
   async function load(refresh: boolean) {
     setLoading(true);
@@ -74,8 +112,20 @@ export function PluginSettingsPage() {
     }
   }
 
+  async function loadMarketplace() {
+    setMarketplaceLoading(true);
+    try {
+      setMarketplace(await getPluginMarketplaceOverview(false));
+    } catch (marketplaceError) {
+      setError(messageFromError(marketplaceError));
+    } finally {
+      setMarketplaceLoading(false);
+    }
+  }
+
   useEffect(() => {
     void load(true);
+    void loadMarketplace();
   }, []);
 
   async function handleToggle(plugin: PluginDiagnostic, enabled: boolean) {
@@ -115,6 +165,62 @@ export function PluginSettingsPage() {
     }
   }
 
+  async function handleAddMarketplace() {
+    const source = marketplaceSource.trim();
+    if (!source) return;
+    setBusyId("add-marketplace");
+    setError("");
+    try {
+      setMarketplace(await addPluginMarketplace(source));
+      setMarketplaceSource("");
+    } catch (addError) {
+      setError(messageFromError(addError));
+      try {
+        setMarketplace(await getPluginMarketplaceOverview(false));
+      } catch {
+        // Keep the last known marketplaces while surfacing the add failure.
+      }
+    } finally {
+      setBusyId(null);
+    }
+  }
+
+  async function handleRemoveMarketplace(marketplaceRow: PluginMarketplaceView) {
+    setBusyId(`remove-marketplace:${marketplaceRow.id}`);
+    setError("");
+    try {
+      setMarketplace(await removePluginMarketplace(marketplaceRow.id));
+    } catch (removeError) {
+      setError(messageFromError(removeError));
+      try {
+        setMarketplace(await getPluginMarketplaceOverview(false));
+      } catch {
+        // Keep the last known marketplaces while surfacing the remove failure.
+      }
+    } finally {
+      setBusyId(null);
+    }
+  }
+
+  async function handleInstallMarketplacePlugin(entry: PluginMarketplaceEntryView, scope: PluginScope) {
+    setBusyId(`install-marketplace:${entry.marketplaceId}:${entry.name}:${scope}`);
+    setError("");
+    try {
+      setOverview(await installMarketplacePlugin(entry.marketplaceId, entry.name, scope));
+      await loadMarketplace();
+    } catch (installError) {
+      setError(messageFromError(installError));
+      try {
+        setOverview(await getPluginOverview(true));
+        setMarketplace(await getPluginMarketplaceOverview(false));
+      } catch (refreshError) {
+        setError(`${messageFromError(installError)}；刷新失败：${messageFromError(refreshError)}`);
+      }
+    } finally {
+      setBusyId(null);
+    }
+  }
+
   async function handleInstall(scope: PluginScope) {
     let selected: string | string[] | null;
     try {
@@ -142,6 +248,7 @@ export function PluginSettingsPage() {
   }
 
   const plugins = overview?.plugins ?? [];
+  const marketplaces = marketplace?.marketplaces ?? [];
 
   return (
     <section className="settings-page plugin-settings-page" aria-labelledby="plugin-page-title">
@@ -149,7 +256,7 @@ export function PluginSettingsPage() {
         <div>
           <p className="settings-eyebrow">扩展</p>
           <h3 id="plugin-page-title">本地插件</h3>
-          <p className="plugin-page-description">内置插件随应用安装并始终启用；安装到本地的插件可用于所有项目，安装到项目的插件只在当前项目生效。</p>
+          <p className="plugin-page-description">内置插件随应用安装并始终启用；安装到本地的插件可用于所有项目，安装到项目的插件只在当前项目生效。添加插件市场后可以直接安装远程市场的插件，安装后默认停用。</p>
         </div>
         <div className="plugin-header-actions">
           <button
@@ -180,7 +287,10 @@ export function PluginSettingsPage() {
             aria-label="刷新插件"
             title="刷新插件"
             disabled={loading || busyId !== null}
-            onClick={() => void load(true)}
+            onClick={() => {
+              void load(true);
+              void loadMarketplace();
+            }}
           >
             {loading ? <LoaderCircle className="plugin-spin" size={16} /> : <RefreshCw size={16} />}
             <span>刷新</span>
@@ -202,6 +312,154 @@ export function PluginSettingsPage() {
             </div>
           </div>
         ))}
+      </div>
+
+      <div className="plugin-marketplace">
+        <div className="plugin-list-heading">
+          <h4>插件市场 <span>{marketplaces.length}</span></h4>
+          <span>{marketplace?.entries.length ?? 0} 个可安装插件</span>
+        </div>
+        <div className="plugin-marketplace-add">
+          <input
+            className="plugin-marketplace-input"
+            type="text"
+            value={marketplaceSource}
+            aria-label="插件市场来源"
+            placeholder="市场来源：HTTP(S) 清单地址、git 仓库、owner/repo 或本地目录"
+            disabled={loading || busyId !== null || marketplaceLoading}
+            onChange={(event) => setMarketplaceSource(event.currentTarget.value)}
+            onKeyDown={(event) => {
+              if (event.key !== "Enter") return;
+              event.preventDefault();
+              void handleAddMarketplace();
+            }}
+          />
+          <button
+            className="plugin-icon-button"
+            type="button"
+            aria-label="添加市场"
+            title="添加市场"
+            disabled={loading || busyId !== null || marketplaceLoading || !marketplaceSource.trim()}
+            onClick={() => void handleAddMarketplace()}
+          >
+            {busyId === "add-marketplace" ? <LoaderCircle className="plugin-spin" size={16} /> : <Plus size={16} />}
+            <span>添加市场</span>
+          </button>
+        </div>
+        <p className="plugin-marketplace-hint">
+          市场只是一份 <code>marketplace.json</code> 清单，插件来源支持 GitHub、Git 仓库、ZIP 下载与本地目录；安装后默认停用，需要在下方「已发现」列表中启用。
+        </p>
+        {marketplaceLoading && !marketplace ? (
+          <div className="plugin-marketplace-empty" role="status">
+            <LoaderCircle className="plugin-spin" size={20} />
+            <span>正在读取已添加的市场…</span>
+          </div>
+        ) : marketplaces.length === 0 ? (
+          <div className="plugin-marketplace-empty">
+            <Store size={22} aria-hidden="true" />
+            <span>尚未添加市场。填入 <code>marketplace.json</code> 的 HTTP(S) 地址或 Git 仓库后点击「添加市场」。</span>
+          </div>
+        ) : (
+          <div className="plugin-marketplace-list" aria-label="已添加的市场">
+            {marketplaces.map((marketplaceRow) => {
+              const entries = (marketplace?.entries ?? []).filter((entry) => entry.marketplaceId === marketplaceRow.id);
+              const removing = busyId === `remove-marketplace:${marketplaceRow.id}`;
+              return (
+                <article className="plugin-marketplace-row" key={marketplaceRow.id}>
+                  <div className="plugin-marketplace-row-heading">
+                    <Store size={16} aria-hidden="true" />
+                    <strong title={marketplaceRow.label}>{marketplaceRow.label}</strong>
+                    <span className="plugin-marketplace-kind">{marketplaceSourceKindLabels[marketplaceRow.sourceKind]}</span>
+                    <span className="plugin-marketplace-count">{marketplaceRow.entryCount} 个插件</span>
+                    <span className="plugin-marketplace-source" title={marketplaceRow.sourceDisplay}>
+                      {marketplaceRow.sourceDisplay}
+                    </span>
+                    <button
+                      className="plugin-delete-button"
+                      type="button"
+                      aria-label={`移除市场 ${marketplaceRow.label}`}
+                      title="移除市场"
+                      disabled={busyId !== null}
+                      onClick={() => void handleRemoveMarketplace(marketplaceRow)}
+                    >
+                      {removing ? <LoaderCircle className="plugin-spin" size={15} /> : <Trash2 size={15} />}
+                    </button>
+                  </div>
+                  {marketplaceRow.error && (
+                    <div className="plugin-marketplace-error" role="alert">
+                      <AlertCircle size={14} aria-hidden="true" />
+                      <span>{marketplaceRow.error}</span>
+                    </div>
+                  )}
+                  {entries.length === 0 ? (
+                    <p className="plugin-marketplace-row-empty">
+                      {marketplaceRow.error ? "市场不可用，暂时无法列出插件。" : "此市场暂无可安装插件。"}
+                    </p>
+                  ) : (
+                    <ul className="plugin-marketplace-entries">
+                      {entries.map((entry) => {
+                        const localInstalled = entry.installedScopes.includes("local") || entry.installedScopes.includes("builtin");
+                        const projectInstalled = entry.installedScopes.includes("project");
+                        return (
+                          <li className="plugin-marketplace-entry" key={`${entry.marketplaceId}:${entry.name}`}>
+                            <div className="plugin-marketplace-entry-heading">
+                              <Puzzle size={14} aria-hidden="true" />
+                              <strong title={entry.name}>{entry.name}</strong>
+                              {entry.version && <span className="plugin-version">v{entry.version}</span>}
+                              <span className="plugin-marketplace-kind">{pluginSourceKindLabels[entry.sourceKind]}</span>
+                              {entry.installedScopes.map((scope) => (
+                                <span className="plugin-marketplace-installed" key={scope}>
+                                  已安装到{scopeLabels[scope]}
+                                </span>
+                              ))}
+                            </div>
+                            {entry.description && <p className="plugin-marketplace-entry-description">{entry.description}</p>}
+                            <div className="plugin-marketplace-entry-meta">
+                              <span title={entry.sourceDisplay}>{entry.sourceDisplay}</span>
+                              {entry.dependencies.length > 0 && <span>依赖：{entry.dependencies.join("、")}</span>}
+                            </div>
+                            <div className="plugin-marketplace-entry-actions">
+                              <button
+                                className={`plugin-icon-button${localInstalled ? " plugin-marketplace-installed-action" : ""}`}
+                                type="button"
+                                aria-label={`安装 ${entry.name} 到本地`}
+                                title={localInstalled ? "已安装到本地" : "安装到本地"}
+                                disabled={busyId !== null || localInstalled}
+                                onClick={() => void handleInstallMarketplacePlugin(entry, "local")}
+                              >
+                                {busyId === `install-marketplace:${entry.marketplaceId}:${entry.name}:local` ? (
+                                  <LoaderCircle className="plugin-spin" size={14} />
+                                ) : (
+                                  <Download size={14} />
+                                )}
+                                <span>{localInstalled ? "已在本地" : "安装到本地"}</span>
+                              </button>
+                              <button
+                                className={`plugin-icon-button${projectInstalled ? " plugin-marketplace-installed-action" : ""}`}
+                                type="button"
+                                aria-label={`安装 ${entry.name} 到项目`}
+                                title={projectInstalled ? "已安装到项目" : "安装到项目"}
+                                disabled={busyId !== null || projectInstalled}
+                                onClick={() => void handleInstallMarketplacePlugin(entry, "project")}
+                              >
+                                {busyId === `install-marketplace:${entry.marketplaceId}:${entry.name}:project` ? (
+                                  <LoaderCircle className="plugin-spin" size={14} />
+                                ) : (
+                                  <Download size={14} />
+                                )}
+                                <span>{projectInstalled ? "已在项目" : "安装到项目"}</span>
+                              </button>
+                            </div>
+                          </li>
+                        );
+                      })}
+                    </ul>
+                  )}
+                </article>
+              );
+            })}
+          </div>
+        )}
       </div>
 
       {(error || overview?.error) && (
@@ -227,7 +485,7 @@ export function PluginSettingsPage() {
         <div className="plugin-empty">
           <div className="plugin-empty-icon"><Puzzle size={28} /></div>
           <strong>未发现插件</strong>
-          <p>使用上方按钮选择插件文件夹，安装后可在列表中启用、禁用或卸载。</p>
+          <p>使用上方按钮选择插件文件夹，或在插件市场中安装远程插件；安装后可在列表中启用、禁用或卸载。</p>
         </div>
       ) : (
         <div className="plugin-list" aria-label="插件列表">
