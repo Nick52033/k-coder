@@ -1468,7 +1468,6 @@ function App() {
               retryAtMs={activityStatus?.retryAtMs}
               subagentTaskIndex={subagentTaskIndex}
               onFocusSubagent={focusSubagent}
-              onStop={turnId === currentThreadTurnId ? () => void stopTurn() : undefined}
               cancelling={turnId === currentThreadTurnId && currentThreadCancelling}
             />
             {renderMessageChanges(
@@ -1686,7 +1685,6 @@ function App() {
             retryAtMs={activityStatus?.retryAtMs}
             subagentTaskIndex={subagentTaskIndex}
             onFocusSubagent={focusSubagent}
-            onStop={segment.turnId === currentThreadTurnId ? () => void stopTurn() : undefined}
             cancelling={segment.turnId === currentThreadTurnId && currentThreadCancelling}
           />
           {hasFallbackText ? (
@@ -1760,7 +1758,6 @@ function App() {
                   retryAtMs={activityStatus?.retryAtMs}
                   subagentTaskIndex={subagentTaskIndex}
                   onFocusSubagent={focusSubagent}
-                  onStop={turnId === currentThreadTurnId ? () => void stopTurn() : undefined}
                   cancelling={turnId === currentThreadTurnId && currentThreadCancelling}
                 />
                 {!steeredAttemptSegment && !attemptTimeline.length && assistantMessage?.text ? (
@@ -1876,6 +1873,9 @@ function App() {
     setComposerTrigger(null);
     setAttachments([]);
     if (currentThreadBusy) setQueueExpanded(true);
+    // 发送即回到「跟随最新」：无论此前是否停留在历史消息，新消息都把会话区带到底部，
+    // 后续流式输出沿同一条跟随逻辑继续贴底（复用「回到底部」按钮的同一条复位路径）。
+    scrollConversationToBottom();
     void sendMessage(
       composedInput,
       imageAttachments,
@@ -2716,7 +2716,6 @@ function App() {
                           retryAtMs={activityStatus?.retryAtMs}
                           subagentTaskIndex={subagentTaskIndex}
                           onFocusSubagent={focusSubagent}
-                          onStop={message.turnId === currentThreadTurnId ? () => void stopTurn() : undefined}
                           cancelling={message.turnId === currentThreadTurnId && currentThreadCancelling}
                         />
                       )}
@@ -2762,7 +2761,6 @@ function App() {
                       activitySinceMs={activityStatus?.sinceMs}
                       streamRetry={activityStatus?.streamRetry ?? null}
                       retryAtMs={activityStatus?.retryAtMs}
-                      onStop={() => void stopTurn()}
                       cancelling={currentThreadCancelling}
                     />
                   </div>
@@ -2959,7 +2957,11 @@ function App() {
                                 ? "当前对话正在停止"
                                 : "发送到当前对话"}
                             disabled={Boolean(queueItem.workflowId) || currentThreadCancelling}
-                            onClick={() => void sendQueuedMessageNow(queueItem.id)}
+                            onClick={() => {
+                              // 与主发送路径一致：立即发送队首消息也会话区带回底部。
+                              scrollConversationToBottom();
+                              void sendQueuedMessageNow(queueItem.id);
+                            }}
                           >
                             <ArrowUp size={16} strokeWidth={2.2} />
                           </button>

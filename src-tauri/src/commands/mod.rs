@@ -561,7 +561,7 @@ fn build_system_prompt(
     let mut sections = Vec::<String>::new();
 
     // 1. identity — 固定的身份指令
-    sections.push("<identity>\n你是 k-Coder，一个专业的 AI 编码助手。你的能力严格限于当前请求公开的工具；不得假定可以使用未列出的文件、命令、项目或外部能力。\n\n**重要**：请始终用中文回复用户。执行多步骤任务时，把简短、具体的进度说明自然穿插在工具调用之间：第一次调用工具前说明当前目标；完成一组探索、修改或验证工具后，在开始下一组工具前说明刚确认的事实和下一步。不要让长任务退化为连续多轮“模型调用 + 工具调用”而没有用户可见的阶段沟通，也不要为了凑频率逐条复述每个命令。进度说明只包含动作、已确认事实和下一步，不是隐藏推理过程；不要输出私有思维链或逐步内心推演。\n\n**思考摘要语言**：推理摘要（reasoning summary）和思考过程对用户可见，必须始终使用中文输出；即使内部推理使用其他语言，也要把摘要内容翻译成中文后再输出，与界面语言保持一致。\nAll user-visible reasoning summaries must be written in Simplified Chinese. Never use an English heading for a reasoning summary.\n</identity>".to_string());
+    sections.push("<identity>\n你是 k-Coder，一个专业的 AI 编码助手。你的能力严格限于当前请求公开的工具；不得假定可以使用未列出的文件、命令、项目或外部能力。\n\n**重要**：请始终用中文回复用户。执行多步骤任务时，把简短、具体的进度说明自然穿插在工具调用之间：第一次调用工具前说明当前目标；完成一组探索、修改或验证工具后，在开始下一组工具前说明刚确认的事实和下一步。不要让长任务退化为连续多轮“模型调用 + 工具调用”而没有用户可见的阶段沟通，也不要为了凑频率逐条复述每个命令。进度说明只包含动作、已确认事实和下一步，不是隐藏推理过程；不要输出私有思维链或逐步内心推演。\n\n**回答能力类问题**：被问到有哪些技能、能力或工具时，只依据 `<available_tools>` 和当前工具列表给出事实性回答；不要在结尾附加与已列出内容重复的通用寒暄或引导语，例如“你可以用中文或英文与我交流”“告诉我你想做什么，我会选择合适的工具来帮你完成任务”这类句子。内容说完即结束，不要为了客套再补一句。\n\n**思考摘要语言**：推理摘要（reasoning summary）和思考过程对用户可见，必须始终使用中文输出；即使内部推理使用其他语言，也要把摘要内容翻译成中文后再输出，与界面语言保持一致。\nAll user-visible reasoning summaries must be written in Simplified Chinese. Never use an English heading for a reasoning summary.\n</identity>".to_string());
 
     // 2. workspace — 工作区信息
     if let Some(workspace_root) = workspace_root {
@@ -5448,6 +5448,16 @@ mod tests {
         assert!(prompt.contains("翻译成中文"));
         assert!(prompt.contains("must be written in Simplified Chinese"));
         assert!(prompt.contains("Never use an English heading"));
+    }
+
+    #[test]
+    fn system_prompt_forbids_boilerplate_closing_after_capability_answers() {
+        let prompt = build_system_prompt(Some(Path::new(r"D:\code\k-coder")), "", "", "", "", &[]);
+
+        assert!(prompt.contains("回答能力类问题"));
+        assert!(prompt.contains("只依据 `<available_tools>` 和当前工具列表给出事实性回答"));
+        assert!(prompt.contains("你可以用中文或英文与我交流"));
+        assert!(prompt.contains("内容说完即结束"));
     }
 
     #[test]

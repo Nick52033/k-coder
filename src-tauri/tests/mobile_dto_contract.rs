@@ -198,6 +198,7 @@ fn status_matches_the_frontend_fixture() {
             .collect(),
         preferred_bind_address: status["preferredBindAddress"].as_str().map(str::to_string),
         preferred_port: status["preferredPort"].as_u64().expect("preferredPort") as u16,
+        last_error: status["lastError"].as_str().map(str::to_string),
         connections: status["connections"].as_u64().expect("connections") as usize,
         capabilities,
         pairing: None,

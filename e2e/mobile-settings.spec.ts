@@ -38,6 +38,7 @@ interface StatusFixture {
   lanAddresses: string[];
   preferredBindAddress: string | null;
   preferredPort: number;
+  lastError: string | null;
   connections: number;
   capabilities: Capability[];
   pairing: unknown;
@@ -163,16 +164,25 @@ test("mobile settings page drives gateway, pairing and device control", async ({
           state.port = null;
           state.scheme = null;
           state.fingerprint = null;
+          state.lastError = null;
           state.pairing = null;
           return state;
         }
         if (command === "mobile_start") {
           const bind = (args?.bindAddress as string | null) ?? null;
           state.running = true;
-          state.host = bind ?? "127.0.0.1";
           state.port = (args?.port as number | null) ?? 8787;
-          state.scheme = bind ? "https" : "http";
-          state.fingerprint = bind ? fixture.fingerprint : null;
+          if (bind === "192.0.2.1") {
+            state.host = "127.0.0.1";
+            state.scheme = "http";
+            state.fingerprint = null;
+            state.lastError = "监听地址 192.0.2.1 已失效，已回退到仅本机访问；手机无法连接。请选择有效地址后重试。";
+          } else {
+            state.host = bind ?? "127.0.0.1";
+            state.scheme = bind ? "https" : "http";
+            state.fingerprint = bind ? fixture.fingerprint : null;
+            state.lastError = null;
+          }
           return state;
         }
         if (command === "mobile_create_pairing") {
@@ -369,4 +379,10 @@ test("mobile settings page drives gateway, pairing and device control", async ({
   await expect(settings.getByText("未启动")).toBeVisible();
   await expect(settings.getByRole("button", { name: "生成配对二维码" })).toBeDisabled();
   await page.screenshot({ path: testInfo.outputPath("mobile-settings-stopped.png") });
+
+  // 失效地址回退时，启动成功但必须明确告诉用户手机连不上以及如何恢复。
+  await settings.getByLabel("监听地址").fill("192.0.2.1");
+  await settings.getByRole("button", { name: "开启局域网访问" }).click();
+  await expect(settings.getByRole("status")).toContainText("手机无法连接");
+  await expect(settings.getByRole("status")).toContainText("重试");
 });

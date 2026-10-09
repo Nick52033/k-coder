@@ -93,9 +93,8 @@ export function MobileSettingsPage() {
     void refresh();
   }, [refresh]);
 
-  // 待确认配对需要持续轮询：手机提交后必须由电脑这边确认。
+  // 持续刷新状态：既要看到手机提交的配对，也要捕获启动时异步恢复的结果。
   useEffect(() => {
-    if (!status?.running) return;
     pollingRef.current = window.setInterval(() => {
       void refresh();
     }, 3000);
@@ -105,7 +104,7 @@ export function MobileSettingsPage() {
         pollingRef.current = null;
       }
     };
-  }, [status?.running, refresh]);
+  }, [refresh]);
 
   useEffect(() => {
     if (!pairing?.uri) {
@@ -160,7 +159,11 @@ export function MobileSettingsPage() {
       }
       const next = await startMobileGateway(bindAddress.trim(), parsedPort);
       setStatus(next);
-      toast.success("移动网关已启动");
+      if (next.lastError) {
+        toast.info("已仅在本机启动，手机暂时无法连接");
+      } else {
+        toast.success("移动网关已启动");
+      }
     });
 
   const startLoopbackOnly = () =>
@@ -264,6 +267,12 @@ export function MobileSettingsPage() {
           <AlertTriangle size={15} aria-hidden />
           <span>{error}</span>
         </div>
+      ) : null}
+
+      {status?.lastError ? (
+        <p className="mobile-settings__hint is-warning" role="status">
+          {status.lastError}
+        </p>
       ) : null}
 
       <section className="mobile-settings__card">

@@ -1265,6 +1265,7 @@ export interface MobileStatus {
   lanAddresses: string[];
   preferredBindAddress: string | null;
   preferredPort: number;
+  lastError: string | null;
   connections: number;
   capabilities: MobileCapability[];
   pairing: MobilePairingView | null;

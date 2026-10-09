@@ -4233,6 +4233,56 @@ test("pins a scroll-to-bottom button to the conversation while the latest conten
   await expect(button).toHaveCount(0);
 });
 
+test("sending a message returns the conversation to the latest content", async ({ page }) => {
+  await page.goto("/");
+  const area = page.locator(".message-area");
+  await area.evaluate((element) => {
+    const target = element as HTMLElement;
+    target.style.height = "220px";
+    target.style.minHeight = "220px";
+    target.style.maxHeight = "220px";
+    target.scrollTop = target.scrollHeight;
+    target.dispatchEvent(new Event("scroll"));
+  });
+  const emit = (event: Record<string, unknown>) => page.evaluate((payload) => {
+    (window as unknown as { __emitAgentEvent: (value: unknown) => void }).__emitAgentEvent(payload);
+  }, event);
+  const base = { schemaVersion: 1, threadId: "thread-1", turnId: "turn-send-scroll" };
+  await emit({ ...base, type: "turn_started", phase: "exploring" });
+  await emit({
+    ...base,
+    type: "text_delta",
+    phase: "responding",
+    delta: Array.from(
+      { length: 70 },
+      (_, index) => `发送回底验证第 ${index + 1} 段内容，让会话继续向下生长。`,
+    ).join("\n\n"),
+  });
+  await expect.poll(() => area.evaluate((element) =>
+    element.scrollHeight - element.clientHeight,
+  ), { timeout: 8_000 }).toBeGreaterThan(320);
+
+  // 用户向上离开最新内容：跟随暂停，距底超过阈值，「回到底部」按钮出现。
+  await area.evaluate((element) => {
+    const target = element as HTMLElement;
+    target.scrollTop = Math.max(0, target.scrollTop - 160);
+    target.dispatchEvent(new WheelEvent("wheel", { deltaY: -160 }));
+    target.dispatchEvent(new Event("scroll"));
+  });
+  await expect.poll(() => area.evaluate((element) =>
+    element.scrollHeight - element.clientHeight - element.scrollTop,
+  )).toBeGreaterThan(48);
+  await expect(page.locator(".scroll-to-bottom-button")).toBeVisible();
+
+  // 发送消息：无论此前停留在历史何处，会话区都默认回到最新内容。
+  await page.getByRole("textbox", { name: "消息" }).fill("发送后回到最新内容");
+  await page.getByRole("button", { name: "发送消息", exact: true }).click();
+  await expect.poll(() => area.evaluate((element) =>
+    element.scrollHeight - element.clientHeight - element.scrollTop,
+  )).toBeLessThanOrEqual(2);
+  await expect(page.locator(".scroll-to-bottom-button")).toHaveCount(0);
+});
+
 test("primary send queues behind the active turn and the queued send steers it", async ({ page }, testInfo) => {
   await page.goto("/");
   await page.evaluate(() => {
@@ -7896,7 +7946,7 @@ test("opens the embedded browser panel and keeps the page across tab switches", 
 });
 
 
-test("shows an actionable waiting state before the assistant returns its first update", async ({ page }, testInfo) => {
+test("shows a calm waiting pill before the assistant returns its first update", async ({ page }, testInfo) => {
   await page.addInitScript(() => localStorage.setItem("kcoder_e2e_plan", "null"));
   await page.goto("/");
   await expect(page.getByRole("heading", { name: "Phase 6 workbench", exact: true })).toBeVisible();
@@ -7920,34 +7970,37 @@ test("shows an actionable waiting state before the assistant returns its first u
   const waiting = page.locator(".turn-waiting");
   await expect(waiting).toBeVisible();
   await expect(waiting).toContainText("正在理解你的请求");
-  await expect(waiting.locator(".turn-waiting__copy p")).toHaveCount(0);
-  await expect(waiting.locator(".turn-waiting__heading")).toHaveCSS("flex-wrap", "nowrap");
   await expect(waiting.locator(".turn-waiting__elapsed")).toContainText("0s");
-  await expect(waiting.getByRole("button", { name: "停止", exact: true })).toBeEnabled();
+  // 等待态只回答「还在跑吗？」：三点呼吸 + 计时，本身不承载任何操作按钮。
+  await expect(waiting.getByRole("button")).toHaveCount(0);
   const waitingStyle = await waiting.evaluate((element) => {
-    const icon = element.querySelector<HTMLElement>(".turn-waiting__icon");
-    const stop = element.querySelector<HTMLElement>(".turn-waiting__stop");
     const style = getComputedStyle(element);
+    const dot = element.querySelector<HTMLElement>(".turn-waiting__pulse > i");
     return {
+      display: style.display,
+      borderRadius: style.borderRadius,
       backgroundColor: style.backgroundColor,
-      borderRightWidth: style.borderRightWidth,
-      borderTopWidth: style.borderTopWidth,
-      iconBackgroundColor: icon ? getComputedStyle(icon).backgroundColor : null,
-      stopBackgroundColor: stop ? getComputedStyle(stop).backgroundColor : null,
-      stopBorderTopWidth: stop ? getComputedStyle(stop).borderTopWidth : null,
+      dots: element.querySelectorAll(".turn-waiting__pulse > i").length,
+      dotWidth: dot ? getComputedStyle(dot).width : null,
+      dotHeight: dot ? getComputedStyle(dot).height : null,
+      pillWidth: element.getBoundingClientRect().width,
+      rowWidth: element.parentElement?.getBoundingClientRect().width ?? 0,
     };
   });
-  expect(waitingStyle.backgroundColor).toBe("rgba(0, 0, 0, 0)");
-  expect(waitingStyle.borderRightWidth).toBe("0px");
-  expect(waitingStyle.borderTopWidth).toBe("1px");
-  expect(waitingStyle.iconBackgroundColor).toBe("rgba(0, 0, 0, 0)");
-  expect(waitingStyle.stopBackgroundColor).toBe("rgba(0, 0, 0, 0)");
-  expect(waitingStyle.stopBorderTopWidth).toBe("0px");
+  expect(waitingStyle.display).toBe("inline-flex");
+  expect(waitingStyle.borderRadius).toBe("999px");
+  expect(waitingStyle.backgroundColor).not.toBe("rgba(0, 0, 0, 0)");
+  expect(waitingStyle.dots).toBe(3);
+  expect(waitingStyle.dotWidth).toBe("4px");
+  expect(waitingStyle.dotHeight).toBe("4px");
+  // 胶囊贴着内容，不占满整行。
+  expect(waitingStyle.pillWidth).toBeGreaterThan(0);
+  expect(waitingStyle.pillWidth).toBeLessThan(waitingStyle.rowWidth);
   await page.screenshot({ path: testInfo.outputPath("slow-first-update-waiting-state.png"), fullPage: true });
 
-  await waiting.getByRole("button", { name: "停止", exact: true }).click();
+  // 停止只留在输入框右侧；点击后等待态切成「正在停止」。
+  await page.getByRole("button", { name: "停止生成" }).click();
   await expect(waiting).toContainText("正在停止");
-  await expect(waiting.getByRole("button", { name: "停止", exact: true })).toHaveCount(0);
   await expect.poll(() => page.evaluate(() => (
     window as unknown as { __invoked: string[] }
   ).__invoked.filter((command) => command === "turn_interrupt").length)).toBe(1);

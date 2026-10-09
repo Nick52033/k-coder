@@ -51,14 +51,12 @@ export function TurnWaitingIndicator({
   activitySinceMs,
   streamRetry = null,
   retryAtMs,
-  onStop,
   cancelling = false,
 }: {
   activityStatus?: AgentActivityStatus | null;
   activitySinceMs?: number;
   streamRetry?: { attempt: number; maxAttempts: number } | null;
   retryAtMs?: number;
-  onStop?: () => void;
   cancelling?: boolean;
 }) {
   const [mountedAtMs] = useState(() => Date.now());
@@ -87,34 +85,26 @@ export function TurnWaitingIndicator({
 
   return (
     <div className="turn-waiting" role="status" aria-live="polite">
-      <span className="turn-waiting__icon" aria-hidden="true">
-        <LoaderCircle size={17} />
+      <span className="turn-waiting__pulse" aria-hidden="true">
+        <i />
+        <i />
+        <i />
       </span>
-      <div className="turn-waiting__copy">
-        <div className="turn-waiting__heading">
-          <strong>{cancelling ? "正在停止" : copy.title}</strong>
-          {!cancelling ? <span className="turn-waiting__elapsed" aria-hidden="true">
-            {activityStatus === "rate_limited"
-              ? <>
-                <RetryWaitingLabel retryAtMs={retryAtMs} />
-                <span aria-hidden="true"> · </span>
-                <ActivityStatusLabel label="已等待" hint={null} sinceMs={activitySinceMs ?? mountedAtMs} />
-              </>
-              : <ActivityStatusLabel
-                label="已等待"
-                hint={null}
-                sinceMs={activitySinceMs ?? mountedAtMs}
-                streamRetry={streamRetry}
-              />}
-          </span> : null}
-        </div>
-      </div>
-      {onStop && !cancelling ? (
-        <button className="turn-waiting__stop" type="button" onClick={onStop}>
-          <CircleX size={14} aria-hidden="true" />
-          <span>停止</span>
-        </button>
-      ) : null}
+      <span className="turn-waiting__label">{cancelling ? "正在停止" : copy.title}</span>
+      <span className="turn-waiting__elapsed" aria-hidden="true">
+        {activityStatus === "rate_limited"
+          ? <>
+            <RetryWaitingLabel retryAtMs={retryAtMs} />
+            <span aria-hidden="true"> · </span>
+            <ActivityStatusLabel label="已等待" hint={null} sinceMs={activitySinceMs ?? mountedAtMs} />
+          </>
+          : <ActivityStatusLabel
+            label="已等待"
+            hint={null}
+            sinceMs={activitySinceMs ?? mountedAtMs}
+            streamRetry={streamRetry}
+          />}
+      </span>
     </div>
   );
 }
@@ -138,7 +128,6 @@ export const ConversationTurnActivity = memo(function ConversationTurnActivity({
   failureError,
   subagentTaskIndex,
   onFocusSubagent,
-  onStop,
   cancelling = false,
 }: {
   activities: ToolActivity[];
@@ -164,7 +153,6 @@ export const ConversationTurnActivity = memo(function ConversationTurnActivity({
   /** Maps a subagent id to its 1-based `taskN` label within the active thread. */
   subagentTaskIndex?: Record<string, number>;
   onFocusSubagent?: (agentId: string) => void;
-  onStop?: () => void;
   cancelling?: boolean;
 }) {
   const paced = usePacedTimeline(timeline, streaming, initialTextVisible);
@@ -204,7 +192,6 @@ export const ConversationTurnActivity = memo(function ConversationTurnActivity({
         activitySinceMs={activitySinceMs}
         streamRetry={streamRetry}
         retryAtMs={retryAtMs}
-        onStop={onStop}
         cancelling={cancelling}
       />
     );
@@ -946,7 +933,9 @@ function ToolActivityRow({
       ) : activity.state === "completed" ? (
         <CircleCheck size={15} aria-hidden="true" />
       ) : activity.state === "failed" ? (
-        <CircleX size={15} aria-hidden="true" />
+        isCommand
+          ? <CircleDot size={15} aria-hidden="true" />
+          : <CircleX size={15} aria-hidden="true" />
       ) : activity.state === "cancelled" || isPending ? (
         <Circle size={15} aria-hidden="true" />
       ) : (

@@ -266,6 +266,7 @@ impl ProgressSnapshot {
 struct ApplyPatchFailureTracker {
     signature: Option<String>,
     count: usize,
+    permanent: bool,
 }
 
 impl ApplyPatchFailureTracker {
@@ -276,6 +277,7 @@ impl ApplyPatchFailureTracker {
         } else {
             self.signature = Some(signature);
             self.count = 1;
+            self.permanent = apply_patch_failure_is_permanent(result);
         }
         self.count
     }
@@ -283,10 +285,15 @@ impl ApplyPatchFailureTracker {
     fn reset(&mut self) {
         self.signature = None;
         self.count = 0;
+        self.permanent = false;
     }
 
     fn is_active(&self) -> bool {
         self.count > 0
+    }
+
+    fn is_permanent(&self) -> bool {
+        self.permanent
     }
 }
 
@@ -339,6 +346,33 @@ fn repeated_apply_patch_guidance(count: usize) -> String {
     format!(
         "\n\n[apply_patch recovery] This patch failure has repeated {count} times for the same error class and target. Do not resend the same patch shape. Re-read the exact target region, then rebuild the smallest valid patch; every Update File needs an @@ hunk and every hunk needs a + addition or - removal."
     )
+}
+
+/// A per-file size-cap failure cannot be satisfied by any patch shape or full-file
+/// write, so the model must hear that on the first failure instead of spending the
+/// whole recovery budget re-measuring the file. Matches the marker phrase emitted by
+/// `patch::oversized_file_error`.
+fn apply_patch_failure_is_permanent(result: &ToolResult) -> bool {
+    result
+        .output
+        .to_ascii_lowercase()
+        .contains("hard per-file cap")
+}
+
+fn blocked_apply_patch_guidance(targets: &str) -> String {
+    format!(
+        "\n\n[apply_patch blocked] {targets} is over the hard per-file size cap, so no apply_patch or write_file can modify it while it stays that large. Do not re-measure the file or resend the patch: split or trim it below the cap first (run_command may edit it), then retry the change, or report the blockage to the user."
+    )
+}
+
+fn apply_patch_target_label(call: &ToolCall) -> String {
+    call.arguments
+        .get("patch")
+        .and_then(Value::as_str)
+        .map(apply_patch_targets)
+        .filter(|targets| !targets.is_empty())
+        .map(|targets| targets.join(", "))
+        .unwrap_or_else(|| "<unknown target>".to_string())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1008,16 +1042,19 @@ impl AgentRuntime {
             }
             if apply_patch_failures.is_active() {
                 if apply_patch_recovery_rounds >= MAX_APPLY_PATCH_RECOVERY_ROUNDS {
-                    return self
-                        .finish_failed(
-                            &thread_id,
-                            &turn_id,
-                            format!(
-                                "apply_patch_loop: apply_patch 失败后连续 {} 个模型轮次仍未成功写入，已停止本轮；请根据最后一次诊断重新读取目标区域并构造一个有效补丁。",
-                                MAX_APPLY_PATCH_RECOVERY_ROUNDS
-                            ),
-                            &publisher,
+                    let message = if apply_patch_failures.is_permanent() {
+                        format!(
+                            "apply_patch_loop: 目标文件超过单文件大小硬上限，连续 {} 个模型轮次仍未能将其降到上限以内并完成写入，已停止了本轮；请先拆分或精简该文件（run_command 可直接编辑），再开启新 Turn 重试。",
+                            MAX_APPLY_PATCH_RECOVERY_ROUNDS
                         )
+                    } else {
+                        format!(
+                            "apply_patch_loop: apply_patch 失败后连续 {} 个模型轮次仍未成功写入，已停止了本轮；请根据最后一次诊断重新读取目标区域并构造一个有效补丁。",
+                            MAX_APPLY_PATCH_RECOVERY_ROUNDS
+                        )
+                    };
+                    return self
+                        .finish_failed(&thread_id, &turn_id, message, &publisher)
                         .await;
                 }
                 // Count only Provider rounds after the failed patch has been returned
@@ -2396,22 +2433,30 @@ impl AgentRuntime {
                         apply_patch_recovery_rounds = 0;
                     } else {
                         let failure_count = apply_patch_failures.observe(&call, &result);
-                        if failure_count == MAX_REPEATED_APPLY_PATCH_FAILURES.saturating_sub(1)
+                        let permanent = apply_patch_failures.is_permanent();
+                        if permanent {
+                            // A per-file size cap blocks every patch shape and full-file
+                            // write, so the generic "rebuild a smaller patch" advice would
+                            // send the model re-measuring a file it cannot touch.
+                            result.output.push_str(&blocked_apply_patch_guidance(
+                                &apply_patch_target_label(&call),
+                            ));
+                        } else if failure_count
+                            == MAX_REPEATED_APPLY_PATCH_FAILURES.saturating_sub(1)
                         {
                             result
                                 .output
                                 .push_str(&repeated_apply_patch_guidance(failure_count));
-                        } else if failure_count >= MAX_REPEATED_APPLY_PATCH_FAILURES {
-                            let targets = call
-                                .arguments
-                                .get("patch")
-                                .and_then(Value::as_str)
-                                .map(apply_patch_targets)
-                                .filter(|targets| !targets.is_empty())
-                                .map(|targets| targets.join(", "))
-                                .unwrap_or_else(|| "<unknown target>".to_string());
+                        }
+                        if failure_count >= MAX_REPEATED_APPLY_PATCH_FAILURES {
+                            let targets = apply_patch_target_label(&call);
+                            let remedy = if permanent {
+                                "The target is over the hard per-file size cap: split or trim it below the cap (run_command may edit it) before retrying."
+                            } else {
+                                "Re-read the target and construct one valid patch before retrying."
+                            };
                             let reason = format!(
-                                "apply_patch_loop: the same apply_patch error for {targets} repeated {failure_count} times; stopped this Turn. Re-read the target and construct one valid patch before retrying."
+                                "apply_patch_loop: the same apply_patch error for {targets} repeated {failure_count} times; stopped this Turn. {remedy}"
                             );
                             result.output.push_str(&format!("\n\n{reason}"));
                             item_status = AgentItemStatus::Failed;
@@ -10031,6 +10076,140 @@ mod tests {
                 .error
                 .as_deref()
                 .is_some_and(|error| error.contains("连续 6 个模型轮次"))
+        );
+        assert_eq!(
+            provider.requests().len(),
+            MAX_APPLY_PATCH_RECOVERY_ROUNDS + 1
+        );
+    }
+
+    #[tokio::test]
+    async fn permanent_size_cap_failure_guides_the_model_on_the_first_failure() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("small.txt"), "before\n").unwrap();
+        std::fs::write(directory.path().join("big.txt"), vec![b'a'; 512 * 1024 + 1]).unwrap();
+        let (repository, runtime, _approvals, thread_id) =
+            editing_runtime(directory.path(), Duration::from_secs(1)).await;
+        let runtime = runtime.with_approval_mode(ApprovalMode::FullAccess);
+        let provider = Arc::new(FakeProvider::script(vec![
+            vec![
+                Ok(ProviderEvent::ToolCall {
+                    call: patch_call_with_id(
+                        "too-big",
+                        "*** Begin Patch\n*** Update File: big.txt\n@@\n-a\n+b\n*** End Patch",
+                    ),
+                }),
+                Ok(ProviderEvent::Completed),
+            ],
+            vec![
+                Ok(ProviderEvent::ToolCall {
+                    call: patch_call_with_id(
+                        "small-fix",
+                        "*** Begin Patch\n*** Update File: small.txt\n@@\n-before\n+after\n*** End Patch",
+                    ),
+                }),
+                Ok(ProviderEvent::Completed),
+            ],
+            vec![
+                Ok(ProviderEvent::TextDelta {
+                    delta: "reported the blockage".to_string(),
+                }),
+                Ok(ProviderEvent::Completed),
+            ],
+        ]));
+
+        let outcome = runtime
+            .run_turn(
+                provider.clone(),
+                "fake".to_string(),
+                RunTurnRequest {
+                    thread_id: thread_id.clone(),
+                    input: "update both files".to_string(),
+                    agent_mode: None,
+                },
+                CancellationToken::new(),
+                Arc::new(RecordingPublisher::default()),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.state, TurnState::Completed);
+        let patch_results = repository
+            .load(&thread_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter_map(|event| match event.kind {
+                StoredEventKind::ToolResult { name, result, .. } if name == "apply_patch" => {
+                    Some(result)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(patch_results.len(), 2);
+        assert!(!patch_results[0].success);
+        assert!(patch_results[0].output.contains("hard per-file cap"));
+        assert!(patch_results[0].output.contains("[apply_patch blocked]"));
+        assert!(patch_results[0].output.contains("big.txt"));
+        assert!(!patch_results[0].output.contains("[apply_patch recovery]"));
+        assert!(patch_results[1].success);
+    }
+
+    #[tokio::test]
+    async fn permanent_size_cap_failure_stops_with_a_size_specific_message() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("big.txt"), vec![b'a'; 512 * 1024 + 1]).unwrap();
+        let (_repository, runtime, _approvals, thread_id) =
+            editing_runtime(directory.path(), Duration::from_secs(1)).await;
+        let runtime = runtime.with_approval_mode(ApprovalMode::FullAccess);
+        let oversized_patch =
+            "*** Begin Patch\n*** Update File: big.txt\n@@\n-a\n+b\n*** End Patch";
+        let mut scripts = vec![vec![
+            Ok(ProviderEvent::ToolCall {
+                call: patch_call_with_id("too-big", oversized_patch),
+            }),
+            Ok(ProviderEvent::Completed),
+        ]];
+        for index in 0..(MAX_APPLY_PATCH_RECOVERY_ROUNDS + 1) {
+            scripts.push(vec![
+                Ok(ProviderEvent::ToolCall {
+                    call: ToolCall {
+                        id: format!("read-{index}"),
+                        name: "read_file".into(),
+                        arguments: json!({
+                            "path": "big.txt",
+                            "startLine": index + 1,
+                            "lineCount": 1,
+                        }),
+                        metadata: json!({}),
+                    },
+                }),
+                Ok(ProviderEvent::Completed),
+            ]);
+        }
+        let provider = Arc::new(FakeProvider::script(scripts));
+
+        let outcome = runtime
+            .run_turn(
+                provider.clone(),
+                "fake".into(),
+                RunTurnRequest {
+                    thread_id,
+                    input: "shrink the file".into(),
+                    agent_mode: None,
+                },
+                CancellationToken::new(),
+                Arc::new(RecordingPublisher::default()),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.state, TurnState::Failed);
+        assert!(
+            outcome
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("单文件大小硬上限"))
         );
         assert_eq!(
             provider.requests().len(),

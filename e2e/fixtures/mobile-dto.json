@@ -44,6 +44,7 @@
     "lanAddresses": ["192.168.1.20"],
     "preferredBindAddress": "192.168.1.20",
     "preferredPort": 8787,
+    "lastError": null,
     "connections": 1,
     "capabilities": ["chat", "approval", "interrupt"],
     "pairing": null,

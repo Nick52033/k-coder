@@ -1980,6 +1980,10 @@
       input.value = "";
       resizeInput();
       state.draft = "";
+      // 发送即回到底部：无论此前停留在历史何处，新消息都把视图带回最新内容，
+      // 后续流式输出沿同一条跟随逻辑继续贴底。
+      state.follow = true;
+      followBottom();
       renderChatMeta();
       updateComposerState();
     } catch (error) {

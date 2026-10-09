@@ -848,31 +848,43 @@ async fn read_stream<R: tokio::io::AsyncRead + Unpin>(
     stream: OutputStream,
     session: Arc<Session>,
 ) {
+    let mut decoder = OutputDecoder::new();
     let mut lines = BufReader::new(reader).split(b'\n');
     while let Ok(Some(bytes)) = lines.next_segment().await {
-        let mut text = String::from_utf8_lossy(&bytes).into_owned();
+        let mut text = decoder.push(&bytes);
         text.push('\n');
         let text = redact(&text);
-        let mut output = session.output.lock().await;
-        let cursor = output.next_cursor;
-        output.next_cursor += 1;
-        output.bytes += text.len();
-        output.chunks.push_back(OutputChunk {
-            cursor,
-            stream,
-            text,
-        });
-        while output.bytes > output.limit {
-            if let Some(chunk) = output.chunks.pop_front() {
-                output.bytes = output.bytes.saturating_sub(chunk.text.len());
-                output.truncated = true;
-            } else {
-                break;
-            }
-        }
-        drop(output);
-        session.changed.notify_waiters();
+        append_session_output(&session, stream, text).await;
     }
+    // 按行切分切不断多字节字符（换行字节不会出现在 GBK/UTF-8 序列中间），
+    // 所以这里正常不会有余留；真出现了也别丢字节。
+    let tail = redact(&decoder.finish());
+    if !tail.is_empty() {
+        append_session_output(&session, stream, tail).await;
+    }
+}
+
+/// 追加一段输出并维护有界缓冲的截断。调用方需已保证 `text` 已脱敏。
+async fn append_session_output(session: &Arc<Session>, stream: OutputStream, text: String) {
+    let mut output = session.output.lock().await;
+    let cursor = output.next_cursor;
+    output.next_cursor += 1;
+    output.bytes += text.len();
+    output.chunks.push_back(OutputChunk {
+        cursor,
+        stream,
+        text,
+    });
+    while output.bytes > output.limit {
+        if let Some(chunk) = output.chunks.pop_front() {
+            output.bytes = output.bytes.saturating_sub(chunk.text.len());
+            output.truncated = true;
+        } else {
+            break;
+        }
+    }
+    drop(output);
+    session.changed.notify_waiters();
 }
 
 async fn drain_output_tasks(
@@ -1007,6 +1019,185 @@ fn wait_state(result: std::io::Result<std::process::ExitStatus>) -> CommandState
         Err(e) => CommandState::Failed {
             message: e.to_string(),
         },
+    }
+}
+
+/// 子进程输出的增量解码器。
+///
+/// 为什么不直接 `String::from_utf8_lossy`：子进程并不保证按 UTF-8 写。中文 Windows 上
+/// PowerShell 的原生报错走系统 ANSI 代码页（CP936/GBK），逐字节按 UTF-8 解会把每个汉字
+/// 换成一个 U+FFFD，原文（例如「在其上下文中，该请求的地址无效」）彻底读不出来，模型和
+/// 人都看不出这次失败的真实原因——`k-coder-runtime-error-triage` 的 B2 报的就是这个。
+/// 因此这里先按严格 UTF-8 解，失败再按当前 ANSI 代码页解。
+///
+/// 另外 stdout/stderr 按行读、PTY 按 4096 字节块读，多字节字符可能正巧被切在两段之间，
+/// 所以半条序列要缓存到下一段再解，否则每个切点都会凭空多出一个乱码字符。
+struct OutputDecoder {
+    /// 上一段遗留的、尚不完整的多字节序列尾部。
+    carry: Vec<u8>,
+    #[cfg(windows)]
+    code_page: u32,
+}
+
+impl OutputDecoder {
+    fn new() -> Self {
+        #[cfg(windows)]
+        {
+            Self::with_code_page(windows_sys::Win32::Globalization::CP_ACP)
+        }
+        #[cfg(not(windows))]
+        {
+            Self { carry: Vec::new() }
+        }
+    }
+
+    #[cfg(windows)]
+    fn with_code_page(code_page: u32) -> Self {
+        Self {
+            carry: Vec::new(),
+            code_page,
+        }
+    }
+
+    /// 解码一段字节，返回可以直接展示/入库的文本。
+    fn push(&mut self, bytes: &[u8]) -> String {
+        if self.carry.is_empty() {
+            // 快路径：整段就是合法 UTF-8（绝大多数输出，含纯 ASCII）。
+            if let Ok(text) = std::str::from_utf8(bytes) {
+                return text.to_string();
+            }
+        }
+        let mut buffer = std::mem::take(&mut self.carry);
+        buffer.extend_from_slice(bytes);
+        let (text, carry) = self.decode(&buffer);
+        self.carry = carry;
+        text
+    }
+
+    fn decode(&self, bytes: &[u8]) -> (String, Vec<u8>) {
+        #[cfg(windows)]
+        {
+            decode_process_bytes_with_code_page(bytes, self.code_page)
+        }
+        #[cfg(not(windows))]
+        {
+            decode_process_bytes(bytes)
+        }
+    }
+
+    /// 流结束时冲刷残留的半条序列。正常到不了这里（换行读法不会切断多字节字符），
+    /// 真出现了也按替换符解出，不丢字节。
+    fn finish(&mut self) -> String {
+        if self.carry.is_empty() {
+            return String::new();
+        }
+        String::from_utf8_lossy(&std::mem::take(&mut self.carry)).into_owned()
+    }
+}
+
+/// 解码一整段（已含上一次的残留尾部），返回 `(文本, 留给下一段的尾部字节)`。
+#[cfg(not(windows))]
+fn decode_process_bytes(bytes: &[u8]) -> (String, Vec<u8>) {
+    decode_utf8_or_lossy(bytes)
+}
+
+#[cfg(not(windows))]
+fn decode_utf8_or_lossy(bytes: &[u8]) -> (String, Vec<u8>) {
+    match std::str::from_utf8(bytes) {
+        Ok(text) => (text.to_string(), Vec::new()),
+        Err(error) => {
+            let valid_up_to = error.valid_up_to();
+            if error.error_len().is_none() {
+                // 尾部是一条被截断的 UTF-8 序列：前缀完整合法，原样收下；尾部留给下一段。
+                return (
+                    String::from_utf8_lossy(&bytes[..valid_up_to]).into_owned(),
+                    bytes[valid_up_to..].to_vec(),
+                );
+            }
+            (String::from_utf8_lossy(bytes).into_owned(), Vec::new())
+        }
+    }
+}
+
+#[cfg(windows)]
+fn decode_process_bytes_with_code_page(bytes: &[u8], code_page: u32) -> (String, Vec<u8>) {
+    match std::str::from_utf8(bytes) {
+        Ok(text) => (text.to_string(), Vec::new()),
+        Err(error) => {
+            let valid_up_to = error.valid_up_to();
+            if error.error_len().is_none() {
+                return (
+                    String::from_utf8_lossy(&bytes[..valid_up_to]).into_owned(),
+                    bytes[valid_up_to..].to_vec(),
+                );
+            }
+
+            // 不是 UTF-8，按当前 ANSI 代码页解（中文 Windows 即 CP936/GBK）。
+            // 只缓存代码页解析后确实落在块尾的前导字节。
+            let split = dbcs_lead_tail(bytes, code_page);
+            let (head, tail) = bytes.split_at(bytes.len() - split);
+            if let Some(text) = decode_ansi_with_code_page(head, code_page) {
+                return (text, tail.to_vec());
+            }
+
+            (String::from_utf8_lossy(bytes).into_owned(), Vec::new())
+        }
+    }
+}
+
+/// 扫描当前代码页的字节序列，末尾孤立的双字节前导字节留给下一段。
+#[cfg(windows)]
+fn dbcs_lead_tail(bytes: &[u8], code_page: u32) -> usize {
+    use windows_sys::Win32::Globalization::IsDBCSLeadByteEx;
+
+    let mut index = 0;
+    while index < bytes.len() {
+        // SAFETY: IsDBCSLeadByteEx 只读取给定代码页和单个字节，没有指针参数。
+        let is_lead = unsafe { IsDBCSLeadByteEx(code_page, bytes[index]) != 0 };
+        if is_lead {
+            if index + 1 == bytes.len() {
+                return 1;
+            }
+            index += 2;
+        } else {
+            index += 1;
+        }
+    }
+    0
+}
+
+/// 按当前线程的 ANSI 代码页把字节解成字符串；API 调用失败时返回 `None`。
+#[cfg(windows)]
+fn decode_ansi_with_code_page(bytes: &[u8], code_page: u32) -> Option<String> {
+    use windows_sys::Win32::Globalization::MultiByteToWideChar;
+    if bytes.is_empty() {
+        return Some(String::new());
+    }
+    unsafe {
+        let wide_len = MultiByteToWideChar(
+            code_page,
+            0,
+            bytes.as_ptr(),
+            bytes.len() as i32,
+            std::ptr::null_mut(),
+            0,
+        );
+        if wide_len <= 0 {
+            return None;
+        }
+        let mut wide = vec![0u16; wide_len as usize];
+        let written = MultiByteToWideChar(
+            code_page,
+            0,
+            bytes.as_ptr(),
+            bytes.len() as i32,
+            wide.as_mut_ptr(),
+            wide_len,
+        );
+        if written <= 0 {
+            return None;
+        }
+        String::from_utf16(&wide[..written as usize]).ok()
     }
 }
 
@@ -1431,33 +1622,70 @@ impl NativePtyRuntime {
 
 fn read_pty_stream(mut reader: Box<dyn Read + Send>, session: Arc<PtySession>) {
     let mut bytes = [0u8; 4096];
+    let mut decoder = OutputDecoder::new();
     loop {
         let count = match reader.read(&mut bytes) {
             Ok(0) | Err(_) => break,
             Ok(count) => count,
         };
-        let text = redact(&String::from_utf8_lossy(&bytes[..count]));
-        let mut output = session.output.blocking_lock();
-        let cursor = output.next_cursor;
-        output.next_cursor += 1;
-        output.bytes += text.len();
-        output.chunks.push_back(PtyOutputChunk { cursor, text });
-        while output.bytes > output.limit {
-            if let Some(chunk) = output.chunks.pop_front() {
-                output.bytes = output.bytes.saturating_sub(chunk.text.len());
-                output.truncated = true;
-            } else {
-                break;
-            }
-        }
-        drop(output);
-        session.changed.notify_waiters();
+        append_pty_output(&session, redact(&decoder.push(&bytes[..count])));
     }
+    let tail = redact(&decoder.finish());
+    if !tail.is_empty() {
+        append_pty_output(&session, tail);
+    }
+}
+
+fn append_pty_output(session: &Arc<PtySession>, text: String) {
+    if text.is_empty() {
+        return;
+    }
+    let mut output = session.output.blocking_lock();
+    let cursor = output.next_cursor;
+    output.next_cursor += 1;
+    output.bytes += text.len();
+    output.chunks.push_back(PtyOutputChunk { cursor, text });
+    while output.bytes > output.limit {
+        if let Some(chunk) = output.chunks.pop_front() {
+            output.bytes = output.bytes.saturating_sub(chunk.text.len());
+            output.truncated = true;
+        } else {
+            break;
+        }
+    }
+    drop(output);
+    session.changed.notify_waiters();
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn output_decoder_preserves_utf8_and_split_utf8_characters() {
+        let mut decoder = OutputDecoder::new();
+        assert_eq!(decoder.push("hello 中文".as_bytes()), "hello 中文");
+
+        let mut decoder = OutputDecoder::new();
+        assert_eq!(decoder.push(&[0xE4, 0xB8]), "");
+        assert_eq!(decoder.push(&[0xAD]), "中");
+        assert_eq!(decoder.finish(), "");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn output_decoder_decodes_gbk_and_buffers_a_split_character() {
+        const GBK_MIDDLE_CHARACTER: [u8; 2] = [0xD6, 0xD0]; // “中” in code page 936.
+        assert_eq!(
+            decode_ansi_with_code_page(&GBK_MIDDLE_CHARACTER, 936).as_deref(),
+            Some("中")
+        );
+
+        let mut decoder = OutputDecoder::with_code_page(936);
+        assert_eq!(decoder.push(&GBK_MIDDLE_CHARACTER[..1]), "");
+        assert_eq!(decoder.push(&GBK_MIDDLE_CHARACTER[1..]), "中");
+        assert_eq!(decoder.finish(), "");
+    }
 
     #[test]
     fn strip_verbatim_prefix_strips_windows_extended_length_prefix() {

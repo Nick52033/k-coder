@@ -113,6 +113,8 @@ pub struct MobileStatus {
     /// 用户偏好的绑定地址与端口（即使当前未运行也保留）。
     pub preferred_bind_address: Option<String>,
     pub preferred_port: u16,
+    /// 启动时最近一次降级或失败的原因，例如已失效的本机网卡地址。
+    pub last_error: Option<String>,
     pub connections: usize,
     pub capabilities: Vec<MobileCapability>,
     pub pairing: Option<MobilePairingView>,
@@ -135,6 +137,12 @@ pub struct MobileService<R: Runtime = Wry> {
     ctx: GatewayContext,
     data_root: PathBuf,
     runtime: Mutex<Option<server::ServerHandle>>,
+    /// 最近一次启动/恢复失败的原因，`None` 表示当前配置能正常监听。
+    ///
+    /// 存在的理由是「静默失败」：`restore_on_startup` 在异步任务里 bind，失败只写一条
+    /// 运行日志，桌面端只看到「未运行」，用户拿不到原因。把它放进 [`MobileStatus`]，
+    /// 设置页才能把「为什么没连上」直接显示出来。
+    last_error: Mutex<Option<String>>,
 }
 
 impl MobileService<Wry> {
@@ -173,6 +181,7 @@ impl<R: Runtime> MobileService<R> {
             ctx,
             data_root,
             runtime: Mutex::new(None),
+            last_error: Mutex::new(None),
         })
     }
 
@@ -232,6 +241,7 @@ impl<R: Runtime> MobileService<R> {
             return Err(MobileError::invalid_params("port must be 1..=65535"));
         }
         let ip = server::resolve_bind_ip(bind_address.as_deref())?;
+        let (ip, note) = fallback_if_unavailable(ip);
         let tls = if ip.is_loopback() {
             None
         } else {
@@ -241,11 +251,21 @@ impl<R: Runtime> MobileService<R> {
             )?)
         };
 
-        let handle = server::start(self.ctx.clone(), server::ServerBind { ip, port }, tls).await?;
+        let handle =
+            match server::start(self.ctx.clone(), server::ServerBind { ip, port }, tls).await {
+                Ok(handle) => handle,
+                Err(error) => {
+                    self.record_start_failure(&error.message);
+                    return Err(error);
+                }
+            };
+        self.clear_start_failure(note.as_deref());
 
         self.ctx.registry.update_settings(|settings| {
             settings.enabled = true;
-            settings.bind_address = if ip.is_loopback() {
+            settings.bind_address = if note.is_some() {
+                bind_address.clone()
+            } else if ip.is_loopback() {
                 None
             } else {
                 Some(ip.to_string())
@@ -256,7 +276,17 @@ impl<R: Runtime> MobileService<R> {
         Ok(self.status())
     }
 
+    fn record_start_failure(&self, reason: &str) {
+        *self.last_error.lock().expect("last_error lock poisoned") = Some(reason.to_string());
+    }
+
+    fn clear_start_failure(&self, note: Option<&str>) {
+        let mut slot = self.last_error.lock().expect("last_error lock poisoned");
+        *slot = note.map(str::to_string);
+    }
+
     pub fn stop(&self) -> MobileStatus {
+        *self.last_error.lock().expect("last_error lock poisoned") = None;
         let handle = self.runtime.lock().expect("runtime lock poisoned").take();
         if let Some(handle) = handle {
             handle.shutdown();
@@ -312,6 +342,11 @@ impl<R: Runtime> MobileService<R> {
             lan_addresses: server::detect_lan_addresses(),
             preferred_bind_address: settings.bind_address,
             preferred_port: settings.port,
+            last_error: self
+                .last_error
+                .lock()
+                .expect("last_error lock poisoned")
+                .clone(),
             connections,
             capabilities: self.ctx.policy.granted(),
             pairing: self.pairing_view(),
@@ -421,6 +456,21 @@ impl<R: Runtime> MobileService<R> {
     }
 }
 
+/// 已保存的私网地址可能属于已经断开的虚拟网卡。保留用户选择，但本次启动退回回环，
+/// 并让设置页明确提示手机当前无法连接。
+fn fallback_if_unavailable(ip: std::net::IpAddr) -> (std::net::IpAddr, Option<String>) {
+    if ip.is_loopback() || server::is_local_bind_address(ip) {
+        return (ip, None);
+    }
+
+    (
+        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        Some(format!(
+            "监听地址 {ip} 已不再属于本机网卡，已回退到仅本机访问；手机无法连接。请选择当前有效的本机私网地址后重试。"
+        )),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -450,5 +500,23 @@ mod tests {
             assert!(!parsed.is_loopback());
             assert!(server::is_allowed_source(parsed));
         }
+    }
+
+    #[test]
+    fn unavailable_bind_address_falls_back_to_loopback_with_a_user_facing_reason() {
+        let (ip, note) = fallback_if_unavailable("192.0.2.1".parse().unwrap());
+        assert!(ip.is_loopback());
+        let note = note.expect("unavailable address should explain the fallback");
+        assert!(note.contains("192.0.2.1"));
+        assert!(note.contains("手机无法连接"));
+        assert!(note.contains("重试"));
+    }
+
+    #[test]
+    fn loopback_bind_address_does_not_report_a_fallback() {
+        let (ip, note) =
+            fallback_if_unavailable(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+        assert!(ip.is_loopback());
+        assert!(note.is_none());
     }
 }

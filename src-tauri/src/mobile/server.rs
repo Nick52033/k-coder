@@ -184,6 +184,22 @@ pub fn resolve_bind_ip(requested: Option<&str>) -> Result<IpAddr, MobileError> {
     Ok(address)
 }
 
+/// 判断地址是否真的绑在本机某块网卡上。
+///
+/// [`resolve_bind_ip`] 只校验地址**形态**（回环/私网），校验不出「设置里还留着上一次
+/// 会话的隧道或虚拟网卡地址，而那块网卡现在已经不存在」。这正是 WSL/Hyper-V 虚拟网卡
+/// 下线后 `10.8.0.2` 会以 `os error 10049`（在其上下文中，该请求的地址无效）失败的原因：
+/// 字面量合法、落在放行的私网段内，但本机根本没有这块网卡。
+///
+/// 用一次 UDP `bind` 做探测：地址不属于任何本机网卡时内核直接返回 `EADDRNOTAVAIL`，
+/// 与随后 TCP `bind` 的失败原因一致，因此不会引入新的假阴性。回环地址恒真。
+///
+/// 注意这里**不替代** `resolve_bind_ip`：WireGuard 隧道这类合法配置要求的地址在隧道
+/// 未建立时同样不属于本机网卡，调用方应据此回退到回环而不是报错拒绝。
+pub fn is_local_bind_address(ip: IpAddr) -> bool {
+    std::net::UdpSocket::bind(SocketAddr::new(ip, 0)).is_ok()
+}
+
 /// 探测本机在局域网中的地址，供桌面端预填。
 ///
 /// 通过 UDP `connect` 让内核选出出口网卡；不会真的发送数据包。

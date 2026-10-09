@@ -19,6 +19,19 @@ const MAX_PATCH_FILES: usize = 20;
 const MAX_FILE_BYTES: usize = 512 * 1024;
 const MAX_TOTAL_SNAPSHOT_BYTES: usize = 2 * 1024 * 1024;
 
+/// Marker phrase for the per-file size cap. `agent` matches this string to tell a
+/// permanent blockage (no patch shape can succeed) apart from a retryable one;
+/// keep both sides in sync when rewording.
+const OVERSIZED_FILE_MARKER: &str = "hard per-file cap";
+
+fn oversized_file_error(actual_bytes: usize, path: &str) -> PatchError {
+    PatchError::Limit(format!(
+        "{path} is {actual_bytes} bytes, over the {OVERSIZED_FILE_MARKER} of {MAX_FILE_BYTES} bytes; \
+         neither apply_patch nor write_file can modify the file while it is over the cap. \
+         Split or trim it below {MAX_FILE_BYTES} bytes first (run_command may edit it), then retry the change"
+    ))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PatchDocument {
     pub operations: Vec<FilePatch>,
@@ -190,7 +203,8 @@ impl PatchService {
 pub fn parse_patch(patch: &str) -> Result<PatchDocument, PatchError> {
     if patch.len() > MAX_PATCH_BYTES {
         return Err(PatchError::Limit(format!(
-            "patch is larger than {MAX_PATCH_BYTES} bytes"
+            "patch is larger than {MAX_PATCH_BYTES} bytes; \
+             split the change into several smaller patches and apply them one at a time"
         )));
     }
     let normalized = patch.replace("\r\n", "\n");
@@ -206,7 +220,8 @@ pub fn parse_patch(patch: &str) -> Result<PatchDocument, PatchError> {
     while index + 1 < lines.len() {
         if operations.len() >= MAX_PATCH_FILES {
             return Err(PatchError::Limit(format!(
-                "patch contains more than {MAX_PATCH_FILES} file operations"
+                "patch contains more than {MAX_PATCH_FILES} file operations; \
+                 split the change into several smaller patches and apply them one at a time"
             )));
         }
         let header = lines[index];
@@ -408,7 +423,8 @@ fn preview_document(workspace_root: &Path, patch: &str) -> Result<PatchPreview, 
             .saturating_add(after_content.as_ref().map_or(0, String::len));
         if total_snapshot_bytes > MAX_TOTAL_SNAPSHOT_BYTES {
             return Err(PatchError::Limit(format!(
-                "combined before/after snapshots exceed {MAX_TOTAL_SNAPSHOT_BYTES} bytes"
+                "combined before/after snapshots exceed {MAX_TOTAL_SNAPSHOT_BYTES} bytes; \
+                 split the patch into smaller batches and apply them one at a time"
             )));
         }
 
@@ -462,7 +478,8 @@ fn preview_full_write(
     let total_snapshot_bytes = before_content.as_ref().map_or(0, String::len) + content.len();
     if total_snapshot_bytes > MAX_TOTAL_SNAPSHOT_BYTES {
         return Err(PatchError::Limit(format!(
-            "combined before/after snapshots exceed {MAX_TOTAL_SNAPSHOT_BYTES} bytes"
+            "combined before/after snapshots exceed {MAX_TOTAL_SNAPSHOT_BYTES} bytes; \
+             split the change into smaller batches and apply them one at a time"
         )));
     }
     let operation = if before_content.is_some() {
@@ -1035,10 +1052,10 @@ fn ensure_parent(
 fn read_text(path: &Path) -> Result<String, PatchError> {
     let bytes = fs::read(path).map_err(|error| PatchError::Io(error.to_string()))?;
     if bytes.len() > MAX_FILE_BYTES {
-        return Err(PatchError::Limit(format!(
-            "{} is larger than {MAX_FILE_BYTES} bytes",
-            path.display()
-        )));
+        return Err(oversized_file_error(
+            bytes.len(),
+            &path.display().to_string(),
+        ));
     }
     if bytes.iter().any(|byte| *byte == 0) {
         return Err(PatchError::Conflict(format!(
@@ -1057,13 +1074,12 @@ fn write_text(path: &Path, content: &str) -> Result<(), PatchError> {
 }
 
 fn enforce_file_size(content: Option<&str>, path: &str) -> Result<(), PatchError> {
-    if content.is_some_and(|content| content.len() > MAX_FILE_BYTES) {
-        Err(PatchError::Limit(format!(
-            "{path} is larger than {MAX_FILE_BYTES} bytes"
-        )))
-    } else {
-        Ok(())
+    if let Some(content) = content
+        && content.len() > MAX_FILE_BYTES
+    {
+        return Err(oversized_file_error(content.len(), path));
     }
+    Ok(())
 }
 
 fn content_from_lines(lines: &[String]) -> String {
@@ -1137,6 +1153,36 @@ mod tests {
                 "\"src/protocol/mod.rs\": update hunk 1 at patch line 3 has no additions or removals; remove it or include a '+' addition or '-' removal".to_string()
             ))
         );
+    }
+
+    #[test]
+    fn oversized_update_target_reports_the_hard_size_cap_with_a_remedy() {
+        let directory = tempfile::tempdir().unwrap();
+        let oversized = "a".repeat(MAX_FILE_BYTES + 1);
+        fs::write(directory.path().join("big.txt"), &oversized).unwrap();
+        let patch = "*** Begin Patch\n*** Update File: big.txt\n@@\n-a\n+b\n*** End Patch";
+        let error = PatchService::new()
+            .preview_patch(directory.path(), patch)
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(message.starts_with("patch exceeds a safety limit:"));
+        assert!(message.contains(&format!("is {} bytes", MAX_FILE_BYTES + 1)));
+        assert!(message.contains(&format!("hard per-file cap of {MAX_FILE_BYTES} bytes")));
+        assert!(message.contains("run_command may edit it"));
+    }
+
+    #[tokio::test]
+    async fn oversized_full_write_content_reports_the_hard_size_cap_with_a_remedy() {
+        let directory = tempfile::tempdir().unwrap();
+        let oversized = "a".repeat(MAX_FILE_BYTES + 1);
+        let error = PatchService::new()
+            .preview_write_file(directory.path(), "big.txt", &oversized)
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(message.starts_with("patch exceeds a safety limit:"));
+        assert!(message.contains(&format!("is {} bytes", MAX_FILE_BYTES + 1)));
+        assert!(message.contains(&format!("hard per-file cap of {MAX_FILE_BYTES} bytes")));
+        assert!(message.contains("run_command may edit it"));
     }
 
     #[test]
