@@ -1867,6 +1867,9 @@ test("polls, cancels, and refreshes knowledge sources without layout overflow", 
           embeddingStatus: "lexical_only",
         };
       }
+      if (["list_knowledge_retrieval_events", "list_knowledge_entities", "list_knowledge_facts"].includes(command)) {
+        return [];
+      }
       if (command === "list_knowledge_collections") {
         return [
           ...(primaryCollectionExists ? [collection("knowledge-collection-1", "项目知识", sourceExists ? 1 : 0, !sourceExists || sourceState === "cancelled" ? 0 : 3)] : []),
@@ -1938,7 +1941,7 @@ test("polls, cancels, and refreshes knowledge sources without layout overflow", 
   await collectionName.fill("  团队文档  ");
   await expect(settings.getByText("请输入 Collection 名称", { exact: true })).toHaveCount(0);
   await createCollection.click();
-  await expect(settings.getByText("团队文档", { exact: true })).toBeVisible();
+  await expect(settings.getByRole("heading", { name: "团队文档", exact: true })).toBeVisible();
   await expect(collectionName).toHaveValue("");
   await expect(collectionName).toHaveAttribute("aria-invalid", "false");
   await expect.poll(() => page.evaluate(() => (
@@ -1984,7 +1987,7 @@ test("polls, cancels, and refreshes knowledge sources without layout overflow", 
   await expect(reopenedSettings.getByRole("button", { name: "选择文件" }).first()).toBeVisible();
 
   await refresh.click();
-  await expect(settings.getByText("正在索引", { exact: false })).toBeVisible();
+  await expect(settings.locator(".knowledge-source-status").filter({ hasText: "正在索引" })).toBeVisible();
   await expect(settings.getByRole("button", { name: /取消 .* 的索引/ })).toBeVisible();
   await expect(refresh).toBeDisabled();
   await expect.poll(() => page.evaluate(() => {
@@ -3440,7 +3443,7 @@ test("selects and persists the global reasoning effort", async ({ page }) => {
   await expect.poll(() => page.evaluate(() => (window as unknown as { __invoked: string[] }).__invoked.filter((command) => command === "set_reasoning_effort").length)).toBe(1);
 });
 
-test("explains when an active model has no displayable reasoning summary", async ({ page }) => {
+test("keeps activity visible without a missing reasoning summary notice", async ({ page }) => {
   await page.goto("/");
   await expect(page.getByRole("heading", { name: "Phase 6 workbench" })).toBeVisible();
 
@@ -3460,9 +3463,10 @@ test("explains when an active model has no displayable reasoning summary", async
   ]);
 
   const execution = page.locator(".message--assistant").last().locator(".turn-execution--live");
-  await expect(execution.locator(".turn-reasoning-unavailable")).toHaveText(
-    "当前模型未提供可展示的思考摘要，公开进度和工具活动仍会继续显示。",
-  );
+  await expect(execution.locator(".turn-reasoning-unavailable")).toHaveCount(0);
+  await expect(execution.getByText("当前模型未提供可展示的思考摘要，公开进度和工具活动仍会继续显示。", { exact: true })).toHaveCount(0);
+  await expect(execution.locator(".turn-disclosure-title").first()).toContainText("思考中");
+  await expect(execution.locator(".turn-tool-group")).toHaveCount(1);
   await expect(execution.locator(".turn-reasoning")).toHaveCount(0);
 
   await emitDisclosureEvents(page, [
@@ -6548,6 +6552,8 @@ test("switches providers and models from the composer footer", async ({ page }, 
   await page.getByRole("option", { name: /GPT-4 Omni.*gpt-4o/ }).click();
   await expect(selector).toContainText("GPT-4 Omni");
   await expect(selector.locator("em")).toHaveText("gpt-4o");
+  await expect(page.locator(".toast--success")).toHaveText("已切换模型：OpenAI / GPT-4 Omni\n下一轮将使用新模型");
+  await expect(page.locator(".toast-msg--multiline")).toHaveCSS("white-space", "pre-line");
   await expect.poll(() => page.evaluate(() =>
     (window as unknown as { __lastThreadModelSelection: { providerId: string; model: string } | null })
       .__lastThreadModelSelection,
@@ -6558,6 +6564,7 @@ test("switches providers and models from the composer footer", async ({ page }, 
   await expect(selector).toContainText("zicc");
   await expect(selector).toContainText("gpt-5.6-terra");
   await expect(selector.locator("em")).toHaveCount(0);
+  await expect(page.locator(".toast--success").last()).toHaveText("已切换模型：zicc / gpt-5.6-terra\n下一轮将使用新模型");
   await expect.poll(() => page.evaluate(() =>
     (window as unknown as { __lastThreadModelSelection: { providerId: string; model: string } | null })
       .__lastThreadModelSelection,
@@ -6572,6 +6579,60 @@ test("switches providers and models from the composer footer", async ({ page }, 
   await page.keyboard.press("Escape");
   await expect(page.getByRole("listbox", { name: "可用模型" })).toBeHidden();
   await expect(selector).toBeFocused();
+});
+
+test("explains that switching models during a turn takes effect next turn", async ({ page }) => {
+  await page.goto("/");
+  const selector = page.locator(".composer").getByRole("button", { name: "选择模型" });
+  await expect(selector).toContainText("GPT-4.1");
+  await expect(page.locator(".toast--success")).toHaveCount(0);
+  await emitDisclosureEvents(page, [{ type: "turn_started" }]);
+  await expect(page.getByRole("button", { name: "停止生成", exact: true })).toBeVisible();
+
+  await selector.click();
+  await page.getByRole("option", { name: /GPT-4 Omni.*gpt-4o/ }).click();
+  await expect(page.locator(".toast--success")).toHaveText("已切换模型：OpenAI / GPT-4 Omni\n当前轮次仍使用原模型，下轮生效");
+  await expect(selector).toContainText("GPT-4 Omni");
+  await expect(page.getByRole("button", { name: "停止生成", exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "关闭通知" }).click();
+
+  await selector.click();
+  await page.locator(".model-selector-provider-options").getByRole("button", { name: /zicc/ }).click();
+  await expect(page.locator(".toast--success")).toHaveText("已切换模型：zicc / gpt-5.6-terra\n当前轮次仍使用原模型，下轮生效");
+});
+
+test("does not announce a model switch for unchanged or failed selections", async ({ page }) => {
+  await page.goto("/");
+  const selector = page.locator(".composer").getByRole("button", { name: "选择模型" });
+  await expect(selector).toContainText("GPT-4.1");
+  const selectionCalls = () => page.evaluate(() => (window as unknown as { __invoked: string[] })
+    .__invoked.filter((command) => command === "select_thread_model").length);
+  const initialCalls = await selectionCalls();
+  await selector.click();
+  await page.locator(".model-selector-provider-options").getByRole("button", { name: /OpenAI/ }).click();
+  await page.getByRole("option", { name: /GPT-4.1.*gpt-4.1/ }).click();
+  await expect(page.locator(".toast--success")).toHaveCount(0);
+  expect(await selectionCalls()).toBe(initialCalls);
+
+  await page.evaluate(() => {
+    const internals = (window as unknown as {
+      __TAURI_INTERNALS__: { invoke: (command: string, args?: Record<string, unknown>) => Promise<unknown> };
+    }).__TAURI_INTERNALS__;
+    const originalInvoke = internals.invoke;
+    internals.invoke = async (command, args) => {
+      if (command === "select_thread_model") throw new Error("fixture model switch failed");
+      return originalInvoke(command, args);
+    };
+  });
+  await selector.click();
+  await page.getByRole("option", { name: /GPT-4 Omni.*gpt-4o/ }).click();
+  await expect(page.getByText("fixture model switch failed", { exact: true })).toBeVisible();
+  await expect(selector).toContainText("GPT-4.1");
+  await expect(page.locator(".toast--success")).toHaveCount(0);
+  await page.locator(".model-selector-provider-options").getByRole("button", { name: /zicc/ }).click();
+  await expect(page.getByRole("listbox", { name: "可用模型" })).toBeHidden();
+  await expect(selector).toContainText("OpenAI");
+  await expect(page.locator(".toast--success")).toHaveCount(0);
 });
 
 test("shows the actual fallback route while keeping the selected model unchanged", async ({ page }, testInfo) => {
@@ -6721,7 +6782,7 @@ test("switches the runtime approval mode from the composer", async ({ page }, te
   await expect(trigger).toBeFocused();
 });
 
-test("configures ordered cross-provider failover from the shared settings page", async ({ page }) => {
+test("configures ordered cross-provider failover from the shared settings page", async ({ page }, testInfo) => {
   await page.goto("/");
   await page.locator('button[aria-label="设置"]:visible').click();
 
@@ -6730,9 +6791,12 @@ test("configures ordered cross-provider failover from the shared settings page",
   await page.getByRole("button", { name: "故障切换" }).click();
 
   await expect(page.getByRole("heading", { name: "跨供应商故障切换" })).toBeVisible();
+  await page.getByText("切换规则", { exact: true }).click();
   await expect(page.getByText("网关内部渠道由 New API 管理", { exact: false })).toBeVisible();
+  await page.getByText("切换规则", { exact: true }).click();
   const openAiRoute = page.getByRole("group", { name: "备用供应商顺序：OpenAI" });
-  await expect(page.getByRole("group", { name: "备用供应商顺序：zicc" })).toBeVisible();
+  await expect(page.locator(".provider-fallback-card")).toHaveCount(1);
+  await expect(page.getByRole("button", { name: "编辑故障切换：OpenAI" })).toHaveAttribute("aria-pressed", "true");
   await expect(page.locator(".provider-fallback-route-model").filter({ hasText: "gpt-4.1" })).toBeVisible();
   await expect(openAiRoute.getByText("尚未设置备用供应商")).toBeVisible();
   await expect(openAiRoute.getByText("本轮会直接结束", { exact: false })).toBeVisible();
@@ -6746,6 +6810,14 @@ test("configures ordered cross-provider failover from the shared settings page",
   await expect(openAiRoute.getByRole("list", { name: "OpenAI 的备用供应商尝试顺序" }).getByText("zicc", { exact: true })).toBeVisible();
   await expect(openAiRoute.getByRole("list", { name: "OpenAI 的备用供应商尝试顺序" }).getByText("gpt-5.6-terra", { exact: true })).toBeVisible();
   await expect(openAiRoute.getByText("1/4", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "编辑故障切换：zicc" }).click();
+  const ziccRoute = page.getByRole("group", { name: "备用供应商顺序：zicc" });
+  await expect(ziccRoute.getByText("尚未设置备用供应商")).toBeVisible();
+  await ziccRoute.getByRole("button", { name: "添加备用供应商" }).click();
+  await ziccRoute.getByRole("checkbox", { name: "备用供应商：OpenAI" }).check();
+  await page.getByRole("button", { name: "编辑故障切换：OpenAI" }).click();
+  await expect(openAiRoute.getByText("1/4", { exact: true })).toBeVisible();
+  await expect(page.locator(".provider-fallback-dirty-dot")).toHaveCount(2);
   await page.getByRole("button", { name: "保存 OpenAI 路由" }).click();
 
   await expect.poll(() => page.evaluate(() => {
@@ -6757,6 +6829,110 @@ test("configures ordered cross-provider failover from the shared settings page",
     id: "openai",
     fallbackProviderIds: ["zicc"],
   });
+  await expect(page.getByRole("button", { name: "保存 OpenAI 路由" })).toBeDisabled();
+  await expect(page.locator(".provider-fallback-dirty-dot")).toHaveCount(1);
+  await page.getByRole("button", { name: "编辑故障切换：zicc" }).click();
+  await expect(ziccRoute.getByText("1/4", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "撤销修改" }).click();
+  await expect(ziccRoute.getByText("0/4", { exact: true })).toBeVisible();
+
+  const filters = page.getByRole("group", { name: "路由配置筛选" });
+  await filters.getByRole("button", { name: "已配置", exact: true }).click();
+  await expect(page.locator(".provider-fallback-provider-item")).toHaveCount(1);
+  await expect(page.getByRole("button", { name: "编辑故障切换：OpenAI" })).toBeVisible();
+  await filters.getByRole("button", { name: "未配置", exact: true }).click();
+  await expect(page.locator(".provider-fallback-provider-item")).toHaveCount(2);
+  await filters.getByRole("button", { name: "全部", exact: true }).click();
+  const search = page.getByRole("textbox", { name: "搜索主供应商" });
+  await search.fill("GPT-5.6");
+  await expect(page.locator(".provider-fallback-provider-item")).toHaveCount(1);
+  await expect(page.getByRole("button", { name: "编辑故障切换：zicc" })).toBeVisible();
+  await search.fill("不存在的供应商");
+  await expect(page.getByText("没有匹配的供应商，试试其他关键词或筛选。")).toBeVisible();
+  await page.getByRole("button", { name: "清空主供应商搜索" }).click();
+  await page.getByRole("button", { name: "编辑故障切换：OpenAI" }).click();
+  await openAiRoute.getByRole("button", { name: "移除备用供应商 zicc" }).click();
+  await expect(page.getByRole("button", { name: "保存 OpenAI 路由" })).toBeEnabled();
+  await page.getByRole("button", { name: "撤销修改" }).click();
+  await expect(openAiRoute.getByText("1/4", { exact: true })).toBeVisible();
+  await expect(openAiRoute.getByRole("button", { name: "上移备用供应商 zicc" })).toBeDisabled();
+  await expect(openAiRoute.getByRole("button", { name: "下移备用供应商 zicc" })).toBeDisabled();
+  await page.screenshot({ path: testInfo.outputPath(`provider-fallback-${testInfo.project.name}.png`), fullPage: true });
+  const layout = await page.locator(".provider-fallback-workspace").evaluate((element) => {
+    const sidebar = element.querySelector(".provider-fallback-sidebar")!.getBoundingClientRect();
+    const card = element.querySelector(".provider-fallback-card")!.getBoundingClientRect();
+    return { width: element.clientWidth, scrollWidth: element.scrollWidth, sidebarRight: sidebar.right, sidebarBottom: sidebar.bottom, cardLeft: card.left, cardTop: card.top };
+  });
+  expect(layout.scrollWidth).toBeLessThanOrEqual(layout.width + 1);
+  if (testInfo.project.name === "desktop") expect(layout.sidebarRight).toBeLessThanOrEqual(layout.cardLeft);
+  else expect(layout.sidebarBottom).toBeLessThanOrEqual(layout.cardTop);
+});
+
+test("searches many cross-provider routes and preserves ordering on save failure", async ({ page }) => {
+  await page.addInitScript(() => {
+    const internals = (window as unknown as {
+      __TAURI_INTERNALS__: { invoke: (command: string, args?: Record<string, unknown>) => Promise<unknown> };
+    }).__TAURI_INTERNALS__;
+    const originalInvoke = internals.invoke;
+    internals.invoke = async (command, args) => {
+      const result = await originalInvoke(command, args);
+      if (command !== "get_provider_catalog") return result;
+      const catalog = result as { activeProviderId: string; providers: Array<Record<string, unknown>> };
+      return {
+        ...catalog,
+        activeProviderId: "backup-24",
+        providers: [...catalog.providers, ...Array.from({ length: 25 }, (_, index) => ({
+          ...catalog.providers[0], id: `backup-${index}`, name: `备用 ${String(index).padStart(2, "0")}`, model: `test-model-${index}`,
+        }))],
+      };
+    };
+  });
+  await page.goto("/");
+  await page.locator('button[aria-label="设置"]:visible').click();
+  await page.getByRole("button", { name: "故障切换" }).click();
+  await expect(page.getByRole("button", { name: "编辑故障切换：备用 24" })).toHaveAttribute("aria-pressed", "true");
+  await expect(page.locator(".provider-fallback-card")).toHaveCount(1);
+  await page.getByRole("textbox", { name: "搜索主供应商" }).fill("OpenAI");
+  await page.getByRole("button", { name: "编辑故障切换：OpenAI" }).click();
+  const route = page.getByRole("group", { name: "备用供应商顺序：OpenAI" });
+  await route.getByRole("button", { name: "添加备用供应商" }).click();
+  const candidateSearch = page.getByRole("textbox", { name: "搜索备用供应商" });
+  await candidateSearch.fill("不存在");
+  await expect(route.getByText("没有匹配的备用供应商。")).toBeVisible();
+  await candidateSearch.fill("test-model-24");
+  await expect(route.getByRole("checkbox")).toHaveCount(1);
+  await route.getByRole("checkbox", { name: "备用供应商：备用 24" }).check();
+  await candidateSearch.fill("zicc");
+  await route.getByRole("checkbox", { name: "备用供应商：zicc" }).check();
+  await candidateSearch.fill("test-model-23");
+  await route.getByRole("checkbox", { name: "备用供应商：备用 23" }).check();
+  await candidateSearch.fill("test-model-22");
+  await route.getByRole("checkbox", { name: "备用供应商：备用 22" }).check();
+  await candidateSearch.fill("test-model-21");
+  await expect(route.getByRole("checkbox", { name: "备用供应商：备用 21" })).toBeDisabled();
+  await route.getByRole("button", { name: "移除备用供应商 备用 22" }).click();
+  await expect(route.getByRole("checkbox", { name: "备用供应商：备用 21" })).toBeEnabled();
+  await route.getByRole("button", { name: "移除备用供应商 备用 23" }).click();
+  await route.getByRole("button", { name: "上移备用供应商 zicc" }).click();
+  await expect(route.getByRole("listitem").first()).toContainText("zicc");
+  await route.getByRole("button", { name: "下移备用供应商 zicc" }).click();
+  await expect(route.getByRole("listitem").first()).toContainText("备用 24");
+  await route.getByRole("button", { name: "上移备用供应商 zicc" }).click();
+  await page.evaluate(() => {
+    const internals = (window as unknown as {
+      __TAURI_INTERNALS__: { invoke: (command: string, args?: Record<string, unknown>) => Promise<unknown> };
+    }).__TAURI_INTERNALS__;
+    const originalInvoke = internals.invoke;
+    internals.invoke = async (command, args) => {
+      if (command === "save_provider_config") throw new Error("fixture save failure");
+      return originalInvoke(command, args);
+    };
+  });
+  await page.getByRole("button", { name: "保存 OpenAI 路由" }).click();
+  await expect(page.getByText("保存失败，请重试", { exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "保存 OpenAI 路由" })).toBeEnabled();
+  await expect(route.getByText("2/4", { exact: true })).toBeVisible();
+  await expect(route.getByRole("listitem").first()).toContainText("zicc");
 });
 
 test("adds, edits, deletes, and saves structured provider models", async ({ page }) => {
@@ -8401,11 +8577,29 @@ async function installRuntimeLogFixture(page: import('@playwright/test').Page) {
   await page.evaluate(() => {
     const internals = (window as unknown as { __TAURI_INTERNALS__: { invoke: (command: string, args?: Record<string, unknown>) => Promise<unknown> } }).__TAURI_INTERNALS__;
     const original = internals.invoke;
-    const state = { clearCount: 0, failClear: false, cleared: false, readCount: 0, searchQueries: [] as string[] };
+    const defaultDirectory = 'C:/Users/test/AppData/Roaming/com.kcoder.app/runtime-data/logs';
+    const state = { clearCount: 0, failClear: false, cleared: false, readCount: 0, searchQueries: [] as string[], directory: defaultDirectory, customDirectory: null as string | null, cancelChoose: false, failChoose: false, chooseCount: 0, resetCount: 0, clearDirectory: '' };
+    const storage = () => ({ directory: state.directory, filePath: `${state.directory}/runtime.jsonl`, defaultDirectory, customDirectory: state.customDirectory, warning: null });
     Object.assign(window, { runtimeLogTest: state });
     internals.invoke = async (command, args) => {
+      if (command === 'get_log_storage') return storage();
+      if (command === 'choose_log_directory') {
+        state.chooseCount += 1;
+        if (state.cancelChoose) return null;
+        if (state.failChoose) throw new Error('新日志目录不可写');
+        state.directory = 'D:/custom-runtime-logs';
+        state.customDirectory = state.directory;
+        return storage();
+      }
+      if (command === 'reset_log_directory') {
+        state.resetCount += 1;
+        state.directory = defaultDirectory;
+        state.customDirectory = null;
+        return storage();
+      }
       if (command === 'clear_logs') {
         if (args?.confirmed !== true) throw new Error('Confirmation missing');
+        state.clearDirectory = state.directory;
         state.clearCount += 1;
         if (state.failClear) throw new Error('日志文件暂时不可写');
         state.cleared = true;
@@ -8472,6 +8666,41 @@ test('runtime logs show two levels, original conversation sources and confirmed 
   await dialog.getByRole('button', { name: '刷新', exact: true }).click();
   await expect(dialog.locator('.log-row')).toHaveCount(1);
   await expect(dialog.locator('.log-event')).toHaveText('logs_cleared');
+  expect(await dialog.evaluate(el => el.scrollWidth <= el.clientWidth)).toBe(true);
+});
+
+test('runtime log directory can change, cancel, fail and reset without moving history', async ({ page }) => {
+  await page.goto('/');
+  await installRuntimeLogFixture(page);
+  const viewport = page.viewportSize();
+  await page.setViewportSize({ width: 1280, height: 820 });
+  await page.getByTitle('查看本地运行日志').click();
+  if (viewport) await page.setViewportSize(viewport);
+  const dialog = page.getByRole('dialog', { name: '本地运行日志' });
+  const location = dialog.locator('.log-storage-location');
+  await expect(location).toContainText('runtime-data/logs');
+  await expect(dialog.getByRole('button', { name: '恢复默认', exact: true })).toBeDisabled();
+  await page.evaluate(() => { (window as any).runtimeLogTest.cancelChoose = true; });
+  await dialog.getByRole('button', { name: '更改目录', exact: true }).click();
+  await expect.poll(() => page.evaluate(() => (window as any).runtimeLogTest.chooseCount)).toBe(1);
+  await expect(location).toContainText('runtime-data/logs');
+  await expect(dialog.locator('.log-row')).toHaveCount(5);
+  await page.evaluate(() => { const state = (window as any).runtimeLogTest; state.cancelChoose = false; state.failChoose = true; });
+  await dialog.getByRole('button', { name: '更改目录', exact: true }).click();
+  await expect(dialog.getByRole('alert')).toContainText('新日志目录不可写');
+  await expect(location).toContainText('runtime-data/logs');
+  await page.evaluate(() => { (window as any).runtimeLogTest.failChoose = false; });
+  await dialog.getByRole('button', { name: '更改目录', exact: true }).click();
+  await expect(location).toContainText('D:/custom-runtime-logs');
+  await expect(dialog).toContainText('旧目录历史日志保留');
+  await dialog.getByRole('button', { name: '清理日志', exact: true }).click();
+  await expect(dialog).toContainText('其他目录的日志和对话历史不受影响');
+  await expect(dialog.getByRole('button', { name: '更改目录', exact: true })).toBeDisabled();
+  await dialog.getByRole('button', { name: '确认清理', exact: true }).click();
+  await expect.poll(() => page.evaluate(() => (window as any).runtimeLogTest.clearDirectory)).toBe('D:/custom-runtime-logs');
+  await dialog.getByRole('button', { name: '恢复默认', exact: true }).click();
+  await expect(location).toContainText('runtime-data/logs');
+  await expect(dialog.getByRole('button', { name: '恢复默认', exact: true })).toBeDisabled();
   expect(await dialog.evaluate(el => el.scrollWidth <= el.clientWidth)).toBe(true);
 });
 

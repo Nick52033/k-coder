@@ -22,6 +22,7 @@ use crate::protocol::{
 };
 
 mod command_diagnostics;
+pub mod memory;
 
 const TOOL_PROGRESS_CHANNEL_CAPACITY: usize = 64;
 const TOOL_PROGRESS_BATCH_BYTES: usize = 16 * 1024;
@@ -1283,7 +1284,7 @@ impl ToolHandler for RunCommandTool {
         ToolDefinition {
             name: "run_command".to_string(),
             description: format!(
-                "{description} Commands are non-interactive (stdin is closed). For repository searches always give rg an explicit directory, such as '.', and use one search per call. Select-Object -First/-Last/-Skip requires a numeric count, e.g. Select-Object -First 20. Known invalid PowerShell commands are rejected before execution with a correction hint; fix the command and call again. Use single quotes for literal PowerShell regexes; backslash does not escape a double quote. Do not suppress stderr while diagnosing a failed search."
+                "{description} Commands are non-interactive (stdin is closed). For repository searches always give rg an explicit directory, such as '.', and use one search per call. Select-Object -First/-Last/-Skip requires a numeric count, e.g. Select-Object -First 20. Known invalid PowerShell commands are rejected before execution with a correction hint; fix the command and call again. Use single quotes for literal PowerShell regexes; backslash does not escape a double quote. Do not suppress stderr while diagnosing a failed search. Run builds and tests directly without 2>&1 or output-limiting pipelines: output is already bounded by the runtime. In PowerShell do not use Bash heredocs (python - <<'PY') or assume head is available; use a script file or Select-Object -First N. A confirmed rg no-match is a normal result with its original exit code 1 retained."
             ),
             input_schema: json!({
                 "type": "object",
@@ -1429,7 +1430,7 @@ impl ToolHandler for RunCommandTool {
         // pipe. The delivered lines are complete and correct, so treat this shape
         // as a successful search and expose the exit code separately.
         let success = matches!(status.state, CommandState::Exited { code: 0 })
-            || result_kind == Some("bounded_output");
+            || matches!(result_kind, Some("bounded_output" | "no_matches"));
         if output_was_empty
             && let Some(message) = empty_command_failure_message(result_kind, exit_code)
         {
@@ -1440,6 +1441,11 @@ impl ToolHandler for RunCommandTool {
             Some(
                 "PowerShell 命令语法错误：正则或含双引号的文本优先使用单引号包裹；PowerShell 不使用反斜杠转义双引号。请修正引号后重试。",
             )
+        } else if shell == "powershell"
+            && !success
+            && let Some(hint) = command_diagnostics::powershell_native_stderr_hint(&stderr)
+        {
+            Some(hint)
         } else {
             command_recovery_hint(
                 shell,
@@ -1506,12 +1512,13 @@ fn command_result_kind(
     // artifact of the bounded receiver stopping early.
     if !output_is_empty
         && stderr_is_empty
-        && exit_code.is_some_and(|code| code != 0)
+        && exit_code == Some(1)
         && command_diagnostics::is_bounded_rg_search(command)
     {
         return Some("bounded_output");
     }
     (output_is_empty
+        && stderr_is_empty
         && exit_code == Some(1)
         && command_diagnostics::is_unambiguous_rg_search(command))
     .then_some("no_matches")
@@ -2349,7 +2356,10 @@ mod tests {
             "rg -n AbsentMarker . | Select-Object -First 20",
         ] {
             let absent = run(command).await;
-            assert!(!absent.success, "keep the original exit fact");
+            assert!(
+                absent.success,
+                "no matches is a normal search result: {absent:?}"
+            );
             assert_eq!(absent.metadata["exitCode"], 1);
             assert_eq!(absent.metadata["resultKind"], "no_matches");
             assert!(absent.output.contains("no matches"));
@@ -2406,12 +2416,71 @@ mod tests {
 
     #[cfg(windows)]
     #[tokio::test]
+    async fn run_command_native_stderr_guidance_keeps_failure_and_exit_code() {
+        let directory = tempfile::tempdir().unwrap();
+        let tool = RunCommandTool {
+            runtime: CommandRuntime::new(directory.path()).unwrap(),
+        };
+        for (command, success, exit_code, expected_hint) in [
+            (
+                "[Console]::Error.WriteLine('NativeCommandError'); Write-Output 'test result: FAILED'; exit 101",
+                false,
+                101,
+                Some(command_diagnostics::NATIVE_STDERR_HINT),
+            ),
+            (
+                "[Console]::Error.WriteLine('ParserError NativeCommandError'); exit 1",
+                false,
+                1,
+                None,
+            ),
+            ("Write-Output 'NativeCommandError'; exit 1", false, 1, None),
+            (
+                "[Console]::Error.WriteLine('NativeCommandError'); exit 0",
+                true,
+                0,
+                None,
+            ),
+        ] {
+            let result = tool
+                .execute(
+                    &context(directory.path()),
+                    json!({ "command": command, "timeoutMs": 10000 }),
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(result.success, success, "{command}: {result:?}");
+            assert_eq!(result.metadata["exitCode"], exit_code, "{result:?}");
+            assert!(result.metadata.get("resultKind").is_none(), "{result:?}");
+            if command.contains("ParserError") {
+                assert!(
+                    result.metadata["recoveryHint"]
+                        .as_str()
+                        .is_some_and(|hint| hint.contains("语法错误")),
+                    "{result:?}"
+                );
+            } else {
+                assert_eq!(result.metadata["recoveryHint"].as_str(), expected_hint);
+            }
+            if expected_hint.is_some() {
+                assert!(result.output.contains("test result: FAILED"), "{result:?}");
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
     async fn run_command_preflight_returns_repair_guidance_without_starting_a_process() {
         let directory = tempfile::tempdir().unwrap();
         let tool = RunCommandTool {
             runtime: CommandRuntime::new(directory.path()).unwrap(),
         };
         for (command, hint) in [
+            (
+                "python - <<'PY'\nprint(1)\nPY",
+                command_diagnostics::PYTHON_HEREDOC_HINT,
+            ),
             (
                 "Set-Content marker.txt should-not-run | Select-Object -First",
                 command_diagnostics::SELECT_COUNT_HINT,
@@ -3072,6 +3141,23 @@ mod tests {
             None
         );
         assert_eq!(command_result_kind("cargo test", Some(1), true, true), None);
+        assert_eq!(
+            command_result_kind("rg -n missing .", Some(1), true, false),
+            None
+        );
+        assert_eq!(
+            command_result_kind("rg -n missing .", Some(2), false, false),
+            None
+        );
+        assert_eq!(
+            command_result_kind(
+                "rg -n needle . | Select-Object -First 20",
+                Some(101),
+                false,
+                true,
+            ),
+            None
+        );
     }
 
     #[test]
@@ -3117,6 +3203,18 @@ mod tests {
             ),
             Some("no_matches")
         );
+        for exit_code in [None, Some(0), Some(2), Some(101), Some(-1)] {
+            assert_eq!(
+                command_result_kind(
+                    "rg -n needle src | Select-Object -First 20",
+                    exit_code,
+                    false,
+                    true,
+                ),
+                None,
+                "{exit_code:?}"
+            );
+        }
     }
 
     #[test]

@@ -19,7 +19,10 @@ pub mod providers;
 pub mod scheduled_tasks;
 pub mod storage;
 pub mod tools;
+pub mod weixin;
 pub mod workbench;
+
+pub use memory::capture::MemoryDiagnostics;
 
 use app_state::AppState;
 use std::path::{Path, PathBuf};
@@ -137,6 +140,8 @@ pub fn run() {
             )
             .map_err(|error| std::io::Error::other(error.to_string()))?;
             app.manage(mobile_service);
+            app.manage(weixin::WeixinService::new());
+            app.state::<weixin::WeixinService>().restore_on_startup(app.handle().clone());
             // 只有在用户此前显式开启过局域网访问时才自动恢复监听。
             app.state::<mobile::MobileService>().restore_on_startup()?;
             scheduled_tasks::spawn_scheduler(app.handle().clone());
@@ -261,6 +266,10 @@ pub fn run() {
             commands::query_knowledge_relations,
             commands::run_knowledge_retrieval_evaluation,
             commands::get_memory_settings,
+            commands::list_project_memories,
+            commands::read_project_memory,
+            commands::get_memory_scopes,
+            commands::get_memory_diagnostics,
             commands::set_memory_settings,
             commands::set_memory_enabled,
             commands::list_memories,
@@ -373,6 +382,9 @@ pub fn run() {
             commands::mobile::mobile_revoke_device,
             commands::mobile::mobile_remove_device,
             commands::mobile::mobile_set_capabilities,
+            commands::weixin::weixin_status,
+            commands::weixin::weixin_start,
+            commands::weixin::weixin_stop,
             commands::start_command,
             commands::command_status,
             commands::read_command_output,
@@ -389,6 +401,9 @@ pub fn run() {
             commands::close_pty,
             commands::read_logs,
             commands::clear_logs,
+            commands::get_log_storage,
+            commands::choose_log_directory,
+            commands::reset_log_directory,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -6143,15 +6143,26 @@ mod tests {
             .iter()
             .filter_map(|event| match &event.kind {
                 StoredEventKind::ItemStarted { item_id, item_type }
-                | StoredEventKind::ItemCompleted {
-                    item_id, item_type, ..
-                } if *item_type == AgentItemType::Reasoning => Some(item_id.clone()),
+                    if *item_type == AgentItemType::Reasoning =>
+                {
+                    Some((item_id.as_str(), None))
+                }
+                StoredEventKind::ItemCompleted {
+                    item_id,
+                    item_type: AgentItemType::Reasoning,
+                    status,
+                } => Some((item_id.as_str(), Some(*status))),
                 _ => None,
             })
             .collect::<Vec<_>>();
         assert_eq!(
             reasoning_lifecycle,
-            ["reasoning-1", "reasoning-1", "reasoning-2", "reasoning-2"]
+            [
+                ("reasoning-1", None),
+                ("reasoning-2", None),
+                ("reasoning-1", Some(AgentItemStatus::Completed)),
+                ("reasoning-2", Some(AgentItemStatus::Completed)),
+            ]
         );
         let summaries = events
             .iter()
@@ -7982,7 +7993,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exhausted_rate_limits_are_typed_and_partial_output_is_never_replayed() {
+    async fn exhausted_rate_limits_are_typed_and_partial_drafts_are_reset_before_replay() {
         for partial in [false, true] {
             let (_directory, repository, runtime, thread_id) = runtime_fixture().await;
             let mut events = vec![];
@@ -7996,6 +8007,8 @@ mod tests {
                 retry_after: Some(Duration::from_millis(1)),
             }));
             let provider = Arc::new(FakeProvider::new(events));
+            let max_retries = runtime.transient_retry_delays.len();
+            let publisher = Arc::new(RecordingPublisher::default());
             let outcome = runtime
                 .run_turn(
                     provider.clone(),
@@ -8006,16 +8019,34 @@ mod tests {
                         agent_mode: None,
                     },
                     CancellationToken::new(),
-                    Arc::new(RecordingPublisher::default()),
+                    publisher.clone(),
                 )
                 .await
                 .unwrap();
             assert_eq!(outcome.state, TurnState::Failed);
-            assert_eq!(provider.requests().len(), if partial { 1 } else { 4 });
-            let history = repository.read_thread_history(&thread_id).await.unwrap();
+            assert_eq!(provider.requests().len(), max_retries + 1);
             assert_eq!(
-                history.last_turn.unwrap().error.unwrap().code,
-                "rate_limited"
+                publisher
+                    .events
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|event| matches!(event.event, AgentEvent::TextReset { .. }))
+                    .count(),
+                if partial { max_retries } else { 0 }
+            );
+            let events = repository.load(&thread_id).await.unwrap();
+            assert!(!events.iter().any(|event| matches!(
+                &event.kind,
+                StoredEventKind::AssistantMessage { message }
+                    if message.text().contains("already visible")
+            )));
+            let history = repository.read_thread_history(&thread_id).await.unwrap();
+            let error = history.last_turn.unwrap().error.unwrap();
+            assert_eq!(error.code, "rate_limited");
+            assert_eq!(
+                error.details,
+                Some(transient_retry_details(max_retries, max_retries, partial))
             );
         }
     }
@@ -9017,7 +9048,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn provider_failure_after_visible_output_is_not_retried() {
+    async fn protocol_failure_after_visible_output_exhausts_bounded_retries() {
         let (_directory, repository, runtime, thread_id) = runtime_fixture().await;
         let provider = Arc::new(FakeProvider::script(vec![vec![
             Ok(ProviderEvent::TextDelta {
@@ -9052,7 +9083,17 @@ mod tests {
             .unwrap();
 
         assert_eq!(outcome.state, TurnState::Failed);
-        assert_eq!(provider.requests().len(), 1);
+        assert_eq!(provider.requests().len(), MAX_PROTOCOL_RETRIES + 1);
+        assert_eq!(
+            publisher
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|event| matches!(event.event, AgentEvent::TextReset { .. }))
+                .count(),
+            MAX_PROTOCOL_RETRIES
+        );
         assert!(
             publisher
                 .events
@@ -9068,15 +9109,30 @@ mod tests {
                     }
                 ))
         );
+        let events = repository.load(&thread_id).await.unwrap();
+        assert!(!events.iter().any(|event| matches!(
+            &event.kind,
+            StoredEventKind::AssistantMessage { message } if message.text().contains("partial")
+        )));
         assert_eq!(
-            repository
-                .read_thread(&thread_id)
-                .await
-                .unwrap()
-                .last_usage
-                .unwrap()
-                .total_tokens,
-            5
+            events
+                .iter()
+                .filter(|event| matches!(event.kind, StoredEventKind::ProviderCallUsage { .. }))
+                .count(),
+            MAX_PROTOCOL_RETRIES + 1
+        );
+        let detail = repository.read_thread(&thread_id).await.unwrap();
+        assert_eq!(
+            detail.last_usage.unwrap().total_tokens,
+            5 * (MAX_PROTOCOL_RETRIES as u64 + 1)
+        );
+        let history = repository.read_thread_history(&thread_id).await.unwrap();
+        assert_eq!(
+            history.last_turn.unwrap().error.unwrap().details,
+            Some(json!({
+                "protocolRetries": MAX_PROTOCOL_RETRIES,
+                "outputAlreadyStarted": true,
+            }))
         );
     }
 

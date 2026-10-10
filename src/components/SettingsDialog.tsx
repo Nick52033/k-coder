@@ -1,4 +1,4 @@
-import { FormEvent, useEffect, useRef, useState, type CSSProperties } from "react";
+import { FormEvent, useCallback, useEffect, useRef, useState, type CSSProperties, type RefObject } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
   getExtensionOverview,
@@ -37,14 +37,10 @@ import {
   listKnowledgeFacts,
   reviewKnowledgeFact,
   queryKnowledgeRelations,
+  listProjectMemories,
+  readProjectMemory,
   getMemorySettings,
-  setMemorySettings,
   setMemoryEnabled,
-  listMemories,
-  listMemoryCandidates,
-  reviewMemoryCandidate,
-  deleteMemory,
-  clearMemories,
   getWorkspaceState,
 } from "../api/runtime";
 import { useToast } from "./Toast";
@@ -134,14 +130,13 @@ import type {
   KnowledgeEntityType,
   KnowledgeFactCandidateRecord,
   KnowledgeRelationQueryResult,
-  MemorySettings,
-  MemoryRecord,
-  MemoryCandidate,
-  MemoryScopeKind,
+  ProjectMemoryWorkspace,
+  ProjectMemoryContent,
 } from "../types/runtime";
 import { toUserFacingPath, workspacePathKey } from "../lib/path";
 import { McpSettingsPage } from "./McpSettingsPage";
 import { MobileSettingsPage } from "./MobileSettingsPage";
+import { WeixinSettingsPage } from "./WeixinSettingsPage";
 import { PluginSettingsPage } from "./PluginSettingsPage";
 import { WorkflowSettingsPage } from "./WorkflowSettingsPage";
 import { RuleSettingsPage } from "./RuleSettingsPage";
@@ -401,7 +396,7 @@ export function SettingsDialog({
             ) : section === "knowledge" ? (
               <KnowledgePage />
             ) : section === "memory" ? (
-              <MemoryPage activeThreadId={activeThreadId} />
+              <MemoryPage key={activeThreadId ?? "no-thread"} activeThreadId={activeThreadId} />
             ) : section === "browser" ? (
               <BrowserPage />
             ) : section === "goal" ? (
@@ -427,7 +422,10 @@ export function SettingsDialog({
             ) : section === "rules" ? (
               <RuleSettingsPage />
             ) : section === "mobile" ? (
-              <MobileSettingsPage />
+              <>
+                <MobileSettingsPage />
+                <WeixinSettingsPage activeThreadId={activeThreadId} />
+              </>
             ) : section === "skills" ? (
               <ExtensionsPage />
             ) : (
@@ -461,6 +459,27 @@ function ProviderFallbackSettingsPage({
   const routableProviders = configuredProviders.filter(
     (item) => item.transport !== "open_ai_image_generations",
   );
+  const [selectedProviderId, setSelectedProviderId] = useState(
+    activeProviderId ?? routableProviders[0]?.id ?? null,
+  );
+  const [query, setQuery] = useState("");
+  const [filter, setFilter] = useState<"all" | "configured" | "empty">("all");
+  const [drafts, setDrafts] = useState<Record<string, string[]>>({});
+  const [saving, setSaving] = useState(false);
+  const selectedProvider = routableProviders.find((item) => item.id === selectedProviderId)
+    ?? routableProviders.find((item) => item.id === activeProviderId)
+    ?? routableProviders[0];
+  const routeIds = (item: ProviderConfigView) => drafts[item.id] ?? item.fallbackProviderIds ?? [];
+  const isDirty = (item: ProviderConfigView) => (
+    JSON.stringify(routeIds(item)) !== JSON.stringify(item.fallbackProviderIds ?? [])
+  );
+  const configuredCount = routableProviders.filter((item) => routeIds(item).length > 0).length;
+  const normalizedQuery = query.trim().toLocaleLowerCase();
+  const visibleProviders = routableProviders.filter((item) => {
+    const matchesQuery = `${item.name} ${item.model}`.toLocaleLowerCase().includes(normalizedQuery);
+    const hasRoute = routeIds(item).length > 0;
+    return matchesQuery && (filter === "all" || (filter === "configured" ? hasRoute : !hasRoute));
+  });
 
   return (
     <section className="settings-page provider-fallback-page" aria-labelledby="provider-fallback-page-title">
@@ -468,33 +487,110 @@ function ProviderFallbackSettingsPage({
         <div>
           <p className="settings-eyebrow">模型与用量</p>
           <h3 id="provider-fallback-page-title">跨供应商故障切换</h3>
+          <p className="provider-fallback-intro">选择主供应商，设置故障时接手的备用顺序。</p>
         </div>
+        <details className="provider-fallback-rules">
+          <summary>切换规则</summary>
+          <div>
+            <p>遇到可切换的故障时，k-Coder 会按设置的顺序尝试备用供应商。主供应商已开始回复或调用工具后，本轮不会再切换。</p>
+            <p>使用 New API 时，网关内部渠道由 New API 管理；这里配置的是网关整体不可用时接手的供应商。</p>
+          </div>
+        </details>
       </div>
-
-      <p className="provider-fallback-intro">
-        遇到可切换的故障时，k-Coder 会按下方顺序尝试备用供应商。主供应商已开始回复或调用工具后，本轮不会再切换。
-      </p>
-      <p className="provider-fallback-gateway-note">
-        使用 New API 时，网关内部渠道由 New API 管理；这里配置的是网关整体不可用时接手的供应商。
-      </p>
 
       {error && <div className="settings-error" role="alert">{error}</div>}
-      <div className="provider-fallback-routes" aria-label="供应商故障切换路由">
-        {routableProviders.map((source) => (
+      {selectedProvider ? (
+        <div className="provider-fallback-workspace">
+          <aside className="provider-fallback-sidebar" aria-label="主供应商列表">
+            <div className="provider-fallback-sidebar-tools">
+              <div className="provider-fallback-sidebar-title">
+                <strong>主供应商</strong>
+                <span>{configuredCount} / {routableProviders.length} 已配置</span>
+              </div>
+              <div className="provider-fallback-search">
+                <Search size={16} aria-hidden="true" />
+                <input
+                  aria-label="搜索主供应商"
+                  placeholder="搜索供应商或模型"
+                  value={query}
+                  onChange={(event) => setQuery(event.target.value)}
+                />
+                {query && (
+                  <button type="button" aria-label="清空主供应商搜索" onClick={() => setQuery("")}>
+                    <X size={14} aria-hidden="true" />
+                  </button>
+                )}
+              </div>
+              <div className="provider-fallback-filters" role="group" aria-label="路由配置筛选">
+                {([
+                  ["all", "全部"], ["configured", "已配置"], ["empty", "未配置"],
+                ] as const).map(([value, label]) => (
+                  <button key={value} type="button" aria-pressed={filter === value} onClick={() => setFilter(value)}>
+                    {label}
+                  </button>
+                ))}
+              </div>
+            </div>
+            <div className="provider-fallback-provider-list">
+              {visibleProviders.map((source) => {
+                const ids = routeIds(source);
+                const routeSummary = ids.map((id) => configuredProviders.find((item) => item.id === id)?.name ?? "供应商已移除").join(" → ");
+                return (
+                  <button
+                    key={source.id}
+                    type="button"
+                    className="provider-fallback-provider-item"
+                    aria-label={`编辑故障切换：${source.name}`}
+                    aria-pressed={source.id === selectedProvider.id}
+                    disabled={saving}
+                    onClick={() => setSelectedProviderId(source.id)}
+                  >
+                    <span className="provider-fallback-provider-title">
+                      <strong title={source.name}>{source.name}</strong>
+                      {source.id === activeProviderId && <span className="provider-fallback-active-label">当前</span>}
+                      {isDirty(source) && <span className="provider-fallback-dirty-dot" title="未保存" aria-label="未保存修改" />}
+                    </span>
+                    <span className="provider-fallback-provider-model" title={source.model}>{source.model || "未选择模型"}</span>
+                    <span className={`provider-fallback-provider-summary${ids.length ? " provider-fallback-provider-summary--configured" : ""}`} title={routeSummary}>
+                      {ids.length ? `${ids.length} 个备用 · ${routeSummary}` : "未配置备用"}
+                    </span>
+                  </button>
+                );
+              })}
+              {visibleProviders.length === 0 && <p className="provider-fallback-no-results">没有匹配的供应商，试试其他关键词或筛选。</p>}
+            </div>
+          </aside>
           <ProviderFallbackRoute
-            key={source.id}
-            provider={source}
+            key={selectedProvider.id}
+            provider={selectedProvider}
             configuredProviders={configuredProviders}
             activeProviderId={activeProviderId}
-            onSave={onSave}
+            fallbackProviderIds={routeIds(selectedProvider)}
+            dirty={isDirty(selectedProvider)}
+            onChange={(ids) => setDrafts((current) => ({ ...current, [selectedProvider.id]: ids }))}
+            onSave={async (request) => {
+              setSaving(true);
+              try {
+                const didSave = await onSave(request);
+                if (didSave) {
+                  setDrafts((current) => {
+                    const next = { ...current };
+                    delete next[request.id];
+                    return next;
+                  });
+                }
+                return didSave;
+              } finally {
+                setSaving(false);
+              }
+            }}
           />
-        ))}
-        {routableProviders.length === 0 && (
-          <div className="provider-editor provider-editor--empty">
-            <p>添加一个对话供应商后，可在此配置备用路由。</p>
-          </div>
-        )}
-      </div>
+        </div>
+      ) : (
+        <div className="provider-editor provider-editor--empty">
+          <p>添加一个对话供应商后，可在此配置备用路由。</p>
+        </div>
+      )}
     </section>
   );
 }
@@ -503,6 +599,9 @@ interface ProviderFallbackRouteProps {
   provider: ProviderConfigView;
   configuredProviders: ProviderConfigView[];
   activeProviderId: string | null;
+  fallbackProviderIds: string[];
+  dirty: boolean;
+  onChange: (ids: string[]) => void;
   onSave: (request: SaveProviderConfigRequest) => Promise<boolean>;
 }
 
@@ -510,67 +609,73 @@ function ProviderFallbackRoute({
   provider,
   configuredProviders,
   activeProviderId,
+  fallbackProviderIds,
+  dirty,
+  onChange,
   onSave,
 }: ProviderFallbackRouteProps) {
   const toast = useToast();
-  const [fallbackProviderIds, setFallbackProviderIds] = useState<string[]>(
-    provider.fallbackProviderIds ?? [],
-  );
   const [saving, setSaving] = useState(false);
   const [isPickingFallbacks, setIsPickingFallbacks] = useState(false);
+  const [candidateQuery, setCandidateQuery] = useState("");
 
   function moveFallbackProvider(providerId: string, offset: number) {
-    setFallbackProviderIds((current) => {
-      const from = current.indexOf(providerId);
-      const to = from + offset;
-      if (from < 0 || to < 0 || to >= current.length) return current;
-      const next = [...current];
-      [next[from], next[to]] = [next[to], next[from]];
-      return next;
-    });
+    const from = fallbackProviderIds.indexOf(providerId);
+    const to = from + offset;
+    if (from < 0 || to < 0 || to >= fallbackProviderIds.length) return;
+    const next = [...fallbackProviderIds];
+    [next[from], next[to]] = [next[to], next[from]];
+    onChange(next);
   }
 
   async function submit(event: FormEvent) {
     event.preventDefault();
+    if (saving || !dirty) return;
     setSaving(true);
-    const didSave = await onSave({
-      id: provider.id,
-      kind: provider.kind,
-      transport: provider.transport,
-      name: provider.name,
-      baseUrl: provider.baseUrl,
-      model: provider.model,
-      models: provider.models,
-      endpoints: provider.endpoints,
-      fallbackProviderIds,
-      activate: provider.id === activeProviderId,
-    });
-    setSaving(false);
-    if (didSave) {
-      toast.success(`${provider.name} 的备用路由已保存`);
-    } else {
+    try {
+      const didSave = await onSave({
+        id: provider.id,
+        kind: provider.kind,
+        transport: provider.transport,
+        name: provider.name,
+        baseUrl: provider.baseUrl,
+        model: provider.model,
+        models: provider.models,
+        endpoints: provider.endpoints,
+        fallbackProviderIds,
+        activate: provider.id === activeProviderId,
+      });
+      if (didSave) toast.success(`${provider.name} 的备用路由已保存`);
+      else toast.error("保存失败，请重试");
+    } catch {
       toast.error("保存失败，请重试");
+    } finally {
+      setSaving(false);
     }
   }
 
   const candidates = configuredProviders.filter(
     (candidate) => candidate.id !== provider.id && candidate.transport !== "open_ai_image_generations",
   );
+  const visibleCandidates = candidates.filter((candidate) => (
+    `${candidate.name} ${candidate.model}`.toLocaleLowerCase().includes(candidateQuery.trim().toLocaleLowerCase())
+  ));
 
   return (
     <form className="provider-fallback-card" onSubmit={submit}>
       <header className="provider-fallback-card-heading">
         <div className="provider-fallback-route-source">
-          <span className="provider-fallback-route-name">{provider.name}</span>
-          <span className="provider-fallback-route-model">{provider.model || "未选择模型"}</span>
+          <span className="provider-fallback-route-name" title={provider.name}>{provider.name}</span>
+          <span className="provider-fallback-route-model" title={provider.model}>{provider.model || "未选择模型"}</span>
         </div>
-        <span className="provider-fallback-primary-label">首选供应商</span>
+        <span className="provider-fallback-primary-label">{provider.id === activeProviderId ? "当前使用" : "主供应商"}</span>
       </header>
-      <fieldset className="provider-fallback-route" aria-label={`备用供应商顺序：${provider.name}`}>
+      <fieldset className="provider-fallback-route" disabled={saving} aria-label={`备用供应商顺序：${provider.name}`}>
         <legend>
-          <span>故障时按顺序尝试</span>
+          <span>备用尝试顺序</span>
           <span className="provider-fallback-count">{fallbackProviderIds.length}/4</span>
         </legend>
+        <p className="provider-fallback-help">从上到下依次接手，最多 4 个备用供应商。</p>
         {fallbackProviderIds.length === 0 ? (
           <div className="provider-fallback-empty-route">
             <span>尚未设置备用供应商</span>
@@ -580,32 +685,39 @@ function ProviderFallbackRoute({
           <ol className="provider-fallback-selected-list" aria-label={`${provider.name} 的备用供应商尝试顺序`}>
             {fallbackProviderIds.map((id, index) => {
               const candidate = candidates.find((item) => item.id === id);
-              if (!candidate) return null;
+              const candidateName = candidate?.name ?? "供应商已移除";
               return (
                 <li className="provider-fallback-selected" key={id}>
                   <span className="provider-fallback-order" aria-label={`第 ${index + 1} 顺位`}>{index + 1}</span>
                   <span className="provider-fallback-selected-details">
-                    <strong>{candidate.name}</strong>
-                    <span>{candidate.model || "未选择模型"}</span>
+                    <strong title={candidateName}>{candidateName}</strong>
+                    <span title={candidate?.model}>{candidate?.model || "不可用"}</span>
                   </span>
-                  {!candidate.hasApiKey && <span className="provider-fallback-missing-key">未配置 API Key</span>}
+                  {!candidate?.hasApiKey && <span className="provider-fallback-missing-key">{candidate ? "未配置 API Key" : "请移除"}</span>}
                   <div className="provider-fallback-order-actions">
                     <button
                       className="provider-fallback-order-button"
                       type="button"
-                      aria-label={`上移备用供应商 ${candidate.name}`}
+                      aria-label={`上移备用供应商 ${candidateName}`}
                       title="上移"
                       disabled={index === 0}
-                      onClick={() => moveFallbackProvider(candidate.id, -1)}
+                      onClick={() => moveFallbackProvider(id, -1)}
                     ><ArrowUp size={15} /></button>
                     <button
                       className="provider-fallback-order-button"
                       type="button"
-                      aria-label={`下移备用供应商 ${candidate.name}`}
+                      aria-label={`下移备用供应商 ${candidateName}`}
                       title="下移"
                       disabled={index === fallbackProviderIds.length - 1}
-                      onClick={() => moveFallbackProvider(candidate.id, 1)}
+                      onClick={() => moveFallbackProvider(id, 1)}
                     ><ArrowDown size={15} /></button>
+                    <button
+                      className="provider-fallback-order-button"
+                      type="button"
+                      aria-label={`移除备用供应商 ${candidateName}`}
+                      title="移除"
+                      onClick={() => onChange(fallbackProviderIds.filter((item) => item !== id))}
+                    ><X size={15} aria-hidden="true" /></button>
                   </div>
                 </li>
               );
@@ -626,8 +738,22 @@ function ProviderFallbackRoute({
         {isPickingFallbacks && (
           <div className="provider-fallback-picker" role="group" aria-label={`为 ${provider.name} 选择备用供应商`}>
             <p className="provider-fallback-help">选中的供应商会追加到路由末尾；最多 4 个，没有 API Key 的供应商不能启用。</p>
+            <div className="provider-fallback-search">
+              <Search size={16} aria-hidden="true" />
+              <input
+                aria-label="搜索备用供应商"
+                placeholder="搜索供应商或模型"
+                value={candidateQuery}
+                onChange={(event) => setCandidateQuery(event.target.value)}
+              />
+              {candidateQuery && (
+                <button type="button" aria-label="清空备用供应商搜索" onClick={() => setCandidateQuery("")}>
+                  <X size={14} aria-hidden="true" />
+                </button>
+              )}
+            </div>
             <div className="provider-fallback-candidates">
-              {candidates.map((candidate) => {
+              {visibleCandidates.map((candidate) => {
                 const selected = fallbackProviderIds.includes(candidate.id);
                 const blockedByLimit = !selected && fallbackProviderIds.length >= 4;
                 return (
@@ -637,15 +763,15 @@ function ProviderFallbackRoute({
                       checked={selected}
                       disabled={(!candidate.hasApiKey && !selected) || blockedByLimit}
                       onChange={(event) => {
-                        setFallbackProviderIds((current) => event.target.checked
-                          ? [...current, candidate.id]
-                          : current.filter((id) => id !== candidate.id));
+                        onChange(event.target.checked
+                          ? [...fallbackProviderIds, candidate.id]
+                          : fallbackProviderIds.filter((id) => id !== candidate.id));
                       }}
                       aria-label={`备用供应商：${candidate.name}`}
                     />
                     <span className="provider-fallback-candidate-details">
-                      <strong>{candidate.name}</strong>
-                      <small>{candidate.model || "未选择模型"}</small>
+                      <strong title={candidate.name}>{candidate.name}</strong>
+                      <small title={candidate.model}>{candidate.model || "未选择模型"}</small>
                     </span>
                     <span className="provider-fallback-candidate-status">
                       {selected ? `备用 ${fallbackProviderIds.indexOf(candidate.id) + 1}`
@@ -655,15 +781,21 @@ function ProviderFallbackRoute({
                   </label>
                 );
               })}
+              {visibleCandidates.length === 0 && <p className="provider-fallback-no-results">没有匹配的备用供应商。</p>}
             </div>
           </div>
         )}
       </fieldset>
       <footer className="provider-fallback-card-actions">
-        <span>修改仅在保存后生效</span>
-        <button className="primary-button" type="submit" disabled={saving}>
-          <Save size={14} />{saving ? "保存中…" : `保存 ${provider.name} 路由`}
-        </button>
+        <span className={dirty ? "provider-fallback-unsaved" : ""} role="status">
+          {dirty ? "未保存 · 切换供应商会保留修改" : "修改仅在保存后生效"}
+        </span>
+        <div className="provider-fallback-save-actions">
+          {dirty && <button className="provider-fallback-reset" type="button" disabled={saving} onClick={() => onChange(provider.fallbackProviderIds ?? [])}>撤销修改</button>}
+          <button className="primary-button" type="submit" disabled={saving || !dirty} aria-label={`保存 ${provider.name} 路由`}>
+            <Save size={14} />{saving ? "保存中…" : "保存路由"}
+          </button>
+        </div>
       </footer>
     </form>
   );
@@ -1952,6 +2084,8 @@ function KnowledgePage() {
     name: string;
   }>(null);
   const nameInputRef = useRef<HTMLInputElement>(null);
+  const sourcePickerRef = useRef<HTMLButtonElement>(null);
+  const searchInputRef = useRef<HTMLInputElement>(null);
   const loadVersionRef = useRef(0);
 
   async function load() {
@@ -2087,18 +2221,35 @@ function KnowledgePage() {
     });
   }
 
-  if (!settings || !embedding) return <section className="settings-page knowledge-page"><div className="settings-page-header"><div><p className="settings-eyebrow">知识与规则</p><h3>知识库</h3></div></div><div className="settings-pending">正在加载知识库</div></section>;
-  return <section className="settings-page knowledge-page" aria-labelledby="knowledge-page-title">
+  const allSources = Object.values(sources).flat();
+  const indexedSources = allSources.filter((source) => source.state === "indexed").length;
+  const activeSources = allSources.filter((source) => source.state === "queued" || source.state === "indexing").length;
+  const guideStep = collections.length === 0 ? 0 : allSources.length === 0 ? 1 : 2;
+  const guideSteps = [
+    { title: "创建集合", hint: "按项目或主题分组", target: nameInputRef },
+    { title: "添加文件", hint: "选择工作区文件，自动索引", target: sourcePickerRef },
+    { title: "试搜验证", hint: "输入关键词，查看引用", target: searchInputRef },
+  ];
+
+  if (!settings || !embedding) return <section className="settings-page knowledge-page knowledge-page--compact"><div className="settings-page-header"><div><p className="settings-eyebrow">知识与规则</p><h3>知识库</h3></div></div><div className="settings-pending">正在加载知识库</div></section>;
+  return <section className="settings-page knowledge-page knowledge-page--compact" aria-labelledby="knowledge-page-title">
     <header className="knowledge-hero">
       <div className="knowledge-hero-copy">
         <div className="knowledge-title-line"><span className="knowledge-title-icon" aria-hidden="true"><Library size={18} /></span><div><p className="settings-eyebrow">知识与规则</p><h3 id="knowledge-page-title">知识库</h3></div></div>
-        <p>把工作区中的文档整理成可检索的本地知识。只会索引你明确添加的文件。</p>
+        <p>把工作区文件变成可引用的知识，只索引你添加的内容。</p>
       </div>
       <label className="knowledge-enable-toggle"><input type="checkbox" checked={settings.enabled} disabled={busy} onChange={(event) => void run(async () => { setSettings(await setKnowledgeEnabled(event.target.checked)); })} /><span><strong>{settings.enabled ? "知识库已启用" : "知识库已停用"}</strong><small>{settings.enabled ? "搜索时可使用已建立的索引" : "开启后允许智能体检索本地来源"}</small></span></label>
     </header>
 
+    <nav className="knowledge-quickstart" aria-label="知识库使用步骤">
+      {guideSteps.map((step, index) => <button className={`knowledge-guide-step${index < guideStep ? " is-complete" : index === guideStep ? " is-current" : ""}`} type="button" key={step.title} aria-current={index === guideStep ? "step" : undefined} disabled={busy || (index === 1 && collections.length === 0)} onClick={() => step.target.current?.focus()}>
+        <span className="knowledge-guide-number" aria-hidden="true">{index < guideStep ? <Check size={13} /> : index + 1}</span><span><strong>{step.title}</strong><small>{step.hint}</small></span><ChevronRight size={14} aria-hidden="true" />
+      </button>)}
+    </nav>
+    <p className="knowledge-guide-note">{!settings.enabled ? "知识库已停用。你仍可管理文件，启用后才能试搜。" : activeSources > 0 ? `${activeSources} 个来源正在索引，完成后可试搜验证。` : collections.length === 0 ? "从创建第一个集合开始；本地全文检索无需配置 API Key。" : allSources.length === 0 ? "下一步：为集合选择文件，系统会自动建立索引。" : "在下方试搜关键词，确认索引效果；语义检索可按需开启。"}</p>
+
     <section className="knowledge-create-card" aria-labelledby="knowledge-create-title">
-      <div className="knowledge-card-heading"><div><span className="knowledge-section-kicker">集合</span><h4 id="knowledge-create-title">新建 Collection</h4></div><span className="knowledge-card-hint">按项目、领域或团队分组</span></div>
+      <div className="knowledge-card-heading"><div><h4 id="knowledge-create-title">新建集合</h4></div></div>
       <form className="knowledge-collection-form" noValidate onSubmit={(event) => void createCollection(event)}>
         <label className="knowledge-field"><span>名称</span><input ref={nameInputRef} value={name} maxLength={80} placeholder="例如：项目文档" aria-label="Collection 名称" aria-invalid={Boolean(nameError)} aria-describedby={nameError ? "knowledge-collection-name-error" : undefined} onChange={(event) => { setName(event.target.value); if (nameError) setNameError(""); }} /></label>
         <button className="primary-button" type="submit" disabled={busy}><Plus size={14} />创建</button>
@@ -2106,7 +2257,7 @@ function KnowledgePage() {
       </form>
     </section>
 
-    <div className="knowledge-section-header"><div><span className="knowledge-section-kicker">已配置</span><h4>Collections</h4></div><span className="knowledge-count-badge">{collections.length}</span></div>
+    <div className="knowledge-section-header"><div><h4>我的集合 <span className="knowledge-count-badge">{collections.length}</span></h4></div><span>{allSources.length} 个来源 · {indexedSources} 个已索引</span></div>
     {collections.length ? collections.map((collection) => {
       const collectionPath = sourcePaths[collection.id] ?? "";
       const collectionSources = sources[collection.id] ?? [];
@@ -2117,11 +2268,11 @@ function KnowledgePage() {
           <div className="knowledge-collection-actions"><label className="extension-toggle"><input type="checkbox" checked={collection.enabled} disabled={busy} onChange={(event) => void run(async () => { await upsertKnowledgeCollection({ id: collection.id, name: collection.name, enabled: event.target.checked }); })} /><span>启用</span></label><button className="knowledge-icon-button" type="button" title="删除 Collection" aria-label={`删除 Collection ${collection.name}`} disabled={busy} onClick={() => setPendingDelete({ kind: "collection", id: collection.id, name: collection.name })}><Trash2 size={15} /></button></div>
         </header>
         <div className="knowledge-source-panel">
-          <div className="knowledge-source-heading"><div><span className="knowledge-section-kicker">来源</span><strong>添加要纳入检索的文件</strong></div><span>{collectionSources.length ? `${collectionSources.length} 个已添加` : "尚未添加来源"}</span></div>
+          <div className="knowledge-source-heading"><div><strong>{collectionSources.length ? "管理来源" : "下一步：添加文件"}</strong></div><span>仅限当前工作区 · 支持多选</span></div>
           <div className="knowledge-source-add">
+            <button ref={collection.id === collections[0]?.id ? sourcePickerRef : undefined} className="primary-button knowledge-picker-button" type="button" disabled={busy || picking} aria-label="选择文件" title="从当前工作区选择文件" onClick={() => void pickSources(collection.id)}><FolderOpen size={15} />{picking ? "选择中..." : "选择文件"}</button>
             <label className="knowledge-source-input"><span className="sr-only">工作区相对路径</span><FileText size={15} aria-hidden="true" /><input value={collectionPath} placeholder="工作区相对路径，如 docs/guide.md" aria-label="来源路径" onChange={(event) => { setSourcePaths((current) => ({ ...current, [collection.id]: event.target.value })); if (sourceErrors[collection.id]) setSourceErrors((current) => ({ ...current, [collection.id]: "" })); }} /></label>
             <button className="secondary-button" type="button" disabled={busy || picking || !collectionPath.trim()} onClick={() => void addManualSource(collection.id)}><Plus size={14} />添加路径</button>
-            <button className="secondary-button knowledge-picker-button" type="button" disabled={busy || picking} aria-label="选择文件" title="从当前工作区选择文件" onClick={() => void pickSources(collection.id)}><FolderOpen size={15} />{picking ? "选择中..." : "选择文件"}</button>
           </div>
           {sourceErrors[collection.id] && <small className="knowledge-field-error" role="alert">{sourceErrors[collection.id]}</small>}
           <div className="knowledge-source-list">
@@ -2143,16 +2294,22 @@ function KnowledgePage() {
           </div>
         </div>
       </article>;
-    }) : <div className="knowledge-empty-collections"><Library size={20} aria-hidden="true" /><strong>先创建一个 Collection</strong><span>Collection 用来管理一组相关的工作区来源。</span></div>}
+    }) : <div className="knowledge-empty-collections"><Library size={20} aria-hidden="true" /><strong>先创建一个集合</strong><span>在上方填写名称，再添加需要检索的文件。</span></div>}
 
-    <section className="knowledge-settings-card" aria-labelledby="knowledge-semantic-title">
-      <div className="knowledge-card-heading"><div><span className="knowledge-section-kicker">检索引擎</span><h4 id="knowledge-semantic-title">语义检索</h4></div><span className="knowledge-card-hint">固定 SiliconFlow BGE-M3</span></div>
+    <KnowledgeRetrievalPanel enabled={settings.enabled} budgetPercent={settings.knowledgeBudgetPercent} inputRef={searchInputRef} />
+
+    <div className="knowledge-section-header knowledge-advanced-heading"><h4>进阶与诊断</h4><span>基础检索无需配置以下选项</span></div>
+    <details className="knowledge-disclosure">
+      <summary><Sparkles size={15} aria-hidden="true" /><span><strong id="knowledge-semantic-title">语义检索</strong><small>按含义匹配，需配置 API Key</small></span><span className="knowledge-count-badge">{embedding.semanticEnabled ? "已开启" : "可选"}</span><ChevronRight className="knowledge-disclosure-chevron" size={15} aria-hidden="true" /></summary>
+      <section className="knowledge-settings-card" aria-labelledby="knowledge-semantic-title">
       <p className="settings-help">关闭语义检索时使用本地 FTS-only；开启后只会向 SiliconFlow 发送已建立索引的文本片段。</p>
       <div className="knowledge-semantic-layout"><label className="knowledge-enable-toggle knowledge-enable-toggle--compact"><input type="checkbox" checked={embedding.semanticEnabled} disabled={busy} onChange={(event) => void run(async () => { setEmbedding(await setEmbeddingSettings({ semanticEnabled: event.target.checked, batchSize: embedding.batchSize, timeoutMs: embedding.timeoutMs, maxVectorScanChunks: embedding.maxVectorScanChunks })); })} /><span><strong>启用语义检索</strong><small>{embedding.semanticEnabled ? "混合 BM25 与向量排序" : "仅使用本地全文检索"}</small></span></label><div className="knowledge-engine-meta"><span>{embedding.provider}</span><span>{embedding.model}</span><span>{embedding.embeddingStatus}</span></div></div>
       <div className="knowledge-api-row"><label className="knowledge-api-input"><span className="sr-only">SiliconFlow API Key</span><KeyRound size={15} aria-hidden="true" /><input type="password" value={apiKey} maxLength={512} autoComplete="new-password" placeholder={embedding.embeddingConfigured ? "已配置 API Key" : "SiliconFlow API Key"} aria-label="SiliconFlow API Key" onChange={(event) => setApiKey(event.target.value)} /></label><button className="secondary-button" type="button" disabled={busy || !apiKey.trim()} onClick={() => void run(async () => { await setEmbeddingApiKey(apiKey); setApiKey(""); })}><Save size={14} />保存</button>{embedding.embeddingConfigured && <><button className="secondary-button" type="button" disabled={busy} onClick={() => void run(async () => { const result = await testEmbeddingConnection(); if (!result.connected) throw new Error(result.errorCode ?? "连接失败"); })}><PlayCircle size={14} />测试连接</button><button className="secondary-button knowledge-danger-button" type="button" disabled={busy} onClick={() => void run(async () => { await deleteEmbeddingApiKey(); })}><Trash2 size={14} />删除 Key</button></>}</div>
-    </section>
-    <section className="knowledge-settings-card" aria-labelledby="knowledge-metrics-title">
-      <div className="knowledge-card-heading"><div><span className="knowledge-section-kicker">索引指标</span><h4 id="knowledge-metrics-title">运行指标</h4></div><span className="knowledge-card-hint">仅统计本次运行</span></div>
+      </section>
+    </details>
+    <details className="knowledge-disclosure">
+      <summary><BarChart3 size={15} aria-hidden="true" /><span><strong id="knowledge-metrics-title">运行指标</strong><small>索引耗时、向量请求与错误</small></span><span className="knowledge-card-hint">仅统计本次运行</span><ChevronRight className="knowledge-disclosure-chevron" size={15} aria-hidden="true" /></summary>
+      <section className="knowledge-settings-card" aria-labelledby="knowledge-metrics-title">
       <div className="knowledge-metrics-grid">
         <div><span>已完成</span><strong>{metrics?.jobsCompleted ?? 0}</strong></div>
         <div><span>内容未变化</span><strong>{metrics?.jobsReused ?? 0}</strong></div>
@@ -2165,9 +2322,12 @@ function KnowledgePage() {
         <div><span>平均耗时</span><strong>{metrics?.averageIndexDurationMs ?? 0} ms</strong></div>
       </div>
       {metrics?.lastErrorCode ? <p className="settings-help">最近一次索引错误：{metrics.lastErrorCode}</p> : null}
-    </section>
-    <KnowledgeRetrievalPanel enabled={settings.enabled} budgetPercent={settings.knowledgeBudgetPercent} />
-    <KnowledgeGraphPanel collections={collections} enabled={settings.enabled} />
+      </section>
+    </details>
+    <details className="knowledge-disclosure">
+      <summary><Network size={15} aria-hidden="true" /><span><strong>关系审核</strong><small>审核事实候选，查询已生效关系</small></span><ChevronRight className="knowledge-disclosure-chevron" size={15} aria-hidden="true" /></summary>
+      <KnowledgeGraphPanel collections={collections} enabled={settings.enabled} />
+    </details>
     {error && <div className="settings-error" role="alert">{error}</div>}
     {pendingDelete && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && setPendingDelete(null)} onKeyDown={(event) => { if (event.key !== "Escape") return; event.preventDefault(); event.stopPropagation(); setPendingDelete(null); }}>
       <section className="delete-confirm-dialog" role="dialog" aria-modal="true" aria-labelledby="knowledge-delete-title">
@@ -2214,7 +2374,7 @@ function shortKnowledgeRevision(revision: string) {
   return revision.length > 10 ? revision.slice(0, 10) : revision;
 }
 
-function KnowledgeRetrievalPanel({ enabled, budgetPercent }: { enabled: boolean; budgetPercent: number }) {
+function KnowledgeRetrievalPanel({ enabled, budgetPercent, inputRef }: { enabled: boolean; budgetPercent: number; inputRef: RefObject<HTMLInputElement | null> }) {
   const [query, setQuery] = useState("");
   const [modelRewrite, setModelRewrite] = useState(false);
   const [response, setResponse] = useState<KnowledgeSearchResponse | null>(null);
@@ -2285,10 +2445,10 @@ function KnowledgeRetrievalPanel({ enabled, budgetPercent }: { enabled: boolean;
   const budgetChars = knowledgeMetadataNumber(metadata, "budgetChars");
 
   return <section className="knowledge-settings-card" aria-labelledby="knowledge-retrieval-title">
-    <div className="knowledge-card-heading"><div><span className="knowledge-section-kicker">检索与反馈</span><h4 id="knowledge-retrieval-title">检索控制台</h4></div><span className="knowledge-card-hint">最多 6 个切片 · 预算 {budgetPercent}%</span></div>
-    <p className="settings-help">用与智能体相同的通道验证索引效果。反馈会绑定到切片与 revision，并在之后的排序中生效。</p>
+    <div className="knowledge-card-heading"><div><h4 id="knowledge-retrieval-title">试搜一下</h4></div><span className="knowledge-card-hint">最多 6 个切片 · 预算 {budgetPercent}%</span></div>
+    <p className="settings-help">输入文件中的关键词，查看命中内容与引用；反馈可改善后续排序。</p>
     <form className="knowledge-retrieval-form" noValidate onSubmit={(event) => void search(event)}>
-      <label className="knowledge-retrieval-input"><span className="sr-only">检索关键词</span><Search size={15} aria-hidden="true" /><input value={query} maxLength={2000} placeholder="例如：schema 迁移" aria-label="知识库检索关键词" onChange={(event) => setQuery(event.target.value)} /></label>
+      <label className="knowledge-retrieval-input"><span className="sr-only">检索关键词</span><Search size={15} aria-hidden="true" /><input ref={inputRef} value={query} maxLength={2000} placeholder="输入关键词，验证已索引的文件" aria-label="知识库检索关键词" onChange={(event) => setQuery(event.target.value)} /></label>
       <label className="knowledge-retrieval-toggle" title="额外调用一次模型改写查询，失败时回退到确定性改写"><input type="checkbox" checked={modelRewrite} disabled={busy} onChange={(event) => setModelRewrite(event.target.checked)} />模型改写</label>
       <button className="primary-button" type="submit" disabled={busy || !enabled || !query.trim()}><Search size={14} />检索</button>
     </form>
@@ -2320,172 +2480,52 @@ function KnowledgeRetrievalPanel({ enabled, budgetPercent }: { enabled: boolean;
       })}
     </div> : <div className="knowledge-retrieval-empty"><FileText size={18} aria-hidden="true" /><span>没有命中任何切片。试试更短的关键词，或先为 Collection 添加来源。</span></div>) : <div className="knowledge-retrieval-empty"><Search size={18} aria-hidden="true" /><span>输入关键词检索本地知识，结果会显示引用来源、评分与反馈入口。</span></div>}
     {error && <div className="settings-error" role="alert">{error}</div>}
-    <div className="knowledge-card-heading"><div><span className="knowledge-section-kicker">最近检索</span><h4>检索事件</h4></div><span className="knowledge-card-hint">只记录查询摘要，不保存原文</span></div>
+    <details className="knowledge-disclosure knowledge-disclosure--inline">
+      <summary><Clock3 size={14} aria-hidden="true" /><span><strong>最近检索</strong><small>只记录查询摘要，不保存原文</small></span><span className="knowledge-count-badge">{events.length}</span><ChevronRight className="knowledge-disclosure-chevron" size={14} aria-hidden="true" /></summary>
     {events.length ? <div className="knowledge-events">{events.map((event) => <div className="knowledge-event-row" key={event.id}><div><code>{event.queryHash}</code><small>{event.retrievalMode} · 候选 {event.resultCount} · 返回引用 {event.selectedCitationCount} · {event.latencyMs} ms</small></div><time dateTime={new Date(event.createdAtMs).toISOString()}>{new Date(event.createdAtMs).toLocaleString()}</time></div>)}</div> : <div className="knowledge-retrieval-empty"><Clock3 size={18} aria-hidden="true" /><span>还没有检索记录。</span></div>}
+    </details>
   </section>;
 }
 
-const MEMORY_SCOPE_KINDS: Array<{ id: MemoryScopeKind; label: string }> = [
-  { id: "user", label: "用户" },
-  { id: "workspace", label: "工作区" },
-  { id: "project", label: "项目" },
-  { id: "thread", label: "当前会话" },
-];
-
-/// 规范 scope 串：`user`，其余为 `<kind>:<id>`。
-///
-/// 这个应用里一个工作区就是一个 `ProjectRecord`，所以工作区级与项目级共用同一个宿主 ID；会话级
-/// 用当前会话 ID，没有活动会话时该项直接禁用——绝不用一个猜出来的 ID 去查记忆。
-function memoryScopeValue(kind: MemoryScopeKind, workspaceId: string, threadId: string | null) {
-  if (kind === "user") return "user";
-  if (kind === "thread") return threadId ? `thread:${threadId}` : "";
-  return `${kind}:${workspaceId}`;
-}
-
-/// 记忆页：开关、写入策略、待审核候选，以及按作用域查看/删除生效记忆。
-///
-/// 删除与清空的确认令牌由宿主计算（记忆 ID 与规范 scope 串），前端只是把它回传，所以这里不可能
-/// 通过构造参数删除一条它没有看到的记忆。
-function MemoryPage({ activeThreadId }: { activeThreadId: string | null }) {
-  const [settings, setSettings] = useState<MemorySettings | null>(null);
-  const [workspaceId, setWorkspaceId] = useState("");
-  const [scopeKind, setScopeKind] = useState<MemoryScopeKind>("user");
-  const [memories, setMemories] = useState<MemoryRecord[]>([]);
-  const [candidates, setCandidates] = useState<MemoryCandidate[]>([]);
-  const [autoAccept, setAutoAccept] = useState(false);
-  const [ttl, setTtl] = useState("0");
+function MemoryPage({ activeThreadId: _activeThreadId }: { activeThreadId: string | null }) {
+  const [enabled, setEnabled] = useState(false);
+  const [workspaces, setWorkspaces] = useState<ProjectMemoryWorkspace[]>([]);
+  const [selected, setSelected] = useState<{ workspaceId: string; path: string } | null>(null);
+  const [content, setContent] = useState<ProjectMemoryContent | null>(null);
   const [error, setError] = useState("");
-  const [busy, setBusy] = useState(false);
-  const [pending, setPending] = useState<null | { kind: "memory" | "clear"; id: string; label: string }>(null);
-
-  const scope = memoryScopeValue(scopeKind, workspaceId, activeThreadId);
-
-  async function load() {
-    const [nextSettings, workspace, nextCandidates] = await Promise.all([
-      getMemorySettings(),
-      getWorkspaceState(),
-      listMemoryCandidates("pending", 50),
-    ]);
-    setSettings(nextSettings);
-    setAutoAccept(nextSettings.autoAcceptHighConfidence);
-    setTtl(String(nextSettings.defaultTtlDays));
-    setWorkspaceId(workspace.current.id);
-    setCandidates(nextCandidates);
-    const nextScope = memoryScopeValue(scopeKind, workspace.current.id, activeThreadId);
-    setMemories(nextScope ? (await listMemories(nextScope, "active", undefined, 50)).items : []);
-  }
-
-  useEffect(() => {
-    void load().catch((reason) => setError(formatKnowledgeError(reason)));
-  }, [scopeKind, activeThreadId]);
-
-  async function run(action: () => Promise<void>) {
-    setBusy(true);
-    setError("");
+  const [loading, setLoading] = useState(true);
+  const load = useCallback(async () => {
+    setLoading(true); setError("");
     try {
-      await action();
-      await load();
-    } catch (reason) {
-      setError(formatKnowledgeError(reason));
-    } finally {
-      setBusy(false);
-    }
+      const [settings, next] = await Promise.all([getMemorySettings(), listProjectMemories()]);
+      setEnabled(settings.enabled); setWorkspaces(next);
+      const first = next[0]?.files[0];
+      if (first) { setSelected({ workspaceId: next[0].id, path: first.path }); setContent(await readProjectMemory(next[0].id, first.path)); }
+      else { setSelected(null); setContent(null); }
+    } catch (reason) { setError(formatKnowledgeError(reason)); }
+    finally { setLoading(false); }
+  }, []);
+  useEffect(() => { void load(); }, [load]);
+  async function openFile(workspaceId: string, path: string) {
+    setSelected({ workspaceId, path }); setError("");
+    try { setContent(await readProjectMemory(workspaceId, path)); } catch (reason) { setError(formatKnowledgeError(reason)); }
   }
-
-  async function confirm() {
-    const target = pending;
-    if (!target) return;
-    setPending(null);
-    await run(async () => {
-      if (target.kind === "memory") {
-        await deleteMemory(target.id, target.id);
-      } else {
-        await clearMemories(target.id, target.id);
-      }
-    });
+  async function toggle(next: boolean) {
+    setError("");
+    try { const settings = await setMemoryEnabled(next); setEnabled(settings.enabled); } catch (reason) { setError(formatKnowledgeError(reason)); }
   }
-
-  if (!settings) return <section className="settings-page knowledge-page"><div className="settings-page-header"><div><p className="settings-eyebrow">知识与规则</p><h3>记忆</h3></div></div><div className="settings-pending">正在加载记忆</div></section>;
-
-  return <section className="settings-page knowledge-page" aria-labelledby="memory-page-title">
-    <header className="knowledge-hero">
-      <div className="knowledge-hero-copy">
-        <div className="knowledge-title-line"><span className="knowledge-title-icon" aria-hidden="true"><Brain size={18} /></span><div><p className="settings-eyebrow">知识与规则</p><h3 id="memory-page-title">记忆</h3></div></div>
-        <p>记忆只保存结构化摘要，不保存完整会话正文。模型只能提出候选，接受、删除与清空都在这里由你决定。</p>
-      </div>
-      <label className="knowledge-enable-toggle"><input type="checkbox" checked={settings.enabled} disabled={busy} onChange={(event) => void run(async () => { setSettings(await setMemoryEnabled(event.target.checked)); })} /><span><strong>{settings.enabled ? "记忆已启用" : "记忆已停用"}</strong><small>{settings.enabled ? "注入前会经过敏感项过滤与预算裁剪" : "停用后不会注入任何记忆"}</small></span></label>
-    </header>
-
-    <section className="knowledge-settings-card" aria-labelledby="memory-settings-title">
-      <div className="knowledge-card-heading"><div><span className="knowledge-section-kicker">写入策略</span><h4 id="memory-settings-title">自动接受与默认 TTL</h4></div><span className="knowledge-card-hint">默认全部进审核队列</span></div>
-      <label className="knowledge-enable-toggle knowledge-enable-toggle--compact"><input type="checkbox" checked={autoAccept} disabled={busy} onChange={(event) => setAutoAccept(event.target.checked)} /><span><strong>高置信且非敏感的候选自动接受</strong><small>关闭时所有模型提案都要人工审核；敏感项与冲突永远需要审核</small></span></label>
-      <div className="knowledge-api-row">
-        <label className="knowledge-field"><span>默认 TTL（天，0 为不过期）</span><input type="number" min={0} max={3650} value={ttl} aria-label="默认 TTL 天数" disabled={busy} onChange={(event) => setTtl(event.target.value)} /></label>
-        <button className="secondary-button" type="button" disabled={busy} onClick={() => void run(async () => { setSettings(await setMemorySettings({ enabled: settings.enabled, autoAcceptHighConfidence: autoAccept, defaultTtlDays: Number(ttl) || 0 })); })}><Save size={14} />保存</button>
-      </div>
-    </section>
-
-    <section className="knowledge-settings-card" aria-labelledby="memory-review-title">
-      <div className="knowledge-card-heading"><div><span className="knowledge-section-kicker">审核队列</span><h4 id="memory-review-title">待审核候选</h4></div><span className="knowledge-count-badge">{candidates.length}</span></div>
-      {candidates.length ? <div className="knowledge-retrieval-results">
-        {candidates.map((candidate) => <article className="knowledge-result" key={candidate.id}>
-          <header className="knowledge-result-head">
-            <div className="knowledge-result-title"><strong>{candidate.operation} · {candidate.memoryType}</strong><small>{candidate.reason}</small></div>
-            <span className="knowledge-result-score">{candidate.scopeType}{candidate.scopeId ? `:${candidate.scopeId}` : ""} · conf {candidate.confidence.toFixed(2)}</span>
-          </header>
-          <pre className="knowledge-result-preview">{candidate.content}</pre>
-          <div className="knowledge-result-actions">
-            <button className="secondary-button" type="button" disabled={busy} onClick={() => void run(async () => { await reviewMemoryCandidate(candidate.id, "accept"); })}><Check size={14} />接受</button>
-            <button className="knowledge-feedback-button" type="button" disabled={busy} onClick={() => void run(async () => { await reviewMemoryCandidate(candidate.id, "reject"); })}>拒绝</button>
-          </div>
-        </article>)}
-      </div> : <div className="knowledge-retrieval-empty"><CheckCircle2 size={18} aria-hidden="true" /><span>没有待审核的候选。</span></div>}
-    </section>
-
-    <section className="knowledge-settings-card" aria-labelledby="memory-list-title">
-      <div className="knowledge-card-heading"><div><span className="knowledge-section-kicker">已存储</span><h4 id="memory-list-title">生效记忆</h4></div><span className="knowledge-card-hint">{scope || "该作用域不可用"}</span></div>
-      <div className="knowledge-graph-controls">
-        <label className="knowledge-field"><span>作用域</span><select className="knowledge-select" value={scopeKind} aria-label="记忆作用域" onChange={(event) => setScopeKind(event.target.value as MemoryScopeKind)}>{MEMORY_SCOPE_KINDS.map((kind) => <option key={kind.id} value={kind.id} disabled={kind.id === "thread" && !activeThreadId}>{kind.label}</option>)}</select></label>
-        <label className="knowledge-field"><span>操作</span><button className="secondary-button knowledge-danger-button" type="button" disabled={busy || !scope || memories.length === 0} onClick={() => setPending({ kind: "clear", id: scope, label: scope })}><Trash2 size={14} />清空该作用域</button></label>
-      </div>
-      {memories.length ? <div className="knowledge-events">
-        {memories.map((memory) => <div className="knowledge-event-row" key={memory.id}>
-          <div><code>{memory.memoryType} · rev {memory.revision}</code><small>{memory.content}</small><small>{memory.sensitivity}{memory.sourceType === "model" ? " · 模型提案" : ""}{memory.expiresAtMs ? ` · 到期 ${new Date(memory.expiresAtMs).toLocaleDateString()}` : " · 不过期"}</small></div>
-          <button className="knowledge-icon-button knowledge-icon-button--danger" type="button" title="删除记忆" aria-label={`删除记忆 ${memory.memoryType}`} disabled={busy} onClick={() => setPending({ kind: "memory", id: memory.id, label: memory.content })}><Trash2 size={15} /></button>
-        </div>)}
-      </div> : <div className="knowledge-retrieval-empty"><Brain size={18} aria-hidden="true" /><span>这个作用域下还没有生效记忆。</span></div>}
-    </section>
-
-    {error && <div className="settings-error" role="alert">{error}</div>}
-    {pending && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && setPending(null)} onKeyDown={(event) => { if (event.key !== "Escape") return; event.preventDefault(); event.stopPropagation(); setPending(null); }}>
-      <section className="delete-confirm-dialog" role="dialog" aria-modal="true" aria-labelledby="memory-delete-title">
-        <h4 id="memory-delete-title">{pending.kind === "clear" ? "清空该作用域的记忆" : "删除这条记忆"}</h4>
-        <p>{pending.kind === "clear" ? `将把作用域 ${pending.label} 下的全部记忆软删除，并逐条写入审计事件。` : `将软删除“${pending.label}”，审计行保留。`}</p>
-        <div className="delete-confirm-actions">
-          <button className="secondary-button" type="button" autoFocus disabled={busy} onClick={() => setPending(null)}>取消</button>
-          <button className="danger-button" type="button" disabled={busy} onClick={() => void confirm()}><Trash2 size={14} />确认</button>
-        </div>
-      </section>
-    </div>}
+  return <section className="settings-page knowledge-page memory-settings-page" aria-labelledby="memory-page-title">
+    <header className="knowledge-hero"><div className="knowledge-hero-copy"><div className="knowledge-title-line"><span className="knowledge-title-icon" aria-hidden="true"><Brain size={18} /></span><div><p className="settings-eyebrow">知识与规则</p><h3 id="memory-page-title">记忆</h3></div></div><p>记忆使用工作区对应的本地 Markdown 文件。你可以查看 MEMORY.md 和 memory 目录中的文件；开启后运行中的会话才会读取它们。</p></div><label className="knowledge-enable-toggle"><input type="checkbox" checked={enabled} disabled={loading} onChange={(event) => void toggle(event.target.checked)} /><span><strong>{enabled ? "工作区记忆已启用" : "工作区记忆已停用"}</strong><small>{enabled ? "会话可读取本地 Markdown 记忆" : "停用后会话不会读取记忆"}</small></span></label></header>
+    <div className="memory-browser-layout"><section className="knowledge-settings-card" aria-labelledby="memory-workspaces-title"><div className="knowledge-card-heading"><div><span className="knowledge-section-kicker">本地文件</span><h4 id="memory-workspaces-title">工作区记忆</h4></div><button className="secondary-button" type="button" disabled={loading} onClick={() => void load()}><RefreshCw size={14} />刷新</button></div>{loading ? <p className="settings-help">正在读取记忆文件。</p> : workspaces.length ? workspaces.map((workspace) => <div className="memory-workspace" key={workspace.id}><strong>{workspace.label}</strong>{workspace.files.length ? workspace.files.map((file) => <button className={`memory-file-button${selected?.workspaceId === workspace.id && selected.path === file.path ? " memory-file-button--active" : ""}`} type="button" key={file.path} onClick={() => void openFile(workspace.id, file.path)}><FileText size={14} />{file.path}<small>{Math.ceil(file.sizeBytes / 1024)} KiB</small></button>) : <span className="settings-help">没有 Markdown 记忆文件</span>}</div>) : <div className="knowledge-retrieval-empty"><Brain size={18} /><span>还没有找到工作区记忆。创建 MEMORY.md 或 memory/*.md 后刷新。</span></div>}</section><section className="knowledge-settings-card memory-preview-card" aria-labelledby="memory-preview-title"><div className="knowledge-card-heading"><div><span className="knowledge-section-kicker">文件预览</span><h4 id="memory-preview-title">{content?.path ?? "选择一个文件"}</h4></div></div>{content ? <pre className="memory-file-preview">{content.content}</pre> : <div className="knowledge-retrieval-empty"><FileText size={18} /><span>选择左侧 Markdown 文件查看内容。</span></div>}</section></div>{error && <div className="settings-error" role="alert">{error}</div>}
   </section>;
 }
 
 const KNOWLEDGE_ENTITY_TYPES: Array<{ type: KnowledgeEntityType; label: string }> = [
-  { type: "concept", label: "概念" },
-  { type: "module", label: "模块" },
-  { type: "symbol", label: "符号" },
-  { type: "file", label: "文件" },
-  { type: "api", label: "接口" },
-  { type: "config", label: "配置" },
-  { type: "service", label: "服务" },
-  { type: "technology", label: "技术" },
+  { type: "concept", label: "概念" }, { type: "module", label: "模块" }, { type: "symbol", label: "符号" },
+  { type: "file", label: "文件" }, { type: "api", label: "接口" }, { type: "config", label: "配置" },
+  { type: "service", label: "服务" }, { type: "technology", label: "技术" },
 ];
 
-/// 实体与事实的审核面板。
-///
-/// 这里是 `active` 事实的唯一来源：模型提出的读法一律是 `candidate`，只有「通过」会让它生效，
-/// 并且只能给本次新建（仍是 candidate）的实体指定宿主词表里的类型。「驳回」把候选标成 rejected
-/// 而不是删除，所以审核痕迹与来源绑定都保留。下方的关系查询是只读的，用来确认审核后的图长什么样。
 function KnowledgeGraphPanel({ collections, enabled }: { collections: KnowledgeCollection[]; enabled: boolean }) {
   const [collectionId, setCollectionId] = useState("");
   const [candidates, setCandidates] = useState<KnowledgeFactCandidateRecord[]>([]);

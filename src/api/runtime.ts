@@ -61,6 +61,11 @@ import type {
   GoalState,
   GoalView,
   MemorySettings,
+  ProjectMemoryWorkspace,
+  ProjectMemoryContent,
+  MemoryScopeOption,
+  MemoryDiagnostics,
+  MemoryChanged,
   MemoryUpsertRequest,
   MemoryUpsertOutcome,
   MemoryRecord,
@@ -87,10 +92,12 @@ import type {
   WorkflowSkillReadinessView,
   LogQuery,
   LogQueryResult,
+  LogStorage,
   MobileCapability,
   MobileDeviceView,
   MobilePairingView,
   MobileStatus,
+  WeixinStatus,
   KnowledgeSettings,
   EmbeddingSettings,
   KnowledgeCollection,
@@ -390,9 +397,16 @@ export function listKnowledgeEntities(collectionId: string, status: string = "ac
 export function listKnowledgeFacts(collectionId: string, status: string = "candidate", limit?: number) { return invoke<KnowledgeFactCandidateRecord[]>("list_knowledge_facts", { collectionId, status, limit }); }
 export function reviewKnowledgeFact(factId: string, decision: "accept" | "reject", entityType?: KnowledgeEntityType) { return invoke<KnowledgeFactRecord>("review_knowledge_fact", { factId, decision, entityType }); }
 export function queryKnowledgeRelations(name: string, limit?: number) { return invoke<KnowledgeRelationQueryResult>("query_knowledge_relations", { name, limit }); }
-export function getMemorySettings() { return invoke<MemorySettings>("get_memory_settings"); }
-export function setMemorySettings(request: SetMemorySettingsRequest) { return invoke<MemorySettings>("set_memory_settings", { request }); }
-export function setMemoryEnabled(enabled: boolean) { return invoke<MemorySettings>("set_memory_enabled", { enabled }); }
+export function listProjectMemories() { return invoke<ProjectMemoryWorkspace[]>("list_project_memories"); }
+export function readProjectMemory(workspaceId: string, path: string) { return invoke<ProjectMemoryContent>("read_project_memory", { workspaceId, path }); }
+function normalizeMemorySettings(settings: MemorySettings): MemorySettings {
+  return { ...settings, autoExtractionConsentVersion: settings.autoExtractionConsentVersion ?? 0, captureAfterMs: settings.captureAfterMs ?? null };
+}
+export function getMemorySettings() { return invoke<MemorySettings>("get_memory_settings").then(normalizeMemorySettings); }
+export function setMemorySettings(request: SetMemorySettingsRequest) { return invoke<MemorySettings>("set_memory_settings", { request }).then(normalizeMemorySettings); }
+export function setMemoryEnabled(enabled: boolean) { return invoke<MemorySettings>("set_memory_enabled", { enabled }).then(normalizeMemorySettings); }
+export function getMemoryScopes(threadId?: string | null) { return invoke<MemoryScopeOption[]>("get_memory_scopes", { threadId: threadId ?? null }); }
+export function getMemoryDiagnostics() { return invoke<MemoryDiagnostics>("get_memory_diagnostics"); }
 export function listMemories(scope: MemoryScope, status?: MemoryStatus, cursor?: string, limit?: number) { return invoke<MemoryPage>("list_memories", { scope, status, cursor, limit }); }
 export function upsertMemory(request: MemoryUpsertRequest) { return invoke<MemoryUpsertOutcome>("upsert_memory", { request }); }
 export function listMemoryCandidates(status?: MemoryCandidateStatus, limit?: number) { return invoke<MemoryCandidate[]>("list_memory_candidates", { status, limit }); }
@@ -592,10 +606,28 @@ export function clearLogs(confirmed: boolean): Promise<void> {
   return invoke<void>("clear_logs", { confirmed });
 }
 
+export function getLogStorage(): Promise<LogStorage> {
+  return invoke<LogStorage>("get_log_storage");
+}
+
+export function chooseLogDirectory(): Promise<LogStorage | null> {
+  return invoke<LogStorage | null>("choose_log_directory");
+}
+
+export function resetLogDirectory(): Promise<LogStorage> {
+  return invoke<LogStorage>("reset_log_directory");
+}
+
 export function subscribeToAgentEvents(
   handler: (event: AgentEvent) => void,
 ): Promise<UnlistenFn> {
   return listen<AgentEvent>("agent-event", ({ payload }) => handler(payload));
+}
+
+export function subscribeToMemoryChanges(
+  handler: (event: MemoryChanged) => void,
+): Promise<UnlistenFn> {
+  return listen<MemoryChanged>("memory:changed", ({ payload }) => handler({ revision: payload.revision }));
 }
 
 export function subscribeToMailboxEvents(
@@ -629,6 +661,18 @@ export function startMobileGateway(
 
 export function stopMobileGateway(): Promise<MobileStatus> {
   return invoke<MobileStatus>("mobile_stop");
+}
+
+export function weixinStatus(): Promise<WeixinStatus> {
+  return invoke<WeixinStatus>("weixin_status");
+}
+
+export function startWeixin(threadId: string, rememberLogin: boolean, autoConnect: boolean): Promise<WeixinStatus> {
+  return invoke<WeixinStatus>("weixin_start", { threadId, rememberLogin, autoConnect });
+}
+
+export function stopWeixin(): Promise<WeixinStatus> {
+  return invoke<WeixinStatus>("weixin_stop");
 }
 
 export function createMobilePairing(): Promise<MobilePairingView> {

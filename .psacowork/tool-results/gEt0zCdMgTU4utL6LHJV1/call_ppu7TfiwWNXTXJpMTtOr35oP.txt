@@ -1,0 +1,3403 @@
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::fmt::Write;
+use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use serde::Deserialize;
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
+
+use crate::execution::{CommandRuntime, CommandState, OutputStream};
+use crate::patch::{PatchError, PatchService};
+use crate::policy::{
+    AllowRegisteredTools, ExecutionWorkspacePolicy, PolicyDecision, PolicyEngine,
+    ReadOnlyWorkspacePolicy, WorkspacePolicy,
+};
+use crate::protocol::{
+    ChangeSet, ExpectedFileHash, PatchPreview, ToolDefinition, ToolOutputStream, ToolResult,
+    ToolRisk,
+};
+
+mod command_diagnostics;
+
+const TOOL_PROGRESS_CHANNEL_CAPACITY: usize = 64;
+const TOOL_PROGRESS_BATCH_BYTES: usize = 16 * 1024;
+const TOOL_PROGRESS_READ_LIMIT: usize = 200;
+const MAX_PERSISTED_TOOL_PROGRESS_BYTES: usize = 64 * 1024;
+const MAX_PROVIDER_TOOL_DESCRIPTION_BYTES: usize = 2 * 1024;
+const MAX_PATH_SUGGESTION_SIBLING_ENTRIES: usize = 500;
+const MAX_PATH_SUGGESTION_SCAN_ENTRIES: usize = 2_000;
+const MAX_PATH_SUGGESTION_DEPTH: usize = 8;
+const POWERSHELL_RG_GLOB_RECOVERY_HINT: &str = "PowerShell 不会展开传给原生 rg 的路径通配符。请把文件通配符放到 rg 的 --glob 选项并传目录，例如 `rg --glob 'index-*.js' -n 'CodeEditor' dist/assets`；其他模式同理（如 `rg --glob 'CodeEditor-*.js' ... dist/assets`），也可以先用 `Get-ChildItem` 获取精确 `.FullName`。";
+const WINDOWS_POWERSHELL_RG_CRLF_RECOVERY_HINT: &str = "Windows PowerShell 会把原生命令管道重新编码为 CRLF，所以下游 rg 的 `$` 行尾锚点可能得到空结果。请给接收管道输入的 rg 添加 `--crlf`，例如 `rg --files path | rg --crlf 'name\\.js$'`；或改用 `Select-String`。";
+
+#[derive(Debug, Clone)]
+pub struct ToolProgress {
+    pub stream: ToolOutputStream,
+    pub cursor: u64,
+    pub delta: String,
+}
+
+/// Host-owned constraints applied while an ordinary plan is being reconciled
+/// immediately before a turn completes.  The model may update status/detail,
+/// but it must not turn a five-step plan into a six-step plan (or silently
+/// rename an existing step) during this bounded phase.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanReconciliationContext {
+    /// Revision observed when the host captured the reconciliation snapshot.
+    /// A status/detail update made by another writer must advance this value,
+    /// so a stale completion request cannot overwrite that newer plan state.
+    pub revision: u64,
+    pub steps: Vec<PlanReconciliationStep>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanReconciliationStep {
+    pub id: String,
+    pub step: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ToolContext {
+    pub thread_id: String,
+    pub turn_id: String,
+    pub call_id: String,
+    pub workspace_root: PathBuf,
+    pub approval: Option<ApprovedToolExecution>,
+    pub progress: Option<mpsc::Sender<ToolProgress>>,
+    pub plan_reconciliation: Option<PlanReconciliationContext>,
+}
+
+impl ToolContext {
+    pub fn publish_progress(&self, progress: ToolProgress) {
+        if let Some(sender) = &self.progress {
+            let _ = sender.try_send(progress);
+        }
+    }
+}
+
+pub fn tool_progress_channel() -> (mpsc::Sender<ToolProgress>, mpsc::Receiver<ToolProgress>) {
+    mpsc::channel(TOOL_PROGRESS_CHANNEL_CAPACITY)
+}
+
+#[derive(Debug, Clone)]
+pub struct ApprovedToolExecution {
+    pub patch: Option<String>,
+    pub selected_paths: Vec<String>,
+    pub expected_hashes: Vec<ExpectedFileHash>,
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum ToolError {
+    #[error("unknown tool: {0}")]
+    UnknownTool(String),
+    #[error("invalid tool arguments: {0}")]
+    InvalidArguments(String),
+    #[error("tool execution denied: {0}")]
+    Denied(String),
+    #[error("tool execution was cancelled")]
+    Cancelled,
+    #[error("tool execution requires approval: {0}")]
+    ApprovalRequired(String),
+    #[error(transparent)]
+    Patch(#[from] PatchError),
+    #[error("tool execution failed: {0}")]
+    Execution(String),
+}
+
+#[async_trait]
+pub trait ToolHandler: Send + Sync {
+    fn definition(&self) -> ToolDefinition;
+    fn preview(
+        &self,
+        _context: &ToolContext,
+        _arguments: &Value,
+    ) -> Result<Option<PatchPreview>, ToolError> {
+        Ok(None)
+    }
+    async fn execute(
+        &self,
+        context: &ToolContext,
+        arguments: Value,
+        cancellation: CancellationToken,
+    ) -> Result<ToolResult, ToolError>;
+}
+
+#[async_trait]
+pub trait ToolHookRunner: Send + Sync {
+    async fn before(
+        &self,
+        context: &ToolContext,
+        name: &str,
+        arguments: &Value,
+        cancellation: CancellationToken,
+    ) -> Result<(), ToolError>;
+
+    async fn after(
+        &self,
+        context: &ToolContext,
+        name: &str,
+        arguments: &Value,
+        result: ToolResult,
+        cancellation: CancellationToken,
+    ) -> Result<ToolResult, ToolError>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolAuthorization {
+    pub decision: PolicyDecision,
+    pub risk: ToolRisk,
+}
+
+#[derive(Clone)]
+pub struct ToolRegistry {
+    handlers: Arc<HashMap<String, Arc<dyn ToolHandler>>>,
+    policy: Arc<dyn PolicyEngine>,
+    patch_service: Option<PatchService>,
+    extension_risks: Arc<HashMap<String, ToolRisk>>,
+    hooks: Option<Arc<dyn ToolHookRunner>>,
+}
+
+impl ToolRegistry {
+    pub fn read_only() -> Self {
+        Self::new_with_policy(
+            vec![
+                Arc::new(ListDirectoryTool) as Arc<dyn ToolHandler>,
+                Arc::new(ReadFileTool) as Arc<dyn ToolHandler>,
+            ],
+            Arc::new(ReadOnlyWorkspacePolicy),
+        )
+        .expect("built-in tool names and schemas must be valid")
+    }
+
+    pub fn workspace_tools(patch_service: PatchService) -> Self {
+        let mut registry = Self::new_with_policy(
+            vec![
+                Arc::new(ListDirectoryTool) as Arc<dyn ToolHandler>,
+                Arc::new(ReadFileTool) as Arc<dyn ToolHandler>,
+                Arc::new(ApplyPatchTool {
+                    service: patch_service.clone(),
+                }) as Arc<dyn ToolHandler>,
+                Arc::new(WriteFileTool {
+                    service: patch_service.clone(),
+                }) as Arc<dyn ToolHandler>,
+            ],
+            Arc::new(WorkspacePolicy),
+        )
+        .expect("built-in workspace tool names and schemas must be valid");
+        registry.patch_service = Some(patch_service);
+        registry
+    }
+
+    pub fn workspace_tools_with_execution(
+        patch_service: PatchService,
+        command_runtime: CommandRuntime,
+    ) -> Self {
+        let mut registry = Self::new_with_policy(
+            vec![
+                Arc::new(ListDirectoryTool) as Arc<dyn ToolHandler>,
+                Arc::new(ReadFileTool) as Arc<dyn ToolHandler>,
+                Arc::new(ApplyPatchTool {
+                    service: patch_service.clone(),
+                }) as Arc<dyn ToolHandler>,
+                Arc::new(WriteFileTool {
+                    service: patch_service.clone(),
+                }) as Arc<dyn ToolHandler>,
+                Arc::new(RunCommandTool {
+                    runtime: command_runtime.clone(),
+                }) as Arc<dyn ToolHandler>,
+            ],
+            Arc::new(ExecutionWorkspacePolicy {
+                runtime: command_runtime,
+            }),
+        )
+        .expect("built-in workspace and execution tool schemas must be valid");
+        registry.patch_service = Some(patch_service);
+        registry
+    }
+
+    pub fn new(handlers: Vec<Arc<dyn ToolHandler>>) -> Result<Self, ToolError> {
+        Self::new_with_policy(handlers, Arc::new(AllowRegisteredTools))
+    }
+
+    pub fn new_with_policy(
+        handlers: Vec<Arc<dyn ToolHandler>>,
+        policy: Arc<dyn PolicyEngine>,
+    ) -> Result<Self, ToolError> {
+        let mut registered = HashMap::new();
+        for handler in handlers {
+            let definition = handler.definition();
+            if definition.name.trim().is_empty() {
+                return Err(ToolError::InvalidArguments(
+                    "tool name must not be empty".to_string(),
+                ));
+            }
+            jsonschema::validator_for(&definition.input_schema).map_err(|error| {
+                ToolError::InvalidArguments(format!(
+                    "tool {} has an invalid JSON schema: {error}",
+                    definition.name
+                ))
+            })?;
+            if registered
+                .insert(definition.name.clone(), handler)
+                .is_some()
+            {
+                return Err(ToolError::InvalidArguments(format!(
+                    "duplicate tool name: {}",
+                    definition.name
+                )));
+            }
+        }
+        Ok(Self {
+            handlers: Arc::new(registered),
+            policy,
+            patch_service: None,
+            extension_risks: Arc::new(HashMap::new()),
+            hooks: None,
+        })
+    }
+
+    pub fn with_extensions(
+        mut self,
+        handlers: Vec<Arc<dyn ToolHandler>>,
+        risks: HashMap<String, ToolRisk>,
+        hooks: Option<Arc<dyn ToolHookRunner>>,
+    ) -> Result<Self, ToolError> {
+        let mut registered = self.handlers.as_ref().clone();
+        let mut registered_risks = self.extension_risks.as_ref().clone();
+        for handler in handlers {
+            let definition = handler.definition();
+            if registered.contains_key(&definition.name) {
+                return Err(ToolError::InvalidArguments(format!(
+                    "extension tool conflicts with an existing tool: {}",
+                    definition.name
+                )));
+            }
+            jsonschema::validator_for(&definition.input_schema).map_err(|error| {
+                ToolError::InvalidArguments(format!(
+                    "extension tool {} has an invalid JSON schema: {error}",
+                    definition.name
+                ))
+            })?;
+            let risk = risks.get(&definition.name).copied().ok_or_else(|| {
+                ToolError::InvalidArguments(format!(
+                    "extension tool is missing risk metadata: {}",
+                    definition.name
+                ))
+            })?;
+            registered_risks.insert(definition.name.clone(), risk);
+            registered.insert(definition.name, handler);
+        }
+        self.handlers = Arc::new(registered);
+        self.extension_risks = Arc::new(registered_risks);
+        self.hooks = hooks;
+        Ok(self)
+    }
+
+    pub fn with_additional_handlers(
+        mut self,
+        handlers: Vec<Arc<dyn ToolHandler>>,
+        risks: HashMap<String, ToolRisk>,
+    ) -> Result<Self, ToolError> {
+        let mut registered = self.handlers.as_ref().clone();
+        let mut registered_risks = self.extension_risks.as_ref().clone();
+        for handler in handlers {
+            let definition = handler.definition();
+            if registered.contains_key(&definition.name) {
+                return Err(ToolError::InvalidArguments(format!(
+                    "additional tool conflicts with an existing tool: {}",
+                    definition.name
+                )));
+            }
+            jsonschema::validator_for(&definition.input_schema).map_err(|error| {
+                ToolError::InvalidArguments(format!(
+                    "additional tool {} has an invalid JSON schema: {error}",
+                    definition.name
+                ))
+            })?;
+            let risk = risks.get(&definition.name).copied().ok_or_else(|| {
+                ToolError::InvalidArguments(format!(
+                    "additional tool is missing risk metadata: {}",
+                    definition.name
+                ))
+            })?;
+            registered_risks.insert(definition.name.clone(), risk);
+            registered.insert(definition.name, handler);
+        }
+        self.handlers = Arc::new(registered);
+        self.extension_risks = Arc::new(registered_risks);
+        Ok(self)
+    }
+
+    pub fn restricted_to(&self, allowed: &[String]) -> Result<Self, ToolError> {
+        let allowed = allowed.iter().cloned().collect::<HashSet<_>>();
+        if let Some(name) = allowed
+            .iter()
+            .find(|name| !self.handlers.contains_key(name.as_str()))
+        {
+            return Err(ToolError::InvalidArguments(format!(
+                "tool capability is not available to the parent: {name}"
+            )));
+        }
+        let handlers = self
+            .handlers
+            .iter()
+            .filter(|(name, _)| allowed.contains(name.as_str()))
+            .map(|(name, handler)| (name.clone(), handler.clone()))
+            .collect();
+        let extension_risks = self
+            .extension_risks
+            .iter()
+            .filter(|(name, _)| allowed.contains(name.as_str()))
+            .map(|(name, risk)| (name.clone(), *risk))
+            .collect();
+        Ok(Self {
+            handlers: Arc::new(handlers),
+            policy: self.policy.clone(),
+            patch_service: self.patch_service.clone(),
+            extension_risks: Arc::new(extension_risks),
+            hooks: self.hooks.clone(),
+        })
+    }
+
+    pub fn definitions(&self) -> Vec<ToolDefinition> {
+        let mut definitions = self
+            .handlers
+            .values()
+            .map(|handler| handler.definition())
+            .collect::<Vec<_>>();
+        definitions.sort_by(|left, right| left.name.cmp(&right.name));
+        definitions
+    }
+
+    /// Build the provider-facing schema without allowing an extension's prose
+    /// description to consume an unbounded amount of every request context.
+    /// Validation and local tool dispatch continue to use the full definition.
+    pub fn provider_definitions(&self) -> Vec<ToolDefinition> {
+        self.definitions()
+            .into_iter()
+            .map(|mut definition| {
+                definition.description = bound_provider_description(&definition.description);
+                definition
+            })
+            .collect()
+    }
+
+    /// 返回所有已注册工具的名称（排序后），用于 system prompt 中的工具列表。
+    pub fn definition_names(&self) -> Vec<String> {
+        let mut names = self
+            .handlers
+            .keys()
+            .map(|name| name.to_string())
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    }
+
+    pub async fn dispatch(
+        &self,
+        context: &ToolContext,
+        name: &str,
+        arguments: Value,
+        cancellation: CancellationToken,
+    ) -> Result<ToolResult, ToolError> {
+        if cancellation.is_cancelled() {
+            return Err(ToolError::Cancelled);
+        }
+        let authorization = self.authorization(name, &arguments)?;
+        match authorization.decision {
+            PolicyDecision::Allow => {}
+            PolicyDecision::RequireApproval { reason } => {
+                return Err(ToolError::ApprovalRequired(reason));
+            }
+            PolicyDecision::Deny { reason } => return Err(ToolError::Denied(reason)),
+        }
+        self.dispatch_authorized(context, name, arguments, cancellation)
+            .await
+    }
+
+    pub fn authorization(
+        &self,
+        name: &str,
+        arguments: &Value,
+    ) -> Result<ToolAuthorization, ToolError> {
+        self.validate_arguments(name, arguments)?;
+        if let Some(risk) = self.extension_risks.get(name).copied() {
+            let decision = match risk {
+                ToolRisk::Read => PolicyDecision::Allow,
+                ToolRisk::Write => PolicyDecision::RequireApproval {
+                    reason: "review the external write tool before execution".into(),
+                },
+                ToolRisk::Delete => PolicyDecision::RequireApproval {
+                    reason: "review the destructive external tool before execution".into(),
+                },
+                ToolRisk::External => PolicyDecision::RequireApproval {
+                    reason: "review external network or process access before execution".into(),
+                },
+            };
+            return Ok(ToolAuthorization { decision, risk });
+        }
+        Ok(ToolAuthorization {
+            decision: self.policy.authorize(name, arguments),
+            risk: self.policy.risk(name, arguments),
+        })
+    }
+
+    pub fn preview(
+        &self,
+        context: &ToolContext,
+        name: &str,
+        arguments: &Value,
+    ) -> Result<Option<PatchPreview>, ToolError> {
+        self.validate_arguments(name, arguments)?;
+        self.handlers
+            .get(name)
+            .ok_or_else(|| ToolError::UnknownTool(name.to_string()))?
+            .preview(context, arguments)
+    }
+
+    pub async fn dispatch_authorized(
+        &self,
+        context: &ToolContext,
+        name: &str,
+        arguments: Value,
+        cancellation: CancellationToken,
+    ) -> Result<ToolResult, ToolError> {
+        if cancellation.is_cancelled() {
+            return Err(ToolError::Cancelled);
+        }
+        self.validate_arguments(name, &arguments)?;
+        if let Some(hooks) = &self.hooks {
+            hooks
+                .before(context, name, &arguments, cancellation.clone())
+                .await?;
+        }
+        let handler = self
+            .handlers
+            .get(name)
+            .ok_or_else(|| ToolError::UnknownTool(name.to_string()))?;
+        let result = handler
+            .execute(context, arguments.clone(), cancellation.clone())
+            .await?;
+        if let Some(hooks) = &self.hooks {
+            hooks
+                .after(context, name, &arguments, result, cancellation)
+                .await
+        } else {
+            Ok(result)
+        }
+    }
+
+    pub async fn rollback_change(
+        &self,
+        workspace_root: PathBuf,
+        change_set: ChangeSet,
+    ) -> Result<ChangeSet, ToolError> {
+        let service = self.patch_service.as_ref().ok_or_else(|| {
+            ToolError::Execution("the registry has no file change service".to_string())
+        })?;
+        service
+            .undo(workspace_root, change_set)
+            .await
+            .map_err(ToolError::from)
+    }
+
+    fn validate_arguments(&self, name: &str, arguments: &Value) -> Result<(), ToolError> {
+        let handler = self
+            .handlers
+            .get(name)
+            .ok_or_else(|| ToolError::UnknownTool(name.to_string()))?;
+        let definition = handler.definition();
+        let validator = jsonschema::validator_for(&definition.input_schema).map_err(|error| {
+            ToolError::Execution(format!("registered JSON schema became invalid: {error}"))
+        })?;
+        validator
+            .validate(arguments)
+            .map_err(|error| ToolError::InvalidArguments(format!("{}: {error}", definition.name)))
+    }
+}
+
+fn bound_provider_description(description: &str) -> String {
+    if description.len() <= MAX_PROVIDER_TOOL_DESCRIPTION_BYTES {
+        return description.to_string();
+    }
+    let mut end = MAX_PROVIDER_TOOL_DESCRIPTION_BYTES;
+    while end > 0 && !description.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut body_end = end.saturating_sub(3);
+    while body_end > 0 && !description.is_char_boundary(body_end) {
+        body_end -= 1;
+    }
+    format!("{}...", &description[..body_end])
+}
+
+#[derive(Debug, Clone)]
+struct Workspace {
+    root: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkspaceEntryKind {
+    Directory,
+    File,
+}
+
+impl WorkspaceEntryKind {
+    fn noun(self) -> &'static str {
+        match self {
+            Self::Directory => "directory",
+            Self::File => "file",
+        }
+    }
+
+    fn matches(self, path: &Path) -> bool {
+        match self {
+            Self::Directory => path.is_dir(),
+            Self::File => path.is_file(),
+        }
+    }
+
+    fn type_mismatch(self, display_path: &str, path: &Path) -> ToolError {
+        let actual = if path.is_dir() {
+            "a directory"
+        } else if path.is_file() {
+            "a regular file"
+        } else {
+            "an unsupported filesystem entry"
+        };
+        let recovery = match self {
+            Self::Directory => "use read_file for a file, or list_directory on its parent",
+            Self::File => {
+                "use list_directory to inspect this directory and then pass one exact file path"
+            }
+        };
+        ToolError::InvalidArguments(format!(
+            "workspace path {display_path:?} is {actual}, not the requested {}; {recovery}",
+            self.noun()
+        ))
+    }
+}
+
+impl Workspace {
+    fn new(root: &Path) -> Result<Self, ToolError> {
+        let root = root.canonicalize().map_err(|error| {
+            ToolError::Denied(format!("workspace root cannot be resolved: {error}"))
+        })?;
+        if !root.is_dir() {
+            return Err(ToolError::Denied(
+                "workspace root is not a directory".to_string(),
+            ));
+        }
+        Ok(Self { root })
+    }
+
+    fn resolve_existing(
+        &self,
+        relative: &str,
+        expected_kind: WorkspaceEntryKind,
+    ) -> Result<PathBuf, ToolError> {
+        let directory_shaped = relative.ends_with('/') || relative.ends_with('\\');
+        let relative = Path::new(relative);
+        let display_path = relative.to_string_lossy().replace('\\', "/");
+        if relative.is_absolute()
+            || relative.components().any(|component| {
+                matches!(
+                    component,
+                    Component::ParentDir | Component::RootDir | Component::Prefix(_)
+                )
+            })
+        {
+            return Err(ToolError::Denied(
+                "path must be relative and must not contain parent traversal".to_string(),
+            ));
+        }
+        if contains_path_glob(relative) {
+            return Err(ToolError::InvalidArguments(format!(
+                "workspace {} path {display_path:?} must name exactly one existing entry; wildcard patterns (*, ?, [...]) are not supported. Use list_directory or search_repository to discover an exact path.",
+                expected_kind.noun()
+            )));
+        }
+        let target = match self.root.join(relative).canonicalize() {
+            Ok(target) => target,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let suggestion = sibling_path_suggestion(&self.root, relative, expected_kind)
+                    .map(|value| format!(" Possible existing path: {value}."))
+                    .unwrap_or_default();
+                let directory_hint = if expected_kind == WorkspaceEntryKind::File
+                    && directory_shaped
+                {
+                    " The path ends with a directory separator, so it looks like a directory; read_file requires one exact file path."
+                } else {
+                    ""
+                };
+                return Err(ToolError::InvalidArguments(format!(
+                    "workspace {} path {display_path:?} does not exist.{directory_hint}{suggestion} Use list_directory on the parent directory or search_repository before retrying.",
+                    expected_kind.noun()
+                )));
+            }
+            Err(error) => {
+                return Err(ToolError::Execution(format!(
+                    "path cannot be resolved for workspace path {display_path:?}: {error}"
+                )));
+            }
+        };
+        if !target.starts_with(&self.root) {
+            return Err(ToolError::Denied(
+                "path resolves outside the workspace".to_string(),
+            ));
+        }
+        if !expected_kind.matches(&target) {
+            return Err(expected_kind.type_mismatch(&display_path, &target));
+        }
+        Ok(target)
+    }
+}
+
+fn contains_path_glob(path: &Path) -> bool {
+    path.to_string_lossy()
+        .chars()
+        .any(|character| matches!(character, '*' | '?' | '[' | ']'))
+}
+
+/// Return bounded, workspace-relative suggestions for a misspelled path.
+///
+/// The fast path only inspects the requested parent. If that parent is itself
+/// misspelled (for example `src/store/workbench.ts` when the real path is
+/// `src/stores/workbenchStore.ts`), a bounded breadth-first scan can find a
+/// close path elsewhere in the workspace. Every candidate is canonicalized and
+/// checked against the workspace root, and symlinks are ignored.
+fn sibling_path_suggestion(
+    root: &Path,
+    relative: &Path,
+    expected_kind: WorkspaceEntryKind,
+) -> Option<String> {
+    let parent = relative.parent().unwrap_or_else(|| Path::new(""));
+    let wanted = relative.file_name()?.to_string_lossy().to_lowercase();
+    if wanted.is_empty() {
+        return None;
+    }
+
+    let mut candidates = Vec::new();
+    if let Ok(parent_path) = root.join(parent).canonicalize() {
+        if parent_path.starts_with(root) && parent_path.is_dir() {
+            collect_direct_path_suggestions(
+                root,
+                relative,
+                parent,
+                &parent_path,
+                expected_kind,
+                &mut candidates,
+            );
+        }
+    }
+    if candidates.is_empty() {
+        collect_workspace_path_suggestions(root, relative, expected_kind, &mut candidates);
+    }
+
+    candidates.sort_by(|left, right| {
+        right
+            .0
+            .cmp(&left.0)
+            .then_with(|| left.1.to_lowercase().cmp(&right.1.to_lowercase()))
+    });
+    let mut seen = HashSet::new();
+    let suggestions = candidates
+        .into_iter()
+        .filter_map(|(_, path)| seen.insert(path.to_lowercase()).then_some(path))
+        .take(3)
+        .collect::<Vec<_>>();
+    (!suggestions.is_empty()).then(|| suggestions.join(", "))
+}
+
+fn collect_direct_path_suggestions(
+    root: &Path,
+    requested: &Path,
+    parent: &Path,
+    parent_path: &Path,
+    expected_kind: WorkspaceEntryKind,
+    candidates: &mut Vec<(i32, String)>,
+) {
+    let Ok(entries) = std::fs::read_dir(parent_path) else {
+        return;
+    };
+    for entry in entries.take(MAX_PATH_SUGGESTION_SIBLING_ENTRIES).flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        let name = entry.file_name().to_string_lossy().to_string();
+        if IGNORED_NAMES.contains(&name.as_str()) {
+            continue;
+        }
+        let candidate = parent.join(&name);
+        add_path_suggestion(
+            root,
+            requested,
+            &candidate,
+            &entry.path(),
+            file_type,
+            expected_kind,
+            candidates,
+        );
+    }
+}
+
+fn collect_workspace_path_suggestions(
+    root: &Path,
+    requested: &Path,
+    expected_kind: WorkspaceEntryKind,
+    candidates: &mut Vec<(i32, String)>,
+) {
+    let mut pending = VecDeque::from([(root.to_path_buf(), PathBuf::new(), 0usize)]);
+    let mut scanned = 0usize;
+
+    'directories: while let Some((directory, relative_directory, depth)) = pending.pop_front() {
+        if depth > MAX_PATH_SUGGESTION_DEPTH {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(&directory) else {
+            continue;
+        };
+        for entry in entries {
+            if scanned >= MAX_PATH_SUGGESTION_SCAN_ENTRIES {
+                break 'directories;
+            }
+            scanned += 1;
+            let Ok(entry) = entry else {
+                continue;
+            };
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            let name = entry.file_name().to_string_lossy().to_string();
+            if IGNORED_NAMES.contains(&name.as_str()) {
+                continue;
+            }
+            let candidate = relative_directory.join(&name);
+            add_path_suggestion(
+                root,
+                requested,
+                &candidate,
+                &entry.path(),
+                file_type,
+                expected_kind,
+                candidates,
+            );
+            if file_type.is_dir() && depth < MAX_PATH_SUGGESTION_DEPTH {
+                let Ok(canonical) = entry.path().canonicalize() else {
+                    continue;
+                };
+                if canonical.starts_with(root) {
+                    pending.push_back((canonical, candidate, depth + 1));
+                }
+            }
+        }
+    }
+}
+
+fn add_path_suggestion(
+    root: &Path,
+    requested: &Path,
+    candidate: &Path,
+    candidate_absolute: &Path,
+    file_type: std::fs::FileType,
+    expected_kind: WorkspaceEntryKind,
+    candidates: &mut Vec<(i32, String)>,
+) {
+    if file_type.is_symlink() {
+        return;
+    }
+    let Ok(canonical) = candidate_absolute.canonicalize() else {
+        return;
+    };
+    if !canonical.starts_with(root) {
+        return;
+    }
+    let kind_matches = match expected_kind {
+        WorkspaceEntryKind::Directory => canonical.is_dir(),
+        WorkspaceEntryKind::File => canonical.is_file(),
+    };
+    if !kind_matches {
+        return;
+    }
+
+    let wanted_name = requested
+        .file_name()
+        .map(|value| value.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    let candidate_name = candidate
+        .file_name()
+        .map(|value| value.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    let name_score = path_suggestion_score(&wanted_name, &candidate_name);
+    let requested_path = requested
+        .to_string_lossy()
+        .replace('\\', "/")
+        .to_lowercase();
+    let candidate_path = candidate
+        .to_string_lossy()
+        .replace('\\', "/")
+        .to_lowercase();
+    let path_score = path_suggestion_score(&requested_path, &candidate_path);
+    let score = name_score.saturating_mul(4).saturating_add(path_score);
+    if name_score > 0 {
+        candidates.push((score, candidate.to_string_lossy().replace('\\', "/")));
+    }
+}
+
+fn path_suggestion_score(wanted: &str, candidate: &str) -> i32 {
+    let common_prefix = wanted
+        .chars()
+        .zip(candidate.chars())
+        .take_while(|(left, right)| left == right)
+        .count() as i32;
+    let same_extension = Path::new(wanted).extension() == Path::new(candidate).extension();
+    let wanted_numeric_prefix = wanted.chars().take(4).collect::<String>();
+    let numeric_prefix = wanted_numeric_prefix.len() == 4
+        && wanted_numeric_prefix
+            .chars()
+            .all(|character| character.is_ascii_digit())
+        && wanted.chars().take(4).eq(candidate.chars().take(4));
+    let distance = edit_distance(wanted, candidate) as i32;
+    let score = common_prefix * 4
+        + if same_extension { 4 } else { 0 }
+        + if numeric_prefix { 12 } else { 0 }
+        - distance;
+    if common_prefix >= 3 || numeric_prefix || distance <= 3 {
+        score.max(1)
+    } else {
+        0
+    }
+}
+
+fn edit_distance(left: &str, right: &str) -> usize {
+    let right = right.chars().collect::<Vec<_>>();
+    let mut previous = (0..=right.len()).collect::<Vec<_>>();
+    for (left_index, left_character) in left.chars().enumerate() {
+        let mut current = vec![left_index + 1; right.len() + 1];
+        for (right_index, right_character) in right.iter().enumerate() {
+            current[right_index + 1] = if left_character == *right_character {
+                previous[right_index]
+            } else {
+                1 + previous[right_index]
+                    .min(previous[right_index + 1])
+                    .min(current[right_index])
+            };
+        }
+        previous = current;
+    }
+    previous[right.len()]
+}
+
+const DEFAULT_DIRECTORY_LIMIT: usize = 200;
+const MAX_DIRECTORY_LIMIT: usize = 500;
+const DEFAULT_READ_BYTES: usize = 64 * 1024;
+const MAX_READ_BYTES: usize = 256 * 1024;
+const DEFAULT_READ_LINES: usize = 400;
+const MAX_READ_LINES: usize = 2_000;
+const MAX_FILE_SIZE_BYTES: u64 = 4 * 1024 * 1024;
+const COMMAND_CANCEL_GRACE_MS: u64 = 2_000;
+const IGNORED_NAMES: &[&str] = &[".git", "node_modules", "target", "dist", "build"];
+const WORKSPACE_RELATIVE_PATH_DESCRIPTION: &str = "Exact workspace-relative path only. Use '.' for the workspace root. Absolute paths, parent traversal, directories/files in the wrong tool, and wildcard patterns are rejected.";
+const DIRECTORY_PATH_DESCRIPTION: &str = "Existing workspace-relative directory path only. Use '.' for the workspace root. Absolute paths, files, guessed paths, and wildcards are rejected.";
+const FILE_PATH_DESCRIPTION: &str = "Existing workspace-relative regular file path only. Absolute paths, directories, paths ending with a directory separator, guessed paths, and wildcards are rejected; discover the exact path with list_directory or search_repository first.";
+
+struct ListDirectoryTool;
+
+#[async_trait]
+impl ToolHandler for ListDirectoryTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "list_directory".to_string(),
+            description: "List direct children of one existing directory inside the current workspace. Use '.' for the workspace root. Do not guess directory names or use wildcard paths; after a path error, inspect the parent directory before retrying."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "minLength": 1, "description": DIRECTORY_PATH_DESCRIPTION },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": MAX_DIRECTORY_LIMIT }
+                },
+                "required": ["path"],
+                "additionalProperties": false
+            }),
+        }
+    }
+
+    async fn execute(
+        &self,
+        context: &ToolContext,
+        arguments: Value,
+        cancellation: CancellationToken,
+    ) -> Result<ToolResult, ToolError> {
+        let path = required_string(&arguments, "path")?;
+        let limit = optional_usize(&arguments, "limit")?.unwrap_or(DEFAULT_DIRECTORY_LIMIT);
+        let workspace = Workspace::new(&context.workspace_root)?;
+        let directory = workspace.resolve_existing(path, WorkspaceEntryKind::Directory)?;
+
+        let mut reader = tokio::fs::read_dir(&directory)
+            .await
+            .map_err(|error| ToolError::Execution(error.to_string()))?;
+        let mut entries = Vec::new();
+        let mut omitted = 0usize;
+        loop {
+            let entry = tokio::select! {
+                _ = cancellation.cancelled() => return Err(ToolError::Cancelled),
+                entry = reader.next_entry() => entry,
+            }
+            .map_err(|error| ToolError::Execution(error.to_string()))?;
+            let Some(entry) = entry else { break };
+            let name = entry.file_name().to_string_lossy().to_string();
+            if IGNORED_NAMES.contains(&name.as_str()) {
+                continue;
+            }
+            if entries.len() >= limit {
+                omitted = 1;
+                break;
+            }
+            let file_type = entry
+                .file_type()
+                .await
+                .map_err(|error| ToolError::Execution(error.to_string()))?;
+            entries.push(json!({
+                "name": name,
+                "kind": if file_type.is_dir() { "directory" } else if file_type.is_file() { "file" } else { "link" }
+            }));
+        }
+        entries.sort_by(|left, right| left["name"].as_str().cmp(&right["name"].as_str()));
+        let entry_count = entries.len();
+        let normalized_path = directory
+            .strip_prefix(&workspace.root)
+            .map(|value| {
+                let value = value.to_string_lossy().replace('\\', "/");
+                if value.is_empty() {
+                    ".".to_string()
+                } else {
+                    value
+                }
+            })
+            .map_err(|_| {
+                ToolError::Denied("directory resolved outside the workspace".to_string())
+            })?;
+        let output = serde_json::to_string_pretty(&json!({
+            "path": normalized_path,
+            "entries": entries,
+            "truncated": omitted > 0,
+            "omitted": omitted
+        }))
+        .map_err(|error| ToolError::Execution(error.to_string()))?;
+        let directory_revision = sha256_hex(output.as_bytes());
+        Ok(ToolResult {
+            success: true,
+            output,
+            metadata: json!({
+                "path": normalized_path,
+                "directoryRevision": directory_revision,
+                "entryCount": entry_count,
+                "truncated": omitted > 0
+            }),
+        })
+    }
+}
+
+struct ReadFileTool;
+
+#[async_trait]
+impl ToolHandler for ReadFileTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "read_file".to_string(),
+            description: "Read a bounded text range from one existing regular file inside the current workspace. The path must be an exact workspace-relative file path: directories, paths ending with a directory separator, guessed names, and wildcard patterns are rejected. Use list_directory or search_repository first. For code inspection, use startLine with lineCount. startLine/endLine remains accepted for compatibility when lineCount is absent. If both lineCount and endLine are provided, lineCount takes precedence. Any line-range field takes precedence over offset/limit; otherwise offset/limit remain available for byte-precise reads."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "minLength": 1, "description": FILE_PATH_DESCRIPTION },
+                    "offset": { "type": "integer", "minimum": 0, "description": "Zero-based byte offset. Ignored when startLine or lineCount is present." },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": MAX_READ_BYTES, "description": "Maximum bytes for a byte-range read. Ignored when startLine or lineCount is present." },
+                    "startLine": { "type": "integer", "minimum": 1, "description": "One-based starting line. Takes precedence over offset/limit." },
+                    "lineCount": { "type": "integer", "minimum": 1, "maximum": MAX_READ_LINES, "description": "Preferred maximum number of lines to return. Takes precedence over endLine and offset/limit." },
+                    "endLine": { "type": "integer", "minimum": 1, "description": "Compatibility-only one-based inclusive ending line. Used only when lineCount is absent." }
+                },
+                "required": ["path"],
+                "additionalProperties": false
+            }),
+        }
+    }
+
+    async fn execute(
+        &self,
+        context: &ToolContext,
+        arguments: Value,
+        cancellation: CancellationToken,
+    ) -> Result<ToolResult, ToolError> {
+        let path = required_string(&arguments, "path")?;
+        let byte_offset = optional_usize(&arguments, "offset")?;
+        let byte_limit = optional_usize(&arguments, "limit")?;
+        let requested_start_line = optional_usize(&arguments, "startLine")?;
+        let requested_line_count = optional_usize(&arguments, "lineCount")?;
+        let requested_end_line = optional_usize(&arguments, "endLine")?;
+        let uses_line_range = requested_start_line.is_some()
+            || requested_line_count.is_some()
+            || requested_end_line.is_some();
+        let workspace = Workspace::new(&context.workspace_root)?;
+        let file = workspace.resolve_existing(path, WorkspaceEntryKind::File)?;
+        let file_size = tokio::fs::metadata(&file)
+            .await
+            .map_err(|error| ToolError::Execution(error.to_string()))?
+            .len();
+        if file_size > MAX_FILE_SIZE_BYTES {
+            return Err(ToolError::Execution(format!(
+                "file exceeds the {MAX_FILE_SIZE_BYTES} byte read limit"
+            )));
+        }
+        let bytes = tokio::select! {
+            _ = cancellation.cancelled() => return Err(ToolError::Cancelled),
+            bytes = tokio::fs::read(&file) => bytes,
+        }
+        .map_err(|error| ToolError::Execution(error.to_string()))?;
+        let file_revision = sha256_hex(&bytes);
+        let normalized_path = file
+            .strip_prefix(&workspace.root)
+            .map(|value| value.to_string_lossy().replace('\\', "/"))
+            .map_err(|_| ToolError::Denied("file resolved outside the workspace".to_string()))?;
+        let text = decode_text(&bytes)?;
+        let line_starts = line_start_offsets(&text);
+        let total_lines = line_starts.len();
+        let (offset, requested_end, start_line, output_limit) = if uses_line_range {
+            let start_line = requested_start_line.unwrap_or(1);
+            if start_line > total_lines {
+                return Err(ToolError::InvalidArguments(format!(
+                    "startLine must be within the decoded text (1..={total_lines})"
+                )));
+            }
+            let line_count = if let Some(line_count) = requested_line_count {
+                line_count
+            } else if let Some(end_line) = requested_end_line {
+                if end_line < start_line {
+                    return Err(ToolError::InvalidArguments(
+                        "endLine must be greater than or equal to startLine".to_string(),
+                    ));
+                }
+                end_line.saturating_sub(start_line).saturating_add(1)
+            } else {
+                DEFAULT_READ_LINES
+            };
+            if line_count > MAX_READ_LINES {
+                return Err(ToolError::InvalidArguments(format!(
+                    "the requested line range exceeds the {MAX_READ_LINES} line limit"
+                )));
+            }
+            let start_index = start_line - 1;
+            let end_index = start_index.saturating_add(line_count).min(total_lines);
+            let requested_end = line_starts.get(end_index).copied().unwrap_or(text.len());
+            let output_limit = if requested_line_count.is_some() || requested_end_line.is_some() {
+                MAX_READ_BYTES
+            } else {
+                DEFAULT_READ_BYTES
+            };
+            (
+                line_starts[start_index],
+                requested_end,
+                start_line,
+                output_limit,
+            )
+        } else {
+            let offset = byte_offset.unwrap_or(0);
+            if offset > text.len() || !text.is_char_boundary(offset) {
+                return Err(ToolError::InvalidArguments(
+                    "offset must be a valid UTF-8 byte boundary within the decoded text"
+                        .to_string(),
+                ));
+            }
+            let limit = byte_limit.unwrap_or(DEFAULT_READ_BYTES);
+            let start_line = text[..offset].bytes().filter(|byte| *byte == b'\n').count() + 1;
+            (offset, text.len(), start_line, limit)
+        };
+        if offset > text.len() || !text.is_char_boundary(offset) {
+            return Err(ToolError::InvalidArguments(
+                "offset must be a valid UTF-8 byte boundary within the decoded text".to_string(),
+            ));
+        }
+        let end_limit = offset
+            .saturating_add(output_limit)
+            .min(requested_end)
+            .min(text.len());
+        let mut end = end_limit;
+        while end > offset && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        let output = text[offset..end].to_string();
+        let lines_returned = output.lines().count();
+        let end_line = start_line.saturating_add(lines_returned.saturating_sub(1));
+        Ok(ToolResult {
+            success: true,
+            output,
+            metadata: json!({
+                "path": normalized_path,
+                "fileRevision": file_revision,
+                "offset": offset,
+                "bytesReturned": end - offset,
+                "totalBytes": text.len(),
+                "startLine": start_line,
+                "endLine": end_line,
+                "linesReturned": lines_returned,
+                "totalLines": total_lines,
+                "truncated": offset > 0 || end < text.len()
+            }),
+        })
+    }
+}
+
+fn line_start_offsets(text: &str) -> Vec<usize> {
+    let mut offsets = vec![0];
+    offsets.extend(
+        text.char_indices()
+            .filter_map(|(index, value)| (value == '\n').then_some(index + 1)),
+    );
+    offsets
+}
+
+struct ApplyPatchTool {
+    service: PatchService,
+}
+
+#[derive(Deserialize)]
+struct ApplyPatchArguments {
+    patch: String,
+}
+
+#[async_trait]
+impl ToolHandler for ApplyPatchTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "apply_patch".to_string(),
+            description: "Propose a strict multi-file patch for user review. Use '*** Begin Patch' and '*** End Patch', Add/Update/Delete File headers, optional '*** Move to', and '@@' hunks. Every Update File must contain at least one hunk unless it has a Move to destination; every hunk must contain at least one '+' addition or '-' removal, with context lines starting with a space. Omit unchanged files and empty or context-only hunks. If syntax validation fails, use the returned file/hunk location to correct the patch before retrying; do not resend it unchanged. Never place a patch only in assistant text."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "patch": { "type": "string", "minLength": 1, "maxLength": 1048576 }
+                },
+                "required": ["patch"],
+                "additionalProperties": false
+            }),
+        }
+    }
+
+    fn preview(
+        &self,
+        context: &ToolContext,
+        arguments: &Value,
+    ) -> Result<Option<PatchPreview>, ToolError> {
+        let arguments: ApplyPatchArguments = serde_json::from_value(arguments.clone())
+            .map_err(|error| ToolError::InvalidArguments(error.to_string()))?;
+        Ok(Some(self.service.preview_patch(
+            &context.workspace_root,
+            &arguments.patch,
+        )?))
+    }
+
+    async fn execute(
+        &self,
+        context: &ToolContext,
+        arguments: Value,
+        cancellation: CancellationToken,
+    ) -> Result<ToolResult, ToolError> {
+        if cancellation.is_cancelled() {
+            return Err(ToolError::Cancelled);
+        }
+        let arguments: ApplyPatchArguments = serde_json::from_value(arguments)
+            .map_err(|error| ToolError::InvalidArguments(error.to_string()))?;
+        let approval = context.approval.as_ref().ok_or_else(|| {
+            ToolError::Denied("apply_patch requires a backend approval capability".to_string())
+        })?;
+        let patch = approval.patch.clone().unwrap_or(arguments.patch);
+        let change_set = self
+            .service
+            .apply_patch(
+                context.workspace_root.clone(),
+                context.thread_id.clone(),
+                context.turn_id.clone(),
+                context.call_id.clone(),
+                patch,
+                approval.selected_paths.clone(),
+                approval.expected_hashes.clone(),
+            )
+            .await?;
+        change_result(change_set)
+    }
+}
+
+struct WriteFileTool {
+    service: PatchService,
+}
+
+struct RunCommandTool {
+    runtime: CommandRuntime,
+}
+
+#[derive(Deserialize)]
+struct RunCommandArguments {
+    command: String,
+    #[serde(default)]
+    cwd: String,
+    #[serde(
+        default = "default_command_timeout_ms",
+        rename = "timeoutMs",
+        alias = "timeout_ms"
+    )]
+    timeout_ms: u64,
+}
+
+fn default_command_timeout_ms() -> u64 {
+    120_000
+}
+
+#[async_trait]
+impl ToolHandler for RunCommandTool {
+    fn definition(&self) -> ToolDefinition {
+        let description = match (
+            self.runtime.default_shell_name(),
+            self.runtime.uses_windows_powershell_native_pipeline(),
+        ) {
+            ("powershell", true) if self.runtime.has_bundled_ripgrep() => {
+                "Run a Windows PowerShell command in the workspace and return its output. k-Coder provides bundled ripgrep 15.2.0, so rg is available without a system installation. Use PowerShell syntax such as Get-Content, Get-ChildItem, Select-String, and $env:NAME for other shell operations. PowerShell does not expand wildcard paths for native rg arguments: use rg --glob 'index-*.js' ... dist/assets or resolve an exact .FullName with Get-ChildItem. Windows PowerShell re-encodes native pipeline input as CRLF, so a receiving rg command with a $ line anchor must use --crlf, for example: rg --files path | rg --crlf 'name\\.js$'."
+            }
+            ("powershell", _) if self.runtime.has_bundled_ripgrep() => {
+                "Run a PowerShell command in the workspace and return its output. k-Coder provides bundled ripgrep 15.2.0, so rg is available without a system installation. Use PowerShell syntax such as Get-Content, Get-ChildItem, Select-String, and $env:NAME for other shell operations. PowerShell does not expand wildcard paths for native rg arguments: use rg --glob 'CodeEditor-*.js' ... dist/assets or resolve an exact .FullName with Get-ChildItem. The runtime prefers pwsh and falls back to Windows PowerShell."
+            }
+            ("powershell", true) => {
+                "Run a Windows PowerShell command in the workspace and return its output. Use PowerShell syntax such as Get-Content, Get-ChildItem, Select-String, and $env:NAME. Do not assume rg or other Unix utilities are installed; use Select-String unless their availability has been confirmed. If rg is available, use --glob instead of wildcard path arguments. Windows PowerShell re-encodes native pipeline input as CRLF, so a receiving rg command with a $ line anchor must use --crlf."
+            }
+            ("powershell", _) => {
+                "Run a PowerShell command in the workspace and return its output. Use PowerShell syntax such as Get-Content, Get-ChildItem, Select-String, and $env:NAME. Do not assume rg or other Unix utilities are installed; use Select-String unless their availability has been confirmed. If rg is available, PowerShell does not expand wildcard paths for native rg arguments: use rg --glob 'CodeEditor-*.js' ... dist/assets or resolve an exact .FullName with Get-ChildItem. The runtime prefers pwsh and falls back to Windows PowerShell."
+            }
+            ("cmd", _) => "Run a Command Prompt command in the workspace and return its output.",
+            _ => {
+                "Run a command in the user's default shell inside the workspace and return its output."
+            }
+        };
+        ToolDefinition {
+            name: "run_command".to_string(),
+            description: format!(
+                "{description} Commands are non-interactive (stdin is closed). For repository searches always give rg an explicit directory, such as '.', and use one search per call. Select-Object -First/-Last/-Skip requires a numeric count, e.g. Select-Object -First 20. Known invalid PowerShell commands are rejected before execution with a correction hint; fix the command and call again. Use single quotes for literal PowerShell regexes; backslash does not escape a double quote. Do not suppress stderr while diagnosing a failed search. Run builds and tests directly without 2>&1 or output-limiting pipelines: output is already bounded by the runtime. In PowerShell do not use Bash heredocs (python - <<'PY') or assume head is available; use a script file or Select-Object -First N. A confirmed rg no-match is a normal result with its original exit code 1 retained."
+            ),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "command": { "type": "string", "minLength": 1, "maxLength": 65536, "pattern": "\\S", "description": "Shell command to execute." },
+                    "cwd": { "type": "string", "maxLength": 1024, "description": WORKSPACE_RELATIVE_PATH_DESCRIPTION },
+                    "timeoutMs": { "type": "integer", "minimum": 1, "maximum": 3600000 }
+                },
+                "required": ["command"],
+                "additionalProperties": false
+            }),
+        }
+    }
+
+    async fn execute(
+        &self,
+        context: &ToolContext,
+        arguments: Value,
+        cancellation: CancellationToken,
+    ) -> Result<ToolResult, ToolError> {
+        let arguments: RunCommandArguments = serde_json::from_value(arguments)
+            .map_err(|error| ToolError::InvalidArguments(error.to_string()))?;
+        if arguments.command.trim().is_empty() {
+            return Err(ToolError::InvalidArguments(
+                "command must not be empty".to_string(),
+            ));
+        }
+        let shell = self.runtime.default_shell_name();
+        if cancellation.is_cancelled() {
+            return Err(ToolError::Cancelled);
+        }
+        if shell == "powershell"
+            && let Some(hint) = command_diagnostics::powershell_preflight_hint(&arguments.command)
+        {
+            // Preserve the proposed command and return it through the normal tool
+            // result loop. A corrected call must go through authorization again.
+            return Ok(ToolResult {
+                success: false,
+                output: format!("命令未执行：{hint}"),
+                metadata: json!({
+                    "shell": shell,
+                    "executed": false,
+                    "resultKind": "invalid_command",
+                    "recoveryHint": hint,
+                }),
+            });
+        }
+        let request =
+            self.runtime
+                .shell_request(&arguments.command, arguments.cwd, arguments.timeout_ms);
+        let session = self
+            .runtime
+            .start_non_interactive(request)
+            .await
+            .map_err(|error| ToolError::Execution(error.to_string()))?;
+        let id = session.id;
+        let status = {
+            let wait = self.runtime.wait(&id);
+            tokio::pin!(wait);
+            let mut cursor = 0;
+            let mut poll = tokio::time::interval(std::time::Duration::from_millis(75));
+            poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let status = loop {
+                tokio::select! {
+                    status = &mut wait => {
+                        break status.map_err(|error| ToolError::Execution(error.to_string()))?;
+                    }
+                    _ = poll.tick() => {
+                        cursor = self.forward_command_output(context, &id, cursor).await?;
+                    }
+                    _ = cancellation.cancelled() => {
+                        let _ = self.runtime.cancel(&id).await;
+                        // The command watcher normally observes the cancellation and
+                        // terminates the process tree. Do not let a child that keeps
+                        // stdout/stderr open hold the whole Turn forever.
+                        let finished = tokio::time::timeout(
+                            std::time::Duration::from_millis(COMMAND_CANCEL_GRACE_MS),
+                            &mut wait,
+                        )
+                        .await
+                        .is_ok();
+                        if finished {
+                            let _ = self.runtime.close(&id).await;
+                        } else {
+                            let runtime = self.runtime.clone();
+                            let cleanup_id = id.clone();
+                            tokio::spawn(async move {
+                                let finished = tokio::time::timeout(
+                                    std::time::Duration::from_secs(10),
+                                    runtime.wait(&cleanup_id),
+                                )
+                                .await
+                                .is_ok();
+                                if finished {
+                                    let _ = runtime.close(&cleanup_id).await;
+                                }
+                            });
+                        }
+                        return Err(ToolError::Cancelled);
+                    }
+                }
+            };
+            self.forward_command_output(context, &id, cursor).await?;
+            status
+        };
+        let output = self
+            .runtime
+            .read(&id, 0, 1000)
+            .await
+            .map_err(|error| ToolError::Execution(error.to_string()))?;
+        let mut text = output
+            .chunks
+            .iter()
+            .map(|chunk| chunk.text.as_str())
+            .collect::<String>();
+        let output_was_empty = text.trim().is_empty();
+        let exit_code = match &status.state {
+            CommandState::Exited { code } => Some(*code),
+            _ => None,
+        };
+        let stderr = output
+            .chunks
+            .iter()
+            .filter(|chunk| matches!(chunk.stream, crate::execution::OutputStream::Stderr))
+            .map(|chunk| chunk.text.as_str())
+            .collect::<String>();
+        let stderr_was_empty = stderr.trim().is_empty();
+        let result_kind = (shell == "powershell"
+            && !status.output_truncated
+            && !output.truncated_before_cursor
+            && output.next_cursor == status.next_cursor)
+            .then(|| {
+                command_result_kind(
+                    &arguments.command,
+                    exit_code,
+                    output_was_empty,
+                    stderr_was_empty,
+                )
+            })
+            .flatten();
+        // A bounded `rg ... | Select-Object -First N` search reports exit code 1
+        // once the receiver stops reading early, because rg is left with a broken
+        // pipe. The delivered lines are complete and correct, so treat this shape
+        // as a successful search and expose the exit code separately.
+        let success = matches!(status.state, CommandState::Exited { code: 0 })
+            || matches!(result_kind, Some("bounded_output" | "no_matches"));
+        if output_was_empty
+            && let Some(message) = empty_command_failure_message(result_kind, exit_code)
+        {
+            text.push_str(&message);
+        }
+        let recovery_hint = if shell == "powershell" && !success && powershell_parse_error(&stderr)
+        {
+            Some(
+                "PowerShell 命令语法错误：正则或含双引号的文本优先使用单引号包裹；PowerShell 不使用反斜杠转义双引号。请修正引号后重试。",
+            )
+        } else if shell == "powershell"
+            && !success
+            && let Some(hint) = command_diagnostics::powershell_native_stderr_hint(&stderr)
+        {
+            Some(hint)
+        } else {
+            command_recovery_hint(
+                shell,
+                self.runtime.uses_windows_powershell_native_pipeline(),
+                &arguments.command,
+                &status.state,
+                output_was_empty,
+            )
+            .filter(|hint| {
+                *hint != POWERSHELL_RG_GLOB_RECOVERY_HINT || stderr.contains("(os error 123)")
+            })
+        };
+        if let Some(hint) = recovery_hint {
+            if !text.ends_with('\n') && !text.is_empty() {
+                text.push('\n');
+            }
+            text.push_str("[提示] ");
+            text.push_str(hint);
+        }
+        let observation_revision = sha256_hex(text.as_bytes());
+        let output_chunks = bounded_command_output_chunks(&output.chunks);
+        let duration_ms = status
+            .finished_at_ms
+            .map(|finished| finished.saturating_sub(status.started_at_ms));
+        let mut metadata = json!({
+            "sessionId": id,
+            "state": status.state,
+            "startedAtMs": status.started_at_ms,
+            "finishedAtMs": status.finished_at_ms,
+            "durationMs": duration_ms,
+            "exitCode": exit_code,
+            "observationRevision": observation_revision,
+            "shell": shell,
+            "outputTruncated": status.output_truncated,
+            "nextCursor": output.next_cursor,
+            "outputChunks": output_chunks
+        });
+        if let Some(result_kind) = result_kind {
+            metadata["resultKind"] = Value::String(result_kind.to_string());
+        }
+        if let Some(hint) = recovery_hint {
+            metadata["recoveryHint"] = Value::String(hint.to_string());
+        }
+        self.runtime
+            .close(&id)
+            .await
+            .map_err(|error| ToolError::Execution(error.to_string()))?;
+        Ok(ToolResult {
+            success,
+            output: text,
+            metadata,
+        })
+    }
+}
+
+fn command_result_kind(
+    command: &str,
+    exit_code: Option<i32>,
+    output_is_empty: bool,
+    stderr_is_empty: bool,
+) -> Option<&'static str> {
+    // A non-empty stderr means rg itself reported a real failure (IO error,
+    // invalid regex, invalid glob), so the non-zero exit code is not an
+    // artifact of the bounded receiver stopping early.
+    if !output_is_empty
+        && stderr_is_empty
+        && exit_code == Some(1)
+        && command_diagnostics::is_bounded_rg_search(command)
+    {
+        return Some("bounded_output");
+    }
+    (output_is_empty
+        && stderr_is_empty
+        && exit_code == Some(1)
+        && command_diagnostics::is_unambiguous_rg_search(command))
+    .then_some("no_matches")
+}
+
+fn powershell_parse_error(output: &str) -> bool {
+    [
+        "TerminatorExpectedAtEndOfString",
+        "ParserError",
+        "字符串缺少终止符",
+    ]
+    .iter()
+    .any(|marker| output.contains(marker))
+}
+
+fn empty_command_failure_message(
+    result_kind: Option<&str>,
+    exit_code: Option<i32>,
+) -> Option<String> {
+    let code = exit_code.filter(|code| *code != 0)?;
+    if result_kind == Some("no_matches") {
+        return Some("rg: no matches (exit code 1).".to_string());
+    }
+    Some(format!(
+        "command produced no output and exited with code {code}."
+    ))
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .fold(String::with_capacity(64), |mut output, byte| {
+            let _ = write!(output, "{byte:02x}");
+            output
+        })
+}
+
+fn command_recovery_hint(
+    shell: &str,
+    uses_windows_powershell_native_pipeline: bool,
+    command: &str,
+    state: &CommandState,
+    output_is_empty: bool,
+) -> Option<&'static str> {
+    let CommandState::Exited { code } = state else {
+        return None;
+    };
+    if *code == 0 || shell != "powershell" || !contains_rg_command(command) {
+        return None;
+    }
+
+    let has_wildcard_path = command.split_whitespace().any(|token| {
+        let token = token.trim_matches(|character: char| {
+            matches!(character, '\'' | '"' | '(' | ')' | ';' | '|')
+        });
+        !token.starts_with('-')
+            && (token.contains('/') || token.contains('\\'))
+            && !token.contains('|')
+            && !token.contains("\\.")
+            && token
+                .chars()
+                .any(|character| matches!(character, '*' | '?' | '[' | ']'))
+    });
+    if has_wildcard_path {
+        Some(POWERSHELL_RG_GLOB_RECOVERY_HINT)
+    } else if *code == 1
+        && output_is_empty
+        && uses_windows_powershell_native_pipeline
+        && powershell_pipeline_has_anchored_rg_receiver(command)
+    {
+        Some(WINDOWS_POWERSHELL_RG_CRLF_RECOVERY_HINT)
+    } else {
+        None
+    }
+}
+
+fn contains_rg_command(command: &str) -> bool {
+    command.split_whitespace().any(|token| {
+        let token = token.trim_matches(|character: char| {
+            matches!(character, '\'' | '"' | '(' | ')' | ';' | '|' | '&')
+        });
+        let executable = token.rsplit(['/', '\\']).next().unwrap_or(token);
+        executable.eq_ignore_ascii_case("rg") || executable.eq_ignore_ascii_case("rg.exe")
+    })
+}
+
+fn powershell_pipeline_has_anchored_rg_receiver(command: &str) -> bool {
+    #[derive(Clone, Copy)]
+    enum Quote {
+        Single,
+        Double,
+    }
+
+    let mut quote = None;
+    let mut escaped = false;
+    let mut segment_start = 0;
+    let mut has_upstream = false;
+
+    for (index, character) in command.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match quote {
+            Some(Quote::Single) => {
+                if character == '\'' {
+                    quote = None;
+                }
+            }
+            Some(Quote::Double) => match character {
+                '`' => escaped = true,
+                '"' => quote = None,
+                _ => {}
+            },
+            None => match character {
+                '`' => escaped = true,
+                '\'' => quote = Some(Quote::Single),
+                '"' => quote = Some(Quote::Double),
+                '|' => {
+                    if has_upstream
+                        && is_anchored_rg_pipeline_receiver(&command[segment_start..index])
+                    {
+                        return true;
+                    }
+                    has_upstream = true;
+                    segment_start = index + character.len_utf8();
+                }
+                _ => {}
+            },
+        }
+    }
+
+    has_upstream && is_anchored_rg_pipeline_receiver(&command[segment_start..])
+}
+
+fn is_anchored_rg_pipeline_receiver(segment: &str) -> bool {
+    let mut tokens = segment.split_whitespace();
+    let mut executable = tokens.next().unwrap_or_default();
+    if executable == "&" {
+        executable = tokens.next().unwrap_or_default();
+    }
+    let executable = executable
+        .trim_matches(|character: char| matches!(character, '\'' | '"' | '(' | ')' | ';'));
+    let executable = executable.rsplit(['/', '\\']).next().unwrap_or(executable);
+    let invokes_rg =
+        executable.eq_ignore_ascii_case("rg") || executable.eq_ignore_ascii_case("rg.exe");
+    invokes_rg
+        && !segment.split_whitespace().any(|token| {
+            token
+                .trim_matches(|character: char| matches!(character, '\'' | '"' | '(' | ')' | ';'))
+                .eq_ignore_ascii_case("--crlf")
+        })
+        && contains_regex_eol_anchor(segment)
+}
+
+fn contains_regex_eol_anchor(segment: &str) -> bool {
+    let characters = segment.chars().collect::<Vec<_>>();
+    characters.iter().enumerate().any(|(index, character)| {
+        if *character != '$'
+            || index
+                .checked_sub(1)
+                .and_then(|previous| characters.get(previous))
+                .is_some_and(|previous| matches!(previous, '\\' | '`'))
+        {
+            return false;
+        }
+        characters
+            .get(index + 1)
+            .is_none_or(|next| next.is_whitespace() || matches!(next, '\'' | '"' | '|' | ')' | ']'))
+    })
+}
+
+fn bounded_command_output_chunks(chunks: &[crate::execution::OutputChunk]) -> Vec<Value> {
+    let mut remaining = MAX_PERSISTED_TOOL_PROGRESS_BYTES;
+    let mut result = Vec::new();
+    for chunk in chunks.iter().rev() {
+        if remaining == 0 {
+            break;
+        }
+        let text = if chunk.text.len() <= remaining {
+            chunk.text.clone()
+        } else {
+            let mut start = chunk.text.len().saturating_sub(remaining);
+            while start < chunk.text.len() && !chunk.text.is_char_boundary(start) {
+                start += 1;
+            }
+            chunk.text[start..].to_string()
+        };
+        remaining = remaining.saturating_sub(text.len());
+        result.push(json!({
+            "cursor": chunk.cursor,
+            "stream": match chunk.stream {
+                OutputStream::Stdout => "stdout",
+                OutputStream::Stderr => "stderr",
+            },
+            "text": text,
+        }));
+    }
+    result.reverse();
+    result
+}
+
+impl RunCommandTool {
+    async fn forward_command_output(
+        &self,
+        context: &ToolContext,
+        id: &str,
+        mut cursor: u64,
+    ) -> Result<u64, ToolError> {
+        loop {
+            let page = self
+                .runtime
+                .read(id, cursor, TOOL_PROGRESS_READ_LIMIT)
+                .await
+                .map_err(|error| ToolError::Execution(error.to_string()))?;
+            let chunk_count = page.chunks.len();
+            let mut batch: Option<(ToolOutputStream, u64, String)> = None;
+
+            for chunk in page.chunks {
+                let stream = match chunk.stream {
+                    OutputStream::Stdout => ToolOutputStream::Stdout,
+                    OutputStream::Stderr => ToolOutputStream::Stderr,
+                };
+                let can_append = batch.as_ref().is_some_and(|(batch_stream, _, text)| {
+                    *batch_stream == stream
+                        && text.len().saturating_add(chunk.text.len()) <= TOOL_PROGRESS_BATCH_BYTES
+                });
+                if can_append {
+                    if let Some((_, _, text)) = &mut batch {
+                        text.push_str(&chunk.text);
+                    }
+                } else {
+                    if let Some((stream, cursor, delta)) = batch.take() {
+                        context.publish_progress(ToolProgress {
+                            stream,
+                            cursor,
+                            delta,
+                        });
+                    }
+                    batch = Some((stream, chunk.cursor, chunk.text));
+                }
+            }
+            if let Some((stream, cursor, delta)) = batch {
+                context.publish_progress(ToolProgress {
+                    stream,
+                    cursor,
+                    delta,
+                });
+            }
+
+            cursor = page.next_cursor;
+            if chunk_count < TOOL_PROGRESS_READ_LIMIT {
+                return Ok(cursor);
+            }
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct WriteFileArguments {
+    path: String,
+    content: String,
+}
+
+#[async_trait]
+impl ToolHandler for WriteFileTool {
+    fn definition(&self) -> ToolDefinition {
+        ToolDefinition {
+            name: "write_file".to_string(),
+            description: "Propose a complete UTF-8 file replacement for user review. Use apply_patch for normal localized edits; use write_file only when replacing the whole file is explicitly necessary."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "minLength": 1, "description": WORKSPACE_RELATIVE_PATH_DESCRIPTION },
+                    "content": { "type": "string", "maxLength": 524288 }
+                },
+                "required": ["path", "content"],
+                "additionalProperties": false
+            }),
+        }
+    }
+
+    fn preview(
+        &self,
+        context: &ToolContext,
+        arguments: &Value,
+    ) -> Result<Option<PatchPreview>, ToolError> {
+        let arguments: WriteFileArguments = serde_json::from_value(arguments.clone())
+            .map_err(|error| ToolError::InvalidArguments(error.to_string()))?;
+        Ok(Some(self.service.preview_write_file(
+            &context.workspace_root,
+            &arguments.path,
+            &arguments.content,
+        )?))
+    }
+
+    async fn execute(
+        &self,
+        context: &ToolContext,
+        arguments: Value,
+        cancellation: CancellationToken,
+    ) -> Result<ToolResult, ToolError> {
+        if cancellation.is_cancelled() {
+            return Err(ToolError::Cancelled);
+        }
+        let arguments: WriteFileArguments = serde_json::from_value(arguments)
+            .map_err(|error| ToolError::InvalidArguments(error.to_string()))?;
+        let approval = context.approval.as_ref().ok_or_else(|| {
+            ToolError::Denied("write_file requires a backend approval capability".to_string())
+        })?;
+        let change_set = self
+            .service
+            .apply_write_file(
+                context.workspace_root.clone(),
+                context.thread_id.clone(),
+                context.turn_id.clone(),
+                context.call_id.clone(),
+                arguments.path,
+                arguments.content,
+                approval.expected_hashes.clone(),
+            )
+            .await?;
+        change_result(change_set)
+    }
+}
+
+fn change_result(change_set: ChangeSet) -> Result<ToolResult, ToolError> {
+    let file_count = change_set.files.len();
+    Ok(ToolResult {
+        success: true,
+        output: format!(
+            "applied approved change {} to {file_count} file(s)",
+            change_set.id
+        ),
+        metadata: json!({ "changeSet": change_set }),
+    })
+}
+
+fn required_string<'a>(arguments: &'a Value, name: &str) -> Result<&'a str, ToolError> {
+    arguments
+        .get(name)
+        .and_then(Value::as_str)
+        .ok_or_else(|| ToolError::InvalidArguments(format!("{name} must be a string")))
+}
+
+fn optional_usize(arguments: &Value, name: &str) -> Result<Option<usize>, ToolError> {
+    arguments
+        .get(name)
+        .map(|value| {
+            value
+                .as_u64()
+                .and_then(|value| usize::try_from(value).ok())
+                .ok_or_else(|| ToolError::InvalidArguments(format!("{name} must be an integer")))
+        })
+        .transpose()
+}
+
+fn decode_text(bytes: &[u8]) -> Result<String, ToolError> {
+    if bytes.starts_with(&[0xff, 0xfe]) {
+        if !(bytes.len() - 2).is_multiple_of(2) {
+            return Err(ToolError::Execution(
+                "file contains truncated UTF-16LE".to_string(),
+            ));
+        }
+        let words = bytes[2..]
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect::<Vec<_>>();
+        return String::from_utf16(&words)
+            .map_err(|_| ToolError::Execution("file contains invalid UTF-16LE".to_string()));
+    }
+    if bytes.starts_with(&[0xfe, 0xff]) {
+        if !(bytes.len() - 2).is_multiple_of(2) {
+            return Err(ToolError::Execution(
+                "file contains truncated UTF-16BE".to_string(),
+            ));
+        }
+        let words = bytes[2..]
+            .chunks_exact(2)
+            .map(|pair| u16::from_be_bytes([pair[0], pair[1]]))
+            .collect::<Vec<_>>();
+        return String::from_utf16(&words)
+            .map_err(|_| ToolError::Execution("file contains invalid UTF-16BE".to_string()));
+    }
+    if bytes.iter().any(|byte| *byte == 0) {
+        return Err(ToolError::Execution(
+            "binary files are not supported".to_string(),
+        ));
+    }
+    let bytes = bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(bytes);
+    std::str::from_utf8(bytes)
+        .map(str::to_string)
+        .map_err(|_| ToolError::Execution("file is not UTF-8 or BOM-marked UTF-16".to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    struct ExtensionTestTool {
+        name: String,
+    }
+
+    #[async_trait]
+    impl ToolHandler for ExtensionTestTool {
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition {
+                name: self.name.clone(),
+                description: "test extension".into(),
+                input_schema: json!({ "type": "object", "additionalProperties": false }),
+            }
+        }
+
+        async fn execute(
+            &self,
+            _context: &ToolContext,
+            _arguments: Value,
+            _cancellation: CancellationToken,
+        ) -> Result<ToolResult, ToolError> {
+            Ok(ToolResult {
+                success: true,
+                output: "ok".into(),
+                metadata: json!({}),
+            })
+        }
+    }
+
+    fn context(root: &Path) -> ToolContext {
+        ToolContext {
+            thread_id: "thread".to_string(),
+            turn_id: "turn".to_string(),
+            call_id: "call".to_string(),
+            workspace_root: root.to_path_buf(),
+            approval: None,
+            progress: None,
+            plan_reconciliation: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn registry_has_stable_sorted_names_and_rejects_bad_arguments() {
+        let directory = tempfile::tempdir().unwrap();
+        let registry = ToolRegistry::read_only();
+        assert_eq!(
+            registry
+                .definitions()
+                .into_iter()
+                .map(|definition| definition.name)
+                .collect::<Vec<_>>(),
+            vec!["list_directory", "read_file"]
+        );
+        let result = registry
+            .dispatch(
+                &context(directory.path()),
+                "read_file",
+                json!({ "path": 2 }),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(matches!(result, Err(ToolError::InvalidArguments(_))));
+        let result = registry
+            .dispatch(
+                &context(directory.path()),
+                "list_directory",
+                json!({ "path": "" }),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(matches!(result, Err(ToolError::InvalidArguments(_))));
+        let result = registry
+            .dispatch(
+                &context(directory.path()),
+                "shell",
+                json!({}),
+                CancellationToken::new(),
+            )
+            .await;
+        assert_eq!(result, Err(ToolError::UnknownTool("shell".to_string())));
+    }
+
+    #[test]
+    fn run_command_schema_exposes_the_default_shell_contract() {
+        let directory = tempfile::tempdir().unwrap();
+        #[cfg(windows)]
+        let runtime = CommandRuntime::new_with_bundled_tools(
+            directory.path(),
+            Some(
+                crate::execution::BundledTools::new(
+                    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                        .join("../src/resources/tools/windows-x86_64"),
+                )
+                .unwrap(),
+            ),
+        )
+        .unwrap();
+        #[cfg(not(windows))]
+        let runtime = CommandRuntime::new(directory.path()).unwrap();
+        let uses_windows_powershell_native_pipeline =
+            runtime.uses_windows_powershell_native_pipeline();
+        let definition = RunCommandTool { runtime }.definition();
+        let validator = jsonschema::validator_for(&definition.input_schema).unwrap();
+
+        assert!(
+            validator
+                .validate(&json!({ "command": "cargo test" }))
+                .is_ok()
+        );
+        assert!(
+            validator
+                .validate(&json!({ "program": "cargo", "args": ["test"] }))
+                .is_err()
+        );
+        assert!(validator.validate(&json!({ "command": "   " })).is_err());
+        assert!(definition.description.contains("Select-Object -First 20"));
+        assert!(
+            definition
+                .description
+                .contains("fix the command and call again")
+        );
+        if cfg!(windows) {
+            assert!(definition.description.contains("PowerShell"));
+            assert!(definition.description.contains("bundled ripgrep 15.2.0"));
+            assert!(definition.description.contains("rg is available"));
+            assert!(
+                definition
+                    .description
+                    .contains("does not expand wildcard paths")
+            );
+            assert!(definition.description.contains("rg --glob"));
+            if uses_windows_powershell_native_pipeline {
+                assert!(definition.description.contains("CRLF"));
+                assert!(definition.description.contains("rg --crlf"));
+            }
+        }
+    }
+
+    #[test]
+    fn powershell_rg_failures_get_specific_recovery_hints() {
+        let wildcard_command = r#"rg -o "vs/[A-Za-z0-9_./-]+\.js|languages/definitions/[A-Za-z0-9_./-]+" dist/assets/CodeEditor-*.js | Select-Object -First 100"#;
+        assert_eq!(
+            command_recovery_hint(
+                "powershell",
+                true,
+                wildcard_command,
+                &CommandState::Exited { code: 1 },
+                false,
+            ),
+            Some(POWERSHELL_RG_GLOB_RECOVERY_HINT)
+        );
+        assert_eq!(
+            command_recovery_hint(
+                "powershell",
+                true,
+                r#"rg -o "vs/[A-Za-z]+\.js" dist/assets/CodeEditor-exact.js | Select-Object -First 100"#,
+                &CommandState::Exited { code: 1 },
+                false,
+            ),
+            None
+        );
+        assert_eq!(
+            command_recovery_hint(
+                "powershell",
+                true,
+                r#"rg --glob 'CodeEditor-*.js' -o "vs/[A-Za-z]+\.js" dist/assets"#,
+                &CommandState::Exited { code: 1 },
+                false,
+            ),
+            None
+        );
+        assert_eq!(
+            command_recovery_hint(
+                "powershell",
+                true,
+                wildcard_command,
+                &CommandState::Exited { code: 0 },
+                true,
+            ),
+            None
+        );
+        assert_eq!(
+            command_recovery_hint(
+                "bash",
+                false,
+                wildcard_command,
+                &CommandState::Exited { code: 1 },
+                true,
+            ),
+            None
+        );
+        assert_eq!(
+            command_recovery_hint(
+                "powershell",
+                true,
+                wildcard_command,
+                &CommandState::TimedOut,
+                true,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn windows_powershell_rg_pipeline_failures_explain_crlf_anchors() {
+        let anchored_pipeline = r#"rg --files node_modules/monaco-editor | rg "typescript(\.contribution)?\.js$|javascript(\.contribution)?\.js$|json(\.contribution)?\.js$|markdown(\.contribution)?\.js$|toml(\.contribution)?\.js$""#;
+        assert_eq!(
+            command_recovery_hint(
+                "powershell",
+                true,
+                anchored_pipeline,
+                &CommandState::Exited { code: 1 },
+                true,
+            ),
+            Some(WINDOWS_POWERSHELL_RG_CRLF_RECOVERY_HINT)
+        );
+        assert_eq!(
+            command_recovery_hint(
+                "powershell",
+                false,
+                anchored_pipeline,
+                &CommandState::Exited { code: 1 },
+                true,
+            ),
+            None,
+            "pwsh preserves native pipeline bytes and must not receive the legacy hint"
+        );
+        assert_eq!(
+            command_recovery_hint(
+                "powershell",
+                true,
+                anchored_pipeline,
+                &CommandState::Exited { code: 1 },
+                false,
+            ),
+            None,
+            "a real error message is more useful than a speculative CRLF hint"
+        );
+        assert_eq!(
+            command_recovery_hint(
+                "powershell",
+                true,
+                r#"rg --files path | rg --crlf 'name\.js$'"#,
+                &CommandState::Exited { code: 1 },
+                true,
+            ),
+            None
+        );
+        assert_eq!(
+            command_recovery_hint(
+                "powershell",
+                true,
+                r#"rg --files path | rg 'typescript\.js'"#,
+                &CommandState::Exited { code: 1 },
+                true,
+            ),
+            None
+        );
+        assert_eq!(
+            command_recovery_hint(
+                "powershell",
+                true,
+                r#"rg --files path | Select-String 'typescript\.js$'"#,
+                &CommandState::Exited { code: 1 },
+                true,
+            ),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn run_command_honors_public_timeout_ms() {
+        let directory = tempfile::tempdir().unwrap();
+        let tool = RunCommandTool {
+            runtime: CommandRuntime::new(directory.path()).unwrap(),
+        };
+        let command = if cfg!(windows) {
+            "Start-Sleep -Seconds 2"
+        } else {
+            "sleep 2"
+        };
+        let result = tool
+            .execute(
+                &context(directory.path()),
+                json!({ "command": command, "timeoutMs": 10 }),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert_eq!(result.metadata["state"]["state"], "timed_out");
+    }
+
+    #[test]
+    fn run_command_timeout_arguments_preserve_defaults_and_legacy_spelling() {
+        for (value, expected) in [
+            (json!({ "command": "echo test" }), 120_000),
+            (
+                json!({ "command": "echo test", "timeoutMs": 660_000 }),
+                660_000,
+            ),
+            (json!({ "command": "echo test", "timeout_ms": 25 }), 25),
+        ] {
+            let arguments: RunCommandArguments = serde_json::from_value(value).unwrap();
+            assert_eq!(arguments.timeout_ms, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn run_command_streams_redacted_stdout_and_stderr_progress() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = CommandRuntime::new(directory.path()).unwrap();
+        let tool = RunCommandTool { runtime };
+        let (progress, mut output) = tool_progress_channel();
+        let mut tool_context = context(directory.path());
+        tool_context.progress = Some(progress);
+
+        #[cfg(windows)]
+        let arguments = json!({
+            "command": "[Console]::Out.WriteLine('ready'); [Console]::Error.WriteLine('API_KEY=secret')"
+        });
+        #[cfg(not(windows))]
+        let arguments = json!({
+            "command": "printf 'ready\\n'; printf 'API_KEY=secret\\n' >&2"
+        });
+
+        let result = tool
+            .execute(&tool_context, arguments, CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(result.success);
+        assert!(result.metadata["startedAtMs"].as_u64().is_some());
+        assert!(result.metadata["finishedAtMs"].as_u64().is_some());
+        assert!(result.metadata["durationMs"].as_u64().is_some());
+        assert!(result.metadata["shell"].as_str().is_some());
+        let persisted = result.metadata["outputChunks"].as_array().unwrap();
+        assert!(persisted.iter().any(|chunk| {
+            chunk["stream"] == "stdout"
+                && chunk["text"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("ready"))
+        }));
+        assert!(persisted.iter().any(|chunk| {
+            chunk["stream"] == "stderr"
+                && chunk["text"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("[REDACTED]"))
+        }));
+
+        drop(tool_context);
+        let mut progress_events = Vec::new();
+        while let Ok(event) = output.try_recv() {
+            progress_events.push(event);
+        }
+        assert!(progress_events.iter().any(|event| {
+            event.stream == ToolOutputStream::Stdout && event.delta.contains("ready")
+        }));
+        assert!(progress_events.iter().any(|event| {
+            event.stream == ToolOutputStream::Stderr && event.delta.contains("[REDACTED]")
+        }));
+        assert!(
+            !progress_events
+                .iter()
+                .any(|event| event.delta.contains("secret"))
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn run_command_search_diagnostics_preserve_errors_and_do_not_wait_for_input() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("sample.cs"),
+            // Enough lines that rg cannot finish writing before the bounded
+            // receiver stops reading, so the broken pipe is deterministic
+            // instead of racing the pipe buffer.
+            (1..=600)
+                .map(|index| format!("class Item{index} {{}}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+        let runtime = CommandRuntime::new_with_bundled_tools(
+            directory.path(),
+            Some(
+                crate::execution::BundledTools::new(
+                    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                        .join("../src/resources/tools/windows-x86_64"),
+                )
+                .unwrap(),
+            ),
+        )
+        .unwrap();
+        let tool = RunCommandTool { runtime };
+        let run = |command: &'static str| {
+            let tool = &tool;
+            let root = directory.path();
+            async move {
+                tool.execute(
+                    &context(root),
+                    json!({"command":command,"timeoutMs":10000}),
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap()
+            }
+        };
+        // This exact shape used to consume the open pipe for the entire 120s timeout.
+        let found = run("rg -n class --glob '*.cs' -l").await;
+        assert!(found.success, "{found:?}");
+        assert!(found.output.contains("sample.cs"));
+        // A bounded `Select-Object -First` receiver stops reading before rg
+        // finishes, so rg dies from a broken pipe and reports exit code 1 even
+        // though every delivered line is complete and correct.
+        let bounded = run("rg -n class --glob '*.cs' . | Select-Object -First 1").await;
+        assert!(bounded.success, "{bounded:?}");
+        assert_eq!(bounded.metadata["resultKind"], "bounded_output");
+        assert_eq!(bounded.metadata["exitCode"], 1);
+        assert!(bounded.output.contains("sample.cs"), "{bounded:?}");
+        // A real rg failure also reports a non-zero exit code with bounded
+        // output, so stderr must keep it failing instead of forgiving the pipe.
+        let real_error =
+            run("rg -n class --glob '*.cs' . missing-dir | Select-Object -First 5").await;
+        assert!(!real_error.success, "{real_error:?}");
+        assert!(
+            real_error.metadata.get("resultKind").is_none(),
+            "{real_error:?}"
+        );
+        assert!(
+            real_error.output.contains("系统找不到指定的文件"),
+            "{real_error:?}"
+        );
+        for command in [
+            "rg -n AbsentMarker .",
+            "rg -n AbsentMarker . | Select-Object -First 20",
+        ] {
+            let absent = run(command).await;
+            assert!(
+                absent.success,
+                "no matches is a normal search result: {absent:?}"
+            );
+            assert_eq!(absent.metadata["exitCode"], 1);
+            assert_eq!(absent.metadata["resultKind"], "no_matches");
+            assert!(absent.output.contains("no matches"));
+            assert!(
+                absent.metadata["outputChunks"]
+                    .as_array()
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        for command in [
+            "rg x missing.cs",
+            "rg x missing.cs 2>$null",
+            "rg --no-messages x missing.cs",
+            "rg x .; exit 1",
+            "Write-Output 'sample.cs ParserError'; rg AbsentMarker .",
+        ] {
+            let error = run(command).await;
+            assert!(!error.success, "{command}: {error:?}");
+            assert!(
+                error.metadata.get("resultKind").is_none(),
+                "{command}: {error:?}"
+            );
+            assert!(
+                !error.output.contains("rg: no matches"),
+                "{command}: {error:?}"
+            );
+            assert!(
+                error.metadata.get("recoveryHint").is_none(),
+                "{command}: {error:?}"
+            );
+        }
+        let syntax = run(r#"rg "not-closed ./sample*.cs"#).await;
+        assert!(!syntax.success);
+        assert!(syntax.metadata.get("resultKind").is_none());
+        if syntax.metadata["outputChunks"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+        {
+            // Some pwsh hosts emit no diagnostics for a -Command parse failure.
+            // Preserve that uncertainty instead of guessing from the wildcard.
+            assert_eq!(syntax.metadata["exitCode"], 1);
+            assert!(syntax.metadata.get("recoveryHint").is_none());
+            assert!(syntax.output.contains("exited with code 1"));
+        } else {
+            let hint = syntax.metadata["recoveryHint"]
+                .as_str()
+                .expect("PowerShell parser diagnostics should have a syntax hint");
+            assert!(hint.contains("语法错误"), "{syntax:?}");
+            assert!(!hint.contains("--glob"), "{syntax:?}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn run_command_native_stderr_guidance_keeps_failure_and_exit_code() {
+        let directory = tempfile::tempdir().unwrap();
+        let tool = RunCommandTool {
+            runtime: CommandRuntime::new(directory.path()).unwrap(),
+        };
+        for (command, success, exit_code, expected_hint) in [
+            (
+                "[Console]::Error.WriteLine('NativeCommandError'); Write-Output 'test result: FAILED'; exit 101",
+                false,
+                101,
+                Some(command_diagnostics::NATIVE_STDERR_HINT),
+            ),
+            (
+                "[Console]::Error.WriteLine('ParserError NativeCommandError'); exit 1",
+                false,
+                1,
+                None,
+            ),
+            ("Write-Output 'NativeCommandError'; exit 1", false, 1, None),
+            (
+                "[Console]::Error.WriteLine('NativeCommandError'); exit 0",
+                true,
+                0,
+                None,
+            ),
+        ] {
+            let result = tool
+                .execute(
+                    &context(directory.path()),
+                    json!({ "command": command, "timeoutMs": 10000 }),
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(result.success, success, "{command}: {result:?}");
+            assert_eq!(result.metadata["exitCode"], exit_code, "{result:?}");
+            assert!(result.metadata.get("resultKind").is_none(), "{result:?}");
+            if command.contains("ParserError") {
+                assert!(
+                    result.metadata["recoveryHint"]
+                        .as_str()
+                        .is_some_and(|hint| hint.contains("语法错误")),
+                    "{result:?}"
+                );
+            } else {
+                assert_eq!(result.metadata["recoveryHint"].as_str(), expected_hint);
+            }
+            if expected_hint.is_some() {
+                assert!(result.output.contains("test result: FAILED"), "{result:?}");
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn run_command_preflight_returns_repair_guidance_without_starting_a_process() {
+        let directory = tempfile::tempdir().unwrap();
+        let tool = RunCommandTool {
+            runtime: CommandRuntime::new(directory.path()).unwrap(),
+        };
+        for (command, hint) in [
+            (
+                "python - <<'PY'\nprint(1)\nPY",
+                command_diagnostics::PYTHON_HEREDOC_HINT,
+            ),
+            (
+                "Set-Content marker.txt should-not-run | Select-Object -First",
+                command_diagnostics::SELECT_COUNT_HINT,
+            ),
+            (
+                "rg -n marker src/*.tsx src/**/*.css | Select-Object -First 10",
+                command_diagnostics::RG_PATH_GLOB_HINT,
+            ),
+            (
+                "rg -n first src; rg -n second src | Select-Object -First 20",
+                command_diagnostics::RG_BATCH_HINT,
+            ),
+        ] {
+            let result = tool
+                .execute(
+                    &context(directory.path()),
+                    json!({ "command": command }),
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap();
+            assert!(!result.success);
+            assert_eq!(result.metadata["executed"], false);
+            assert_eq!(result.metadata["resultKind"], "invalid_command");
+            assert_eq!(result.metadata["recoveryHint"], hint);
+            assert!(result.metadata.get("sessionId").is_none());
+            assert!(result.metadata.get("exitCode").is_none());
+            assert!(result.output.contains(hint));
+        }
+        assert!(!directory.path().join("marker.txt").exists());
+
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        assert!(matches!(
+            tool.execute(
+                &context(directory.path()),
+                json!({ "command": "Select-Object -First" }),
+                cancellation,
+            )
+            .await,
+            Err(ToolError::Cancelled)
+        ));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn run_command_explains_and_recovers_from_powershell_rg_path_globs() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir(directory.path().join("assets")).unwrap();
+        std::fs::write(
+            directory.path().join("assets/CodeEditor-test.js"),
+            "const marker = 'workspace-glob-test';\n",
+        )
+        .unwrap();
+        let runtime = CommandRuntime::new_with_bundled_tools(
+            directory.path(),
+            Some(
+                crate::execution::BundledTools::new(
+                    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                        .join("../src/resources/tools/windows-x86_64"),
+                )
+                .unwrap(),
+            ),
+        )
+        .unwrap();
+        let tool = RunCommandTool { runtime };
+
+        let failed = tool
+            .execute(
+                &context(directory.path()),
+                json!({ "command": "rg workspace-glob-test assets/CodeEditor-*.js" }),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(!failed.success);
+        assert_eq!(failed.metadata["resultKind"], "invalid_command");
+        assert_eq!(failed.metadata["executed"], false);
+        assert!(failed.metadata.get("exitCode").is_none());
+        assert!(
+            failed.metadata["recoveryHint"]
+                .as_str()
+                .is_some_and(|hint| hint.contains("--glob"))
+        );
+
+        let recovered = tool
+            .execute(
+                &context(directory.path()),
+                json!({ "command": "rg --glob 'CodeEditor-*.js' workspace-glob-test assets" }),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(recovered.success);
+        assert!(recovered.output.contains("workspace-glob-test"));
+        assert!(recovered.metadata.get("recoveryHint").is_none());
+
+        // The screenshot's multi-extension query must search both root files and
+        // nested files after the model follows the repair guidance.
+        std::fs::create_dir(directory.path().join("assets/nested")).unwrap();
+        std::fs::write(directory.path().join("assets/App.tsx"), "Marker\n").unwrap();
+        std::fs::write(directory.path().join("assets/nested/App.css"), "Marker\n").unwrap();
+        let corrected = tool
+            .execute(
+                &context(directory.path()),
+                json!({ "command": "rg -n Marker assets --glob '*.tsx' --glob '*.css' | Select-Object -First 10" }),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(corrected.success, "{corrected:?}");
+        assert!(corrected.output.contains("App.tsx"));
+        assert!(corrected.output.contains("App.css"));
+        assert!(!corrected.output.contains("CodeEditor-test.js"));
+    }
+
+    #[tokio::test]
+    async fn run_command_cancellation_returns_without_waiting_for_a_stuck_child() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = CommandRuntime::new(directory.path()).unwrap();
+        let tool = RunCommandTool { runtime };
+        let cancellation = CancellationToken::new();
+        let tool_context = context(directory.path());
+        let arguments = if cfg!(windows) {
+            json!({
+                "command": "Start-Sleep -Seconds 30"
+            })
+        } else {
+            json!({ "command": "sleep 30" })
+        };
+        let task = tokio::spawn({
+            let cancellation = cancellation.clone();
+            async move { tool.execute(&tool_context, arguments, cancellation).await }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        cancellation.cancel();
+        let result = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("cancelled command should return promptly")
+            .unwrap();
+        assert!(matches!(result, Err(ToolError::Cancelled)));
+    }
+
+    #[tokio::test]
+    async fn extension_tools_cannot_replace_builtins_and_use_host_risk_metadata() {
+        let duplicate = Arc::new(ExtensionTestTool {
+            name: "read_file".into(),
+        }) as Arc<dyn ToolHandler>;
+        assert!(
+            ToolRegistry::read_only()
+                .with_extensions(
+                    vec![duplicate],
+                    HashMap::from([("read_file".into(), ToolRisk::Read)]),
+                    None,
+                )
+                .is_err()
+        );
+
+        let read_name = "mcp__local__read".to_string();
+        let write_name = "mcp__local__write".to_string();
+        let registry = ToolRegistry::read_only()
+            .with_extensions(
+                vec![
+                    Arc::new(ExtensionTestTool {
+                        name: read_name.clone(),
+                    }),
+                    Arc::new(ExtensionTestTool {
+                        name: write_name.clone(),
+                    }),
+                ],
+                HashMap::from([
+                    (read_name.clone(), ToolRisk::Read),
+                    (write_name.clone(), ToolRisk::External),
+                ]),
+                None,
+            )
+            .unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        assert!(
+            registry
+                .dispatch(
+                    &context(workspace.path()),
+                    &read_name,
+                    json!({}),
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap()
+                .success
+        );
+        assert!(matches!(
+            registry
+                .dispatch(
+                    &context(workspace.path()),
+                    &write_name,
+                    json!({}),
+                    CancellationToken::new(),
+                )
+                .await,
+            Err(ToolError::ApprovalRequired(_))
+        ));
+    }
+
+    #[test]
+    fn extension_registration_preserves_additional_risks_without_overriding_builtins() {
+        let additional_name = "search_repository".to_string();
+        let extension_name = "mcp__local__read".to_string();
+        let registry = ToolRegistry::read_only()
+            .with_additional_handlers(
+                vec![Arc::new(ExtensionTestTool {
+                    name: additional_name.clone(),
+                })],
+                HashMap::from([(additional_name.clone(), ToolRisk::Read)]),
+            )
+            .unwrap()
+            .with_extensions(
+                vec![Arc::new(ExtensionTestTool {
+                    name: extension_name.clone(),
+                })],
+                HashMap::from([
+                    (extension_name.clone(), ToolRisk::Read),
+                    ("read_file".to_string(), ToolRisk::External),
+                ]),
+                None,
+            )
+            .unwrap();
+
+        for (name, arguments) in [
+            (additional_name.as_str(), json!({})),
+            (extension_name.as_str(), json!({})),
+            ("read_file", json!({ "path": "README.md" })),
+        ] {
+            let authorization = registry.authorization(name, &arguments).unwrap();
+            assert_eq!(authorization.decision, PolicyDecision::Allow);
+            assert_eq!(authorization.risk, ToolRisk::Read);
+        }
+    }
+
+    #[test]
+    fn workspace_file_tool_schemas_explain_relative_paths() {
+        let registry = ToolRegistry::read_only();
+        let definitions = registry
+            .definitions()
+            .into_iter()
+            .map(|definition| (definition.name.clone(), definition))
+            .collect::<HashMap<_, _>>();
+        let directory =
+            definitions["list_directory"].input_schema["properties"]["path"]["description"]
+                .as_str()
+                .expect("directory path should have a schema description");
+        let file = definitions["read_file"].input_schema["properties"]["path"]["description"]
+            .as_str()
+            .expect("file path should have a schema description");
+
+        assert!(directory.contains("Existing workspace-relative directory"));
+        assert!(file.contains("Existing workspace-relative regular file"));
+        for description in [directory, file] {
+            assert!(description.contains("Absolute paths"));
+            assert!(description.contains("wildcard"));
+        }
+    }
+
+    #[test]
+    fn provider_definitions_bound_verbose_extension_descriptions() {
+        let description = "描述".repeat(2_000);
+        let bounded = bound_provider_description(&description);
+        assert!(bounded.len() <= MAX_PROVIDER_TOOL_DESCRIPTION_BYTES);
+        assert!(bounded.ends_with("..."));
+
+        let registry = ToolRegistry::read_only();
+        let full = registry.definitions();
+        let provider = registry.provider_definitions();
+        assert_eq!(full, provider);
+    }
+
+    #[tokio::test]
+    async fn rejects_absolute_parent_and_link_escape_paths() {
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret.txt"), "secret").unwrap();
+        let registry = ToolRegistry::read_only();
+        for path in [
+            outside
+                .path()
+                .join("secret.txt")
+                .to_string_lossy()
+                .to_string(),
+            "../secret.txt".to_string(),
+        ] {
+            let result = registry
+                .dispatch(
+                    &context(workspace.path()),
+                    "read_file",
+                    json!({ "path": path }),
+                    CancellationToken::new(),
+                )
+                .await;
+            assert!(matches!(result, Err(ToolError::Denied(_))));
+        }
+
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(outside.path(), workspace.path().join("escape")).unwrap();
+        #[cfg(windows)]
+        if std::os::windows::fs::symlink_dir(outside.path(), workspace.path().join("escape"))
+            .is_err()
+        {
+            return;
+        }
+        let result = registry
+            .dispatch(
+                &context(workspace.path()),
+                "read_file",
+                json!({ "path": "escape/secret.txt" }),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(matches!(result, Err(ToolError::Denied(_))));
+    }
+
+    #[tokio::test]
+    async fn workspace_path_diagnostics_are_actionable_and_kind_aware() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::create_dir(workspace.path().join("src")).unwrap();
+        std::fs::create_dir(workspace.path().join("src/module")).unwrap();
+        std::fs::create_dir(workspace.path().join("src/stores")).unwrap();
+        std::fs::write(workspace.path().join("src/main.rs"), "fn main() {}\n").unwrap();
+        std::fs::write(
+            workspace.path().join("src/stores/workbenchStore.ts"),
+            "export const workbenchStore = {};\n",
+        )
+        .unwrap();
+        let registry = ToolRegistry::read_only();
+
+        let missing_file = registry
+            .dispatch(
+                &context(workspace.path()),
+                "read_file",
+                json!({ "path": "src/mian.rs" }),
+                CancellationToken::new(),
+            )
+            .await;
+        let Err(ToolError::InvalidArguments(missing_file)) = missing_file else {
+            panic!("missing file should be a recoverable argument error");
+        };
+        assert!(missing_file.contains("workspace file path \"src/mian.rs\" does not exist"));
+        assert!(missing_file.contains("Possible existing path: src/main.rs"));
+        assert!(!missing_file.contains("src/module"));
+        assert!(missing_file.contains("list_directory"));
+
+        let directory_shaped_file = registry
+            .dispatch(
+                &context(workspace.path()),
+                "read_file",
+                json!({ "path": "src/unknown/" }),
+                CancellationToken::new(),
+            )
+            .await;
+        let Err(ToolError::InvalidArguments(directory_shaped_file)) = directory_shaped_file else {
+            panic!("a directory-shaped missing file should be a recoverable argument error");
+        };
+        assert!(directory_shaped_file.contains("directory separator"));
+        assert!(directory_shaped_file.contains("read_file requires one exact file path"));
+        assert!(directory_shaped_file.contains("list_directory"));
+
+        let missing_nested_file = registry
+            .dispatch(
+                &context(workspace.path()),
+                "read_file",
+                json!({ "path": "src/store/workbench.ts" }),
+                CancellationToken::new(),
+            )
+            .await;
+        let Err(ToolError::InvalidArguments(missing_nested_file)) = missing_nested_file else {
+            panic!("missing nested file should be a recoverable argument error");
+        };
+        assert!(
+            missing_nested_file.contains("Possible existing path: src/stores/workbenchStore.ts")
+        );
+        assert!(missing_nested_file.contains("search_repository"));
+
+        let missing_directory = registry
+            .dispatch(
+                &context(workspace.path()),
+                "list_directory",
+                json!({ "path": "src/moduel" }),
+                CancellationToken::new(),
+            )
+            .await;
+        let Err(ToolError::InvalidArguments(missing_directory)) = missing_directory else {
+            panic!("missing directory should be a recoverable argument error");
+        };
+        assert!(missing_directory.contains("workspace directory path"));
+        assert!(missing_directory.contains("Possible existing path: src/module"));
+        assert!(!missing_directory.contains("src/main.rs"));
+
+        let directory_as_file = registry
+            .dispatch(
+                &context(workspace.path()),
+                "read_file",
+                json!({ "path": "src" }),
+                CancellationToken::new(),
+            )
+            .await;
+        let Err(ToolError::InvalidArguments(directory_as_file)) = directory_as_file else {
+            panic!("reading a directory should be a recoverable argument error");
+        };
+        assert!(directory_as_file.contains("is a directory, not the requested file"));
+        assert!(directory_as_file.contains("list_directory"));
+
+        let file_as_directory = registry
+            .dispatch(
+                &context(workspace.path()),
+                "list_directory",
+                json!({ "path": "src/main.rs" }),
+                CancellationToken::new(),
+            )
+            .await;
+        let Err(ToolError::InvalidArguments(file_as_directory)) = file_as_directory else {
+            panic!("listing a file should be a recoverable argument error");
+        };
+        assert!(file_as_directory.contains("is a regular file, not the requested directory"));
+        assert!(file_as_directory.contains("read_file"));
+
+        let wildcard = registry
+            .dispatch(
+                &context(workspace.path()),
+                "read_file",
+                json!({ "path": "src/*.rs" }),
+                CancellationToken::new(),
+            )
+            .await;
+        let Err(ToolError::InvalidArguments(wildcard)) = wildcard else {
+            panic!("wildcard file path should be a recoverable argument error");
+        };
+        assert!(wildcard.contains("wildcard patterns"));
+        assert!(wildcard.contains("search_repository"));
+
+        let traversal = registry
+            .dispatch(
+                &context(workspace.path()),
+                "read_file",
+                json!({ "path": "../*.rs" }),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(matches!(traversal, Err(ToolError::Denied(_))));
+    }
+
+    #[tokio::test]
+    async fn lists_with_ignore_and_limits_and_reads_utf16_with_bounds() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::create_dir(workspace.path().join("node_modules")).unwrap();
+        std::fs::write(workspace.path().join("b.txt"), "b").unwrap();
+        std::fs::write(workspace.path().join("a.txt"), "a").unwrap();
+        let utf16 = "hello world"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+        let mut encoded = vec![0xff, 0xfe];
+        encoded.extend(utf16);
+        std::fs::write(workspace.path().join("utf16.txt"), encoded).unwrap();
+        let registry = ToolRegistry::read_only();
+        let listed = registry
+            .dispatch(
+                &context(workspace.path()),
+                "list_directory",
+                json!({ "path": ".", "limit": 1 }),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(listed.metadata["truncated"].as_bool().unwrap());
+        assert!(!listed.output.contains("node_modules"));
+        assert_eq!(listed.metadata["path"], ".");
+        assert_eq!(
+            listed.metadata["directoryRevision"].as_str().unwrap().len(),
+            64
+        );
+
+        let read = registry
+            .dispatch(
+                &context(workspace.path()),
+                "read_file",
+                json!({ "path": "utf16.txt", "limit": 5 }),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(read.output, "hello");
+        assert_eq!(read.metadata["truncated"], true);
+        assert_eq!(read.metadata["startLine"], 1);
+        assert_eq!(read.metadata["linesReturned"], 1);
+        assert_eq!(read.metadata["path"], "utf16.txt");
+        assert_eq!(read.metadata["fileRevision"].as_str().unwrap().len(), 64);
+    }
+
+    #[tokio::test]
+    async fn read_file_prefers_bounded_line_ranges_and_keeps_byte_ranges_compatible() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(
+            workspace.path().join("lines.txt"),
+            "one\ntwo\nthree\nfour\n",
+        )
+        .unwrap();
+        let registry = ToolRegistry::read_only();
+
+        let lines = registry
+            .dispatch(
+                &context(workspace.path()),
+                "read_file",
+                json!({ "path": "lines.txt", "startLine": 2, "lineCount": 2 }),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(lines.output, "two\nthree\n");
+        assert_eq!(lines.metadata["startLine"], 2);
+        assert_eq!(lines.metadata["endLine"], 3);
+        assert_eq!(lines.metadata["linesReturned"], 2);
+        assert_eq!(lines.metadata["totalLines"], 5);
+
+        let compatibility_lines = registry
+            .dispatch(
+                &context(workspace.path()),
+                "read_file",
+                json!({ "path": "lines.txt", "startLine": 2, "endLine": 3 }),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(compatibility_lines.output, lines.output);
+        assert_eq!(compatibility_lines.metadata["startLine"], 2);
+        assert_eq!(compatibility_lines.metadata["endLine"], 3);
+        assert_eq!(compatibility_lines.metadata["linesReturned"], 2);
+
+        let preferred_line_count = registry
+            .dispatch(
+                &context(workspace.path()),
+                "read_file",
+                json!({
+                    "path": "lines.txt",
+                    "startLine": 2,
+                    "endLine": 1,
+                    "lineCount": 2,
+                    "offset": 0,
+                    "limit": 1
+                }),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(preferred_line_count.output, lines.output);
+        assert_eq!(preferred_line_count.metadata["startLine"], 2);
+        assert_eq!(preferred_line_count.metadata["endLine"], 3);
+        assert_eq!(preferred_line_count.metadata["linesReturned"], 2);
+
+        let reversed = registry
+            .dispatch(
+                &context(workspace.path()),
+                "read_file",
+                json!({ "path": "lines.txt", "startLine": 3, "endLine": 2 }),
+                CancellationToken::new(),
+            )
+            .await;
+        let Err(ToolError::InvalidArguments(reversed)) = reversed else {
+            panic!("a reversed endLine range should be rejected");
+        };
+        assert!(reversed.contains("endLine must be greater than or equal to startLine"));
+
+        let bytes = registry
+            .dispatch(
+                &context(workspace.path()),
+                "read_file",
+                json!({ "path": "lines.txt", "offset": 4, "limit": 3 }),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(bytes.output, "two");
+        assert_eq!(bytes.metadata["offset"], 4);
+        assert_eq!(bytes.metadata["startLine"], 2);
+        assert_eq!(
+            lines.metadata["fileRevision"],
+            bytes.metadata["fileRevision"]
+        );
+    }
+
+    #[tokio::test]
+    async fn read_file_revision_changes_only_when_the_full_file_changes() {
+        let workspace = tempfile::tempdir().unwrap();
+        let path = workspace.path().join("revision.txt");
+        std::fs::write(&path, "one\ntwo\nthree\n").unwrap();
+        let registry = ToolRegistry::read_only();
+        let first = registry
+            .dispatch(
+                &context(workspace.path()),
+                "read_file",
+                json!({ "path": "revision.txt", "startLine": 1, "lineCount": 1 }),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let second = registry
+            .dispatch(
+                &context(workspace.path()),
+                "read_file",
+                json!({ "path": "revision.txt", "startLine": 2, "lineCount": 1 }),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            first.metadata["fileRevision"],
+            second.metadata["fileRevision"]
+        );
+
+        std::fs::write(&path, "one\nchanged\nthree\n").unwrap();
+        let changed = registry
+            .dispatch(
+                &context(workspace.path()),
+                "read_file",
+                json!({ "path": "revision.txt", "startLine": 1, "lineCount": 1 }),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(
+            first.metadata["fileRevision"],
+            changed.metadata["fileRevision"]
+        );
+    }
+
+    #[test]
+    fn empty_command_failures_report_exit_codes_and_rg_no_matches() {
+        assert_eq!(
+            empty_command_failure_message(Some("no_matches"), Some(1)).as_deref(),
+            Some("rg: no matches (exit code 1).")
+        );
+        assert_eq!(
+            empty_command_failure_message(None, Some(101)).as_deref(),
+            Some("command produced no output and exited with code 101.")
+        );
+        assert_eq!(empty_command_failure_message(None, Some(0)), None);
+    }
+
+    #[test]
+    fn command_result_kind_marks_only_empty_rg_exit_one_as_no_matches() {
+        assert_eq!(
+            command_result_kind("rg -n missing .", Some(1), true, true),
+            Some("no_matches")
+        );
+        assert_eq!(
+            command_result_kind("rg -n missing .; Write-Output other", Some(1), false, true),
+            None
+        );
+        assert_eq!(
+            command_result_kind("rg -n missing .", Some(2), true, true),
+            None
+        );
+        assert_eq!(command_result_kind("cargo test", Some(1), true, true), None);
+        assert_eq!(
+            command_result_kind("rg -n missing .", Some(1), true, false),
+            None
+        );
+        assert_eq!(
+            command_result_kind("rg -n missing .", Some(2), false, false),
+            None
+        );
+        assert_eq!(
+            command_result_kind(
+                "rg -n needle . | Select-Object -First 20",
+                Some(101),
+                false,
+                true,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn command_result_kind_forgives_only_a_bounded_rg_pipe_without_rg_errors() {
+        // Truncated output and a broken pipe: rg reports exit code 1 although
+        // every delivered line is complete and correct.
+        assert_eq!(
+            command_result_kind(
+                "rg -n needle --glob '*.ts' src | Select-Object -First 20",
+                Some(1),
+                false,
+                true,
+            ),
+            Some("bounded_output")
+        );
+        // rg itself reported a failure, so the non-zero exit code is real.
+        assert_eq!(
+            command_result_kind(
+                "rg -n needle --glob '*.ts' src missing | Select-Object -First 20",
+                Some(1),
+                false,
+                false,
+            ),
+            None
+        );
+        // A pipeline the diagnostics cannot read literally stays a failure.
+        assert_eq!(
+            command_result_kind(
+                "rg -n needle $paths | Select-Object -First $limit",
+                Some(1),
+                false,
+                true
+            ),
+            None
+        );
+        // Empty output keeps the no-matches classification, never bounded_output.
+        assert_eq!(
+            command_result_kind(
+                "rg -n needle --glob '*.ts' src | Select-Object -First 20",
+                Some(1),
+                true,
+                true,
+            ),
+            Some("no_matches")
+        );
+        for exit_code in [None, Some(0), Some(2), Some(101), Some(-1)] {
+            assert_eq!(
+                command_result_kind(
+                    "rg -n needle src | Select-Object -First 20",
+                    exit_code,
+                    false,
+                    true,
+                ),
+                None,
+                "{exit_code:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn powershell_parser_markers_are_distinct_from_native_path_errors() {
+        assert!(powershell_parse_error("CategoryInfo: ParserError"));
+        assert!(powershell_parse_error(
+            "FullyQualifiedErrorId: TerminatorExpectedAtEndOfString"
+        ));
+        assert!(powershell_parse_error("字符串缺少终止符"));
+        assert!(!powershell_parse_error("rg: sample*.cs (os error 123)"));
+        assert!(!powershell_parse_error(""));
+    }
+
+    #[tokio::test]
+    async fn read_file_defaults_to_64_kib_and_line_ranges_override_redundant_byte_ranges() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("large.txt"), "x".repeat(70 * 1024)).unwrap();
+        let registry = ToolRegistry::read_only();
+
+        let default_read = registry
+            .dispatch(
+                &context(workspace.path()),
+                "read_file",
+                json!({ "path": "large.txt" }),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(default_read.output.len(), 64 * 1024);
+        assert_eq!(default_read.metadata["bytesReturned"], 64 * 1024);
+        assert_eq!(default_read.metadata["truncated"], true);
+
+        let mixed = registry
+            .dispatch(
+                &context(workspace.path()),
+                "read_file",
+                json!({
+                    "path": "large.txt",
+                    "offset": 0,
+                    "limit": MAX_READ_BYTES,
+                    "startLine": 1,
+                    "lineCount": 1
+                }),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(mixed.output, "x".repeat(70 * 1024));
+        assert_eq!(mixed.metadata["startLine"], 1);
+        assert_eq!(mixed.metadata["endLine"], 1);
+        assert_eq!(mixed.metadata["linesReturned"], 1);
+    }
+
+    #[tokio::test]
+    async fn cancelled_dispatch_does_not_execute() {
+        let directory = tempfile::tempdir().unwrap();
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let result = ToolRegistry::read_only()
+            .dispatch(
+                &context(directory.path()),
+                "list_directory",
+                json!({ "path": "." }),
+                cancellation,
+            )
+            .await;
+        assert_eq!(result, Err(ToolError::Cancelled));
+    }
+
+    #[tokio::test]
+    async fn workspace_write_tools_are_reviewable_and_cannot_self_approve() {
+        let workspace = tempfile::tempdir().unwrap();
+        let registry = ToolRegistry::workspace_tools(PatchService::new());
+        assert_eq!(
+            registry
+                .definitions()
+                .into_iter()
+                .map(|definition| definition.name)
+                .collect::<Vec<_>>(),
+            vec!["apply_patch", "list_directory", "read_file", "write_file"]
+        );
+        let patch = "*** Begin Patch\n*** Add File: added.txt\n+hello\n*** End Patch\n";
+        let arguments = json!({ "patch": patch });
+        let preview = registry
+            .preview(&context(workspace.path()), "apply_patch", &arguments)
+            .unwrap()
+            .unwrap();
+        assert_eq!(preview.files.len(), 1);
+        assert!(!workspace.path().join("added.txt").exists());
+
+        let result = registry
+            .dispatch(
+                &context(workspace.path()),
+                "apply_patch",
+                arguments.clone(),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(matches!(result, Err(ToolError::ApprovalRequired(_))));
+        assert!(!workspace.path().join("added.txt").exists());
+
+        let result = registry
+            .dispatch_authorized(
+                &context(workspace.path()),
+                "apply_patch",
+                arguments,
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(matches!(result, Err(ToolError::Denied(_))));
+        assert!(!workspace.path().join("added.txt").exists());
+    }
+
+    #[test]
+    fn apply_patch_description_explains_hunk_repair() {
+        let description = ApplyPatchTool {
+            service: PatchService::new(),
+        }
+        .definition()
+        .description;
+        assert!(description.contains("empty or context-only hunks"));
+        assert!(description.contains("file/hunk location"));
+    }
+
+    #[tokio::test]
+    async fn model_arguments_cannot_include_approval_capabilities() {
+        let workspace = tempfile::tempdir().unwrap();
+        let registry = ToolRegistry::workspace_tools(PatchService::new());
+        let result = registry
+            .dispatch(
+                &context(workspace.path()),
+                "write_file",
+                json!({
+                    "path": "file.txt",
+                    "content": "content",
+                    "approved": true,
+                    "expectedHashes": []
+                }),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(matches!(result, Err(ToolError::InvalidArguments(_))));
+        assert!(!workspace.path().join("file.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn backend_approval_capability_allows_a_reviewed_full_file_replacement() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("file.txt"), "before\n").unwrap();
+        let registry = ToolRegistry::workspace_tools(PatchService::new());
+        let arguments = json!({ "path": "file.txt", "content": "after\n" });
+        let preview = registry
+            .preview(&context(workspace.path()), "write_file", &arguments)
+            .unwrap()
+            .unwrap();
+        let mut approved_context = context(workspace.path());
+        approved_context.approval = Some(ApprovedToolExecution {
+            patch: None,
+            selected_paths: vec!["file.txt".to_string()],
+            expected_hashes: preview
+                .files
+                .iter()
+                .map(|file| ExpectedFileHash {
+                    path: file.path.clone(),
+                    before_hash: file.before_hash.clone(),
+                })
+                .collect(),
+        });
+
+        let result = registry
+            .dispatch_authorized(
+                &approved_context,
+                "write_file",
+                arguments,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        assert!(result.metadata.get("changeSet").is_some());
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join("file.txt")).unwrap(),
+            "after\n"
+        );
+    }
+}

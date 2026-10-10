@@ -5,6 +5,7 @@ mod goal;
 mod memory;
 mod metrics;
 mod plan;
+mod project_memory;
 mod request_user_input;
 mod search;
 mod store;
@@ -26,6 +27,9 @@ pub use goal::{CreateGoalRequest, GoalState, GoalStore, GoalTransitionRequest, G
 pub use memory::{MemorySettings, MemoryStore, MemoryUpsertRequest, MemoryView};
 pub use metrics::{MetricsSnapshot, RuntimeMetrics};
 pub use plan::{PlanStep, PlanStepInput, PlanStepState, PlanStore, PlanUpdateRequest, PlanView};
+pub use project_memory::{
+    ProjectMemoryContent, ProjectMemoryFile, ProjectMemoryStore, ProjectMemoryWorkspace,
+};
 pub use request_user_input::{
     REQUEST_USER_INPUT_TOOL_NAME, RequestUserInputArgs, RequestUserInputQuestion,
     RequestUserInputTool,
@@ -51,6 +55,7 @@ pub struct AdvancedServices {
     pub goals: GoalStore,
     pub browser: BrowserService,
     pub memory: MemoryStore,
+    pub project_memory: ProjectMemoryStore,
     pub metrics: RuntimeMetrics,
     pub workflows: WorkflowStore,
 }
@@ -62,6 +67,7 @@ impl AdvancedServices {
             goals: GoalStore::new(data_root)?,
             browser: BrowserService::new(data_root)?,
             memory: MemoryStore::new(data_root)?,
+            project_memory: ProjectMemoryStore::new(data_root),
             metrics: RuntimeMetrics::new(data_root)?,
             workflows: WorkflowStore::new(data_root)?,
         })
@@ -76,8 +82,6 @@ impl AdvancedServices {
             Arc::new(plan::PlanTool::new(self.plans.clone())),
             Arc::new(goal::GoalTool::new(self.goals.clone())),
             Arc::new(search::SearchTool::new(search)),
-            Arc::new(memory::RecallMemoryTool::new(self.memory.clone())),
-            Arc::new(memory::RememberTool::new(self.memory.clone())),
             Arc::new(request_user_input::RequestUserInputTool),
             Arc::new(browser::BrowserTool::navigate(self.browser.clone())),
             Arc::new(browser::BrowserTool::click(self.browser.clone())),
@@ -105,7 +109,7 @@ impl AdvancedServices {
 
     pub fn runtime_instructions(&self, thread_id: &str) -> Result<String, String> {
         let mut instructions = String::from(
-            "[Advanced agent runtime]\nFor substantial tasks, create and maintain an explicit plan with update_plan. Keep at most one step in_progress and persist status changes as work advances. Search the repository before editing when the location is not already known. Browser and memory writes are external-risk operations and require user approval. Do not claim browser output or remembered facts without the corresponding tool result.\n",
+            "[Advanced agent runtime]\nFor substantial tasks, create and maintain an explicit plan with update_plan. Keep at most one step in_progress and persist status changes as work advances. Search the repository before editing when the location is not already known. Browser and memory proposals are external-risk operations and require user approval. Memory proposals may remain pending review; never report a pending proposal as an active memory. Do not claim browser output or remembered facts without the corresponding tool result.\n",
         );
         if let Some(goal) = self.goals.current(thread_id)? {
             if goal.state == GoalState::Active {

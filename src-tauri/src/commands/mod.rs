@@ -2,7 +2,9 @@ use std::sync::{Arc, Mutex as StdMutex};
 
 use futures_util::StreamExt;
 use serde::Serialize;
+use serde_json::json;
 use tauri::{AppHandle, Emitter, Manager, State};
+use tauri_plugin_dialog::DialogExt;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -41,12 +43,14 @@ use crate::knowledge::{
     KnowledgeSource, SetEmbeddingSettingsRequest, UpsertCollectionRequest,
 };
 use crate::logging::{LogQuery, LogQueryResult};
+use crate::memory::capture::MemoryDiagnostics;
+use crate::memory::scope::{MemoryScopeOption, MemoryScopeResolver};
 use crate::memory::{
     CandidateDecision, CandidateOutcome, DreamReport, DreamStatus, MAX_MAINTENANCE_INPUT_MEMORIES,
     MaintenanceOutcome, MaintenanceReport, MaintenanceSettings, MaintenanceTrigger,
     MemoryClearOutcome, MemoryError, MemoryPage, MemoryScope, MemoryScopeKind, MemorySettings,
-    MemoryStatus, MemoryUpsertOutcome, bound_failure, build_maintenance_prompt, parse_proposals,
-    run_offline_maintenance,
+    MemoryStatus, MemoryType, MemoryUpsertOutcome, bound_failure, build_maintenance_prompt,
+    parse_proposals, run_offline_maintenance,
 };
 use crate::multi_agent::{
     CreateSubagentRequest, MultiAgentCoordinator, MultiAgentError, SubagentEventPublisher,
@@ -102,6 +106,7 @@ fn ordinary_turn_soft_limits(has_active_goal: bool) -> Option<SoftTurnLimits> {
 
 pub(crate) mod mobile;
 pub(crate) mod threads;
+pub(crate) mod weixin;
 
 async fn emit_mailbox_changed(app: &AppHandle, state: &AppState, thread_id: &str) {
     let revision = state.thread_mailbox().revision(thread_id).await;
@@ -159,6 +164,7 @@ const PROJECT_FREE_TOOL_NAMES: &[&str] = &[
     "browser_type",
     "recall_memory",
     "remember",
+    "propose_memory",
     "request_user_input",
     "todo_write",
     "update_goal",
@@ -405,12 +411,58 @@ fn plugin_command_error(error: impl std::fmt::Display) -> CommandError {
     CommandError::new("plugins", error)
 }
 
+#[derive(Default)]
+struct MemoryCaptureBuffer {
+    final_text: String,
+    tools: Vec<String>,
+}
+
+struct MemoryCapturePublisher {
+    inner: Arc<dyn EventPublisher>,
+    buffer: Arc<std::sync::Mutex<MemoryCaptureBuffer>>,
+}
+
+impl EventPublisher for MemoryCapturePublisher {
+    fn publish(&self, event: AgentEventEnvelope) {
+        if let Ok(mut buffer) = self.buffer.lock() {
+            match &event.event {
+                AgentEvent::TurnCompleted { message, .. } => {
+                    buffer.final_text = message.visible_text().chars().take(2_000).collect();
+                }
+                AgentEvent::ToolCompleted { name, result, .. } if buffer.tools.len() < 12 => {
+                    let name: String = name.chars().take(80).collect();
+                    buffer
+                        .tools
+                        .push(format!("{name} success={}", result.success));
+                }
+                _ => {}
+            }
+        }
+        self.inner.publish(event);
+    }
+}
+
+fn capture_memory_outcome(
+    _state: &AppState,
+    _input: &str,
+    _mode: AgentMode,
+    _user_source: bool,
+    _outcome: &TurnOutcome,
+    _buffer: &Arc<std::sync::Mutex<MemoryCaptureBuffer>>,
+) {
+    // Workspace memory is sourced exclusively from local Markdown files.
+}
+
 struct TauriEventPublisher {
     app: AppHandle,
 }
 
 impl EventPublisher for TauriEventPublisher {
     fn publish(&self, event: AgentEventEnvelope) {
+        if matches!(&event.event, AgentEvent::ToolCompleted { name, .. } if name == "remember" || name == "propose_memory")
+        {
+            emit_memory_changed(&self.app);
+        }
         let _ = self.app.emit(AGENT_EVENT_NAME, event.clone());
         // 同一领域事件同时扇出给已订阅的移动端连接。桌面和手机看到的是同一份事实。
         if let Some(service) = self.app.try_state::<crate::mobile::MobileService>() {
@@ -514,6 +566,7 @@ fn subagent_context(
         agent_events: publishers.agent_events,
         lifecycle_events: publishers.lifecycle_events,
         logger: Some(state.logger()),
+        memory: Some(state.memory()),
     }
 }
 
@@ -648,7 +701,6 @@ fn live_runtime_instruction_provider(
     let advanced = state.advanced();
     let extensions = workspace_extensions.unwrap_or_else(|| state.extension_service());
     let memory = state.memory();
-    let logger = state.logger();
     Arc::new(move || {
         let workflow_active = advanced
             .workflows
@@ -695,21 +747,15 @@ fn live_runtime_instruction_provider(
             }
             advanced_instructions.push_str(&workflow_skills);
         }
-        let legacy_memory_instructions = advanced
-            .memory
-            .context()
-            .map_err(|error| format!("memory: {error}"))?;
-        // Design §5.1: Task 2 memories reach the request only through the assembler, which orders
-        // them by tier, withholds secret-bearing rows, budgets them and records every injection. The
-        // legacy store keeps its own 16 KiB budget and its own `enabled` gate, so it stays a separate
-        // block instead of being folded into the assembly budget.
-        let mut memory_instructions = legacy_memory_instructions;
-        if let Some(assembled) = assemble_memory_context(&memory, &logger, &thread_id) {
-            if !memory_instructions.trim().is_empty() {
-                memory_instructions.push_str("\n\n");
-            }
-            memory_instructions.push_str(&assembled);
-        }
+        let memory_instructions = if memory
+            .settings()
+            .map_err(|error| format!("memory settings: {}", error.code()))?
+            .enabled
+        {
+            workspace_root.as_deref()
+                .map(|workspace| advanced.project_memory.context_for_workspace(workspace).unwrap_or_default())
+                .unwrap_or_default()
+        } else { String::new() };
         Ok(build_system_prompt(
             workspace_root.as_deref(),
             &extension_instructions,
@@ -898,10 +944,28 @@ impl TurnCompletionGuard for LivePlanCompletionGuard {
 /// derive without inventing an identity: the runtime has a thread id but no project id, and design
 /// §7.1 requires host-generated scope ids. Project and workspace memories are therefore stored and
 /// managed but not yet auto-injected; that needs a host project identity, which is not part of Task 3.
+#[cfg(test)]
 fn assemble_memory_context(
     memory: &crate::memory::MemoryService,
     logger: &crate::logging::StructuredLogger,
     thread_id: &str,
+) -> Option<String> {
+    assemble_scoped_memory_context(
+        memory,
+        logger,
+        thread_id,
+        &[
+            MemoryScope::user(),
+            MemoryScope::new(MemoryScopeKind::Thread, Some(thread_id.to_owned())),
+        ],
+    )
+}
+
+fn assemble_scoped_memory_context(
+    memory: &crate::memory::MemoryService,
+    logger: &crate::logging::StructuredLogger,
+    thread_id: &str,
+    scopes: &[MemoryScope],
 ) -> Option<String> {
     let settings = match memory.settings() {
         Ok(settings) => settings,
@@ -917,14 +981,10 @@ fn assemble_memory_context(
     if !settings.enabled {
         return None;
     }
-    let scopes = [
-        MemoryScope::user(),
-        MemoryScope::new(MemoryScopeKind::Thread, Some(thread_id.to_owned())),
-    ];
     let mut records = Vec::<MemoryRecord>::new();
     for scope in scopes {
         match memory.list(
-            &scope,
+            scope,
             MemoryStatus::Active,
             None,
             Some(crate::storage::memory_repository::MAX_MEMORY_PAGE_SIZE),
@@ -1062,6 +1122,74 @@ pub fn clear_logs(state: State<'_, AppState>, confirmed: bool) -> Result<(), Com
     state
         .logger()
         .clear_logs(confirmed)
+        .map_err(|error| CommandError::internal(error.to_string()))
+}
+
+fn require_log_settings_window(label: &str) -> Result<(), CommandError> {
+    if label != "main" {
+        return Err(CommandError::internal("日志目录只能由桌面主窗口修改"));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[test]
+fn log_directory_settings_reject_non_main_windows() {
+    assert!(require_log_settings_window("main").is_ok());
+    for label in ["", "browser", "mobile", "main-other"] {
+        assert!(require_log_settings_window(label).is_err());
+    }
+}
+
+#[tauri::command]
+pub fn get_log_storage<R: tauri::Runtime>(
+    window: tauri::WebviewWindow<R>,
+    state: State<'_, AppState>,
+) -> Result<crate::logging::LogStorage, CommandError> {
+    require_log_settings_window(window.label())?;
+    state
+        .log_storage()
+        .map_err(|error| CommandError::internal(error.to_string()))
+}
+
+#[tauri::command]
+pub async fn choose_log_directory<R: tauri::Runtime>(
+    window: tauri::WebviewWindow<R>,
+    state: State<'_, AppState>,
+) -> Result<Option<crate::logging::LogStorage>, CommandError> {
+    require_log_settings_window(window.label())?;
+    let (sender, receiver) = oneshot::channel();
+    window
+        .dialog()
+        .file()
+        .set_parent(&window)
+        .set_title("选择日志存储目录")
+        .pick_folder(move |path| {
+            let _ = sender.send(path);
+        });
+    let selected = receiver
+        .await
+        .map_err(|error| CommandError::internal(error.to_string()))?;
+    let Some(selected) = selected else {
+        return Ok(None);
+    };
+    let path = selected
+        .into_path()
+        .map_err(|error| CommandError::internal(error.to_string()))?;
+    state
+        .change_log_directory(Some(&path))
+        .map(Some)
+        .map_err(|error| CommandError::internal(error.to_string()))
+}
+
+#[tauri::command]
+pub fn reset_log_directory<R: tauri::Runtime>(
+    window: tauri::WebviewWindow<R>,
+    state: State<'_, AppState>,
+) -> Result<crate::logging::LogStorage, CommandError> {
+    require_log_settings_window(window.label())?;
+    state
+        .change_log_directory(None)
         .map_err(|error| CommandError::internal(error.to_string()))
 }
 
@@ -1437,7 +1565,7 @@ pub(crate) async fn execute_scheduled_task(
         }
     };
     let publisher: Arc<dyn EventPublisher> = Arc::new(TauriEventPublisher { app: app.clone() });
-    execute_turn(
+    execute_turn_with_source(
         app,
         state.inner(),
         RunTurnRequest {
@@ -1450,6 +1578,7 @@ pub(crate) async fn execute_scheduled_task(
         None,
         None,
         publisher,
+        false,
     )
     .await
     .map_err(|error| error.message)
@@ -1859,30 +1988,58 @@ pub fn get_memory_settings(state: State<'_, AppState>) -> CommandResult<MemorySe
     state.memory().settings().map_err(memory_command_error)
 }
 
+#[tauri::command]
+pub fn list_project_memories(
+    state: State<'_, AppState>,
+) -> CommandResult<Vec<crate::advanced::ProjectMemoryWorkspace>> {
+    state
+        .advanced()
+        .project_memory
+        .list()
+        .map_err(CommandError::internal)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub fn read_project_memory(
+    state: State<'_, AppState>,
+    workspace_id: String,
+    path: String,
+) -> CommandResult<crate::advanced::ProjectMemoryContent> {
+    state
+        .advanced()
+        .project_memory
+        .read(&workspace_id, &path)
+        .map_err(CommandError::internal)
+}
+
 /// Updates the whole settings row. `enabled` also mirrors into the legacy Phase 9 store so the
 /// `recall_memory` tool keeps honouring the user's choice during the migration window.
 #[tauri::command(rename_all = "camelCase")]
 pub fn set_memory_settings(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     request: SetMemorySettingsRequest,
 ) -> CommandResult<MemorySettings> {
     let settings = state
         .memory()
-        .set_settings(
+        .set_settings_with_disclosure(
             request.enabled,
             request.auto_accept_high_confidence,
             request.default_ttl_days,
+            request.auto_extraction_disclosure_accepted,
         )
         .map_err(memory_command_error)?;
-    if let Err(error) = state.advanced().memory.set_enabled(settings.enabled) {
-        return Err(CommandError::new("memory", error));
+    if !settings.enabled {
+        state.memory_maintenance().cancel();
     }
+    emit_memory_changed(&app);
     Ok(settings)
 }
 
 /// Kept for the existing settings surface: toggles only the enable flag.
 #[tauri::command(rename_all = "camelCase")]
 pub fn set_memory_enabled(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     enabled: bool,
 ) -> CommandResult<MemorySettings> {
@@ -1895,9 +2052,10 @@ pub fn set_memory_enabled(
             current.default_ttl_days,
         )
         .map_err(memory_command_error)?;
-    if let Err(error) = state.advanced().memory.set_enabled(settings.enabled) {
-        return Err(CommandError::new("memory", error));
+    if !settings.enabled {
+        state.memory_maintenance().cancel();
     }
+    emit_memory_changed(&app);
     Ok(settings)
 }
 
@@ -1910,6 +2068,9 @@ pub fn list_memories(
     limit: Option<u32>,
 ) -> CommandResult<MemoryPage> {
     let scope = MemoryScope::parse(&scope).map_err(memory_command_error)?;
+    MemoryScopeResolver::new(state.repository().projection())
+        .validate_management_scope(&scope)
+        .map_err(memory_command_error)?;
     let status = match status.as_deref() {
         Some(status) => MemoryStatus::parse(status).map_err(memory_command_error)?,
         None => MemoryStatus::Active,
@@ -1922,11 +2083,20 @@ pub fn list_memories(
 
 #[tauri::command]
 pub fn upsert_memory(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     request: UpsertMemoryRequest,
 ) -> CommandResult<MemoryUpsertOutcome> {
     let command = request.into_command().map_err(memory_command_error)?;
-    state.memory().upsert(command).map_err(memory_command_error)
+    MemoryScopeResolver::new(state.repository().projection())
+        .validate_management_scope(&command.scope)
+        .map_err(memory_command_error)?;
+    let outcome = state
+        .memory()
+        .upsert(command)
+        .map_err(memory_command_error)?;
+    emit_memory_changed(&app);
+    Ok(outcome)
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -1944,43 +2114,85 @@ pub fn list_memory_candidates(
 
 #[tauri::command(rename_all = "camelCase")]
 pub fn review_memory_candidate(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     candidate_id: String,
     decision: String,
 ) -> CommandResult<MemoryCandidateRecord> {
     let decision = CandidateDecision::parse(&decision).map_err(memory_command_error)?;
-    state
+    let outcome = state
         .memory()
         .review_candidate(&candidate_id, decision)
-        .map_err(memory_command_error)
+        .map_err(memory_command_error)?;
+    emit_memory_changed(&app);
+    Ok(outcome)
 }
 
 /// Soft-deletes one memory. `confirmationToken` must equal `memoryId`, matching the knowledge
 /// source and collection deletion contract.
 #[tauri::command(rename_all = "camelCase")]
 pub fn delete_memory(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     memory_id: String,
     confirmation_token: String,
 ) -> CommandResult<MemoryRecord> {
-    state
+    let outcome = state
         .memory()
         .delete(&memory_id, &confirmation_token)
-        .map_err(memory_command_error)
+        .map_err(memory_command_error)?;
+    emit_memory_changed(&app);
+    Ok(outcome)
 }
 
 /// Clears every active memory in one scope. `confirmationToken` must equal the canonical scope
 /// string, which the UI shows verbatim in the confirmation dialog.
 #[tauri::command(rename_all = "camelCase")]
 pub fn clear_memories(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     scope: String,
     confirmation_token: String,
 ) -> CommandResult<MemoryClearOutcome> {
     let scope = MemoryScope::parse(&scope).map_err(memory_command_error)?;
-    state
+    MemoryScopeResolver::new(state.repository().projection())
+        .validate_management_scope(&scope)
+        .map_err(memory_command_error)?;
+    let outcome = state
         .memory()
         .clear(&scope, &confirmation_token)
+        .map_err(memory_command_error)?;
+    emit_memory_changed(&app);
+    Ok(outcome)
+}
+
+fn emit_memory_changed(app: &tauri::AppHandle) {
+    static REVISION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let revision = REVISION.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    let _ = app.emit("memory:changed", json!({"revision": revision}));
+}
+
+#[tauri::command(rename_all = "camelCase")]
+pub fn get_memory_scopes(
+    state: State<'_, AppState>,
+    thread_id: Option<String>,
+) -> CommandResult<Vec<MemoryScopeOption>> {
+    match thread_id {
+        Some(thread_id) => MemoryScopeResolver::new(state.repository().projection())
+            .options(&thread_id)
+            .map_err(memory_command_error),
+        None => Ok(vec![MemoryScopeOption {
+            scope: "user".into(),
+            label: "用户（所有项目）".into(),
+        }]),
+    }
+}
+
+#[tauri::command]
+pub fn get_memory_diagnostics(state: State<'_, AppState>) -> CommandResult<MemoryDiagnostics> {
+    state
+        .memory_capture()
+        .diagnostics(&state)
         .map_err(memory_command_error)
 }
 
@@ -2028,14 +2240,27 @@ async fn run_dream_turn(
         Ok(settings) => settings,
         Err(error) => return DreamReport::failed(error),
     };
-    if !settings.dream_runnable() {
+    if !settings.dream_runnable()
+        || !state
+            .memory()
+            .settings()
+            .is_ok_and(|memory| memory.enabled && memory.auto_extraction_consent_version >= 2)
+    {
         return DreamReport::skipped();
     }
-    let memories = match state
-        .memory()
-        .maintenance_input(MAX_MAINTENANCE_INPUT_MEMORIES as u32)
+    let (host_scope, task_summaries, summary_ids) = match state.memory_capture().summary_for_dream()
     {
-        Ok(memories) => memories,
+        Ok(Some(batch)) => batch,
+        Ok(None) => return DreamReport::skipped(),
+        Err(error) => return DreamReport::failed(error),
+    };
+    let memories = match state.memory().list(
+        &host_scope,
+        MemoryStatus::Active,
+        None,
+        Some(MAX_MAINTENANCE_INPUT_MEMORIES as u32),
+    ) {
+        Ok(page) => page.items,
         Err(error) => return DreamReport::failed(error),
     };
     // No Provider means no Dream. That is not a failure: the offline half already ran, and the design
@@ -2052,11 +2277,7 @@ async fn run_dream_turn(
         }
     };
     let workspace = state.workspace_root();
-    let thread = match state
-        .repository()
-        .create_thread_in_workspace(&workspace)
-        .await
-    {
+    let thread = match state.repository().create_standalone_thread().await {
         Ok(thread) => thread,
         Err(error) => return DreamReport::failed(error),
     };
@@ -2094,7 +2315,7 @@ async fn run_dream_turn(
             return DreamReport::failed(error);
         }
     };
-    let prompt = build_maintenance_prompt(&memories, &[], now_ms);
+    let prompt = build_maintenance_prompt(&memories, &task_summaries, now_ms);
     let runtime = AgentRuntime::with_tools_and_approvals(
         state.runtime_repository(),
         tools,
@@ -2126,15 +2347,14 @@ async fn run_dream_turn(
     if cancellation.is_cancelled() {
         return DreamReport::cancelled();
     }
-    if let Err(error) = result {
-        return DreamReport::failed(error);
+    match result {
+        Ok(outcome) if outcome.state == TurnState::Completed => {}
+        Ok(_) => return DreamReport::failed("the maintenance turn did not complete"),
+        Err(error) => return DreamReport::failed(error),
     }
     let Some(raw) = last_assistant_text(state, &thread.id).await else {
         return DreamReport::failed("the maintenance turn produced no text to parse");
     };
-    // The host owns the scope: the model never names one. A background pass has no thread context, so
-    // user scope is the only honest choice.
-    let host_scope = MemoryScope::user();
     let drafts = match parse_proposals(&raw, &host_scope, &turn_id) {
         Ok(drafts) => drafts,
         Err(error) => return DreamReport::failed(error),
@@ -2150,8 +2370,16 @@ async fn run_dream_turn(
             Ok(CandidateOutcome::Pending { .. }) => report.pending += 1,
             // A draft identical to an existing memory is dropped silently; it is not a decision the
             // user needs to see.
-            Ok(CandidateOutcome::Deduplicated { .. }) => {}
-            Err(error) => report.error = Some(bound_failure(&error.to_string())),
+            Ok(CandidateOutcome::Deduplicated { .. } | CandidateOutcome::Suppressed { .. }) => {}
+            Err(error) => {
+                report.status = DreamStatus::Failed;
+                report.error = Some(bound_failure(error.code()));
+            }
+        }
+    }
+    if report.status == DreamStatus::Completed {
+        if let Err(error) = state.memory_capture().mark_dream_processed(&summary_ids) {
+            return DreamReport::failed(error);
         }
     }
     report
@@ -2307,8 +2535,11 @@ pub async fn run_memory_maintenance(
     state: State<'_, AppState>,
 ) -> CommandResult<MaintenanceReport> {
     let publisher: Arc<dyn EventPublisher> = Arc::new(TauriEventPublisher { app: app.clone() });
-    run_memory_maintenance_with_publisher(state.inner(), publisher, MaintenanceTrigger::Manual)
-        .await
+    let result =
+        run_memory_maintenance_with_publisher(state.inner(), publisher, MaintenanceTrigger::Manual)
+            .await;
+    emit_memory_changed(&app);
+    result
 }
 
 /// Cancels the in-flight run. Returns false when nothing was running.
@@ -2327,45 +2558,8 @@ const MEMORY_MAINTENANCE_POLL_SECS: u64 = 5;
 /// admission. A timer would have to be rebuilt on every settings change and could drift out of step
 /// with the runtime. The first tick is delayed, so a freshly started app never runs maintenance
 /// before its own setup has finished.
-pub fn spawn_memory_maintenance_scheduler(app: AppHandle) {
-    tauri::async_runtime::spawn(async move {
-        loop {
-            tokio::time::sleep(std::time::Duration::from_secs(MEMORY_MAINTENANCE_POLL_SECS)).await;
-            let (trigger, publisher) = {
-                let state = app.state::<AppState>();
-                let state = state.inner();
-                let service = state.memory_maintenance();
-                let settings = match service.settings() {
-                    Ok(settings) => settings,
-                    // A bad settings row must not spin the loop or spam the log: the manual command
-                    // and the settings surface are what the user can act on.
-                    Err(_) => continue,
-                };
-                let idle_since_ms = state.memory_maintenance_idle_since_ms().await;
-                let now_ms = crate::storage::now_ms();
-                let Some(trigger) = service.automatic_trigger(&settings, now_ms, idle_since_ms)
-                else {
-                    continue;
-                };
-                let publisher: Arc<dyn EventPublisher> =
-                    Arc::new(TauriEventPublisher { app: app.clone() });
-                (trigger, publisher)
-            };
-            // A run in flight makes the lease claim fail; that is the expected way two ticks cannot
-            // overlap, so the error is not worth logging.
-            let state_handle = app.state::<AppState>();
-            if let Err(error) =
-                run_memory_maintenance_with_publisher(state_handle.inner(), publisher, trigger)
-                    .await
-            {
-                let _ = app.state::<AppState>().logger().log(
-                    "error",
-                    "memory_maintenance_failed",
-                    serde_json::json!({"trigger": trigger.as_str(), "error": error.message}),
-                );
-            }
-        }
-    });
+pub fn spawn_memory_maintenance_scheduler(_app: AppHandle) {
+    // The former capture/Dream scheduler is retired with the SQLite memory implementation.
 }
 
 #[tauri::command]
@@ -3498,6 +3692,40 @@ async fn execute_turn(
     operation_guard: Option<ThreadOperationGuard>,
     publisher: Arc<dyn EventPublisher>,
 ) -> CommandResult<TurnOutcome> {
+    execute_turn_with_source(
+        app,
+        state,
+        request,
+        attachments,
+        workflow_id,
+        assigned_turn_id,
+        operation_guard,
+        publisher,
+        true,
+    )
+    .await
+}
+
+async fn execute_turn_with_source(
+    app: AppHandle,
+    state: &AppState,
+    request: RunTurnRequest,
+    attachments: Vec<ImageAttachment>,
+    workflow_id: Option<String>,
+    assigned_turn_id: Option<String>,
+    operation_guard: Option<ThreadOperationGuard>,
+    publisher: Arc<dyn EventPublisher>,
+    user_source: bool,
+) -> CommandResult<TurnOutcome> {
+    let capture_input: String = request.input.chars().take(2_000).collect();
+    let capture_buffer = Arc::new(std::sync::Mutex::new(MemoryCaptureBuffer::default()));
+    let publisher: Arc<dyn EventPublisher> = Arc::new(MemoryCapturePublisher {
+        inner: publisher,
+        buffer: capture_buffer.clone(),
+    });
+    if user_source {
+        state.memory_maintenance().cancel();
+    }
     let has_image_attachments = !attachments.is_empty();
     let thread_id = request.thread_id.clone();
     let project_workspace = state
@@ -3761,6 +3989,17 @@ async fn execute_turn(
             .record_turn(&goal_id, tokens, started.elapsed().as_millis() as u64);
     }
     state.finish_turn(&thread_id).await;
+    if let Ok(outcome) = &result {
+        capture_memory_outcome(
+            state,
+            &capture_input,
+            agent_mode,
+            user_source,
+            outcome,
+            &capture_buffer,
+        );
+        emit_memory_changed(&app);
+    }
     let _ = state.logger().log(
         if result.is_ok() { "info" } else { "error" },
         "turn_finished",
@@ -3799,6 +4038,12 @@ async fn execute_retry(
     publisher: Arc<dyn EventPublisher>,
     subagent_publishers: SubagentPublishers,
 ) -> CommandResult<TurnOutcome> {
+    let capture_buffer = Arc::new(std::sync::Mutex::new(MemoryCaptureBuffer::default()));
+    let publisher: Arc<dyn EventPublisher> = Arc::new(MemoryCapturePublisher {
+        inner: publisher,
+        buffer: capture_buffer.clone(),
+    });
+    state.memory_maintenance().cancel();
     let project_workspace = state
         .resolve_thread_workspace(&thread_id)
         .await
@@ -3832,6 +4077,7 @@ async fn execute_retry(
         .as_ref()
         .map(|message| message.text())
         .unwrap_or_default();
+    let retry_capture_input: String = retry_input.chars().take(2_000).collect();
     let advanced = state.advanced();
     let active_workflow_id = advanced
         .workflows
@@ -4022,6 +4268,16 @@ async fn execute_retry(
             .record_turn(&goal_id, tokens, started.elapsed().as_millis() as u64);
     }
     state.finish_turn(&thread_id).await;
+    if let Ok(outcome) = &result {
+        capture_memory_outcome(
+            state,
+            &retry_capture_input,
+            agent_mode,
+            true,
+            outcome,
+            &capture_buffer,
+        );
+    }
     let _ = state.logger().log(
         if result.is_ok() { "info" } else { "error" },
         "turn_finished",
@@ -4456,6 +4712,7 @@ pub async fn close_pty(state: State<'_, AppState>, session_id: String) -> Comman
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use std::collections::HashMap;
     use std::path::Path;
     use std::sync::{Arc, Mutex};
@@ -4467,6 +4724,7 @@ mod tests {
     use tokio::sync::mpsc;
     use tokio_util::sync::CancellationToken;
     use uuid::Uuid;
+    use serde_json::json;
 
     use super::{
         CRAFT_MODE_INSTRUCTIONS, CommandError, PROJECT_FREE_TOOL_NAMES, PreparedTurnTools,
@@ -4505,6 +4763,127 @@ mod tests {
     #[derive(Default)]
     struct RecordingPublisher {
         events: Mutex<Vec<AgentEventEnvelope>>,
+    }
+
+    #[test]
+    fn memory_capture_publisher_keeps_only_bounded_public_evidence() {
+        let delegate = Arc::new(RecordingPublisher::default());
+        let buffer = Arc::new(Mutex::new(MemoryCaptureBuffer::default()));
+        let publisher = MemoryCapturePublisher {
+            inner: delegate.clone(),
+            buffer: buffer.clone(),
+        };
+        publisher.publish(AgentEventEnvelope::new(AgentEvent::ToolCompleted {
+            thread_id: Uuid::new_v4().to_string(),
+            turn_id: Uuid::new_v4().to_string(),
+            call_id: Uuid::new_v4().to_string(),
+            name: "read_file".into(),
+            result: crate::protocol::ToolResult {
+                success: true,
+                output: "private tool output".into(),
+                metadata: json!({}),
+            },
+        }));
+        publisher.publish(AgentEventEnvelope::new(AgentEvent::TurnCompleted {
+            thread_id: Uuid::new_v4().to_string(),
+            turn_id: Uuid::new_v4().to_string(),
+            message: ChatMessage::text_message(MessageRole::Assistant, "公".repeat(3_000)),
+            usage: None,
+            started_at_ms: 1,
+            completed_at_ms: 2,
+            duration_ms: 1,
+        }));
+        let buffer = buffer.lock().unwrap();
+        assert_eq!(buffer.final_text.chars().count(), 2_000);
+        assert_eq!(buffer.tools, vec!["read_file success=true"]);
+        assert!(!buffer.tools.join(" ").contains("private"));
+        assert_eq!(delegate.events.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn memory_capture_hook_excludes_background_readonly_and_failed_turns() {
+        let data = tempfile::tempdir().unwrap();
+        let state =
+            AppState::with_credentials(data.path(), Arc::new(TestCredentials::default())).unwrap();
+        state
+            .memory()
+            .set_settings_with_disclosure(true, false, 0, true)
+            .unwrap();
+        let thread = state.repository().create_standalone_thread().await.unwrap();
+        let outcome = TurnOutcome {
+            schema_version: PROTOCOL_VERSION,
+            thread_id: thread.id,
+            turn_id: Uuid::new_v4().to_string(),
+            state: TurnState::Completed,
+            error: None,
+            started_at_ms: crate::storage::now_ms(),
+            completed_at_ms: crate::storage::now_ms(),
+            duration_ms: 0,
+        };
+        let buffer = Arc::new(Mutex::new(MemoryCaptureBuffer {
+            final_text: "已验证构建".into(),
+            tools: vec![],
+        }));
+        capture_memory_outcome(
+            &state,
+            "以后使用 pnpm",
+            AgentMode::Craft,
+            false,
+            &outcome,
+            &buffer,
+        );
+        capture_memory_outcome(
+            &state,
+            "以后使用 pnpm",
+            AgentMode::Ask,
+            true,
+            &outcome,
+            &buffer,
+        );
+        let failed = TurnOutcome {
+            state: TurnState::Failed,
+            ..outcome.clone()
+        };
+        capture_memory_outcome(
+            &state,
+            "以后使用 pnpm",
+            AgentMode::Craft,
+            true,
+            &failed,
+            &buffer,
+        );
+        assert_eq!(
+            state
+                .memory_capture()
+                .diagnostics(&state)
+                .unwrap()
+                .queued_jobs,
+            0
+        );
+        capture_memory_outcome(
+            &state,
+            "以后使用 pnpm",
+            AgentMode::Craft,
+            true,
+            &outcome,
+            &buffer,
+        );
+        capture_memory_outcome(
+            &state,
+            "以后使用 pnpm",
+            AgentMode::Craft,
+            true,
+            &outcome,
+            &buffer,
+        );
+        assert_eq!(
+            state
+                .memory_capture()
+                .diagnostics(&state)
+                .unwrap()
+                .queued_jobs,
+            1
+        );
     }
 
     #[test]
@@ -4720,6 +5099,7 @@ mod tests {
             agent_events: Arc::new(RecordingPublisher::default()),
             lifecycle_events: Arc::new(NoopSubagentPublisher),
             logger: None,
+            memory: None,
         };
         let tools = PreparedTurnTools::with_delegation(
             base_tools,
@@ -5067,21 +5447,21 @@ mod tests {
                 activate: true,
             })
             .unwrap();
-        state.switch_workspace(workspace.path()).await.unwrap();
+        let workspace_root = state.switch_workspace(workspace.path()).await.unwrap();
 
         let direct_project = state
             .repository()
-            .create_thread_in_workspace(workspace.path())
+            .create_thread_in_workspace(&workspace_root)
             .await
             .unwrap();
         let standalone = state.repository().create_standalone_thread().await.unwrap();
         let mailbox_project = state
             .repository()
-            .create_thread_in_workspace(workspace.path())
+            .create_thread_in_workspace(&workspace_root)
             .await
             .unwrap();
         for thread in [&direct_project, &standalone, &mailbox_project] {
-            seed_failed_turn(&state, &thread.id, workspace.path()).await;
+            seed_failed_turn(&state, &thread.id, &workspace_root).await;
         }
 
         let direct = execute_retry(
@@ -5263,14 +5643,16 @@ mod tests {
         let state = AppState::new_with_builtin_skills(data.path(), builtin.path()).unwrap();
         state.switch_workspace(workspace.path()).await.unwrap();
         let publisher = RecordingPublisher::default();
+        let thread = state
+            .repository()
+            .create_thread_in_workspace(&state.workspace_root())
+            .await
+            .unwrap();
 
-        let error = preflight_requested_or_active_workflow(
-            &state,
-            "thread-without-run",
-            Some("quality-assurance"),
-        )
-        .await
-        .unwrap_err();
+        let error =
+            preflight_requested_or_active_workflow(&state, &thread.id, Some("quality-assurance"))
+                .await
+                .unwrap_err();
 
         assert_eq!(error.code, "workflow_skill_preflight_failed");
         let details = error.details.as_ref().unwrap();
@@ -5283,7 +5665,7 @@ mod tests {
             state
                 .advanced()
                 .workflows
-                .current("thread-without-run")
+                .current(&thread.id)
                 .unwrap()
                 .is_none()
         );

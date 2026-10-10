@@ -14,9 +14,11 @@
 //!   raise the sensitivity level, never lower it.
 
 pub mod candidate;
+pub mod capture;
 pub mod entity;
 pub mod maintenance;
 pub mod policy;
+pub mod scope;
 pub mod service;
 
 pub use candidate::{CandidateDecision, CandidateDraft, CandidateOutcome, ConflictKind};

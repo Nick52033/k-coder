@@ -39,7 +39,7 @@ category: observability
    python <本 skill 目录>/scripts/triage_runtime_errors.py classify [--minutes 1440] [--all] [--verbose]
    ```
 
-   脚本读 `runtime.jsonl` 的全部 error 记录，按内置规则表自动分成三组输出：**需要修复（产品缺陷）/ 待人工判定 / 不是 bug**，每条带时间、会话、根因、源码证据和修复建议，末尾给总结论和复核入口。`--all` 扫全部历史，默认看 24 小时；`--verbose` 附注每条命中记录。规则表与脚本 `RULES` / `OBSERVATIONS` 一一对应，新增类别时两边同步改，别让脚本和文档给出两套结论。
+   脚本读 `runtime.jsonl` 的 error 记录，按规则表分成三组输出：**已确认需要修复 / 待人工判定 / 按设计或输入问题**。规则只能提出调查线索，不能仅凭历史 error 确认当前源码仍有缺陷；涉及版本和成败时须核对当前源码、运行版本及完整工具结果。`--all` 扫全部历史，默认看 24 小时；`--verbose` 附注命中记录。
 
 1. **时间窗过滤 error 级记录**（默认半小时；用户给别的窗口就用用户的）：
 
@@ -61,9 +61,9 @@ category: observability
 
    ### A. `turn_failed`：provider completed without text or a tool call
 
-   模型侧空响应，**不是 k-coder 对话 bug**。判定方法：看失败前最后一次 `provider_call_usage`——若 `details.reasoningOutputTokens` ≈ `usage.outputTokens`（模型把输出预算几乎全用于 reasoning），且模型是阶跃星辰（baseUrl `https://api.stepfun.com/step_plan/v1`）的 `step-5-preview` / `step-3.7-flash`，即可坐实。健康的 provider 失败长这样：HTTP 4xx/5xx、流中断；干净的 completed + 空内容只在该模型上见过。
+   空完成可能来自模型输出预算、协议适配或运行版本，应先列为待核对。读取失败前的 Provider 用量、响应终态和当前收尾源码，不能仅因模型名称或 reasoning 占比就排除适配器缺陷。
 
-   还要区分**部署版本行为**：源码 `src-tauri/src/agent/mod.rs` 已有空响应守卫（`MAX_EMPTY_RESPONSE_RETRIES=2`，先有界重试、仍空则 `finish_completed` + `empty_response_message()` 优雅收尾，不判整轮失败）。对比 `D:\apps\k-coder\k-coder.exe` 的 mtime 与源码 mtime：exe 早于源码改动时，运行中的仍是旧逻辑，`turn_failed` 红卡片会复现——这是部署滞后，不是代码缺陷。结论引导用户「重试」或换 `gpt-6-sol`（同 provider 下实测正常）。
+   涉及部署版本时，核对当前源码与实际构建版本；文件 mtime 只能提供线索，不能证明正在运行的进程包含某项修复。不要依赖这份文档中历史守卫次数或模型推荐来判断当前行为。
 
    ### B. `tool_failed`：tool execution denied: path must be relative…
 
@@ -71,32 +71,34 @@ category: observability
 
    ### C. `tool_failed`：run_command 有输出但 exitCode 非零
 
-   先在 Windows PowerShell 里原样复现该命令，看真实退出码，再下结论。两个高频模型侧原因：
+   先读取相关会话完整 `tool_result`，核对退出码、stderr 和失败汇总，不要仅凭有输出判定成功，也不要自动重跑可能写文件、修改系统或访问外部服务的历史命令。
 
-   - 命令里带 `2>$null` 把 rg 对不存在路径的报错吞了（模型把别的仓库的目录结构套到本仓库，rg 对缺失路径退出非零）。stdout 看着正常，退出码是真的失败。
-   - `rg … | Select-Object -First N` 扫描大目录时，接收端提前收手会终止 rg，PowerShell 进程退出码变 1（broken pipe）。行数是完整的，但退出码非零。
+   - **真实失败优先**：`test result: FAILED`、panic、失败断言必须列为待修根因调查，不能被管道或 `Finished test profile` 覆盖。
+   - **状态不明需核对**：Windows PowerShell 的 `2>&1 | Select-Object` 可能产生 `NativeCommandError`；构建和测试应直接运行，运行时已有有界输出。不能按输出关键词强制成功。
+   - **确认无匹配是正常结果**：只有形态可确认的 rg、退出码 1、完整空输出且无 stderr 才归为 `no_matches`；保留原始退出码。路径不存在、非法正则、错误抑制、复杂脚本和其他非零退出码仍保留失败。
+   - **历史现象不代表当前缺陷**：乱码、网关恢复失败等应核对源码和运行版本，不能凭旧日志直接宣称解码或回退缺失。
 
-   k-coder 的判定是**有意保守**：只对「无错误抑制、形状无歧义的 `rg … | Select-Object -First N`」判为 `bounded_output` 成功（`src-tauri/src/tools/command_diagnostics.rs` 的 `is_bounded_rg_search` / `is_unambiguous_rg_search`）；带 `2>$null`、分号串联、中间夹 `Where-Object` 的一律保持失败——否则模型永远学不到自己的路径写错了。所以这类 `tool_failed` **也不是判定 bug**，是模型命令自身的问题。
+   Shell 预检与安全评估互相独立：恢复提示不能授予权限，原始命令必须继续审计，不静默改写后重跑。
 
-4. **输出结论**。每条 error 一行：时间 + 事件 + 一句话根因；然后给「是否对话 bug」总判断和修复建议。没有代码缺陷就明说「无需修复」，不要把按设计行为包装成待修问题。
+4. **输出结论**。每条 error 一行：时间 + 事件 + 已确认原因或待核对项；然后给「是否已确认当前源码缺陷」和修复建议。明确区分已确认无须修改、证据不足和已确认需要修复，不能把未确认缺陷写成「没有缺陷」。
 
 ## 结论模板（照这个格式写给用户）
 
 ```text
 时间窗内 N 条 error，集中在会话 <threadId>（<最近活跃时间>）：
 
-1. HH:MM turn_failed「provider completed without text or a tool call」
-   最后一次调用 out=58 / thinking=56，模型 step-5-preview 把预算全用于 reasoning 后空完成
-   → 模型侧空响应，非对话 bug。部署 exe（14:18）早于源码空响应修复（15:52），跑的是旧逻辑。
+1. HH:MM tool_failed run_command
+   完整输出包含 test result: FAILED，16 项失败。
+   → 真实测试失败；待对照测试夹具、断言和当前源码定位根因，不能作为 Shell 噪声忽略。
 
 2. HH:MM tool_failed read_file 绝对路径
-   → 工作区沙箱按设计拒绝，非 bug。
+   → 工作区沙箱按设计拒绝；修正调用路径，不放松路径安全检查。
 
-结论：不是 k-coder 对话 bug。原因 1 换 gpt-6-sol 或点重试即可；该会话在用户切换模型后已自行完成。
+结论：已确认一类输入路径问题；测试失败尚需定位根因。日志本身不足以判断当前源码是否已修复，不重跑有副作用的历史命令。
 ```
 
 ## 注意
 
 - runtime.jsonl 可能含 `logs_cleared` 记录：用户手动清过日志时，窗口内无 error 不等于没发生错误，要如实说明。
-- 结论涉及「部署版本是否含某修复」时，必须对比 exe mtime 与源码 mtime / `git status`，别凭记忆断言。
+- 结论涉及「部署版本是否含某修复」时，核对构建版本和实际运行进程；exe 与源码 mtime / `git status` 只作线索，不是证明。
 - 涉及源码判定逻辑的结论，落到具体文件行（如 `src-tauri/src/tools/command_diagnostics.rs`），方便用户复核。

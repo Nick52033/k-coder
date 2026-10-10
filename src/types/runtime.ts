@@ -855,11 +855,37 @@ export interface MemorySettings {
   enabled: boolean;
   autoAcceptHighConfidence: boolean;
   defaultTtlDays: number;
+  autoExtractionConsentVersion: number;
+  captureAfterMs: number | null;
 }
+export interface ProjectMemoryFile { name: string; path: string; sizeBytes: number; }
+export interface ProjectMemoryWorkspace { id: string; label: string; files: ProjectMemoryFile[]; }
+export interface ProjectMemoryContent { workspaceId: string; path: string; content: string; }
+export interface MemoryScopeOption { scope: MemoryScope; label: string; }
+export interface MemoryDiagnostics {
+  schemaVersion: number;
+  queuedJobs: number;
+  runningJobs: number;
+  completedJobs: number;
+  failedJobs: number;
+  skippedJobs: number;
+  dreamPendingSummaries: number;
+  lastCaptureAtMs: number | null;
+  lastExtractionAtMs: number | null;
+  lastCandidateCount: number;
+  lastAcceptedCount: number;
+  lastPendingCount: number;
+  lastSuppressedCount: number;
+  lastReason: string | null;
+  providerUnavailableReason: string | null;
+  recoveryError: string | null;
+}
+export interface MemoryChanged { revision: number; }
 export interface SetMemorySettingsRequest {
   enabled: boolean;
   autoAcceptHighConfidence: boolean;
   defaultTtlDays: number;
+  autoExtractionDisclosureAccepted?: boolean;
 }
 export interface MemoryRecord {
   id: string;
@@ -1207,6 +1233,14 @@ export interface LogRecord {
   threadTitle: string | null;
 }
 
+export interface LogStorage {
+  directory: string;
+  filePath: string;
+  defaultDirectory: string;
+  customDirectory: string | null;
+  warning: string | null;
+}
+
 export interface LogQueryResult {
   records: LogRecord[];
   total: number;
@@ -1272,4 +1306,16 @@ export interface MobileStatus {
   /** 已提交、等待桌面端确认的配对请求；与 `pairing` 的生命周期无关。 */
   pendingPairings: MobilePendingPairingView[];
   devices: MobileDeviceView[];
+}
+
+export interface WeixinStatus {
+  running: boolean;
+  phase: string;
+  qrCode: string | null;
+  qrImageContent: string | null;
+  threadId: string | null;
+  remembered: boolean;
+  autoConnect: boolean;
+  owner: string | null;
+  error: string | null;
 }

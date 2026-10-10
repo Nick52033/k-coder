@@ -239,10 +239,101 @@ pub fn require_confirmation(expected: &str, provided: &str) -> Result<(), Memory
     Ok(())
 }
 
+pub(crate) fn explicitly_global_preference(user_text: &str, content: &str) -> bool {
+    let content = content.trim().to_lowercase();
+    if content.is_empty() || user_text.contains(['`', '"', '\'', '“', '”', '‘', '’', '「', '」'])
+    {
+        return false;
+    }
+    user_text.lines().any(|line| {
+        let line = line.trim().to_lowercase();
+        if line.starts_with('>') {
+            return false;
+        }
+        line.split(['。', '！', '？', ';', '；', '.', '!', '?', ',', '，'])
+            .any(|clause| {
+                clause.contains(&content)
+                    && ["记住", "记忆", "偏好", "默认", "remember", "prefer"]
+                        .iter()
+                        .any(|marker| clause.contains(marker))
+                    && [
+                        "全局",
+                        "所有项目",
+                        "全部项目",
+                        "以后默认",
+                        "今后默认",
+                        "all projects",
+                        "globally",
+                        "global preference",
+                        "always by default",
+                    ]
+                    .iter()
+                    .any(|marker| clause.contains(marker))
+                    && ![
+                        "不要",
+                        "不想",
+                        "不应",
+                        "不能",
+                        "不需要",
+                        "不用",
+                        "别",
+                        "取消",
+                        "仅",
+                        "只在",
+                        "只对",
+                        "不是",
+                        "示例",
+                        "例子",
+                        "引用",
+                        "假设",
+                        "don't",
+                        "do not",
+                        "not ",
+                        "never",
+                        "only ",
+                        "example",
+                        "quote",
+                    ]
+                    .iter()
+                    .any(|marker| clause.contains(marker))
+            })
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::memory::{MemoryScopeKind, MemoryStatus};
+
+    #[test]
+    fn global_confirmation_is_explicit_content_bound_and_conservative() {
+        for text in [
+            "请全局记住偏好简短回答",
+            "所有项目都记住偏好简短回答",
+            "以后默认偏好简短回答",
+        ] {
+            assert!(explicitly_global_preference(text, "偏好简短回答"));
+        }
+        for text in [
+            "不要全局记住偏好简短回答",
+            "只在此项目记住偏好简短回答",
+            "不要在所有项目记住偏好简短回答",
+            "示例：请全局记住偏好简短回答",
+            "引用：请全局记住偏好简短回答",
+            "请全局记住其他内容。偏好简短回答",
+            "> 请全局记住偏好简短回答",
+            "用户说“请全局记住偏好简短回答”",
+            "请记住偏好简短回答",
+            "```\n请全局记住偏好简短回答\n```",
+            "请记住偏好简短回答\n`以后默认`",
+            "请全局记住其他内容，当前项目偏好简短回答",
+        ] {
+            assert!(
+                !explicitly_global_preference(text, "偏好简短回答"),
+                "{text}"
+            );
+        }
+    }
 
     #[test]
     fn default_ttl_follows_memory_type_then_settings() {

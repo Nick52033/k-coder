@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { RefreshCw, Trash2, X } from "lucide-react";
-import { clearLogs, readLogs } from "../api/runtime";
-import type { LogLevel, LogRecord } from "../types/runtime";
+import { FolderOpen, RefreshCw, RotateCcw, Trash2, X } from "lucide-react";
+import { chooseLogDirectory, clearLogs, getLogStorage, readLogs, resetLogDirectory } from "../api/runtime";
+import type { LogLevel, LogRecord, LogStorage } from "../types/runtime";
+import { toUserFacingPath } from "../lib/path";
 import { BrandMark } from "./BrandMark";
 
 const LEVELS: Array<{ value: LogLevel | ""; label: string }> = [
@@ -51,6 +52,7 @@ export function LogViewerDialog({ onClose }: LogViewerDialogProps) {
   const [error, setError] = useState("");
   const [confirmClear, setConfirmClear] = useState(false);
   const [notice, setNotice] = useState("");
+  const [storage, setStorage] = useState<LogStorage | null>(null);
   const busy = useRef(false);
 
   async function load() {
@@ -59,6 +61,7 @@ export function LogViewerDialog({ onClose }: LogViewerDialogProps) {
     setLoading(true);
     setError("");
     try {
+      setStorage(await getLogStorage());
       const result = await readLogs({
         level: level || undefined,
         search: search.trim() || undefined,
@@ -70,6 +73,30 @@ export function LogViewerDialog({ onClose }: LogViewerDialogProps) {
       setError(String(reason));
       setRecords([]);
       setTotal(0);
+    } finally {
+      busy.current = false;
+      setLoading(false);
+    }
+  }
+
+  async function changeDirectory(reset = false) {
+    if (busy.current) return;
+    busy.current = true;
+    setLoading(true);
+    setError("");
+    setNotice("");
+    try {
+      const result = reset ? await resetLogDirectory() : await chooseLogDirectory();
+      if (!result) return;
+      setStorage(result);
+      setRecords([]);
+      setTotal(0);
+      setNotice(reset ? "已恢复默认日志目录，原目录历史日志保留。" : "新日志目录已立即生效，旧目录历史日志保留，不搬移、不删除。");
+      const logs = await readLogs({ level: level || undefined, search: search.trim() || undefined, limit });
+      setRecords(logs.records);
+      setTotal(logs.total);
+    } catch (reason) {
+      setError(String(reason));
     } finally {
       busy.current = false;
       setLoading(false);
@@ -144,6 +171,25 @@ export function LogViewerDialog({ onClose }: LogViewerDialogProps) {
           </button>
         </header>
 
+        <div className="log-storage-panel">
+          <div className="log-storage-location">
+            <span className="log-storage-label">存储目录 · {storage?.customDirectory ? "自定义" : "默认"}</span>
+            <code title={storage ? toUserFacingPath(storage.filePath) : ""}>
+              {storage ? toUserFacingPath(storage.directory) : "正在读取目录…"}
+            </code>
+            <span className="log-storage-hint">runtime.jsonl · 修改后立即生效，历史日志保留在原目录</span>
+          </div>
+          <div className="log-storage-actions">
+            <button className="secondary-button" type="button" disabled={loading || confirmClear || !storage} onClick={() => void changeDirectory()}>
+              <FolderOpen size={15} />更改目录
+            </button>
+            <button className="secondary-button" type="button" disabled={loading || confirmClear || !storage?.customDirectory} onClick={() => void changeDirectory(true)} title={storage ? toUserFacingPath(storage.defaultDirectory) : ""}>
+              <RotateCcw size={15} />恢复默认
+            </button>
+          </div>
+          {storage?.warning && <p className="settings-error" role="alert">{storage.warning}</p>}
+        </div>
+
         <div className="log-viewer-toolbar">
           <label className="log-viewer-field">
             <span>级别</span>
@@ -200,7 +246,7 @@ export function LogViewerDialog({ onClose }: LogViewerDialogProps) {
           {notice && <p role="status">{notice}</p>}
           {confirmClear && (
             <div className="log-clear-confirm" role="group" aria-label="确认清理运行日志">
-              <p>将永久清理所有级别的本地运行日志及轮转文件，不受当前筛选条件限制。对话历史不受影响。</p>
+              <p>将永久清理当前目录中所有级别的本地运行日志及轮转文件，不受当前筛选条件限制。其他目录的日志和对话历史不受影响。</p>
               <button type="button" className="secondary-button" disabled={loading} onClick={() => setConfirmClear(false)}>取消</button>
               <button type="button" className="danger-button" disabled={loading} onClick={() => void clear()}>确认清理</button>
             </div>

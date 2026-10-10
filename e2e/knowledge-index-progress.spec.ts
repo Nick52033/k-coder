@@ -108,7 +108,7 @@ test("knowledge page renders live index progress and metrics", async ({ page }) 
           case "get_embedding_settings":
             return { provider: "siliconflow", endpoint: "https://api.siliconflow.cn/v1/embeddings", model: "BAAI/bge-m3", semanticEnabled: false, encodingFormat: "float", batchSize: 16, timeoutMs: 30000, maxVectorScanChunks: 10000, modelMaxInputTokens: 8192, vectorDimension: 0, embeddingConfigured: false, embeddingStatus: "lexical_only" };
           case "list_knowledge_collections":
-            return [collection];
+            return (window as unknown as { __knowledgeEmpty?: boolean }).__knowledgeEmpty ? [] : [collection];
           case "list_knowledge_sources":
             return [source];
           case "get_knowledge_metrics":
@@ -141,7 +141,18 @@ test("knowledge page renders live index progress and metrics", async ({ page }) 
   await page.locator('button[aria-label="设置"]:visible').click();
   await expect(settings).toBeVisible();
   await settings.getByRole("button", { name: /^知识库/ }).click();
-  await expect(settings.getByRole("heading", { name: "运行指标", exact: true })).toBeVisible();
+  const guide = settings.getByRole("navigation", { name: "知识库使用步骤" });
+  await expect(guide).toBeVisible();
+  await expect(guide.getByRole("button", { name: /试搜验证/ })).toHaveAttribute("aria-current", "step");
+  await guide.getByRole("button", { name: /创建集合/ }).click();
+  await expect(settings.getByLabel("Collection 名称")).toBeFocused();
+  await guide.getByRole("button", { name: /添加文件/ }).click();
+  await expect(settings.getByRole("button", { name: "选择文件", exact: true })).toBeFocused();
+  await guide.getByRole("button", { name: /试搜验证/ }).click();
+  await expect(settings.getByLabel("知识库检索关键词")).toBeFocused();
+  await expect(settings.locator("details").filter({ has: page.locator("summary", { hasText: "语义检索" }) })).not.toHaveAttribute("open", "");
+  await expect(settings.getByText("已索引切片")).toBeHidden();
+  await settings.locator("summary").filter({ hasText: "运行指标" }).click();
   await expect(settings.getByText("已索引切片")).toBeVisible();
 
   await page.evaluate(() => {
@@ -179,4 +190,16 @@ test("knowledge page renders live index progress and metrics", async ({ page }) 
     clientWidth: document.documentElement.clientWidth,
   }));
   expect(dimensions.scrollWidth).toBeLessThanOrEqual(dimensions.clientWidth + 1);
+  const contentDimensions = await settings.locator(".settings-content").evaluate((element) => ({ scrollWidth: element.scrollWidth, clientWidth: element.clientWidth }));
+  expect(contentDimensions.scrollWidth).toBeLessThanOrEqual(contentDimensions.clientWidth + 1);
+
+  await page.evaluate(() => { (window as unknown as { __knowledgeEmpty?: boolean }).__knowledgeEmpty = true; });
+  await settings.getByRole("button", { name: /^外观/ }).click();
+  await settings.getByRole("button", { name: /^知识库/ }).click();
+  await expect(settings.getByText("先创建一个集合", { exact: true })).toBeVisible();
+  await expect(guide.getByRole("button", { name: /创建集合/ })).toHaveAttribute("aria-current", "step");
+  await expect(guide.getByRole("button", { name: /添加文件/ })).toBeDisabled();
+  await expect(settings.getByText("从创建第一个集合开始；本地全文检索无需配置 API Key。")).toBeVisible();
+  await guide.getByRole("button", { name: /创建集合/ }).click();
+  await expect(settings.getByLabel("Collection 名称")).toBeFocused();
 });

@@ -30,7 +30,6 @@ import datetime
 import json
 import os
 import sys
-import re
 
 
 # ── 分类规则表 ────────────────────────────────────────────────────────────
@@ -38,7 +37,7 @@ import re
 # verdict 取值：
 #   bug      产品缺陷，需要改代码
 #   not-bug  按设计 / 模型侧 / 环境侧，无需改代码
-#   review   规则没覆盖到，交给人判，不要默认当 bug
+#   review   证据不足或需要核对当前源码/运行版本，不能自动排除或确认缺陷
 
 REPLACEMENT_CHAR = "\ufffd"
 
@@ -58,7 +57,17 @@ PS_SYNTAX_MARKERS = (
     "表达式或语句中包含意外的标记",
 )
 
-TEST_NOISE_MARKERS = (
+TEST_FAILURE_MARKERS = (
+    "test result: FAILED",
+    "panicked at",
+    "AssertionError",
+    "assertion failed",
+    "assertion `",
+    "FAILED tests/",
+    "error: test failed",
+)
+
+TEST_CONTEXT_MARKERS = (
     "toBeVisible",
     "Timeout:",
     "element(s) not found",
@@ -77,8 +86,7 @@ TEST_NOISE_MARKERS = (
 
 
 def has_replacement_chars(text: str) -> bool:
-    """from_utf8_lossy 对非 UTF-8 字节（中文 Windows 上 PowerShell 的 GBK stderr）
-    会写成 U+FFFD；一条输出里出现多个替换符基本可断定是解码问题，不是原文。"""
+    """检测替换字符，只作为编码待核对信号，不推断当前解码实现。"""
     return text.count(REPLACEMENT_CHAR) >= 2
 
 
@@ -90,16 +98,23 @@ def _match(event: str, text: str, *needles: str) -> bool:
 RULES: list[dict] = [
     {
         "id": "B1",
-        "verdict": "bug",
-        "title": "移动网关恢复失败：绑定地址失效后既不回退也不提示",
-        "detail": "restore_on_startup 只在 bind 失败时写日志；resolve_bind_ip 只校验"
-                  " IP 字面量是否属于回环/私网，不校验是否真的是本机网卡地址，"
-                  "于是失效地址（如 WSL 虚拟网卡）能过校验但必然 bind 失败，"
-                  "用户侧只看到「未运行」，拿不到原因。",
-        "evidence": "src-tauri/src/mobile/mod.rs:192、src-tauri/src/mobile/server.rs:172",
-        "fix": "start() bind 失败时回退 loopback 并持久化；"
-               "或把失败原因透出到 MobileStatus 供设置页展示。",
+        "verdict": "review",
+        "title": "移动网关恢复失败：需核对绑定原因和运行版本",
+        "detail": "日志证明当时恢复失败，不证明当前源码仍缺少回退或提示。"
+                  "应核对绑定错误、后续回退事件、修复提交与实际运行版本。",
+        "evidence": "src-tauri/src/mobile/mod.rs、src-tauri/src/mobile/server.rs",
+        "fix": "先确认是否已经修复并部署；仅仍可复现时修改绑定回退或错误提示。",
         "match": lambda event, text: "mobile.gateway.restore_failed" in event,
+    },
+    {
+        "id": "R1",
+        "verdict": "review",
+        "title": "真实测试失败：不能作为命令噪声忽略",
+        "detail": "输出包含失败断言、panic 或测试失败汇总。即使命令使用 PowerShell 管道，"
+                  "也不能覆盖这些失败证据；仍需对照测试、源码和环境判断根因。",
+        "evidence": "session tool_result 的完整输出、exitCode 与失败测试名",
+        "fix": "定位失败测试并修复源码、夹具或过时断言，再只运行受影响测试。",
+        "match_record": lambda record: has_test_failure(record),
     },
     {
         "id": "N1",
@@ -115,7 +130,7 @@ RULES: list[dict] = [
         "title": "本地插件未启用被拒绝",
         "detail": "按设计拒绝未启用的插件，需要用户在设置里启用后才能调用。",
         "evidence": "extensions 插件加载逻辑",
-        "match": lambda event, text: _match(event, text, "is not enabled", "plugin"),
+        "match": lambda event, text: "plugin" in text.lower() and "is not enabled" in text.lower(),
     },
     {
         "id": "N3",
@@ -147,18 +162,19 @@ RULES: list[dict] = [
     },
     {
         "id": "N6",
-        "verdict": "not-bug",
-        "title": "Provider 返回 HTTP 错误",
-        "detail": "账号实名认证、配额、限流或服务端故障，属供应商侧；换模型或供应商即可。",
+        "verdict": "review",
+        "title": "Provider 返回 HTTP 错误：需核对账号、请求与服务状态",
+        "detail": "实名认证、配额、限流通常由账号或供应商处理，但 HTTP 错误也可能由请求协议"
+                  "或配置引起，不能仅凭错误正文排除产品缺陷。",
         "evidence": "fields.status / retryAfterMs 已随记录落库",
         "match": lambda event, text: _match(event, text, "provider returned http"),
     },
     {
         "id": "N7",
-        "verdict": "not-bug",
-        "title": "模型空响应（completed 但既无文本也无工具调用）",
-        "detail": "模型把输出预算几乎全用于 reasoning 后空完成。源码已有空响应守卫，"
-                  "若部署 exe 早于源码改动则为部署滞后，不是代码缺陷。",
+        "verdict": "review",
+        "title": "模型空响应：需核对 Provider 用量、收尾逻辑和运行版本",
+        "detail": "completed 没有可见内容可能来自模型输出预算、协议适配或旧版本行为。"
+                  "需读取相关会话和当前源码，不能根据历史规则断言已有守卫或不是缺陷。",
         "evidence": "src-tauri/src/agent/mod.rs MAX_EMPTY_RESPONSE_RETRIES",
         "match": lambda event, text: "completed without text or a tool call" in text,
     },
@@ -181,18 +197,27 @@ RULES: list[dict] = [
     {
         "id": "N10",
         "verdict": "not-bug",
-        "title": "命令自身失败：无匹配、路径不存在、正则不合法",
-        "detail": "rg 退出码 1（无命中）、模型套用了别的仓库目录、正则写错，均属模型侧命令问题。",
+        "title": "命令自身失败：路径不存在或正则不合法",
+        "detail": "命令报告不存在的目录或非法正则，应修正输入；不能把这些错误当作搜索无匹配。",
         "evidence": "run_command 退出码与 stderr",
         "match": lambda event, text: _match(
             event, text,
-            "no matches (exit code 1)",
-            "command produced no output and exited with code",
             "系统找不到指定的文件",
             "未能找到路径",
             "regex parse error",
             "unclosed character class",
         ),
+    },
+    {
+        "id": "N16",
+        "verdict": "review",
+        "title": "历史搜索未匹配提示：需核对原始结果与运行版本",
+        "detail": "仅有 no matches 提示不能证明命令形态、完整空输出或 stderr 均符合条件。"
+                  "当前工具对确认的无匹配返回 success=true 并保留 exitCode=1，"
+                  "但历史失败日志不会因此消失，也不能据此确认安装端已修复。",
+        "evidence": "session tool_result 完整输出、metadata 与原始 command",
+        "fix": "核对真实退出码、命令形态及 stderr；不要将路径、正则错误或复杂脚本强制转为成功。",
+        "match": lambda event, text: _match(event, text, "no matches (exit code 1)"),
     },
     {
         "id": "N11",
@@ -212,54 +237,49 @@ RULES: list[dict] = [
     },
     {
         "id": "N13",
-        "verdict": "not-bug",
-        "title": "测试运行自身的输出与退出码",
-        "detail": "Playwright / vite / pnpm 的 stderr 与断言失败被当成 error 记录，属测试侧噪声。",
-        "evidence": "run_command output 片段",
-        "match": lambda event, text: any(marker in text for marker in TEST_NOISE_MARKERS),
-    },
-    {
-        "id": "N14",
-        "verdict": "not-bug",
-        "title": "命令有输出但退出码非零（PowerShell 管道/串联/重定向造成的伪失败）",
-        "detail": "stdout 已经拿到想要的内容，退出码却非零：PowerShell 里 `2>&1` 会把原生命令的 stderr "
-                  "并进输出流并记一条 NativeCommandError，`;` 串联后以最后一条的退出码收尾，"
-                  "`| Select-Object -First N` 提前收手还会掐断上游进程。"
-                  "k-coder 有意只对「无错误抑制、形状无歧义的 rg … | Select-Object -First N」判成功，"
-                  "带重定向、错误抑制、串联的一律保持失败，否则模型永远学不到自己的命令写错了。",
-        "evidence": "src-tauri/src/tools/command_diagnostics.rs is_bounded_rg_search / is_unambiguous_rg_search",
-        "fix": "无需改代码。模型侧应拆成单条命令、去掉 2>&1 与 `;` 串联，或改用 Read/Grep 类工具。",
-        "match_record": lambda record: is_nonzero_exit_with_output(record),
+        "verdict": "review",
+        "title": "测试或构建上下文：输出不足以判定根因",
+        "detail": "测试命令和 locator 上下文不是成功证据。需核对完整汇总和真实退出码，"
+                  "区分失败测试、基础设施错误与 Shell 状态误判。",
+        "evidence": "session tool_result 完整输出与 exitCode",
+        "match_record": lambda record: any(
+            marker in record_output(record) for marker in TEST_CONTEXT_MARKERS
+        ),
     },
     {
         "id": "N15",
         "verdict": "not-bug",
         "title": "模型把 bash heredoc 带到 PowerShell（python - <<'PY'）",
-        "detail": "PowerShell 没有 heredoc 语法，命令在解析期就失败。属模型侧命令问题；"
-                  "这类记录的 stderr 是中文报错，常同时命中 B2 解码缺陷，但主因仍是命令写错。",
-        "evidence": "fields.arguments.command 含 <<；stderr 为 PowerShell ParserError",
-        "fix": "无需改代码。模型侧改用 WriteFile 工具或单行 python -c。",
-        "match_record": lambda record: (
-            record.get("event") == "tool_failed"
-            and "<<" in str((record.get("fields", {}).get("arguments") or {}).get("command") or "")
-        ),
+        "detail": "PowerShell 不支持 Bash 的 heredoc 写法，命令在解析期或预检被拒绝。"
+                  "若输出还含替换字符，另行核对编码和运行版本，不能断言当前源码有解码缺陷。",
+        "evidence": "run_command 的 PowerShell heredoc 诊断提示",
+        "fix": "多行 Python 使用脚本文件，单行使用 python -c；不要原样重试。",
+        "match": lambda event, text: "PowerShell 不支持 Bash 的 python" in text,
+    },
+    {
+        "id": "N14",
+        "verdict": "review",
+        "title": "命令有输出但状态失败：需核对实际退出码",
+        "detail": "输出、管道或 stderr 均不能单独证明成功。PowerShell 可能误报原生命令状态，"
+                  "也可能保留了真实测试、IO 或语法失败；必须核对完整工具结果。",
+        "evidence": "session tool_result.metadata.exitCode / state / outputChunks",
+        "fix": "优先核对原程序退出码；构建测试直接运行，不追加 2>&1 或截取管道。"
+               "不要自动重跑有副作用的历史命令或按输出关键词强制成功。",
+        "match_record": lambda record: is_nonzero_exit_with_output(record),
     },
 ]
 
 
-# ── 伴随缺陷（不决定那次调用为什么失败，但确实是产品问题）────────────────────
-# 这些规则单独成表：它们命中的记录已有主因，若并进主表会把「模型命令写错」
-# 误报成「解码 bug 导致的失败」，两头都对不上。
+# 伴随观察独立计数，不把输出损坏直接判成当前源码缺陷或失败主因。
 OBSERVATIONS: list[dict] = [
     {
         "id": "B2",
-        "verdict": "bug",
-        "title": "PowerShell 中文报错被按 UTF-8 解码，原文变成乱码",
-        "detail": "execution.rs 用 String::from_utf8_lossy 直接解码子进程输出，未回退到系统 ANSI 代码页"
-                  "（中文 Windows 为 CP936/GBK），于是 PowerShell 的原生报错读不出来，"
-                  "模型和人都看不出这次失败的真实原因。",
-        "evidence": "src-tauri/src/execution.rs:853、src-tauri/src/execution.rs:1439",
-        "fix": "解码失败时按当前 ANSI 代码页重试，或让 PowerShell 以 UTF-8 输出。",
+        "verdict": "review",
+        "title": "命令输出含替换字符：需核对解码链路和运行版本",
+        "detail": "历史输出存在 U+FFFD 替换字符，但也可能是上游输出或旧版本解码造成。"
+                  "不能据此断言当前源码仍使用错误解码方式。",
+        "evidence": "src-tauri/src/execution.rs OutputDecoder 与原始会话输出",
+        "fix": "确认当前运行版本是否包含解码修复；仍复现时用非敏感输出定位字节来源。",
         "match": lambda event, text: has_replacement_chars(text),
     },
 ]
@@ -268,24 +288,31 @@ UNMATCHED: dict = {
     "id": "R0",
     "verdict": "review",
     "title": "规则未覆盖，需人工判定",
-    "detail": "新出现的错误形态。先按 errors / session 子命令复现，再决定是补规则还是修代码。",
+    "detail": "新出现的错误形态。先按 errors / session 子命令读取相关记录，再核对源码和运行版本。",
     "evidence": "",
-    "fix": "补规则或修代码，二选一，别把未判定项直接算成 bug。",
+    "fix": "依据根因修规则或源码，不把未判定项直接算成 bug，也不自动重跑历史命令。",
 }
 
-# 会让原生命令退出码偏离「命令本身成功与否」的 PowerShell 写法。
-EXIT_CODE_SHIFTING = ("2>&1", "2>$null", ";", "|", "&&", "||", ">", "-ErrorAction", "$(", "if (")
+def as_dict(value: object) -> dict:
+    return value if isinstance(value, dict) else {}
+
+
+def record_output(record: dict) -> str:
+    return str(as_dict(record.get("fields")).get("output") or "")
+
+
+def has_test_failure(record: dict) -> bool:
+    return record.get("event") == "tool_failed" and any(
+        marker in record_output(record) for marker in TEST_FAILURE_MARKERS
+    )
 
 
 def is_nonzero_exit_with_output(record: dict) -> bool:
-    """run_command 拿到了输出却仍被判 failed：退出码被管道/串联/重定向带偏。"""
     if record.get("event") != "tool_failed":
         return False
-    fields = record.get("fields", {})
-    command = (fields.get("arguments") or {}).get("command")
-    if not command or not fields.get("output"):
-        return False
-    return any(token in command for token in EXIT_CODE_SHIFTING)
+    fields = as_dict(record.get("fields"))
+    command = as_dict(fields.get("arguments")).get("command")
+    return bool(command and record_output(record))
 
 
 VERDICT_LABEL = {
@@ -295,8 +322,8 @@ VERDICT_LABEL = {
 }
 
 
-def record_text(record: dict) -> str:
-    fields = record.get("fields", {})
+def record_text(record: dict, include_command: bool = True) -> str:
+    fields = as_dict(record.get("fields"))
     parts = [
         str(fields.get("message") or ""),
         str(fields.get("output") or ""),
@@ -305,18 +332,15 @@ def record_text(record: dict) -> str:
         str(fields.get("tool") or ""),
     ]
     arguments = fields.get("arguments")
-    if isinstance(arguments, dict):
-        # 命令原文也要参与匹配：PowerShell 对 heredoc、bash 管道的报错是中文，
-        # 被 B2 解码问题搅成乱码后标记匹配不上，只能靠命令本身识别。
+    if include_command and isinstance(arguments, dict):
         parts.append(str(arguments.get("command") or ""))
     return "\n".join(parts)
 
 
 def classify_record_with_observations(record: dict) -> tuple[dict, list[dict]]:
-    """返回 (主因规则, 伴随缺陷规则列表)。主因解释这次调用为什么失败，
-    伴随缺陷是同一批记录里另有的产品问题，两者不相加。"""
-    event = record.get("event", "")
-    text = record_text(record)
+    """返回 (主因规则, 伴随观察)，不把历史现象当作当前源码缺陷。"""
+    event = record.get("event") or ""
+    text = record_text(record, include_command=False)
     primary = UNMATCHED
     for rule in RULES:
         if rule.get("match_record") is not None:
@@ -326,7 +350,10 @@ def classify_record_with_observations(record: dict) -> tuple[dict, list[dict]]:
         elif rule["match"](event, text):
             primary = rule
             break
-    extras = [rule for rule in OBSERVATIONS if rule["match"](event, text)]
+    extras = [
+        rule for rule in OBSERVATIONS
+        if record.get("event") == "tool_failed" and rule["match"](event, record_output(record))
+    ]
     return primary, extras
 
 RUNTIME_ROOT = os.path.join(
@@ -364,7 +391,7 @@ def fmt_time(ms: int) -> str:
 
 
 def clip(text: str, limit: int = MAX_TEXT) -> str:
-    text = text.replace("\r\n", "\\n").replace("\n", "\\n")
+    text = str(text or "").replace("\r\n", "\\n").replace("\n", "\\n")
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
@@ -374,10 +401,10 @@ def print_group(group: dict, verbose: bool = False) -> None:
     times = [r.get("timestampMs", 0) for r in records]
     threads: list[str] = []
     for record in records:
-        thread = record.get("fields", {}).get("threadId") or "(无 threadId)"
+        thread = as_dict(record.get("fields")).get("threadId") or "(无 threadId)"
         if thread not in threads:
             threads.append(thread)
-    tag = "（伴随缺陷，不决定上面那些条目的主因）" if group.get("cooccurring") else ""
+    tag = "（伴随观察，不重复计入主因）" if group.get("cooccurring") else ""
     print(f"\n[{rule['id']}]{tag} {rule['title']}  ×{len(records)}")
     print(f"    时间：{fmt_time(min(times))} ~ {fmt_time(max(times))}"
           f"   会话：{', '.join(threads[:3])}{' 等' if len(threads) > 3 else ''}")
@@ -391,7 +418,7 @@ def print_group(group: dict, verbose: bool = False) -> None:
         print(f"    处理：{rule['fix']}")
     if verbose:
         for record in records:
-            fields = record.get("fields", {})
+            fields = as_dict(record.get("fields"))
             print(f"      - {fmt_time(record.get('timestampMs', 0))}"
                   f"  {record.get('event')}  {fields.get('tool') or ''}"
                   f"  {clip(record_text(record), 90)}")
@@ -414,6 +441,8 @@ def cmd_classify(args: argparse.Namespace) -> int:
             try:
                 record = json.loads(line)
             except json.JSONDecodeError:
+                continue
+            if not isinstance(record, dict):
                 continue
             total += 1
             ms = record.get("timestampMs", 0)
@@ -454,7 +483,8 @@ def cmd_classify(args: argparse.Namespace) -> int:
     bugs = [g for g in groups.values() if g["rule"]["verdict"] == "bug"]
     for group in observations.values():
         group["cooccurring"] = True
-        bugs.append(group)
+        if group["rule"]["verdict"] == "bug":
+            bugs.append(group)
     bugs.sort(key=lambda g: (g.get("cooccurring", False), -len(g["records"])))
 
     print(f"\n{'━' * 70}")
@@ -468,6 +498,7 @@ def cmd_classify(args: argparse.Namespace) -> int:
 
     for verdict in ("review", "not-bug"):
         items = [g for g in groups.values() if g["rule"]["verdict"] == verdict]
+        items.extend(g for g in observations.values() if g["rule"]["verdict"] == verdict)
         items.sort(key=lambda g: -len(g["records"]))
         if not items:
             continue
@@ -483,8 +514,7 @@ def cmd_classify(args: argparse.Namespace) -> int:
     primary_bug_n = sum(1 for _, rule, _ in classified if rule["verdict"] == "bug")
     review_n = sum(1 for _, rule, _ in classified if rule["verdict"] == "review")
     obs_n = sum(1 for _, _, extras in classified if extras)
-    rest_n = sum(1 for _, rule, extras in classified
-                 if rule["verdict"] == "not-bug" and not extras)
+    rest_n = sum(1 for _, rule, _ in classified if rule["verdict"] == "not-bug")
     print(f"\n{'━' * 70}")
     print("结论")
     print("━" * 70)
@@ -492,17 +522,18 @@ def cmd_classify(args: argparse.Namespace) -> int:
         names = "、".join(f"{g['rule']['id']}×{len(g['records'])}" for g in primary_bugs)
         print(f"· 需要修复：{primary_bug_n} 条，主因是产品缺陷（{names}）。")
     else:
-        print("· 没有需要修复的产品缺陷。")
+        print("· 未从这些日志确认当前产品缺陷；这不等于已经排除缺陷。")
     if observations:
         names = "、".join(f"{g['rule']['id']}×{len(g['records'])}" for g in observations.values())
-        print(f"· 伴随缺陷：{obs_n} 条（{names}）——这些记录另有主因，但报错正文不可读这点要修。")
+        print(f"· 伴随观察：{obs_n} 条（{names}），不重复计入主因；需核对当前源码与运行版本。")
     if review_n:
-        print(f"· 待人工判定：{review_n} 条规则没覆盖，先跑 errors / session 复现再定性。")
-    print(f"· 其余 {rest_n} 条为按设计行为或模型侧/环境侧问题，"
-          "无需改代码；不要把它包装成待修问题。")
-    if primary_bugs or observations:
-        pointers = "、".join(
-            g["rule"]["evidence"] for g in bugs if g["rule"].get("evidence"))
+        print(f"· 待人工判定：{review_n} 条，核对完整会话、真实退出码和当前源码后再定性。")
+    print(f"· 按设计或命令输入问题：{rest_n} 条；这些证据不要求修改运行时。")
+    pointers = "、".join(
+        g["rule"]["evidence"] for g in [*groups.values(), *observations.values()]
+        if g["rule"]["verdict"] != "not-bug" and g["rule"].get("evidence")
+    )
+    if pointers:
         print(f"· 复核入口：{pointers}")
     return 0
 
@@ -522,6 +553,8 @@ def cmd_errors(args: argparse.Namespace) -> int:
                 record = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            if not isinstance(record, dict):
+                continue
             if record.get("event") == "logs_cleared":
                 cleared_at = record.get("timestampMs")
             if record.get("level") != "error":
@@ -539,7 +572,7 @@ def cmd_errors(args: argparse.Namespace) -> int:
 
     by_thread: dict[str, list[dict]] = {}
     for record in errors:
-        thread = record.get("fields", {}).get("threadId") or "(无 threadId)"
+        thread = as_dict(record.get("fields")).get("threadId") or "(无 threadId)"
         by_thread.setdefault(thread, []).append(record)
 
     for thread, records in sorted(by_thread.items(), key=lambda kv: kv[1][0]["timestampMs"]):
@@ -550,14 +583,15 @@ def cmd_errors(args: argparse.Namespace) -> int:
             with open(session_file, encoding="utf-8") as handle:
                 for line in handle:
                     try:
-                        ms = json.loads(line).get("createdAtMs", 0)
+                        record = json.loads(line)
                     except json.JSONDecodeError:
                         continue
-                    last_ms = max(last_ms, ms)
+                    if isinstance(record, dict):
+                        last_ms = max(last_ms, record.get("createdAtMs", 0))
             last_active = f"  会话最近活跃 {fmt_time(last_ms)}"
         print(f"\n== thread {thread}  ({len(records)} 条 error){last_active}")
         for record in records:
-            fields = record.get("fields", {})
+            fields = as_dict(record.get("fields"))
             detail = fields.get("message") or fields.get("output") or ""
             extra = {k: v for k, v in fields.items()
                      if k not in ("threadId", "message", "output", "arguments")}
@@ -586,13 +620,15 @@ def cmd_session(args: argparse.Namespace) -> int:
                 record = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            if not isinstance(record, dict):
+                continue
             ms = record.get("createdAtMs", 0)
             if args.since_ms and ms < args.since_ms:
                 continue
             event = record.get("type")
             if event not in SESSION_EVENTS:
                 continue
-            data = record.get("data", {})
+            data = as_dict(record.get("data"))
             print(print_session_event(ms, event, data))
             printed += 1
             if printed >= MAX_EVENTS:
@@ -605,38 +641,50 @@ def cmd_session(args: argparse.Namespace) -> int:
 
 def print_session_event(ms: int, event: str, data: dict) -> str:
     stamp = fmt_time(ms)
+    data = as_dict(data)
     if event == "user_message":
-        message = data.get("message", {})
-        text = " ".join(part.get("text", "")
-                        for part in message.get("content", []) if part.get("type") == "text")
+        message = as_dict(data.get("message"))
+        text = " ".join(
+            part["text"]
+            for part in (message.get("content") or [])
+            if isinstance(part, dict)
+            and part.get("type") == "text"
+            and isinstance(part.get("text"), str)
+        )
         return f"{stamp}  USER: {clip(text, 300)}"
     if event == "thread_model_selected":
         return f"{stamp}  MODEL: {data.get('model')}  (provider={data.get('provider_id')})"
     if event == "provider_call_usage":
-        usage = data.get("usage", {})
-        details = data.get("details", {})
+        usage = as_dict(data.get("usage"))
+        details = as_dict(data.get("details"))
         return (f"{stamp}  USAGE #{data.get('call_index')}  {data.get('model')}"
                 f"  出={usage.get('outputTokens')}"
                 f"  思考={details.get('reasoningOutputTokens')}")
     if event == "assistant_tool_calls":
-        calls = data.get("calls", [])
+        calls = data.get("calls") or []
         parts = []
         for call in calls:
-            arguments = call.get("arguments", {})
+            call = as_dict(call)
+            arguments = as_dict(call.get("arguments"))
             brief = arguments.get("command") or arguments.get("path") or json.dumps(
                 arguments, ensure_ascii=False)
             parts.append(f"{call.get('name')}({clip(brief, 160)})")
         return f"{stamp}  CALL: " + " | ".join(parts)
     if event == "tool_result":
-        result = data.get("result", {})
-        meta = result.get("metadata", {})
+        result = as_dict(data.get("result"))
+        meta = as_dict(result.get("metadata"))
         return (f"{stamp}  RESULT {data.get('name')} {data.get('call_id')}"
                 f"  success={result.get('success')} exit={meta.get('exitCode')}"
                 f"  out={clip(result.get('output') or '', 160)}")
     if event == "assistant_message":
-        message = data.get("message", {})
-        text = " ".join(part.get("text", "")
-                        for part in message.get("content", []) if part.get("type") == "text")
+        message = as_dict(data.get("message"))
+        text = " ".join(
+            part["text"]
+            for part in (message.get("content") or [])
+            if isinstance(part, dict)
+            and part.get("type") == "text"
+            and isinstance(part.get("text"), str)
+        )
         return f"{stamp}  ASSISTANT: {clip(text, 300)}"
     return f"{stamp}  {event}: {clip(json.dumps(data, ensure_ascii=False))}"
 

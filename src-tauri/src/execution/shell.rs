@@ -7,6 +7,66 @@ use super::{CommandAssessment, CommandMode, CommandRisk, StartCommandRequest, as
 const POWERSHELL_UTF8_OUTPUT_PREFIX: &str =
     "try { [Console]::OutputEncoding=[System.Text.Encoding]::UTF8 } catch {}\n";
 #[cfg(windows)]
+const WINDOWS_POWERSHELL_EXIT_SUFFIX: &str = r#"
+$__kCoderCommandSucceeded = $?
+if ($__kCoderCommandSucceeded) { exit 0 }
+if ($LASTEXITCODE -eq 0 -and $null -ne $LASTEXITCODE -and $Error.Count -gt 0) {
+    $__kCoderLastStatement = $null
+    foreach ($__kCoderStatement in $MyInvocation.MyCommand.ScriptBlock.Ast.EndBlock.Statements) {
+        if ($__kCoderStatement.Extent.EndOffset -le __KCODER_COMMAND_END__) {
+            $__kCoderLastStatement = $__kCoderStatement
+        }
+    }
+    if ($__kCoderLastStatement -is [System.Management.Automation.Language.PipelineAst] -and
+        $__kCoderLastStatement.PipelineElements.Count -eq 2) {
+        $__kCoderNative = $__kCoderLastStatement.PipelineElements[0]
+        $__kCoderSelect = $__kCoderLastStatement.PipelineElements[1]
+        $__kCoderSafe = $__kCoderNative -is [System.Management.Automation.Language.CommandAst] -and
+            $__kCoderSelect -is [System.Management.Automation.Language.CommandAst] -and
+            $__kCoderSelect.GetCommandName() -in @('Select-Object', 'select') -and
+            $__kCoderSelect.Redirections.Count -eq 0 -and
+            $__kCoderSelect.CommandElements.Count -eq 3
+        if ($__kCoderSafe) {
+            $__kCoderParameter = $__kCoderSelect.CommandElements[1]
+            $__kCoderCount = $__kCoderSelect.CommandElements[2]
+            $__kCoderSafe = $__kCoderParameter -is [System.Management.Automation.Language.CommandParameterAst] -and
+                $__kCoderParameter.ParameterName -in @('First', 'Last') -and
+                $null -eq $__kCoderParameter.Argument -and
+                $__kCoderCount -is [System.Management.Automation.Language.ConstantExpressionAst] -and
+                $__kCoderCount.Value -is [int] -and $__kCoderCount.Value -gt 0 -and
+                $__kCoderNative.Redirections.Count -eq 1
+            foreach ($__kCoderElement in $__kCoderNative.CommandElements) {
+                if ($__kCoderElement -isnot [System.Management.Automation.Language.StringConstantExpressionAst] -and
+                    $__kCoderElement -isnot [System.Management.Automation.Language.ConstantExpressionAst]) {
+                    $__kCoderSafe = $false
+                }
+            }
+        }
+        if ($__kCoderSafe) {
+            $__kCoderMerge = $__kCoderNative.Redirections[0]
+            $__kCoderResolvedSelect = $ExecutionContext.InvokeCommand.GetCommand(
+                $__kCoderSelect.GetCommandName(), [System.Management.Automation.CommandTypes]::All)
+            if ($__kCoderResolvedSelect -is [System.Management.Automation.AliasInfo]) {
+                $__kCoderResolvedSelect = $__kCoderResolvedSelect.ResolvedCommand
+            }
+            $__kCoderSafe = $__kCoderMerge -is [System.Management.Automation.Language.MergingRedirectionAst] -and
+                $__kCoderMerge.FromStream -eq 2 -and $__kCoderMerge.ToStream -eq 1 -and
+                $__kCoderResolvedSelect.ImplementingType -eq [Microsoft.PowerShell.Commands.SelectObjectCommand]
+            foreach ($__kCoderError in $Error) {
+                if ($__kCoderError.FullyQualifiedErrorId -notin @('NativeCommandError', 'NativeCommandErrorMessage') -or
+                    $__kCoderError.InvocationInfo.MyCommand.CommandType -ne 'Application' -or
+                    $__kCoderError.InvocationInfo.ScriptLineNumber -ne $__kCoderNative.Extent.StartLineNumber -or
+                    $__kCoderError.InvocationInfo.OffsetInLine -ne $__kCoderNative.Extent.StartColumnNumber) {
+                    $__kCoderSafe = $false
+                }
+            }
+            if ($__kCoderSafe) { exit 0 }
+        }
+    }
+}
+exit 1
+"#;
+#[cfg(windows)]
 const POWERSHELL_UTF8_INTERACTIVE_INIT: &str = "try { [Console]::InputEncoding=[System.Text.Encoding]::UTF8; [Console]::OutputEncoding=[System.Text.Encoding]::UTF8 } catch {}";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,7 +143,7 @@ impl DetectedShell {
             ShellType::PowerShell => vec![
                 "-NoProfile".to_string(),
                 "-Command".to_string(),
-                format!("{POWERSHELL_UTF8_OUTPUT_PREFIX}{command}"),
+                self.powershell_command(command),
             ],
             #[cfg(windows)]
             ShellType::Cmd => vec!["/c".to_string(), command.to_string()],
@@ -97,6 +157,19 @@ impl DetectedShell {
             timeout_ms: Some(timeout_ms),
             buffer_bytes: None,
         }
+    }
+
+    #[cfg(windows)]
+    fn powershell_command(&self, command: &str) -> String {
+        let mut script = format!("{POWERSHELL_UTF8_OUTPUT_PREFIX}{command}");
+        if self.uses_windows_powershell_native_pipeline() {
+            let command_end = script.encode_utf16().count();
+            script.push_str(
+                &WINDOWS_POWERSHELL_EXIT_SUFFIX
+                    .replace("__KCODER_COMMAND_END__", &command_end.to_string()),
+            );
+        }
+        script
     }
 
     pub(super) fn assess(&self, command: &str) -> CommandAssessment {
@@ -432,6 +505,87 @@ mod tests {
         ));
         assert!(recovered.status.success());
         assert!(String::from_utf8_lossy(&recovered.stdout).contains("fixture.js"));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_powershell_native_stderr_pipeline_preserves_command_results() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = crate::execution::CommandRuntime::new(directory.path()).unwrap();
+        let shell = DetectedShell {
+            shell_type: ShellType::PowerShell,
+            program: PathBuf::from(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"),
+        };
+        let native = "cmd /d /c 'echo progress 1>&2 & exit /b 0'";
+        let pipeline = format!("{native} 2>&1 | Select-Object -Last 5");
+        let cases = [
+            (native.to_string(), 0),
+            (pipeline.clone(), 0),
+            (format!("{native} 2>&1 | Select-Object -First 5"), 0),
+            (format!("{native} 2>&1 | select -Last 5"), 0),
+            (format!("{pipeline} # trailing comment"), 0),
+            (format!("Write-Output '中文𠀀'; {pipeline}"), 0),
+            (
+                "cmd /d /c 'echo progress 1>&2 & exit /b 7' 2>&1 | Select-Object -Last 5"
+                    .to_string(),
+                1,
+            ),
+            (
+                "cmd /d /c 'exit /b 7' | Select-Object -Last 5".to_string(),
+                1,
+            ),
+            ("Write-Error 'broken'".to_string(), 1),
+            (format!("Write-Error 'broken'; {pipeline}"), 1),
+            (
+                format!("{pipeline}; Write-Error 'hidden' -ErrorAction Ignore"),
+                1,
+            ),
+            (
+                format!("{native} 2>&1 | Select-Object -Last 5 -ErrorAction Ignore"),
+                1,
+            ),
+            (
+                format!("{native} 2>&1 | ForEach-Object {{ $_.ToString() }}"),
+                1,
+            ),
+            (
+                format!("function Select-Object {{ Write-Error 'broken' }}; {pipeline}"),
+                1,
+            ),
+            ("throw 'broken'".to_string(), 1),
+            ("Write-Error 'broken' -ErrorAction Stop".to_string(), 1),
+            ("Write-Output 'unterminated".to_string(), 1),
+            (format!("{pipeline}; exit 9"), 9),
+            (format!("{pipeline}; exit 0"), 0),
+        ];
+        for (command, expected) in cases {
+            let assessment = shell.assess(&command);
+            if command.contains("2>&1") {
+                assert!(assessment.requires_approval, "{command}");
+            }
+            let request = shell.request(&command, String::new(), 10_000);
+            assert!(
+                request.args[2].starts_with(&format!("{POWERSHELL_UTF8_OUTPUT_PREFIX}{command}\n"))
+            );
+            let session = runtime.start_non_interactive(request).await.unwrap();
+            let status = runtime.wait(&session.id).await.unwrap();
+            let output = runtime.read(&session.id, 0, 1000).await.unwrap();
+            assert_eq!(
+                status.state,
+                crate::execution::CommandState::Exited { code: expected },
+                "{command}: {:?}",
+                output.chunks
+            );
+            if command == pipeline {
+                assert!(
+                    output
+                        .chunks
+                        .iter()
+                        .any(|chunk| chunk.text.contains("progress"))
+                );
+            }
+            runtime.close(&session.id).await.unwrap();
+        }
     }
 
     #[test]

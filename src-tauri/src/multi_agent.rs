@@ -190,6 +190,42 @@ pub struct SubagentExecutionContext {
     pub agent_events: Arc<dyn EventPublisher>,
     pub lifecycle_events: Arc<dyn SubagentEventPublisher>,
     pub logger: Option<StructuredLogger>,
+    pub memory: Option<crate::memory::MemoryService>,
+}
+
+fn subagent_memory_context(context: &SubagentExecutionContext, thread_id: &str) -> String {
+    let Some(memory) = context.memory.as_ref() else {
+        return String::new();
+    };
+    if !memory.settings().is_ok_and(|settings| settings.enabled) {
+        return String::new();
+    }
+    let scopes =
+        match crate::memory::scope::MemoryScopeResolver::new(context.repository.projection())
+            .scopes(thread_id)
+        {
+            Ok(scopes) => scopes,
+            Err(_) => return String::new(),
+        };
+    let mut records = Vec::new();
+    for scope in scopes {
+        if let Ok(page) = memory.list(&scope, crate::memory::MemoryStatus::Active, None, Some(100))
+        {
+            records.extend(page.items);
+        }
+    }
+    let fragments = crate::context::assembler::memory_fragments(&records, crate::storage::now_ms());
+    let result = crate::context::assembler::ContextAssembler::default().assemble(fragments);
+    if let Some(logger) = context.logger.as_ref() {
+        let _ = logger.log(
+            "info",
+            "memory_context_injected",
+            serde_json::json!({
+                "threadId": thread_id, "audit": result.audit_summary(), "subagent": true,
+            }),
+        );
+    }
+    result.render()
 }
 
 struct ActiveSubagent {
@@ -473,7 +509,12 @@ impl MultiAgentCoordinator {
             .transpose()?
             .unwrap_or(1);
         let thread = match fork_mode {
-            ForkMode::None => context.repository.create_thread().await,
+            ForkMode::None => {
+                context
+                    .repository
+                    .create_thread_in_workspace(&context.workspace_root)
+                    .await
+            }
             ForkMode::All => {
                 context
                     .repository
@@ -683,9 +724,18 @@ impl MultiAgentCoordinator {
                 record.thread_id.clone(),
                 parent_cancellation.child_token(),
             );
-            context.tools.with_additional_handlers(handlers, risks)?
+            context
+                .tools
+                .clone()
+                .with_additional_handlers(handlers, risks)?
         };
-        let allowed_tools = available_tools.restricted_to(&record.capabilities)?;
+        let allowed_capabilities = record
+            .capabilities
+            .iter()
+            .filter(|name| *name != "remember" && *name != "propose_memory")
+            .cloned()
+            .collect::<Vec<_>>();
+        let allowed_tools = available_tools.restricted_to(&allowed_capabilities)?;
         let cancellation = parent_cancellation.child_token();
         let control = TurnControl::new();
         let mailbox = self.mailbox_for(&id)?;
@@ -716,11 +766,14 @@ impl MultiAgentCoordinator {
             let remaining_tokens = record
                 .token_budget
                 .map(|budget| budget.saturating_sub(record.tokens_used));
+            let memory_context = context.clone();
+            let memory_thread_id = record.thread_id.clone();
             let mut runtime = AgentRuntime::with_tools_and_approvals(
                 context.repository.clone(), allowed_tools, context.workspace_root.clone(), context.approvals.clone(),
-            ).with_approval_mode(context.approval_mode).with_runtime_instructions(
-                "You are a bounded subagent. Complete only the delegated task. Return a concise result for the parent agent; do not claim access outside your provided tools or workspace.".into(),
-            )
+            ).with_approval_mode(context.approval_mode).with_runtime_instruction_provider(Arc::new(move || {
+                let memory_instructions = subagent_memory_context(&memory_context, &memory_thread_id);
+                Ok(format!("You are a bounded subagent. Complete only the delegated task. Return a concise result for the parent agent; do not claim access outside your provided tools or workspace.\n\n{memory_instructions}"))
+            }))
             .with_context_limit(context.context_limit)
             .with_reasoning_effort(context.reasoning_effort);
             if let Some(logger) = &context.logger {
@@ -1579,6 +1632,7 @@ mod tests {
             agent_events: Arc::new(NoopAgentPublisher),
             lifecycle_events: lifecycle,
             logger: None,
+            memory: None,
         }
     }
 
@@ -2215,6 +2269,54 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(stopped.state, SubagentState::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn subagent_memory_follows_bound_project_and_disable_gate() {
+        use crate::memory::{MemoryScopeKind, MemoryType, UpsertMemoryCommand};
+        let data = tempfile::tempdir().unwrap();
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let repository = Arc::new(JsonlThreadRepository::new(data.path()).unwrap());
+        let first_thread = repository
+            .create_thread_in_workspace(first.path())
+            .await
+            .unwrap();
+        let second_thread = repository
+            .create_thread_in_workspace(second.path())
+            .await
+            .unwrap();
+        let resolver = crate::memory::scope::MemoryScopeResolver::new(repository.projection());
+        let scope = resolver
+            .default_scope(&first_thread.id, MemoryType::Fact)
+            .unwrap();
+        assert_eq!(scope.kind, MemoryScopeKind::Project);
+        let memory = crate::memory::MemoryService::new(repository.projection(), false);
+        memory.set_settings(true, false, 0).unwrap();
+        memory
+            .upsert(UpsertMemoryCommand {
+                memory_id: None,
+                content: "project uses pnpm".into(),
+                memory_type: MemoryType::Fact,
+                scope,
+                expires_at_ms: None,
+            })
+            .unwrap();
+        let mut execution = context(
+            repository,
+            first.path(),
+            Arc::new(FakeProvider::text(&["done"])),
+            Arc::new(NoopSubagentPublisher),
+        );
+        execution.memory = Some(memory.clone());
+        assert!(
+            subagent_memory_context(&execution, &first_thread.id).contains("project uses pnpm")
+        );
+        assert!(
+            !subagent_memory_context(&execution, &second_thread.id).contains("project uses pnpm")
+        );
+        memory.set_settings(false, false, 0).unwrap();
+        assert!(subagent_memory_context(&execution, &first_thread.id).is_empty());
     }
 
     #[tokio::test]

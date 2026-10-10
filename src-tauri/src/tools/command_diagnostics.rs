@@ -3,11 +3,29 @@
 
 pub(super) const SELECT_COUNT_HINT: &str = "Select-Object 的 -First/-Last/-Skip 必须带行数，例如 `Select-Object -First 20`。命令尚未执行；请补全参数后重新调用，不要重复提交原命令。";
 pub(super) const RG_PATH_GLOB_HINT: &str = "PowerShell 不会展开原生 rg 的路径通配符。命令尚未执行；请改用目录和 --glob，例如 `rg -n '标识符' src --glob '*.tsx' --glob '*.css' | Select-Object -First 10`，再重新调用。";
+pub(super) const PYTHON_HEREDOC_HINT: &str = "PowerShell 不支持 Bash 的 python - <<'PY' heredoc。命令尚未执行；多行 Python 请写入脚本文件后运行，单行使用 python -c，不要重复提交原命令。";
 pub(super) const RG_BATCH_HINT: &str = "请把分号串联的多次 rg 搜索拆成独立的 run_command 调用，以便分别判断匹配、未匹配和真实错误。命令尚未执行；不要通过追加 exit 0 或隐藏 stderr 绕过错误。";
+pub(super) const NATIVE_STDERR_HINT: &str = "PowerShell 将原生 stderr 呈现为错误记录，不能仅凭有输出判定成功。构建或测试请直接运行，若命令含 2>&1 或截取管道请去掉；运行时已限制输出大小。核对完整失败汇总并保留真实退出码，不要追加 exit 0，也不要原样重试有副作用的命令。";
+
+pub(super) fn powershell_native_stderr_hint(stderr: &str) -> Option<&'static str> {
+    stderr
+        .contains("NativeCommandError")
+        .then_some(NATIVE_STDERR_HINT)
+}
 
 /// Reject only literal, recognizable mistakes before starting a process. Unknown
 /// shell syntax is left to the shell and the existing authorization policy.
 pub(super) fn powershell_preflight_hint(command: &str) -> Option<&'static str> {
+    let mut words = command.split_whitespace();
+    if words.next().is_some_and(|word| {
+        ["python", "python3", "py"]
+            .iter()
+            .any(|name| word.eq_ignore_ascii_case(name))
+    }) && words.next() == Some("-")
+        && words.next().is_some_and(|word| word.starts_with("<<"))
+    {
+        return Some(PYTHON_HEREDOC_HINT);
+    }
     let script = literal_script(command)?;
     for pipeline in &script {
         for segment in pipeline {
@@ -237,9 +255,13 @@ fn literal_script(command: &str) -> Option<Vec<Vec<Vec<LiteralWord>>>> {
 }
 
 pub(super) fn is_unambiguous_rg_search(command: &str) -> bool {
-    let Some(segments) = literal_pipeline(command) else {
+    let Some(script) = literal_script(command) else {
         return false;
     };
+    if script.len() != 1 {
+        return false;
+    }
+    let segments = &script[0];
     if !is_plain_rg_search(&segments[0]) {
         return false;
     }
@@ -249,9 +271,15 @@ pub(super) fn is_unambiguous_rg_search(command: &str) -> bool {
     let receiver = &segments[1];
     segments.len() == 2
         && receiver.len() == 3
-        && receiver[0].eq_ignore_ascii_case("Select-Object")
-        && (receiver[1].eq_ignore_ascii_case("-First") || receiver[1].eq_ignore_ascii_case("-Last"))
-        && receiver[2].parse::<usize>().is_ok_and(|count| count > 0)
+        && receiver[0].bare
+        && receiver[0].value.eq_ignore_ascii_case("Select-Object")
+        && receiver[1].bare
+        && (receiver[1].value.eq_ignore_ascii_case("-First")
+            || receiver[1].value.eq_ignore_ascii_case("-Last"))
+        && receiver[2]
+            .value
+            .parse::<usize>()
+            .is_ok_and(|count| count > 0)
 }
 
 /// Detect a native `rg` search whose bounded `Select-Object -First` receiver
@@ -262,91 +290,59 @@ pub(super) fn is_unambiguous_rg_search(command: &str) -> bool {
 /// `rg ... | Select-Object -First N` shape qualifies: dynamic expressions,
 /// redirection and error suppression keep the original failure status.
 pub(super) fn is_bounded_rg_search(command: &str) -> bool {
-    let Some(segments) = literal_pipeline(command) else {
+    let Some(script) = literal_script(command) else {
         return false;
     };
+    if script.len() != 1 {
+        return false;
+    }
+    let segments = &script[0];
     segments.len() == 2 && is_plain_rg_search(&segments[0]) && is_first_bounded_select(&segments[1])
 }
 
 /// A single rg invocation without error suppression, so an exit code still
 /// reflects the search itself instead of an explicitly hidden failure.
-fn is_plain_rg_search(search: &[String]) -> bool {
-    search.len() >= 2
-        && search
-            .first()
-            .is_some_and(|s| s.eq_ignore_ascii_case("rg") || s.eq_ignore_ascii_case("rg.exe"))
-        && !search.iter().any(|arg| {
-            arg == "--no-messages"
-                || arg == "--quiet"
-                || arg.starts_with("--pre")
-                || (arg.starts_with('-') && !arg.starts_with("--") && arg.contains('q'))
-        })
+fn is_plain_rg_search(search: &[LiteralWord]) -> bool {
+    rg_paths(search).is_some()
 }
 
-fn is_first_bounded_select(receiver: &[String]) -> bool {
+fn is_first_bounded_select(receiver: &[LiteralWord]) -> bool {
     receiver.len() == 3
-        && receiver[0].eq_ignore_ascii_case("Select-Object")
-        && receiver[1].eq_ignore_ascii_case("-First")
-        && receiver[2].parse::<usize>().is_ok_and(|count| count > 0)
-}
-
-fn literal_pipeline(command: &str) -> Option<Vec<Vec<String>>> {
-    let mut segments = vec![Vec::new()];
-    let mut word = String::new();
-    let mut started = false;
-    let mut quote = None;
-    for c in command.chars() {
-        if matches!(c, '\r' | '\n' | '`') {
-            return None;
-        }
-        match quote {
-            Some(q) if c == q => quote = None,
-            Some('"') if c == '$' => return None,
-            Some(_) => word.push(c),
-            None => match c {
-                '\'' | '"' => {
-                    quote = Some(c);
-                    started = true;
-                }
-                ';' | '&' | '>' | '<' | '$' | '(' | ')' | '{' | '}' | '#' | ',' => return None,
-                '|' => {
-                    if started {
-                        segments.last_mut()?.push(std::mem::take(&mut word));
-                        started = false;
-                    }
-                    if segments.last()?.is_empty() || segments.len() > 1 {
-                        return None;
-                    }
-                    segments.push(Vec::new());
-                }
-                c if c.is_whitespace() => {
-                    if started {
-                        segments.last_mut()?.push(std::mem::take(&mut word));
-                        started = false;
-                    }
-                }
-                _ => {
-                    started = true;
-                    word.push(c);
-                }
-            },
-        }
-    }
-    if quote.is_some() {
-        return None;
-    }
-    if started {
-        segments.last_mut()?.push(word);
-    }
-    if segments.last()?.is_empty() {
-        return None;
-    }
-    Some(segments)
+        && receiver[0].bare
+        && receiver[0].value.eq_ignore_ascii_case("Select-Object")
+        && receiver[1].bare
+        && receiver[1].value.eq_ignore_ascii_case("-First")
+        && receiver[2]
+            .value
+            .parse::<usize>()
+            .is_ok_and(|count| count > 0)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preflight_rejects_only_recognizable_python_heredocs() {
+        for command in [
+            "python - <<'PY'\nprint(1)\nPY",
+            "py - <<EOF",
+            "python3 - <<'END'",
+        ] {
+            assert_eq!(
+                powershell_preflight_hint(command),
+                Some(PYTHON_HEREDOC_HINT)
+            );
+        }
+        for command in [
+            "python -c \"print(1)\"",
+            "python script.py",
+            "Write-Output 'python - <<PY'",
+            "python - $args",
+        ] {
+            assert_eq!(powershell_preflight_hint(command), None);
+        }
+    }
 
     #[test]
     fn preflight_catches_missing_select_counts_before_any_command_runs() {
@@ -430,6 +426,8 @@ mod tests {
             "rg.exe -n 'first|second' --glob '*.cs' src | Select-Object -First 20",
             "rg -n \"x\" . | select-object -last 10",
             "rg --files src",
+            "rg -equery .",
+            "rg 'don''t/match.*' src",
         ] {
             assert!(is_unambiguous_rg_search(command), "{command}");
         }
@@ -456,8 +454,48 @@ mod tests {
             "rg x $(bad)",
             "rg x . >out",
             "rg 'unterminated",
+            "'rg' x .",
+            "rg x . | 'Select-Object' -First 2",
+            "rg x . | Select-Object '-First' 2",
+            "rg x @paths",
+            "rg --% x .",
+            "rg --unknown-option x .",
         ] {
             assert!(!is_unambiguous_rg_search(command), "{command}");
         }
+    }
+
+    #[test]
+    fn bounded_searches_preserve_literal_command_and_parameter_boundaries() {
+        assert!(is_bounded_rg_search(
+            "rg -equery . | Select-Object -First 2"
+        ));
+        for command in [
+            "'rg' x . | Select-Object -First 2",
+            "rg x . | 'Select-Object' -First 2",
+            "rg x . | Select-Object '-First' 2",
+            "rg x @paths | Select-Object -First 2",
+            "rg --% x . | Select-Object -First 2",
+            "rg --quiet x . | Select-Object -First 2",
+            "rg --no-messages x . | Select-Object -First 2",
+            "rg --unknown-option x . | Select-Object -First 2",
+            "rg x . | Select-Object -Last 2",
+            "rg x . | Select-Object -First 2; exit 1",
+        ] {
+            assert!(!is_bounded_rg_search(command), "{command}");
+        }
+    }
+
+    #[test]
+    fn native_stderr_guidance_does_not_claim_success_or_replay_commands() {
+        assert_eq!(
+            powershell_native_stderr_hint("CategoryInfo: NotSpecified\nNativeCommandError"),
+            Some(NATIVE_STDERR_HINT)
+        );
+        for stderr in ["", "Finished test profile", "rg: regex parse error"] {
+            assert_eq!(powershell_native_stderr_hint(stderr), None);
+        }
+        assert!(NATIVE_STDERR_HINT.contains("保留真实退出码"));
+        assert!(NATIVE_STDERR_HINT.contains("不要原样重试有副作用"));
     }
 }

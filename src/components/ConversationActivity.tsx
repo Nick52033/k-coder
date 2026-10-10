@@ -196,13 +196,6 @@ export const ConversationTurnActivity = memo(function ConversationTurnActivity({
       />
     );
   }
-  const showReasoningUnavailableNotice = Boolean(
-    visuallyStreaming
-      && activityStatus === "thinking"
-      && !terminalEvent
-      && !hasDisplayableReasoning
-      && hasPublicProgress,
-  );
   const toolCount = timelineHasTools
     ? groupedProcessTimeline.reduce(
       (count, entry) => count + (entry.type === "tool_group" ? hideSupersededPatchFailures(entry.activities).length : 0),
@@ -266,12 +259,6 @@ export const ConversationTurnActivity = memo(function ConversationTurnActivity({
   const processContent = (
       <div className="turn-disclosure-panel">
         <div className={visuallyStreaming ? "turn-execution-live" : "turn-execution-content"}>
-        {showReasoningUnavailableNotice ? (
-          <div className="turn-reasoning-unavailable" role="status">
-            <Brain size={15} aria-hidden="true" />
-            <span>当前模型未提供可展示的思考摘要，公开进度和工具活动仍会继续显示。</span>
-          </div>
-        ) : null}
         {processItems.length ? (
           <div className="turn-timeline">
             {groupedProcessTimeline.map((entry) => entry.type === "reasoning_group" ? (

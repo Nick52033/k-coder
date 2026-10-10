@@ -50,6 +50,8 @@ pub struct SetMemorySettingsRequest {
     pub enabled: bool,
     pub auto_accept_high_confidence: bool,
     pub default_ttl_days: u32,
+    #[serde(default)]
+    pub auto_extraction_disclosure_accepted: bool,
 }
 
 /// `set_memory_maintenance_settings` payload.

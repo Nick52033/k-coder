@@ -10,6 +10,8 @@
 //! * Deleting never removes a row. It records a status change, which keeps the audit trail intact and
 //!   lets a rebuild reproduce exactly the same state.
 
+use std::sync::{Arc, Mutex, MutexGuard};
+
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -27,15 +29,16 @@ use crate::memory::policy::{
 };
 use crate::persistence::ProjectionDb;
 use crate::storage::memory_repository::{
-    CANDIDATE_STATUS_PENDING, MAX_MEMORY_CONTENT_CHARS, MAX_MEMORY_PAGE_SIZE,
-    MemoryCandidateRecord, MemoryEventKind, MemoryRecord, MemoryRepository, MemoryStatusChange,
-    MemoryWrite, normalize_memory_key,
+    CANDIDATE_STATUS_PENDING, CandidateApplied, CandidateMemoryChange, CandidateReview,
+    MAX_MEMORY_CONTENT_CHARS, MAX_MEMORY_PAGE_SIZE, MemoryCandidateRecord, MemoryEventKind,
+    MemoryRecord, MemoryRepository, MemoryStatusChange, MemoryWrite, normalize_memory_key,
 };
 use crate::storage::now_ms;
 
 /// Settings row key inside the shared `settings` table.
 const MEMORY_SETTINGS_KEY: &str = "memory.settings";
 const MEMORY_SETTINGS_SCHEMA_VERSION: u32 = 1;
+pub const AUTO_EXTRACTION_CONSENT_VERSION: u32 = 2;
 /// Default page size for `list_memories`.
 const DEFAULT_MEMORY_PAGE_SIZE: u32 = 100;
 /// Hard stop for a scoped clear, so a corrupted projection cannot spin forever.
@@ -67,6 +70,10 @@ pub struct MemorySettings {
     pub auto_accept_high_confidence: bool,
     /// Fallback TTL for memory types without a design-mandated TTL. `0` means "never expires".
     pub default_ttl_days: u32,
+    #[serde(default)]
+    pub auto_extraction_consent_version: u32,
+    #[serde(default)]
+    pub capture_after_ms: Option<u64>,
 }
 
 impl Default for MemorySettings {
@@ -76,6 +83,8 @@ impl Default for MemorySettings {
             enabled: false,
             auto_accept_high_confidence: false,
             default_ttl_days: 0,
+            auto_extraction_consent_version: 0,
+            capture_after_ms: None,
         }
     }
 }
@@ -122,6 +131,8 @@ pub struct UpsertMemoryCommand {
 pub struct MemoryService {
     db: ProjectionDb,
     repository: MemoryRepository,
+    change_lock: Arc<Mutex<()>>,
+    initialization_error: Option<String>,
 }
 
 impl MemoryService {
@@ -132,20 +143,43 @@ impl MemoryService {
     /// reverting to disabled.
     pub fn new(db: ProjectionDb, legacy_enabled: bool) -> Self {
         let repository = MemoryRepository::new(db.clone());
-        let service = Self { db, repository };
+        let mut service = Self {
+            db,
+            repository,
+            change_lock: Arc::new(Mutex::new(())),
+            initialization_error: None,
+        };
         if service.stored_settings().ok().flatten().is_none() {
             let mut settings = MemorySettings::default();
             settings.enabled = legacy_enabled;
             let _ = service.persist_settings(&settings);
         }
-        let _ = service.repository.rebuild_projection();
+        service.initialization_error = service
+            .repository
+            .rebuild_projection()
+            .err()
+            .map(|error| MemoryError::from(error).code().to_owned());
         service
+    }
+
+    pub fn initialization_error(&self) -> Option<String> {
+        self.initialization_error.clone()
     }
 
     /// Rebuilds the SQLite projection from the fact log. Exposed so recovery paths and tests can
     /// assert the projection is reproducible.
     pub fn rebuild_projection(&self) -> Result<(), MemoryError> {
+        let _guard = self.lock_changes()?;
         Ok(self.repository.rebuild_projection()?)
+    }
+
+    fn lock_changes(&self) -> Result<MutexGuard<'_, ()>, MemoryError> {
+        let guard = self
+            .change_lock
+            .lock()
+            .map_err(|_| MemoryError::Storage("memory change lock is poisoned".into()))?;
+        self.repository.recover_projection()?;
+        Ok(guard)
     }
 
     pub fn settings(&self) -> Result<MemorySettings, MemoryError> {
@@ -158,18 +192,48 @@ impl MemoryService {
         auto_accept_high_confidence: bool,
         default_ttl_days: u32,
     ) -> Result<MemorySettings, MemoryError> {
+        self.set_settings_with_disclosure(
+            enabled,
+            auto_accept_high_confidence,
+            default_ttl_days,
+            false,
+        )
+    }
+
+    pub fn set_settings_with_disclosure(
+        &self,
+        enabled: bool,
+        auto_accept_high_confidence: bool,
+        default_ttl_days: u32,
+        accepted: bool,
+    ) -> Result<MemorySettings, MemoryError> {
         if default_ttl_days > MAX_MEMORY_TTL_DAYS {
             return Err(MemoryError::coded(
                 "MEM_INVALID_ARGUMENT",
                 format!("defaultTtlDays must not exceed {MAX_MEMORY_TTL_DAYS}"),
             ));
         }
-        let settings = MemorySettings {
-            schema_version: MEMORY_SETTINGS_SCHEMA_VERSION,
-            enabled,
-            auto_accept_high_confidence,
-            default_ttl_days,
-        };
+        let _guard = self
+            .change_lock
+            .lock()
+            .map_err(|_| MemoryError::Storage("memory change lock is poisoned".into()))?;
+        let mut settings = self.settings()?;
+        let was_enabled = settings.enabled;
+        let previous_consent_version = settings.auto_extraction_consent_version;
+        if accepted {
+            settings.auto_extraction_consent_version = AUTO_EXTRACTION_CONSENT_VERSION;
+        }
+        if enabled
+            && settings.auto_extraction_consent_version == AUTO_EXTRACTION_CONSENT_VERSION
+            && (!was_enabled
+                || previous_consent_version != AUTO_EXTRACTION_CONSENT_VERSION
+                || settings.capture_after_ms.is_none())
+        {
+            settings.capture_after_ms = Some(now_ms());
+        }
+        settings.enabled = enabled;
+        settings.auto_accept_high_confidence = auto_accept_high_confidence;
+        settings.default_ttl_days = default_ttl_days;
         self.persist_settings(&settings)?;
         Ok(settings)
     }
@@ -256,6 +320,7 @@ impl MemoryService {
     /// and credential-shaped content is refused outright — design §8 keeps secrets in the operating
     /// system credential slot, not in memory.
     pub fn upsert(&self, command: UpsertMemoryCommand) -> Result<MemoryUpsertOutcome, MemoryError> {
+        let _guard = self.lock_changes()?;
         let settings = self.settings()?;
         let now = now_ms();
         command.scope.validate()?;
@@ -379,6 +444,7 @@ impl MemoryService {
     /// was new is exactly the kind of conflict the design requires a human to settle.
     pub fn record_candidate(&self, draft: CandidateDraft) -> Result<CandidateOutcome, MemoryError> {
         draft.validate()?;
+        let _guard = self.lock_changes()?;
         let settings = self.settings()?;
         let now = now_ms();
         let content = draft.content.trim().to_owned();
@@ -390,14 +456,41 @@ impl MemoryService {
             ));
         }
 
-        let rows = self
-            .repository
-            .list_by_key(&normalized_key, MAX_MEMORY_PAGE_SIZE)?;
-        let in_scope = rows.iter().find(|record| {
-            record.scope_type == draft.scope.kind.as_str() && record.scope_id == draft.scope.id
-        });
-
-        let (operation, target_memory_id, conflict) = match draft.operation {
+        let explicit_target = draft
+            .target_memory_id
+            .as_deref()
+            .map(|id| self.repository.get(id.trim()))
+            .transpose()?
+            .flatten();
+        if let Some(target) = explicit_target.as_ref() {
+            self.require_candidate_scope(target, &draft.scope)?;
+        }
+        let rows = self.repository.list_by_key_in_scope(
+            draft.scope.kind.as_str(),
+            draft.scope.id.as_deref(),
+            &normalized_key,
+        )?;
+        if let Some(reason) = rows
+            .iter()
+            .find_map(|record| suppressed_memory_reason(record, now))
+        {
+            return Ok(CandidateOutcome::Suppressed { reason });
+        }
+        let prior_candidates = self.repository.list_candidates_by_key_in_scope(
+            draft.scope.kind.as_str(),
+            draft.scope.id.as_deref(),
+            &normalized_key,
+        )?;
+        if prior_candidates
+            .iter()
+            .any(|candidate| candidate.status == "rejected")
+        {
+            return Ok(CandidateOutcome::Suppressed {
+                reason: "a candidate with this scope and key was rejected".into(),
+            });
+        }
+        let in_scope = rows.first();
+        let (operation, target, conflict) = match draft.operation {
             MemoryOperation::Create => match in_scope {
                 Some(existing) if existing.content.trim() == content => {
                     return Ok(CandidateOutcome::Deduplicated {
@@ -406,36 +499,41 @@ impl MemoryService {
                 }
                 Some(existing) => (
                     MemoryOperation::Update,
-                    Some(existing.id.clone()),
+                    Some(existing.clone()),
                     ConflictKind::Conflict,
                 ),
                 None => (MemoryOperation::Create, None, ConflictKind::None),
             },
             MemoryOperation::Update | MemoryOperation::Merge | MemoryOperation::Delete => {
                 let target = match draft.target_memory_id.as_deref() {
-                    Some(id) => self.repository.get(id.trim())?.ok_or_else(|| {
+                    Some(id) => explicit_target.ok_or_else(|| {
                         MemoryError::coded("MEM_NOT_FOUND", format!("memory {id} was not found"))
                     })?,
                     None => in_scope.cloned().ok_or_else(|| {
                         MemoryError::coded("MEM_NOT_FOUND", "no memory matches this candidate")
                     })?,
                 };
-                let conflict = if target.scope_type != draft.scope.kind.as_str()
-                    || target.scope_id != draft.scope.id
-                {
-                    ConflictKind::CrossScopeUpdate
-                } else {
-                    ConflictKind::None
-                };
-                (draft.operation, Some(target.id), conflict)
+                self.require_candidate_scope(&target, &draft.scope)?;
+                if let Some(reason) = suppressed_memory_reason(&target, now) {
+                    return Ok(CandidateOutcome::Suppressed { reason });
+                }
+                (draft.operation, Some(target), ConflictKind::None)
             }
         };
+        let target_memory_id = target.as_ref().map(|target| target.id.clone());
+        if let Some(candidate) = prior_candidates
+            .into_iter()
+            .find(|candidate| candidate.status == CANDIDATE_STATUS_PENDING)
+        {
+            return Ok(CandidateOutcome::Pending { candidate });
+        }
 
         let requires_review = draft.requires_review(conflict, settings.auto_accept_high_confidence);
         let candidate = MemoryCandidateRecord {
             id: Uuid::new_v4().to_string(),
             operation: operation.as_str().to_owned(),
             target_memory_id: target_memory_id.clone(),
+            target_revision: target.as_ref().map(|target| target.revision),
             scope_type: draft.scope.kind.as_str().to_owned(),
             scope_id: draft.scope.id.clone(),
             memory_type: draft.memory_type.as_str().to_owned(),
@@ -456,8 +554,9 @@ impl MemoryService {
             return Ok(CandidateOutcome::Pending { candidate });
         }
 
-        let memory = self.apply_candidate(operation, target_memory_id.as_deref(), &draft, now)?;
-        let candidate = self.review(&candidate.id, CandidateDecision::Accept)?;
+        let (candidate, memory) = self.review(&candidate.id, CandidateDecision::Accept)?;
+        let memory = memory
+            .ok_or_else(|| MemoryError::Storage("accepted memory was not projected".into()))?;
         Ok(CandidateOutcome::AutoAccepted { memory, candidate })
     }
 
@@ -489,14 +588,16 @@ impl MemoryService {
         candidate_id: &str,
         decision: CandidateDecision,
     ) -> Result<MemoryCandidateRecord, MemoryError> {
+        let _guard = self.lock_changes()?;
         self.review(candidate_id, decision)
+            .map(|(candidate, _)| candidate)
     }
 
     fn review(
         &self,
         candidate_id: &str,
         decision: CandidateDecision,
-    ) -> Result<MemoryCandidateRecord, MemoryError> {
+    ) -> Result<(MemoryCandidateRecord, Option<MemoryRecord>), MemoryError> {
         let candidate_id = candidate_id.trim();
         if candidate_id.is_empty() {
             return Err(MemoryError::coded(
@@ -520,7 +621,8 @@ impl MemoryService {
             ));
         }
 
-        if matches!(decision, CandidateDecision::Accept) {
+        let now = now_ms();
+        let memory = if decision == CandidateDecision::Accept {
             let operation = parse_operation(&candidate.operation)?;
             let draft = CandidateDraft {
                 operation,
@@ -533,41 +635,132 @@ impl MemoryService {
                 source_type: MemorySourceType::Model,
                 source_turn_id: candidate.source_turn_id.clone(),
             };
-            self.apply_candidate(
-                operation,
-                candidate.target_memory_id.as_deref(),
-                &draft,
-                now_ms(),
+            draft.validate()?;
+            let history = self.repository.list_candidates_by_key_in_scope(
+                &candidate.scope_type,
+                candidate.scope_id.as_deref(),
+                &candidate.normalized_key,
             )?;
-        }
-
-        self.repository.append(MemoryEventKind::CandidateReviewed(
-            crate::storage::memory_repository::CandidateReview {
-                id: candidate_id.to_owned(),
-                status: decision.status().to_owned(),
-            },
-        ))?;
-        self.repository
+            if history.iter().any(|prior| prior.status == "rejected") {
+                return Err(MemoryError::coded(
+                    "MEM_CANDIDATE_SUPPRESSED",
+                    "this scope and key has a rejected candidate",
+                ));
+            }
+            let records = self.repository.list_by_key_in_scope(
+                &candidate.scope_type,
+                candidate.scope_id.as_deref(),
+                &candidate.normalized_key,
+            )?;
+            if records
+                .iter()
+                .any(|record| suppressed_memory_reason(record, now).is_some())
+            {
+                return Err(MemoryError::coded(
+                    "MEM_CANDIDATE_SUPPRESSED",
+                    "this scope and key is inactive or expired",
+                ));
+            }
+            let target = candidate
+                .target_memory_id
+                .as_deref()
+                .map(|id| self.repository.get(id))
+                .transpose()?
+                .flatten();
+            if let Some(target) = target.as_ref() {
+                self.require_candidate_scope(target, &draft.scope)?;
+                if candidate.target_revision != Some(target.revision) {
+                    return Err(MemoryError::coded(
+                        "MEM_CANDIDATE_STALE",
+                        "the target revision changed since this candidate was recorded",
+                    ));
+                }
+                if suppressed_memory_reason(target, now).is_some() {
+                    return Err(MemoryError::coded(
+                        "MEM_CANDIDATE_SUPPRESSED",
+                        "the target is inactive or expired",
+                    ));
+                }
+            } else if candidate.target_memory_id.is_some() {
+                return Err(MemoryError::coded(
+                    "MEM_NOT_FOUND",
+                    "candidate target was not found",
+                ));
+            }
+            if operation == MemoryOperation::Create && !records.is_empty() {
+                return Err(MemoryError::coded(
+                    "MEM_CANDIDATE_STALE",
+                    "this scope and key already has a memory",
+                ));
+            }
+            if let Some(target) = target.as_ref()
+                && records.iter().any(|record| record.id != target.id)
+            {
+                return Err(MemoryError::coded(
+                    "MEM_CANDIDATE_STALE",
+                    "another memory already owns the proposed key",
+                ));
+            }
+            let (change, memory_id) =
+                self.prepare_candidate_change(operation, target.as_ref(), &draft, now)?;
+            self.repository
+                .append(MemoryEventKind::CandidateApplied(CandidateApplied {
+                    review: CandidateReview {
+                        id: candidate_id.to_owned(),
+                        status: decision.status().to_owned(),
+                    },
+                    memory: change,
+                }))?;
+            Some(self.projected(&memory_id)?)
+        } else {
+            self.repository
+                .append(MemoryEventKind::CandidateReviewed(CandidateReview {
+                    id: candidate_id.to_owned(),
+                    status: decision.status().to_owned(),
+                }))?;
+            None
+        };
+        let candidate = self
+            .repository
             .get_candidate(candidate_id)?
-            .ok_or_else(|| MemoryError::Storage("the review was not projected".into()))
+            .ok_or_else(|| MemoryError::Storage("the review was not projected".into()))?;
+        Ok((candidate, memory))
     }
 
-    /// Applies an accepted candidate. Deletion is a status change; everything else is an upsert that
-    /// increments the revision of the resolved target.
-    fn apply_candidate(
+    fn require_candidate_scope(
+        &self,
+        target: &MemoryRecord,
+        scope: &MemoryScope,
+    ) -> Result<(), MemoryError> {
+        if target.scope_type != scope.kind.as_str() || target.scope_id != scope.id {
+            return Err(MemoryError::coded(
+                "MEM_SCOPE_MISMATCH",
+                "candidate target belongs to another scope",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Prepares an accepted candidate without persisting it; application and review share one fact.
+    fn prepare_candidate_change(
         &self,
         operation: MemoryOperation,
-        target_memory_id: Option<&str>,
+        target: Option<&MemoryRecord>,
         draft: &CandidateDraft,
         now: u64,
-    ) -> Result<MemoryRecord, MemoryError> {
+    ) -> Result<(CandidateMemoryChange, String), MemoryError> {
         if matches!(operation, MemoryOperation::Delete) {
-            let id = target_memory_id.ok_or_else(|| {
+            let target = target.ok_or_else(|| {
                 MemoryError::coded("MEM_NOT_FOUND", "a delete candidate needs a target memory")
             })?;
-            return self.mark_deleted(id);
+            return Ok((
+                CandidateMemoryChange::StatusChange(MemoryStatusChange {
+                    id: target.id.clone(),
+                    status: MemoryStatus::Deleted.as_str().to_owned(),
+                }),
+                target.id.clone(),
+            ));
         }
-
         let settings = self.settings()?;
         let content = draft.content.trim().to_owned();
         validate_content(&content)?;
@@ -575,7 +768,7 @@ impl MemoryService {
         if sensitivity == Sensitivity::SecretCandidate {
             return Err(MemoryError::coded(
                 "MEM_SECRET_REJECTED",
-                "candidate content looks like a credential; keep it in the operating system credential slot",
+                "candidate content or reason looks like a credential",
             ));
         }
         let normalized_key = normalize_memory_key(&content);
@@ -585,17 +778,14 @@ impl MemoryService {
                 "content must contain at least one non-whitespace character",
             ));
         }
-        let (id, revision, created_at_ms) = match target_memory_id {
-            Some(id) => {
-                let target = self.repository.get(id.trim())?.ok_or_else(|| {
-                    MemoryError::coded("MEM_NOT_FOUND", format!("memory {id} was not found"))
-                })?;
-                (
-                    target.id,
-                    target.revision.saturating_add(1),
-                    target.created_at_ms,
-                )
-            }
+        let (id, revision, created_at_ms) = match target {
+            Some(target) => (
+                target.id.clone(),
+                target.revision.checked_add(1).ok_or_else(|| {
+                    MemoryError::coded("MEM_INVALID_ARGUMENT", "target revision overflowed")
+                })?,
+                target.created_at_ms,
+            ),
             None => (Uuid::new_v4().to_string(), 1, now),
         };
         let expires_at_ms =
@@ -616,14 +806,13 @@ impl MemoryService {
             expires_at_ms,
             created_at_ms,
         };
-        self.repository
-            .append(MemoryEventKind::MemoryUpserted(write))?;
-        self.projected(&id)
+        Ok((CandidateMemoryChange::Upsert(write), id))
     }
 
     /// Soft-deletes one memory. The confirmation token must match the memory id, mirroring the
     /// knowledge source and collection deletion contract.
     pub fn delete(&self, memory_id: &str, confirmation: &str) -> Result<MemoryRecord, MemoryError> {
+        let _guard = self.lock_changes()?;
         let memory_id = memory_id.trim();
         if memory_id.is_empty() {
             return Err(MemoryError::coded(
@@ -662,6 +851,7 @@ impl MemoryService {
         scope: &MemoryScope,
         confirmation: &str,
     ) -> Result<MemoryClearOutcome, MemoryError> {
+        let _guard = self.lock_changes()?;
         scope.validate()?;
         require_confirmation(&scope_confirmation_token(scope), confirmation)?;
         let mut cleared = 0u64;
@@ -735,6 +925,7 @@ impl MemoryService {
     ///
     /// Returns the ids that changed. Already-expired rows are skipped, so a second run is a no-op.
     pub fn expire_due(&self, now_ms: u64) -> Result<Vec<String>, MemoryError> {
+        let _guard = self.lock_changes()?;
         let mut expired = Vec::new();
         let mut after_id: Option<String> = None;
         loop {
@@ -776,6 +967,7 @@ impl MemoryService {
     /// host-computed and stable, so two runs over the same projection archive the same rows. Losers
     /// are `archived` rather than deleted.
     pub fn merge_duplicate_keys(&self) -> Result<Vec<MergedKeyGroup>, MemoryError> {
+        let _guard = self.lock_changes()?;
         let mut merged = Vec::new();
         for group in self.repository.duplicate_key_groups(MAX_MEMORY_PAGE_SIZE)? {
             if merged.len() >= MAX_MEMORY_MAINTENANCE_SWEEP {
@@ -822,6 +1014,19 @@ impl MemoryService {
         }
         Ok(merged)
     }
+}
+
+fn suppressed_memory_reason(record: &MemoryRecord, now: u64) -> Option<String> {
+    if matches!(
+        record.status.as_str(),
+        "rejected" | "deleted" | "archived" | "expired"
+    ) {
+        return Some(format!("this scope and key has a {} memory", record.status));
+    }
+    if memory_is_expired(record, now) {
+        return Some("this scope and key has an expired memory".into());
+    }
+    None
 }
 
 fn validate_content(content: &str) -> Result<(), MemoryError> {
@@ -1521,7 +1726,7 @@ mod tests {
     }
 
     #[test]
-    fn a_cross_scope_update_candidate_requires_review() {
+    fn a_cross_scope_update_candidate_is_rejected_before_recording() {
         let data_root = tempfile::tempdir().unwrap();
         let service = service(data_root.path());
         let project_memory = service
@@ -1539,12 +1744,15 @@ mod tests {
         );
         // Only a host-constructed draft can carry a target, and even then the service verifies it.
         draft.target_memory_id = Some(project_memory.id.clone());
-        let CandidateOutcome::Pending { candidate } = service.record_candidate(draft).unwrap()
-        else {
-            panic!("a cross-scope update must always be reviewed");
-        };
-        assert!(candidate.requires_review);
-        assert_eq!(candidate.operation, "update");
+        assert_eq!(
+            service.record_candidate(draft).unwrap_err().code(),
+            "MEM_SCOPE_MISMATCH"
+        );
+        assert!(service.list_candidates("pending", None).unwrap().is_empty());
+        assert_eq!(
+            service.projected(&project_memory.id).unwrap().scope_type,
+            "project"
+        );
     }
 
     #[test]
@@ -1637,6 +1845,21 @@ mod tests {
         };
         assert_eq!(memory.content, "the release branch is main");
         assert_eq!(memory.source_type, "model");
+        assert_eq!(memory.revision, 1);
+        assert_eq!(service.projected(&memory.id).unwrap(), memory);
+        assert_eq!(
+            service
+                .list(&MemoryScope::user(), MemoryStatus::Active, None, None)
+                .unwrap()
+                .total,
+            1
+        );
+        assert_eq!(
+            fact_log(data_root.path())
+                .matches("memory_candidate_applied")
+                .count(),
+            1
+        );
         assert_eq!(candidate.status, "accepted");
 
         // A low-confidence candidate still waits, even with auto-accept on.
@@ -1668,6 +1891,426 @@ mod tests {
         ));
     }
 
+    fn model_draft(content: &str, confidence: f64) -> CandidateDraft {
+        let mut draft = CandidateDraft::from_model(
+            MemoryOperation::Create,
+            MemoryType::Fact,
+            content,
+            "observed in the transcript",
+            confidence,
+            MemoryScope::user(),
+        );
+        draft.source_turn_id = Some(Uuid::new_v4().to_string());
+        draft
+    }
+
+    #[test]
+    fn credentials_are_refused_without_persisting_candidates() {
+        let data_root = tempfile::tempdir().unwrap();
+        let service = service(data_root.path());
+        for in_reason in [false, true] {
+            let mut draft = model_draft("prefer pnpm", 1.0);
+            if in_reason {
+                draft.reason = "password: hunter2sword".into();
+            } else {
+                draft.content = "API_KEY=sk-live-abcdefghijklmnop".into();
+            }
+            assert_eq!(
+                service.record_candidate(draft).unwrap_err().code(),
+                "MEM_SECRET_REJECTED"
+            );
+        }
+        assert!(service.list_candidates("pending", None).unwrap().is_empty());
+        assert!(fact_log(data_root.path()).is_empty());
+    }
+
+    #[test]
+    fn autoaccepted_updates_apply_once_and_return_the_final_projection() {
+        let data_root = tempfile::tempdir().unwrap();
+        let service = service(data_root.path());
+        service.set_settings(true, true, 0).unwrap();
+        let target = service
+            .upsert(command(
+                MemoryScope::user(),
+                MemoryType::Fact,
+                "prefer pnpm",
+            ))
+            .unwrap()
+            .memory;
+        let mut draft = model_draft("prefer npm", 0.99);
+        draft.operation = MemoryOperation::Update;
+        draft.target_memory_id = Some(target.id.clone());
+        let CandidateOutcome::AutoAccepted { memory, candidate } =
+            service.record_candidate(draft).unwrap()
+        else {
+            panic!("expected an automatically accepted update");
+        };
+        assert_eq!(memory.id, target.id);
+        assert_eq!(memory.revision, 2);
+        assert_eq!(memory.created_at_ms, target.created_at_ms);
+        assert_eq!(memory, service.projected(&memory.id).unwrap());
+        assert_eq!(candidate.target_revision, Some(1));
+        assert_eq!(candidate.status, "accepted");
+        assert_eq!(
+            fact_log(data_root.path())
+                .matches("memory_candidate_applied")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn stored_cross_scope_candidates_are_rejected_at_review() {
+        let data_root = tempfile::tempdir().unwrap();
+        let service = service(data_root.path());
+        let target = service
+            .upsert(command(project_scope(), MemoryType::Fact, "prefer pnpm"))
+            .unwrap()
+            .memory;
+        let id = Uuid::new_v4().to_string();
+        service
+            .repository
+            .record_candidate(MemoryCandidateRecord {
+                id: id.clone(),
+                operation: "update".into(),
+                target_memory_id: Some(target.id.clone()),
+                target_revision: Some(target.revision),
+                scope_type: "user".into(),
+                scope_id: None,
+                memory_type: "fact".into(),
+                content: "prefer npm".into(),
+                normalized_key: normalize_memory_key("prefer npm"),
+                reason: "legacy cross-scope proposal".into(),
+                confidence: 0.9,
+                requires_review: true,
+                status: "pending".into(),
+                source_turn_id: Some(Uuid::new_v4().to_string()),
+                created_at_ms: now_ms(),
+                reviewed_at_ms: None,
+            })
+            .unwrap();
+        let before = fact_log(data_root.path());
+        assert_eq!(
+            service
+                .review_candidate(&id, CandidateDecision::Accept)
+                .unwrap_err()
+                .code(),
+            "MEM_SCOPE_MISMATCH"
+        );
+        assert_eq!(service.projected(&target.id).unwrap(), target);
+        assert_eq!(fact_log(data_root.path()), before);
+    }
+
+    #[test]
+    fn duplicate_pending_candidates_reuse_the_original_fact() {
+        let data_root = tempfile::tempdir().unwrap();
+        let service = service(data_root.path());
+        let CandidateOutcome::Pending { candidate: first } = service
+            .record_candidate(model_draft("prefer pnpm", 0.9))
+            .unwrap()
+        else {
+            panic!("expected a pending candidate");
+        };
+        let CandidateOutcome::Pending { candidate: second } = service
+            .record_candidate(model_draft("prefer pnpm", 0.95))
+            .unwrap()
+        else {
+            panic!("expected the original pending candidate");
+        };
+        assert_eq!(first, second);
+        assert_eq!(service.list_candidates("pending", None).unwrap().len(), 1);
+        assert_eq!(
+            fact_log(data_root.path())
+                .matches("memory_candidate_recorded")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn rejected_candidates_suppress_the_same_scope_and_key() {
+        let data_root = tempfile::tempdir().unwrap();
+        let service = service(data_root.path());
+        let CandidateOutcome::Pending { candidate } = service
+            .record_candidate(model_draft("prefer pnpm", 0.9))
+            .unwrap()
+        else {
+            panic!("expected a pending candidate");
+        };
+        service
+            .review_candidate(&candidate.id, CandidateDecision::Reject)
+            .unwrap();
+        let before = fact_log(data_root.path());
+        assert!(matches!(
+            service
+                .record_candidate(model_draft("prefer pnpm", 1.0))
+                .unwrap(),
+            CandidateOutcome::Suppressed { .. }
+        ));
+        assert_eq!(fact_log(data_root.path()), before);
+        let mut other_scope = model_draft("prefer pnpm", 0.9);
+        other_scope.scope =
+            MemoryScope::new(MemoryScopeKind::Project, Some(Uuid::new_v4().to_string()));
+        assert!(matches!(
+            service.record_candidate(other_scope).unwrap(),
+            CandidateOutcome::Pending { .. }
+        ));
+    }
+
+    #[test]
+    fn inactive_or_expired_memory_keys_never_reactivate_automatically() {
+        for status in ["deleted", "archived", "expired", "rejected", "active"] {
+            let data_root = tempfile::tempdir().unwrap();
+            let service = service(data_root.path());
+            let memory = service
+                .upsert(command(
+                    MemoryScope::user(),
+                    MemoryType::Fact,
+                    "prefer pnpm",
+                ))
+                .unwrap()
+                .memory;
+            if status == "active" {
+                let mut write = MemoryWrite::from(memory);
+                write.expires_at_ms = Some(now_ms().saturating_sub(1));
+                service.repository.upsert(write).unwrap();
+            } else {
+                service.repository.set_status(&memory.id, status).unwrap();
+            }
+            let before = fact_log(data_root.path());
+            assert!(
+                matches!(
+                    service
+                        .record_candidate(model_draft("prefer pnpm", 1.0))
+                        .unwrap(),
+                    CandidateOutcome::Suppressed { .. }
+                ),
+                "status: {status}"
+            );
+            assert_eq!(fact_log(data_root.path()), before);
+        }
+    }
+
+    #[test]
+    fn accepting_a_stale_candidate_rechecks_target_revision_after_restart() {
+        let data_root = tempfile::tempdir().unwrap();
+        let service = service(data_root.path());
+        let target = service
+            .upsert(command(
+                MemoryScope::user(),
+                MemoryType::Fact,
+                "prefer pnpm",
+            ))
+            .unwrap()
+            .memory;
+        let mut draft = model_draft("prefer npm", 0.9);
+        draft.operation = MemoryOperation::Update;
+        draft.target_memory_id = Some(target.id.clone());
+        let CandidateOutcome::Pending { candidate } = service.record_candidate(draft).unwrap()
+        else {
+            panic!("expected a pending update");
+        };
+        assert_eq!(candidate.target_revision, Some(1));
+        let mut update = command(MemoryScope::user(), MemoryType::Fact, "prefer bun");
+        update.memory_id = Some(target.id.clone());
+        let latest = service.upsert(update).unwrap().memory;
+        let restarted = MemoryService::new(ProjectionDb::open(data_root.path()).unwrap(), false);
+        assert_eq!(
+            restarted
+                .repository
+                .get_candidate(&candidate.id)
+                .unwrap()
+                .unwrap()
+                .target_revision,
+            Some(1)
+        );
+        let before = fact_log(data_root.path());
+        assert_eq!(
+            restarted
+                .review_candidate(&candidate.id, CandidateDecision::Accept)
+                .unwrap_err()
+                .code(),
+            "MEM_CANDIDATE_STALE"
+        );
+        assert_eq!(restarted.projected(&target.id).unwrap(), latest);
+        assert_eq!(fact_log(data_root.path()), before);
+    }
+
+    #[test]
+    fn accepting_an_update_rechecks_new_key_collisions_before_appending() {
+        let data_root = tempfile::tempdir().unwrap();
+        let service = service(data_root.path());
+        let target = service
+            .upsert(command(
+                MemoryScope::user(),
+                MemoryType::Fact,
+                "prefer pnpm",
+            ))
+            .unwrap()
+            .memory;
+        let mut draft = model_draft("prefer npm", 0.9);
+        draft.operation = MemoryOperation::Update;
+        draft.target_memory_id = Some(target.id.clone());
+        let CandidateOutcome::Pending { candidate } = service.record_candidate(draft).unwrap()
+        else {
+            panic!("expected a pending update");
+        };
+        service
+            .upsert(command(MemoryScope::user(), MemoryType::Fact, "prefer npm"))
+            .unwrap();
+        let before = fact_log(data_root.path());
+        assert_eq!(
+            service
+                .review_candidate(&candidate.id, CandidateDecision::Accept)
+                .unwrap_err()
+                .code(),
+            "MEM_CANDIDATE_STALE"
+        );
+        assert_eq!(service.projected(&target.id).unwrap(), target);
+        assert_eq!(fact_log(data_root.path()), before);
+    }
+
+    #[test]
+    fn pending_candidates_cannot_restore_deleted_targets() {
+        let data_root = tempfile::tempdir().unwrap();
+        let service = service(data_root.path());
+        let target = service
+            .upsert(command(
+                MemoryScope::user(),
+                MemoryType::Fact,
+                "prefer pnpm",
+            ))
+            .unwrap()
+            .memory;
+        let mut draft = model_draft("prefer npm", 0.9);
+        draft.operation = MemoryOperation::Update;
+        draft.target_memory_id = Some(target.id.clone());
+        let CandidateOutcome::Pending { candidate } = service.record_candidate(draft).unwrap()
+        else {
+            panic!("expected a pending update");
+        };
+        service.delete(&target.id, &target.id).unwrap();
+        assert_eq!(
+            service
+                .review_candidate(&candidate.id, CandidateDecision::Accept)
+                .unwrap_err()
+                .code(),
+            "MEM_CANDIDATE_SUPPRESSED"
+        );
+        assert_eq!(service.projected(&target.id).unwrap().status, "deleted");
+    }
+
+    #[test]
+    fn service_clones_serialize_candidate_recording_and_review() {
+        let data_root = tempfile::tempdir().unwrap();
+        let service = service(data_root.path());
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let workers = (0..8)
+            .map(|_| {
+                let clone = service.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    clone
+                        .record_candidate(model_draft("prefer pnpm", 0.9))
+                        .unwrap()
+                })
+            })
+            .collect::<Vec<_>>();
+        let candidates = workers
+            .into_iter()
+            .map(|worker| {
+                let CandidateOutcome::Pending { candidate } = worker.join().unwrap() else {
+                    panic!("expected a pending candidate");
+                };
+                candidate
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            candidates
+                .iter()
+                .all(|candidate| candidate.id == candidates[0].id)
+        );
+        let candidate_id = candidates[0].id.clone();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let workers = (0..2)
+            .map(|_| {
+                let clone = service.clone();
+                let candidate_id = candidate_id.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    clone.review_candidate(&candidate_id, CandidateDecision::Accept)
+                })
+            })
+            .collect::<Vec<_>>();
+        let results = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter_map(|result| result.as_ref().err())
+                .next()
+                .unwrap()
+                .code(),
+            "MEM_CANDIDATE_ALREADY_REVIEWED"
+        );
+        assert_eq!(
+            service
+                .list(&MemoryScope::user(), MemoryStatus::Active, None, None)
+                .unwrap()
+                .total,
+            1
+        );
+        let facts = fact_log(data_root.path());
+        assert_eq!(facts.matches("memory_candidate_recorded").count(), 1);
+        assert_eq!(facts.matches("memory_candidate_applied").count(), 1);
+    }
+
+    #[test]
+    fn accepted_candidate_is_one_recoverable_application() {
+        let data_root = tempfile::tempdir().unwrap();
+        let service = service(data_root.path());
+        let CandidateOutcome::Pending { candidate } = service
+            .record_candidate(model_draft("prefer pnpm", 0.9))
+            .unwrap()
+        else {
+            panic!("expected a pending candidate");
+        };
+        let reviewed = service
+            .review_candidate(&candidate.id, CandidateDecision::Accept)
+            .unwrap();
+        let original = service
+            .list(&MemoryScope::user(), MemoryStatus::Active, None, None)
+            .unwrap()
+            .items;
+        assert_eq!(original.len(), 1);
+        assert_eq!(original[0].revision, 1);
+        let facts = fact_log(data_root.path());
+        assert_eq!(facts.matches("memory_candidate_applied").count(), 1);
+        assert!(!facts.contains("memory_candidate_reviewed"));
+        service.rebuild_projection().unwrap();
+        assert_eq!(
+            service
+                .repository
+                .get_candidate(&candidate.id)
+                .unwrap()
+                .unwrap(),
+            reviewed
+        );
+        assert_eq!(
+            service
+                .list(&MemoryScope::user(), MemoryStatus::Active, None, None)
+                .unwrap()
+                .items,
+            original
+        );
+        assert_eq!(fact_log(data_root.path()), facts);
+    }
+
     #[test]
     fn settings_round_trip_and_reject_out_of_range_ttl() {
         let data_root = tempfile::tempdir().unwrap();
@@ -1677,11 +2320,15 @@ mod tests {
         assert!(!defaults.auto_accept_high_confidence);
         assert_eq!(defaults.default_ttl_days, 0);
         assert_eq!(defaults.schema_version, MEMORY_SETTINGS_SCHEMA_VERSION);
+        assert_eq!(defaults.auto_extraction_consent_version, 0);
+        assert_eq!(defaults.capture_after_ms, None);
 
         let updated = service.set_settings(true, true, 30).unwrap();
         assert!(updated.enabled);
         assert!(updated.auto_accept_high_confidence);
         assert_eq!(updated.default_ttl_days, 30);
+        assert_eq!(updated.auto_extraction_consent_version, 0);
+        assert_eq!(updated.capture_after_ms, None);
         assert_eq!(service.settings().unwrap(), updated);
 
         assert_eq!(
@@ -1692,6 +2339,215 @@ mod tests {
             "MEM_INVALID_ARGUMENT"
         );
         assert_eq!(service.settings().unwrap(), updated);
+    }
+
+    #[test]
+    fn schema_one_settings_without_disclosure_fields_remain_readable() {
+        let data_root = tempfile::tempdir().unwrap();
+        let db = ProjectionDb::open(data_root.path()).unwrap();
+        let raw = r#"{"schemaVersion":1,"enabled":true,"autoAcceptHighConfidence":true,"defaultTtlDays":30}"#;
+        db.set_setting(MEMORY_SETTINGS_KEY, raw).unwrap();
+        let service = MemoryService::new(db.clone(), false);
+        let settings = service.settings().unwrap();
+        assert!(settings.enabled);
+        assert!(settings.auto_accept_high_confidence);
+        assert_eq!(settings.default_ttl_days, 30);
+        assert_eq!(settings.auto_extraction_consent_version, 0);
+        assert_eq!(settings.capture_after_ms, None);
+        assert_eq!(
+            db.setting(MEMORY_SETTINGS_KEY).unwrap().as_deref(),
+            Some(raw)
+        );
+        assert_eq!(
+            crate::memory::capture::capture_skip_reason(&settings, now_ms()),
+            Some("extraction_consent_required")
+        );
+        let unchanged = service.set_settings(true, false, 10).unwrap();
+        assert_eq!(unchanged.auto_extraction_consent_version, 0);
+        assert_eq!(unchanged.capture_after_ms, None);
+        let before = now_ms();
+        let authorized = service
+            .set_settings_with_disclosure(true, false, 10, true)
+            .unwrap();
+        assert_eq!(authorized.auto_extraction_consent_version, 2);
+        assert!(authorized.capture_after_ms.unwrap() >= before);
+        assert!(authorized.capture_after_ms.unwrap() <= now_ms());
+    }
+
+    #[test]
+    fn disclosure_requires_acceptance_and_preserves_an_enabled_capture_boundary() {
+        let data_root = tempfile::tempdir().unwrap();
+        let service = service(data_root.path());
+        assert_eq!(AUTO_EXTRACTION_CONSENT_VERSION, 2);
+        let unaccepted = service
+            .set_settings_with_disclosure(true, true, 10, false)
+            .unwrap();
+        assert_eq!(unaccepted.auto_extraction_consent_version, 0);
+        assert_eq!(unaccepted.capture_after_ms, None);
+        let before = now_ms();
+        let mut authorized = service
+            .set_settings_with_disclosure(true, true, 10, true)
+            .unwrap();
+        assert_eq!(authorized.auto_extraction_consent_version, 2);
+        assert!(authorized.capture_after_ms.unwrap() >= before);
+        assert!(authorized.capture_after_ms.unwrap() <= now_ms());
+        authorized.capture_after_ms = Some(1);
+        service.persist_settings(&authorized).unwrap();
+        let repeated = service
+            .set_settings_with_disclosure(true, false, 20, true)
+            .unwrap();
+        assert_eq!(repeated.capture_after_ms, Some(1));
+        assert_eq!(repeated.auto_extraction_consent_version, 2);
+        assert!(!repeated.auto_accept_high_confidence);
+        assert_eq!(repeated.default_ttl_days, 20);
+        let compatibility = service.set_settings(true, true, 30).unwrap();
+        assert_eq!(compatibility.auto_extraction_consent_version, 2);
+        assert_eq!(compatibility.capture_after_ms, Some(1));
+        let reopened = MemoryService::new(ProjectionDb::open(data_root.path()).unwrap(), false);
+        assert_eq!(reopened.settings().unwrap(), compatibility);
+        assert_eq!(
+            reopened
+                .set_settings_with_disclosure(true, true, 30, false)
+                .unwrap(),
+            compatibility
+        );
+    }
+
+    #[test]
+    fn reenable_refreshes_only_an_already_authorized_capture_boundary() {
+        let data_root = tempfile::tempdir().unwrap();
+        let service = service(data_root.path());
+        let mut settings = service
+            .set_settings_with_disclosure(true, false, 0, true)
+            .unwrap();
+        settings.capture_after_ms = Some(1);
+        service.persist_settings(&settings).unwrap();
+        let disabled = service
+            .set_settings_with_disclosure(false, false, 0, false)
+            .unwrap();
+        assert_eq!(disabled.auto_extraction_consent_version, 2);
+        assert_eq!(disabled.capture_after_ms, Some(1));
+        let before = now_ms();
+        let reenabled = service
+            .set_settings_with_disclosure(true, false, 0, false)
+            .unwrap();
+        assert_eq!(reenabled.auto_extraction_consent_version, 2);
+        assert!(reenabled.capture_after_ms.unwrap() >= before);
+        assert!(reenabled.capture_after_ms.unwrap() <= now_ms());
+        settings.auto_extraction_consent_version = 0;
+        settings.enabled = false;
+        settings.capture_after_ms = None;
+        service.persist_settings(&settings).unwrap();
+        let unaccepted = service.set_settings(true, false, 0).unwrap();
+        assert_eq!(unaccepted.auto_extraction_consent_version, 0);
+        assert_eq!(unaccepted.capture_after_ms, None);
+    }
+
+    #[test]
+    fn disclosure_while_disabled_defers_the_first_capture_boundary_until_enable() {
+        let data_root = tempfile::tempdir().unwrap();
+        let service = service(data_root.path());
+        let disabled = service
+            .set_settings_with_disclosure(false, false, 0, true)
+            .unwrap();
+        assert_eq!(disabled.auto_extraction_consent_version, 2);
+        assert_eq!(disabled.capture_after_ms, None);
+        let before = now_ms();
+        let enabled = service.set_settings(true, false, 0).unwrap();
+        assert!(enabled.capture_after_ms.unwrap() >= before);
+        assert!(enabled.capture_after_ms.unwrap() <= now_ms());
+        let mut missing_boundary = enabled;
+        missing_boundary.capture_after_ms = None;
+        service.persist_settings(&missing_boundary).unwrap();
+        let first_boundary = service
+            .set_settings_with_disclosure(true, false, 0, true)
+            .unwrap();
+        assert!(first_boundary.capture_after_ms.is_some());
+    }
+
+    #[test]
+    fn invalid_disclosure_ttl_does_not_persist_consent() {
+        let data_root = tempfile::tempdir().unwrap();
+        let service = service(data_root.path());
+        let original = service.settings().unwrap();
+        assert_eq!(
+            service
+                .set_settings_with_disclosure(true, true, MAX_MEMORY_TTL_DAYS + 1, true)
+                .unwrap_err()
+                .code(),
+            "MEM_INVALID_ARGUMENT"
+        );
+        assert_eq!(service.settings().unwrap(), original);
+    }
+
+    #[test]
+    fn concurrent_disclosure_updates_share_the_first_capture_boundary() {
+        let data_root = tempfile::tempdir().unwrap();
+        let service = service(data_root.path());
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let workers = (0..8)
+            .map(|_| {
+                let service = service.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    service
+                        .set_settings_with_disclosure(true, false, 0, true)
+                        .unwrap()
+                })
+            })
+            .collect::<Vec<_>>();
+        let settings = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>();
+        assert!(settings[0].capture_after_ms.is_some());
+        assert!(settings.iter().all(|setting| setting == &settings[0]));
+        assert_eq!(service.settings().unwrap(), settings[0]);
+    }
+
+    #[test]
+    fn initialization_diagnostic_retains_only_the_error_code_and_settings_stay_available() {
+        let data_root = tempfile::tempdir().unwrap();
+        let db = ProjectionDb::open(data_root.path()).unwrap();
+        let path = data_root.path().join("memory/events.jsonl");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let private_body = "private-memory-body user@example.com sk-live-abcdefghijklmnop";
+        let invalid_event = format!("{}\n", serde_json::to_string(private_body).unwrap());
+        std::fs::write(&path, &invalid_event).unwrap();
+        let service = MemoryService::new(db, true);
+        assert_eq!(
+            service.initialization_error().as_deref(),
+            Some("MEM_INVALID_DATA")
+        );
+        assert_eq!(
+            service.clone().initialization_error(),
+            service.initialization_error()
+        );
+        assert!(
+            !service
+                .initialization_error()
+                .unwrap()
+                .contains(private_body)
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), invalid_event);
+        assert!(service.settings().unwrap().enabled);
+        let disabled = service.set_settings(false, false, 0).unwrap();
+        assert!(!disabled.enabled);
+        assert_eq!(disabled.auto_extraction_consent_version, 0);
+        assert_eq!(disabled.capture_after_ms, None);
+        assert_eq!(
+            service.initialization_error().as_deref(),
+            Some("MEM_INVALID_DATA")
+        );
+    }
+
+    #[test]
+    fn successful_initialization_has_no_diagnostic() {
+        let data_root = tempfile::tempdir().unwrap();
+        let service = service(data_root.path());
+        assert_eq!(service.initialization_error(), None);
+        assert_eq!(service.clone().initialization_error(), None);
     }
 
     #[test]

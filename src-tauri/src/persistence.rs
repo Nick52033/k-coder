@@ -1225,6 +1225,7 @@ fn migrate(connection: &Connection) -> Result<(), rusqlite::Error> {
                id TEXT PRIMARY KEY,
                operation TEXT NOT NULL,
                target_memory_id TEXT,
+               target_revision INTEGER,
                scope_type TEXT NOT NULL,
                scope_id TEXT,
                memory_type TEXT NOT NULL,
@@ -1322,6 +1323,31 @@ fn migrate(connection: &Connection) -> Result<(), rusqlite::Error> {
             [],
         )?;
         transaction.commit()?;
+    }
+    add_column_if_missing(
+        connection,
+        "memory_candidates",
+        "target_revision",
+        "INTEGER",
+    )?;
+    Ok(())
+}
+
+fn add_column_if_missing(
+    connection: &Connection,
+    table: &str,
+    column: &str,
+    column_type: &str,
+) -> Result<(), rusqlite::Error> {
+    let exists: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name=?2)",
+        params![table, column],
+        |row| row.get(0),
+    )?;
+    if !exists {
+        connection.execute_batch(&format!(
+            "ALTER TABLE {table} ADD COLUMN {column} {column_type}"
+        ))?;
     }
     Ok(())
 }

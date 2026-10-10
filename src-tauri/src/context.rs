@@ -1553,8 +1553,12 @@ mod tests {
         }));
         let (summary, compacted) = compact_once(&messages, 2_000);
         let rendered = render_summary(&summary);
-        // The summary records that an image existed, never the pixels.
-        assert!(rendered.contains("[1 image attachment(s)]"));
+        assert!(summary.summary.len() <= compaction_summary_limit(2_000));
+        assert!(
+            summary
+                .summary
+                .contains("earlier compaction summary omitted")
+        );
         assert!(!rendered.contains("base64"));
         assert!(!rendered.contains("iVBORw0KGgo"));
         assert!(!summary.summary.contains("iVBORw0KGgo"));
@@ -1606,7 +1610,12 @@ mod tests {
             "persisted summary leaked: {}",
             summary.summary
         );
-        assert!(summary.summary.contains("[REDACTED]"));
+        assert!(
+            summary
+                .summary
+                .contains("earlier compaction summary omitted")
+        );
+        assert!(rendered.contains("[REDACTED]"));
         assert!(
             summary
                 .important_tool_observations

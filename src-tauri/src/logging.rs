@@ -38,20 +38,58 @@ const SOURCE_KEYS: &[&str] = &["threadid"];
 
 #[derive(Clone)]
 pub struct StructuredLogger {
+    inner: Arc<Mutex<LoggerState>>,
+    default_directory: Arc<PathBuf>,
+}
+
+struct LoggerState {
     path: PathBuf,
-    lock: Arc<Mutex<()>>,
+    custom_directory: Option<PathBuf>,
+    warning: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LogStorage {
+    pub directory: String,
+    pub file_path: String,
+    pub default_directory: String,
+    pub custom_directory: Option<String>,
+    pub warning: Option<String>,
 }
 
 impl StructuredLogger {
     pub fn new(data_root: &Path) -> std::io::Result<Self> {
+        Self::with_directory(data_root, None)
+    }
+
+    pub fn with_directory(data_root: &Path, custom: Option<&Path>) -> std::io::Result<Self> {
         fs::create_dir_all(data_root)?;
         let data_root = data_root.canonicalize()?;
         let directory = data_root.join("logs");
         reject_link(&directory)?;
         fs::create_dir_all(&directory)?;
-        Ok(Self {
+        let mut state = LoggerState {
             path: directory.join("runtime.jsonl"),
-            lock: Arc::new(Mutex::new(())),
+            custom_directory: custom.map(Path::to_path_buf),
+            warning: None,
+        };
+        if let Some(custom) = custom {
+            match prepare_directory(custom) {
+                Ok(path) => {
+                    state.custom_directory = path.parent().map(Path::to_path_buf);
+                    state.path = path;
+                }
+                Err(error) => {
+                    state.warning =
+                        Some(format!("自定义日志目录不可用，已回退到默认目录：{error}"));
+                }
+            }
+        }
+        state.validate_paths()?;
+        Ok(Self {
+            inner: Arc::new(Mutex::new(state)),
+            default_directory: Arc::new(directory),
         })
     }
 
@@ -60,15 +98,98 @@ impl StructuredLogger {
         if !matches!(level.as_str(), "info" | "error") {
             return Ok(());
         }
-        let _guard = self
-            .lock
+        let state = self
+            .inner
             .lock()
             .map_err(|_| std::io::Error::other("log lock poisoned"))?;
-        self.validate_paths()?;
-        self.append(&level, event, fields)
+        state.validate_paths()?;
+        state.append(&level, event, fields)
     }
 
+    pub fn storage(&self) -> std::io::Result<LogStorage> {
+        let state = self
+            .inner
+            .lock()
+            .map_err(|_| std::io::Error::other("log lock poisoned"))?;
+        Ok(self.storage_view(&state))
+    }
+
+    fn storage_view(&self, state: &LoggerState) -> LogStorage {
+        LogStorage {
+            directory: state
+                .path
+                .parent()
+                .expect("logger has a directory")
+                .to_string_lossy()
+                .into_owned(),
+            file_path: state.path.to_string_lossy().into_owned(),
+            default_directory: self.default_directory.to_string_lossy().into_owned(),
+            custom_directory: state
+                .custom_directory
+                .as_ref()
+                .map(|path| path.to_string_lossy().into_owned()),
+            warning: state.warning.clone(),
+        }
+    }
+
+    pub(crate) fn change_directory(
+        &self,
+        directory: Option<&Path>,
+        persist: impl FnOnce(Option<&Path>) -> std::io::Result<()>,
+    ) -> std::io::Result<LogStorage> {
+        let mut state = self
+            .inner
+            .lock()
+            .map_err(|_| std::io::Error::other("log lock poisoned"))?;
+        let path = prepare_directory(directory.unwrap_or(&self.default_directory))?;
+        let custom = (path.parent() != Some(self.default_directory.as_path()))
+            .then(|| path.parent().expect("logger has a directory").to_path_buf());
+        persist(custom.as_deref())?;
+        let previous = state.path.clone();
+        state.path = path;
+        state.custom_directory = custom;
+        state.warning = None;
+        if let Err(error) = state.append(
+            "info",
+            "log_directory_changed",
+            json!({
+                "source": "user", "previousDirectory": previous.parent(),
+                "directory": state.path.parent(), "historyMoved": false,
+            }),
+        ) {
+            state.warning = Some(format!("日志目录已更改，但审计日志写入失败：{error}"));
+        }
+        Ok(self.storage_view(&state))
+    }
+
+    pub fn clear_logs(&self, confirmed: bool) -> std::io::Result<()> {
+        self.inner
+            .lock()
+            .map_err(|_| std::io::Error::other("log lock poisoned"))?
+            .clear_logs(confirmed)
+    }
+
+    pub fn read_logs(&self, query: LogQuery) -> std::io::Result<LogQueryResult> {
+        self.inner
+            .lock()
+            .map_err(|_| std::io::Error::other("log lock poisoned"))?
+            .read_logs(query)
+    }
+
+    #[cfg(test)]
+    fn path(&self) -> PathBuf {
+        self.inner.lock().unwrap().path.clone()
+    }
+
+    #[cfg(test)]
+    fn paths(&self) -> Vec<PathBuf> {
+        self.inner.lock().unwrap().paths()
+    }
+}
+
+impl LoggerState {
     fn append(&self, level: &str, event: &str, fields: Value) -> std::io::Result<()> {
+        self.validate_paths()?;
         if self
             .path
             .metadata()
@@ -95,7 +216,7 @@ impl StructuredLogger {
 
     fn validate_paths(&self) -> std::io::Result<()> {
         let directory = self.path.parent().expect("logger has a directory");
-        reject_link(directory)?;
+        reject_link_ancestors(directory)?;
         if directory.canonicalize()? != directory {
             return Err(std::io::Error::other("log directory changed"));
         }
@@ -116,10 +237,6 @@ impl StructuredLogger {
                 "clearing runtime logs requires confirmation",
             ));
         }
-        let _guard = self
-            .lock
-            .lock()
-            .map_err(|_| std::io::Error::other("log lock poisoned"))?;
         self.validate_paths()?;
         for path in self.paths() {
             match fs::remove_file(path) {
@@ -181,12 +298,8 @@ pub struct LogQueryResult {
     pub total: usize,
 }
 
-impl StructuredLogger {
+impl LoggerState {
     pub fn read_logs(&self, query: LogQuery) -> std::io::Result<LogQueryResult> {
-        let _guard = self
-            .lock
-            .lock()
-            .map_err(|_| std::io::Error::other("log lock poisoned"))?;
         self.validate_paths()?;
         let mut paths: Vec<PathBuf> = Vec::new();
         for generation in (1..=LOG_GENERATIONS).rev() {
@@ -304,6 +417,48 @@ impl StructuredLogger {
         let records: Vec<LogRecord> = records.split_off(start);
         Ok(LogQueryResult { records, total })
     }
+}
+
+fn prepare_directory(directory: &Path) -> std::io::Result<PathBuf> {
+    if !directory.is_absolute() || !directory.is_dir() {
+        return Err(std::io::Error::other("请选择已存在的绝对目录"));
+    }
+    reject_link_ancestors(directory)?;
+    let directory = directory.canonicalize()?;
+    let candidate = LoggerState {
+        path: directory.join("runtime.jsonl"),
+        custom_directory: None,
+        warning: None,
+    };
+    candidate.validate_paths()?;
+    #[cfg(unix)]
+    if directory.metadata()?.permissions().readonly() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "日志目录不可写",
+        ));
+    }
+    if candidate.path.exists() {
+        OpenOptions::new().append(true).open(&candidate.path)?;
+    }
+    let probe = directory.join(format!(".runtime-log-write-check-{}", uuid::Uuid::new_v4()));
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&probe)?;
+    let result = file.write_all(b"log directory check");
+    drop(file);
+    let cleanup = fs::remove_file(&probe);
+    result?;
+    cleanup?;
+    Ok(candidate.path)
+}
+
+fn reject_link_ancestors(path: &Path) -> std::io::Result<()> {
+    for ancestor in path.ancestors() {
+        reject_link(ancestor)?;
+    }
+    Ok(())
 }
 
 fn reject_link(path: &Path) -> std::io::Result<()> {
@@ -460,6 +615,174 @@ mod tests {
     }
 
     #[test]
+    fn directory_switch_updates_clones_preserves_history_and_appends_existing_logs() {
+        let data = tempfile::tempdir().unwrap();
+        let target = tempfile::tempdir().unwrap();
+        let logger = StructuredLogger::new(data.path()).unwrap();
+        let clone = logger.clone();
+        logger.log("info", "original", json!({})).unwrap();
+        let original = logger.path();
+        fs::write(
+            target.path().join("runtime.jsonl"),
+            "{\"timestampMs\":1,\"level\":\"info\",\"event\":\"existing\",\"fields\":{}}\n",
+        )
+        .unwrap();
+        let mut persisted = None;
+        logger
+            .change_directory(Some(target.path()), |path| {
+                persisted = path.map(Path::to_path_buf);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(persisted, Some(target.path().canonicalize().unwrap()));
+        clone.log("error", "from_clone", json!({})).unwrap();
+        assert_eq!(logger.path(), clone.path());
+        assert_eq!(clone.read_logs(query()).unwrap().total, 3);
+        let history = fs::read_to_string(&original).unwrap();
+        assert!(history.contains("original"));
+        assert!(!history.contains("from_clone"));
+        clone.clear_logs(true).unwrap();
+        assert_eq!(fs::read_to_string(&original).unwrap(), history);
+        assert_eq!(logger.read_logs(query()).unwrap().total, 1);
+        logger
+            .change_directory(None, |path| {
+                assert!(path.is_none());
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(clone.path(), original);
+        assert!(clone.storage().unwrap().custom_directory.is_none());
+    }
+
+    #[test]
+    fn directory_switch_failure_preserves_active_configuration() {
+        let data = tempfile::tempdir().unwrap();
+        let target = tempfile::tempdir().unwrap();
+        let logger = StructuredLogger::new(data.path()).unwrap();
+        let original = logger.path();
+        assert!(
+            logger
+                .change_directory(Some(target.path()), |_| Err(std::io::Error::other(
+                    "database unavailable"
+                )))
+                .is_err()
+        );
+        assert_eq!(logger.path(), original);
+        assert!(logger.storage().unwrap().custom_directory.is_none());
+        fs::create_dir(target.path().join("runtime.jsonl.1")).unwrap();
+        assert!(
+            logger
+                .change_directory(Some(target.path()), |_| panic!(
+                    "invalid target cannot persist"
+                ))
+                .is_err()
+        );
+        assert_eq!(logger.path(), original);
+        assert!(
+            logger
+                .change_directory(Some(Path::new("relative")), |_| panic!(
+                    "relative target cannot persist"
+                ))
+                .is_err()
+        );
+        assert!(
+            logger
+                .change_directory(Some(&target.path().join("missing")), |_| panic!(
+                    "missing target cannot persist"
+                ))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn invalid_saved_directory_falls_back_with_visible_warning() {
+        let data = tempfile::tempdir().unwrap();
+        let invalid = data.path().join("missing");
+        let logger = StructuredLogger::with_directory(data.path(), Some(&invalid)).unwrap();
+        let storage = logger.storage().unwrap();
+        assert_eq!(storage.directory, storage.default_directory);
+        assert!(storage.warning.unwrap().contains("回退"));
+        assert!(storage.custom_directory.is_some());
+    }
+
+    #[test]
+    fn concurrent_directory_changes_writes_and_cleanup_share_one_state() {
+        let data = tempfile::tempdir().unwrap();
+        let target = tempfile::tempdir().unwrap();
+        let logger = StructuredLogger::new(data.path()).unwrap();
+        std::thread::scope(|scope| {
+            let clone = logger.clone();
+            scope.spawn(move || {
+                for _ in 0..20 {
+                    clone.log("info", "concurrent", json!({})).unwrap();
+                }
+            });
+            let clone = logger.clone();
+            scope.spawn(move || {
+                for _ in 0..10 {
+                    clone.clear_logs(true).unwrap();
+                }
+            });
+            for _ in 0..10 {
+                logger
+                    .change_directory(Some(target.path()), |_| Ok(()))
+                    .unwrap();
+                logger.change_directory(None, |_| Ok(())).unwrap();
+            }
+        });
+        assert!(logger.read_logs(query()).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_switch_rejects_linked_parent_and_log_file() {
+        let data = tempfile::tempdir().unwrap();
+        let target = tempfile::tempdir().unwrap();
+        let logger = StructuredLogger::new(data.path()).unwrap();
+        std::os::unix::fs::symlink(target.path(), data.path().join("linked")).unwrap();
+        assert!(
+            logger
+                .change_directory(Some(&data.path().join("linked")), |_| panic!(
+                    "link cannot persist"
+                ))
+                .is_err()
+        );
+        std::os::unix::fs::symlink(logger.path(), target.path().join("runtime.jsonl")).unwrap();
+        assert!(
+            logger
+                .change_directory(Some(target.path()), |_| panic!("link cannot persist"))
+                .is_err()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn directory_switch_rejects_windows_junction() {
+        let data = tempfile::tempdir().unwrap();
+        let target = tempfile::tempdir().unwrap();
+        let logger = StructuredLogger::new(data.path()).unwrap();
+        let link = data.path().join("linked");
+        assert!(
+            std::process::Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(&link)
+                .arg(target.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            logger
+                .change_directory(Some(&link), |_| panic!("junction cannot persist"))
+                .is_err()
+        );
+        assert_eq!(
+            logger.storage().unwrap().directory,
+            logger.storage().unwrap().default_directory
+        );
+    }
+
+    #[test]
     fn searches_error_content_case_insensitively_across_rotations_before_limiting() {
         let data = tempfile::tempdir().unwrap();
         let logger = StructuredLogger::new(data.path()).unwrap();
@@ -472,7 +795,7 @@ mod tests {
             }
         });
         fs::write(
-            logger.path.with_extension("jsonl.1"),
+            logger.path().with_extension("jsonl.1"),
             format!("{older_failure}\n"),
         )
         .unwrap();
@@ -558,8 +881,11 @@ mod tests {
                 )
                 .unwrap();
         }
-        assert_eq!(fs::read_to_string(&logger.path).unwrap().lines().count(), 2);
-        fs::write(logger.path.with_extension("jsonl.1"), concat!(
+        assert_eq!(
+            fs::read_to_string(&logger.path()).unwrap().lines().count(),
+            2
+        );
+        fs::write(logger.path().with_extension("jsonl.1"), concat!(
             "{\"timestampMs\":1,\"level\":\"warn\",\"event\":\"legacy\"}\n",
             "{\"timestampMs\":2,\"level\":\"error\",\"event\":\"legacy\",\"fields\":{\"threadId\":\"old-thread\"}}\n",
             "invalid partial line\n"
@@ -608,7 +934,7 @@ mod tests {
             logger.clear_logs(false).unwrap_err().kind(),
             std::io::ErrorKind::PermissionDenied
         );
-        assert_eq!(fs::read_to_string(&logger.path).unwrap(), "old logs");
+        assert_eq!(fs::read_to_string(&logger.path()).unwrap(), "old logs");
         logger.clear_logs(true).unwrap();
         let result = logger.read_logs(query()).unwrap();
         assert_eq!(result.total, 1);
@@ -641,7 +967,7 @@ mod tests {
                 logger.clear_logs(true).unwrap();
             }
         });
-        let lines = fs::read_to_string(&logger.path).unwrap();
+        let lines = fs::read_to_string(&logger.path()).unwrap();
         assert!(
             lines
                 .lines()
@@ -697,9 +1023,9 @@ mod tests {
         let data = tempfile::tempdir().unwrap();
         let logger = StructuredLogger::new(data.path()).unwrap();
         logger.log("error", "keep", json!({})).unwrap();
-        fs::create_dir(logger.path.with_extension("jsonl.2")).unwrap();
+        fs::create_dir(logger.path().with_extension("jsonl.2")).unwrap();
         assert!(logger.clear_logs(true).is_err());
-        assert!(fs::read_to_string(&logger.path).unwrap().contains("keep"));
+        assert!(fs::read_to_string(&logger.path()).unwrap().contains("keep"));
     }
     #[test]
     fn redacts_nested_secrets() {
@@ -730,7 +1056,7 @@ mod tests {
                 }),
             )
             .unwrap();
-        let persisted = fs::read_to_string(&logger.path).unwrap();
+        let persisted = fs::read_to_string(&logger.path()).unwrap();
         let record: Value = serde_json::from_str(persisted.lines().next().unwrap()).unwrap();
         let fields = record["fields"].as_object().unwrap();
         // 调用与 Turn 标识只在会话事实事件里追得回来，不占运行日志的版面。
@@ -770,7 +1096,7 @@ mod tests {
                 }),
             )
             .unwrap();
-        let persisted = fs::read_to_string(&logger.path).unwrap();
+        let persisted = fs::read_to_string(&logger.path()).unwrap();
         let record: Value = serde_json::from_str(persisted.lines().next().unwrap()).unwrap();
         let fields = record["fields"].as_object().unwrap();
         // 事后查因必须在同一行里同时读到「哪条指令失败」和「失败原因」。
@@ -800,7 +1126,7 @@ mod tests {
                 "output": "x".repeat(4096),
             },
         });
-        fs::write(&logger.path, format!("{legacy}\n")).unwrap();
+        fs::write(&logger.path(), format!("{legacy}\n")).unwrap();
         let result = logger.read_logs(query()).unwrap();
         let record = &result.records[0];
         // 来源对话的关联不能因为收敛而失效。
@@ -900,7 +1226,7 @@ mod tests {
         let first = logger.read_logs(query()).unwrap();
         let once = first.records[0].fields.clone();
         fs::write(
-            &logger.path,
+            &logger.path(),
             format!(
                 "{}\n",
                 serde_json::to_string(&json!({

@@ -53,7 +53,7 @@ export function ToastProvider({ children }: { children: ReactNode }) {
                 <CircleAlert size={15} />
               )}
             </span>
-            <span className="toast-msg">{t.message}</span>
+            <span className={`toast-msg${t.message.includes("\n") ? " toast-msg--multiline" : ""}`}>{t.message}</span>
             <button className="toast-close" type="button" aria-label="关闭通知" onClick={() => dismiss(t.id)}>
               <X size={13} />
             </button>

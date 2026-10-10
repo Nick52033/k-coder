@@ -3239,7 +3239,20 @@ function App() {
                   provider={selectedThreadProvider}
                   providers={providerConfigs}
                   activeProviderId={selectedThreadProviderId}
-                  onSelectThreadModel={selectThreadModel}
+                  onSelectThreadModel={async (providerId, model) => {
+                    const unchanged = selectedThreadProviderId === providerId && selectedThreadProvider?.model === model;
+                    const success = await selectThreadModel(providerId, model);
+                    if (success && !unchanged && useWorkbenchStore.getState().activeThreadId === activeThreadId) {
+                      const target = providerConfigs.find((provider) => provider.id === providerId);
+                      const targetModel = target?.models.find((candidate) => candidate.id === model);
+                      toast.success(
+                        `已切换模型：${target?.name ?? providerId} / ${targetModel?.displayName || model}\n${
+                          currentThreadBusy ? "当前轮次仍使用原模型，下轮生效" : "下一轮将使用新模型"
+                        }`,
+                      );
+                    }
+                    return success;
+                  }}
                 />
               </div>
               <div className="composer-actions">

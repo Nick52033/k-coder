@@ -23,6 +23,7 @@ use crate::extensions::{
 };
 use crate::knowledge::KnowledgeService;
 use crate::logging::StructuredLogger;
+use crate::memory::capture::MemoryCaptureService;
 use crate::memory::{MemoryMaintenanceService, MemoryService};
 use crate::multi_agent::MultiAgentCoordinator;
 use crate::patch::{PatchError, PatchService};
@@ -109,6 +110,7 @@ pub struct AppState {
     knowledge: KnowledgeService,
     entities: EntityService,
     memory: MemoryService,
+    memory_capture: MemoryCaptureService,
     memory_maintenance: MemoryMaintenanceService,
     /// Wall-clock instant the app last became fully idle, or `None` while a Turn or subagent runs.
     ///
@@ -291,7 +293,12 @@ impl AppState {
             .map_err(|error| AppStateError::Workspace(error.to_string()))?
             .and_then(|raw| serde_json::from_str::<ReasoningEffort>(&raw).ok())
             .unwrap_or_default();
-        let logger = StructuredLogger::new(&data_root)
+        let log_directory = repository
+            .projection()
+            .setting("log_directory")
+            .map_err(|error| AppStateError::Logging(error.to_string()))?
+            .map(PathBuf::from);
+        let logger = StructuredLogger::with_directory(&data_root, log_directory.as_deref())
             .map_err(|error| AppStateError::Logging(error.to_string()))?;
         let builtin_plugins_root_for_state = builtin_plugins_root.clone();
         let extensions = ExtensionService::with_builtin_skills_and_plugins(
@@ -313,6 +320,7 @@ impl AppState {
             .map(|settings| settings.enabled)
             .unwrap_or(false);
         let memory = MemoryService::new(repository.projection(), legacy_memory_enabled);
+        let memory_capture = MemoryCaptureService::new(repository.projection());
         // Constructing the maintenance service also recovers a run that was in flight when the
         // process stopped, so a crash mid-Dream cannot leave the projection believing a run is live.
         let memory_maintenance = MemoryMaintenanceService::new(repository.projection());
@@ -357,6 +365,7 @@ impl AppState {
             knowledge,
             entities,
             memory,
+            memory_capture,
             memory_maintenance,
             // A freshly started app has no Turn in flight, so it counts as idle from boot. Combined
             // with `idle_after_ms` this still gives the user a quiet window before the first run.
@@ -476,6 +485,25 @@ impl AppState {
         self.data_root.clone()
     }
 
+    /// Read a secret through the configured OS credential store.
+    pub fn get_credential(&self, account: &str) -> Result<Option<String>, AppStateError> {
+        self.credentials
+            .get_api_key(account)
+            .map_err(|error| AppStateError::Workspace(error.to_string()))
+    }
+
+    pub fn set_credential(&self, account: &str, value: &str) -> Result<(), AppStateError> {
+        self.credentials
+            .set_api_key(account, value)
+            .map_err(|error| AppStateError::Workspace(error.to_string()))
+    }
+
+    pub fn delete_credential(&self, account: &str) -> Result<(), AppStateError> {
+        self.credentials
+            .delete_api_key(account)
+            .map_err(|error| AppStateError::Workspace(error.to_string()))
+    }
+
     pub fn tool_registry(&self) -> ToolRegistry {
         self.tool_registry
             .read()
@@ -578,6 +606,10 @@ impl AppState {
 
     pub fn memory(&self) -> MemoryService {
         self.memory.clone()
+    }
+
+    pub fn memory_capture(&self) -> MemoryCaptureService {
+        self.memory_capture.clone()
     }
 
     pub fn memory_maintenance(&self) -> MemoryMaintenanceService {
@@ -1049,6 +1081,24 @@ impl AppState {
 
     pub fn logger(&self) -> StructuredLogger {
         self.logger.clone()
+    }
+
+    pub fn log_storage(&self) -> std::io::Result<crate::logging::LogStorage> {
+        self.logger.storage()
+    }
+
+    pub(crate) fn change_log_directory(
+        &self,
+        directory: Option<&Path>,
+    ) -> std::io::Result<crate::logging::LogStorage> {
+        self.logger.change_directory(directory, |custom| {
+            let projection = self.repository.projection();
+            match custom {
+                Some(path) => projection.set_setting("log_directory", &path.to_string_lossy()),
+                None => projection.delete_setting("log_directory"),
+            }
+            .map_err(|error| std::io::Error::other(error.to_string()))
+        })
     }
 
     pub async fn read_runtime_logs(
@@ -2328,6 +2378,40 @@ mod tests {
     }
 
     #[test]
+    fn log_directory_settings_survive_restart_and_reset() {
+        let data = tempfile::tempdir().unwrap();
+        let target = tempfile::tempdir().unwrap();
+        let credentials = Arc::new(FakeCredentials::default());
+        let state = AppState::with_credentials(data.path(), credentials.clone()).unwrap();
+        let selected = state.change_log_directory(Some(target.path())).unwrap();
+        assert_eq!(
+            state
+                .repository
+                .projection()
+                .setting("log_directory")
+                .unwrap(),
+            selected.custom_directory
+        );
+        drop(state);
+        let state = AppState::with_credentials(data.path(), credentials.clone()).unwrap();
+        assert_eq!(state.log_storage().unwrap().directory, selected.directory);
+        let reset = state.change_log_directory(None).unwrap();
+        assert_eq!(reset.directory, reset.default_directory);
+        assert!(
+            state
+                .repository
+                .projection()
+                .setting("log_directory")
+                .unwrap()
+                .is_none()
+        );
+        assert!(target.path().join("runtime.jsonl").exists());
+        drop(state);
+        let state = AppState::with_credentials(data.path(), credentials).unwrap();
+        assert!(state.log_storage().unwrap().custom_directory.is_none());
+    }
+
+    #[test]
     fn configured_cross_provider_route_controls_capabilities_and_context_budget() {
         let directory = tempfile::tempdir().unwrap();
         let credentials = Arc::new(FakeCredentials::default());
@@ -2613,9 +2697,10 @@ mod tests {
             .expect("a fresh state is idle");
         assert!(boot_idle > 0);
 
+        let thread_id = Uuid::new_v4().to_string();
         let workspace_root = state.workspace_root();
         let (_, _control) = state
-            .begin_turn_with_id_in_workspace("thread-1", "turn-1", &workspace_root)
+            .begin_turn_with_id_in_workspace(&thread_id, "turn-1", &workspace_root)
             .await
             .unwrap();
         assert!(
@@ -2623,7 +2708,7 @@ mod tests {
             "an in-flight Turn must keep maintenance from being scheduled"
         );
 
-        state.finish_turn("thread-1").await;
+        state.finish_turn(&thread_id).await;
         let idle_again = state
             .memory_maintenance_idle_since_ms()
             .await
@@ -3047,29 +3132,34 @@ mod tests {
             AppState::with_credentials(directory.path(), Arc::new(FakeCredentials::default()))
                 .expect("state should initialize");
 
-        state.begin_turn("thread").await.expect("first turn starts");
+        let thread_id = Uuid::new_v4().to_string();
+        let other_thread_id = Uuid::new_v4().to_string();
+        state
+            .begin_turn(&thread_id)
+            .await
+            .expect("first turn starts");
         assert!(matches!(
-            state.begin_turn("thread").await,
+            state.begin_turn(&thread_id).await,
             Err(AppStateError::TurnAlreadyActive(_))
         ));
         state
-            .begin_turn("other-thread")
+            .begin_turn(&other_thread_id)
             .await
             .expect("a different thread may run concurrently");
-        assert!(state.is_turn_active("thread").await);
-        assert!(state.is_turn_active("other-thread").await);
+        assert!(state.is_turn_active(&thread_id).await);
+        assert!(state.is_turn_active(&other_thread_id).await);
         assert!(matches!(
             state
                 .cancel_workflow_run(CancelWorkflowRunRequest {
-                    thread_id: "thread".into(),
+                    thread_id: thread_id.clone(),
                     run_id: "run".into(),
                 })
                 .await,
-            Err(AppStateError::ThreadOperationBusy(thread_id)) if thread_id == "thread"
+            Err(AppStateError::ThreadOperationBusy(active_thread_id)) if active_thread_id == thread_id
         ));
-        assert!(state.cancel_turn("thread").await);
-        state.finish_turn("thread").await;
-        state.finish_turn("other-thread").await;
+        assert!(state.cancel_turn(&thread_id).await);
+        state.finish_turn(&thread_id).await;
+        state.finish_turn(&other_thread_id).await;
     }
 
     #[tokio::test]
@@ -3079,11 +3169,12 @@ mod tests {
             AppState::with_credentials(directory.path(), Arc::new(FakeCredentials::default()))
                 .unwrap(),
         );
+        let thread_id = Uuid::new_v4().to_string();
         state
             .enqueue_thread_turn(MailboxTurn {
                 handle: crate::protocol::TurnHandle {
                     schema_version: crate::protocol::PROTOCOL_VERSION,
-                    thread_id: "thread".into(),
+                    thread_id: thread_id.clone(),
                     turn_id: "turn-dequeued".into(),
                     state: TurnState::Queued,
                 },
@@ -3092,19 +3183,20 @@ mod tests {
             })
             .await;
         let (_, operation_guard) = state
-            .next_thread_turn("thread")
+            .next_thread_turn(&thread_id)
             .await
             .expect("queued turn should be dequeued with the operation gate held");
 
         let fork_state = state.clone();
-        let fork = tokio::spawn(async move { fork_state.fork_thread("thread", None).await });
+        let fork_thread_id = thread_id.clone();
+        let fork = tokio::spawn(async move { fork_state.fork_thread(&fork_thread_id, None).await });
         tokio::task::yield_now().await;
         assert!(!fork.is_finished());
 
         let workspace = state.workspace_root();
         state
             .begin_turn_with_id_in_workspace_locked(
-                "thread",
+                &thread_id,
                 "turn-dequeued",
                 &workspace,
                 &operation_guard,
@@ -3115,9 +3207,9 @@ mod tests {
 
         assert!(matches!(
             fork.await.unwrap(),
-            Err(AppStateError::ThreadOperationBusy(thread_id)) if thread_id == "thread"
+            Err(AppStateError::ThreadOperationBusy(active_thread_id)) if active_thread_id == thread_id
         ));
-        state.finish_turn("thread").await;
+        state.finish_turn(&thread_id).await;
     }
 
     #[tokio::test]
@@ -3165,10 +3257,11 @@ mod tests {
         let state =
             AppState::with_credentials(directory.path(), Arc::new(FakeCredentials::default()))
                 .unwrap();
+        let thread_id = Uuid::new_v4().to_string();
         let active_item = MailboxTurn {
             handle: crate::protocol::TurnHandle {
                 schema_version: crate::protocol::PROTOCOL_VERSION,
-                thread_id: "thread".into(),
+                thread_id: thread_id.clone(),
                 turn_id: "turn-current".into(),
                 state: TurnState::Queued,
             },
@@ -3177,13 +3270,13 @@ mod tests {
         };
         assert!(state.enqueue_thread_turn(active_item).await);
         let (_, operation_guard) = state
-            .next_thread_turn("thread")
+            .next_thread_turn(&thread_id)
             .await
             .expect("the mailbox worker should own the active item");
         let workspace = state.workspace_root();
         let (cancellation, control) = state
             .begin_turn_with_id_in_workspace_locked(
-                "thread",
+                &thread_id,
                 "turn-current",
                 &workspace,
                 &operation_guard,
@@ -3195,13 +3288,13 @@ mod tests {
         let queued_message = MailboxTurn {
             handle: crate::protocol::TurnHandle {
                 schema_version: crate::protocol::PROTOCOL_VERSION,
-                thread_id: "thread".into(),
+                thread_id: thread_id.clone(),
                 turn_id: "turn-queued".into(),
                 state: TurnState::Queued,
             },
             kind: MailboxTurnKind::Message {
                 request: crate::agent::RunTurnRequest {
-                    thread_id: "thread".into(),
+                    thread_id: thread_id.clone(),
                     input: "keep this queued".into(),
                     agent_mode: None,
                 },
@@ -3221,10 +3314,10 @@ mod tests {
         };
         control.steer(still_open.clone()).unwrap();
         assert_eq!(control.take_pending(), vec![still_open]);
-        let snapshot = state.thread_mailbox().snapshot("thread", None).await;
+        let snapshot = state.thread_mailbox().snapshot(&thread_id, None).await;
         assert_eq!(snapshot.pending.len(), 1);
         assert_eq!(snapshot.pending[0].turn_id, "turn-queued");
-        state.finish_turn("thread").await;
+        state.finish_turn(&thread_id).await;
     }
 
     #[tokio::test]
@@ -3234,16 +3327,17 @@ mod tests {
             AppState::with_credentials(directory.path(), Arc::new(FakeCredentials::default()))
                 .unwrap(),
         );
+        let thread_id = Uuid::new_v4().to_string();
         let workspace = state.workspace_root();
         let (cancellation, _) = state
-            .begin_turn_with_id_in_workspace("thread", "turn-blocking", &workspace)
+            .begin_turn_with_id_in_workspace(&thread_id, "turn-blocking", &workspace)
             .await
             .unwrap();
         let should_start = state
             .enqueue_thread_turn(MailboxTurn {
                 handle: crate::protocol::TurnHandle {
                     schema_version: crate::protocol::PROTOCOL_VERSION,
-                    thread_id: "thread".into(),
+                    thread_id: thread_id.clone(),
                     turn_id: "turn-queued".into(),
                     state: TurnState::Queued,
                 },
@@ -3255,10 +3349,12 @@ mod tests {
         assert!(!cancellation.is_cancelled());
 
         let waiting_state = state.clone();
-        let waiting = tokio::spawn(async move { waiting_state.next_thread_turn("thread").await });
+        let waiting_thread_id = thread_id.clone();
+        let waiting =
+            tokio::spawn(async move { waiting_state.next_thread_turn(&waiting_thread_id).await });
         tokio::task::yield_now().await;
         assert!(!waiting.is_finished());
-        state.finish_turn("thread").await;
+        state.finish_turn(&thread_id).await;
         let (queued_turn, operation_guard) = waiting
             .await
             .unwrap()
@@ -3273,9 +3369,10 @@ mod tests {
         let state =
             AppState::with_credentials(directory.path(), Arc::new(FakeCredentials::default()))
                 .unwrap();
+        let thread_id = Uuid::new_v4().to_string();
         let workspace = state.workspace_root();
         let (_, control) = state
-            .begin_turn_with_id_in_workspace("thread", "turn-current", &workspace)
+            .begin_turn_with_id_in_workspace(&thread_id, "turn-current", &workspace)
             .await
             .unwrap();
         let message = crate::protocol::ChatMessage {
@@ -3288,30 +3385,30 @@ mod tests {
 
         assert!(matches!(
             state
-                .steer_turn("thread", "turn-stale", message.clone())
+                .steer_turn(&thread_id, "turn-stale", message.clone())
                 .await,
             Err(AppStateError::ExpectedTurnMismatch { .. })
         ));
         assert_eq!(
             state
-                .steer_turn("thread", "turn-current", message.clone())
+                .steer_turn(&thread_id, "turn-current", message.clone())
                 .await
                 .unwrap(),
             "turn-current"
         );
         assert_eq!(control.take_pending(), vec![message]);
         assert!(matches!(
-            state.interrupt_turn("thread", "turn-stale").await,
+            state.interrupt_turn(&thread_id, "turn-stale").await,
             Err(AppStateError::ExpectedTurnMismatch { .. })
         ));
         state
-            .interrupt_turn("thread", "turn-current")
+            .interrupt_turn(&thread_id, "turn-current")
             .await
             .unwrap();
-        assert!(state.cancel_turn("thread").await);
-        state.finish_turn("thread").await;
+        assert!(state.cancel_turn(&thread_id).await);
+        state.finish_turn(&thread_id).await;
         assert!(matches!(
-            state.interrupt_turn("thread", "turn-current").await,
+            state.interrupt_turn(&thread_id, "turn-current").await,
             Err(AppStateError::NoActiveTurn(_))
         ));
     }
@@ -3322,9 +3419,10 @@ mod tests {
         let state =
             AppState::with_credentials(directory.path(), Arc::new(FakeCredentials::default()))
                 .unwrap();
+        let thread_id = Uuid::new_v4().to_string();
         let workspace = state.workspace_root();
         let (_, control) = state
-            .begin_turn_with_id_in_workspace("thread", "turn-current", &workspace)
+            .begin_turn_with_id_in_workspace(&thread_id, "turn-current", &workspace)
             .await
             .unwrap();
         for (turn_id, kind) in [
@@ -3332,7 +3430,7 @@ mod tests {
                 "queued-message",
                 MailboxTurnKind::Message {
                     request: crate::agent::RunTurnRequest {
-                        thread_id: "thread".into(),
+                        thread_id: thread_id.clone(),
                         input: "queued input".into(),
                         agent_mode: None,
                     },
@@ -3347,7 +3445,7 @@ mod tests {
                 .enqueue(MailboxTurn {
                     handle: crate::protocol::TurnHandle {
                         schema_version: crate::protocol::PROTOCOL_VERSION,
-                        thread_id: "thread".into(),
+                        thread_id: thread_id.clone(),
                         turn_id: turn_id.into(),
                         state: TurnState::Queued,
                     },
@@ -3365,7 +3463,7 @@ mod tests {
         };
 
         let stale_result = state
-            .steer_queued_message("thread", "turn-stale", "queued-message", message.clone())
+            .steer_queued_message(&thread_id, "turn-stale", "queued-message", message.clone())
             .await;
         assert!(matches!(
             stale_result,
@@ -3374,28 +3472,33 @@ mod tests {
         assert_eq!(
             state
                 .thread_mailbox()
-                .snapshot("thread", Some("turn-current".into()))
+                .snapshot(&thread_id, Some("turn-current".into()))
                 .await
                 .pending
                 .len(),
             2
         );
         let accepted_turn = state
-            .steer_queued_message("thread", "turn-current", "queued-message", message.clone())
+            .steer_queued_message(
+                &thread_id,
+                "turn-current",
+                "queued-message",
+                message.clone(),
+            )
             .await
             .unwrap();
         assert_eq!(accepted_turn, "turn-current");
         assert_eq!(control.take_pending(), vec![message]);
         let snapshot = state
             .thread_mailbox()
-            .snapshot("thread", Some("turn-current".into()))
+            .snapshot(&thread_id, Some("turn-current".into()))
             .await;
         assert_eq!(snapshot.pending.len(), 1);
         assert_eq!(snapshot.pending[0].turn_id, "queued-retry");
         assert!(matches!(
             state
                 .steer_queued_message(
-                    "thread",
+                    &thread_id,
                     "turn-current",
                     "queued-retry",
                     crate::protocol::ChatMessage {
@@ -3412,13 +3515,13 @@ mod tests {
         assert_eq!(
             state
                 .thread_mailbox()
-                .snapshot("thread", Some("turn-current".into()))
+                .snapshot(&thread_id, Some("turn-current".into()))
                 .await
                 .pending
                 .len(),
             1
         );
-        state.finish_turn("thread").await;
+        state.finish_turn(&thread_id).await;
     }
 
     #[tokio::test]
@@ -3428,13 +3531,14 @@ mod tests {
         let state = AppState::with_credentials(directory.path(), credentials.clone())
             .expect("state should initialize");
 
+        let thread_id = Uuid::new_v4().to_string();
         assert_eq!(state.approval_mode(), ApprovalMode::Ask);
-        state.begin_turn("thread").await.expect("turn starts");
+        state.begin_turn(&thread_id).await.expect("turn starts");
         assert!(matches!(
             state.set_approval_mode(ApprovalMode::FullAccess).await,
             Err(AppStateError::ApprovalModeBusy)
         ));
-        state.finish_turn("thread").await;
+        state.finish_turn(&thread_id).await;
         assert_eq!(
             state
                 .set_approval_mode(ApprovalMode::FullAccess)
@@ -3467,7 +3571,8 @@ mod tests {
             .expect("state should restore");
         assert_eq!(restored.reasoning_effort(), ReasoningEffort::High);
 
-        state.begin_turn("thread").await.unwrap();
+        let thread_id = Uuid::new_v4().to_string();
+        state.begin_turn(&thread_id).await.unwrap();
         assert_eq!(
             state
                 .set_reasoning_effort(ReasoningEffort::Low)
@@ -3475,8 +3580,8 @@ mod tests {
                 .unwrap(),
             ReasoningEffort::Low
         );
-        state.cancel_turn("thread").await;
-        state.finish_turn("thread").await;
+        state.cancel_turn(&thread_id).await;
+        state.finish_turn(&thread_id).await;
     }
 
     #[tokio::test]

@@ -14,12 +14,15 @@ use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::memory::entity::Sensitivity;
+use crate::memory::policy::detect_sensitivity;
 use crate::persistence::{ProjectionDb, ProjectionError};
 use crate::storage::event_validation::{
     validate_bounded, validate_confidence, validate_id, validate_optional_bounded,
@@ -46,7 +49,7 @@ const MEMORY_COLUMNS: &str = "id,scope_type,scope_id,memory_type,normalized_key,
 
 const CANDIDATE_COLUMNS: &str = "id,operation,target_memory_id,scope_type,scope_id,memory_type,content,\
      normalized_key,reason,confidence,requires_review,status,source_turn_id,created_at_ms,\
-     reviewed_at_ms";
+     reviewed_at_ms,target_revision";
 
 /// A projected memory row.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -113,6 +116,8 @@ pub struct MemoryCandidateRecord {
     pub id: String,
     pub operation: String,
     pub target_memory_id: Option<String>,
+    #[serde(default)]
+    pub target_revision: Option<u64>,
     pub scope_type: String,
     pub scope_id: Option<String>,
     pub memory_type: String,
@@ -132,6 +137,20 @@ pub struct MemoryCandidateRecord {
 pub struct CandidateReview {
     pub id: String,
     pub status: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "data", rename_all = "snake_case")]
+pub enum CandidateMemoryChange {
+    Upsert(MemoryWrite),
+    StatusChange(MemoryStatusChange),
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CandidateApplied {
+    pub review: CandidateReview,
+    pub memory: CandidateMemoryChange,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -155,9 +174,32 @@ pub enum MemoryEventKind {
     CandidateRecorded(MemoryCandidateRecord),
     #[serde(rename = "memory_candidate_reviewed")]
     CandidateReviewed(CandidateReview),
+    #[serde(rename = "memory_candidate_applied")]
+    CandidateApplied(CandidateApplied),
 }
 
 impl MemoryEvent {
+    fn validate_for_append(&self) -> Result<(), ProjectionError> {
+        self.validate()?;
+        let secret = match &self.kind {
+            MemoryEventKind::CandidateRecorded(candidate) => {
+                detect_sensitivity(&format!("{}\n{}", candidate.content, candidate.reason))
+                    == Sensitivity::SecretCandidate
+            }
+            MemoryEventKind::CandidateApplied(CandidateApplied {
+                memory: CandidateMemoryChange::Upsert(write),
+                ..
+            }) => detect_sensitivity(&write.content) == Sensitivity::SecretCandidate,
+            _ => false,
+        };
+        if secret {
+            return Err(ProjectionError::InvalidData(
+                "candidate content or reason looks like a credential".into(),
+            ));
+        }
+        Ok(())
+    }
+
     fn validate(&self) -> Result<(), ProjectionError> {
         if self.schema_version != MEMORY_EVENT_SCHEMA_VERSION {
             return Err(ProjectionError::InvalidData(format!(
@@ -176,6 +218,21 @@ impl MemoryEvent {
             MemoryEventKind::CandidateReviewed(review) => {
                 validate_id(&review.id, "id")?;
                 validate_token(&review.status, "status")
+            }
+            MemoryEventKind::CandidateApplied(applied) => {
+                validate_id(&applied.review.id, "id")?;
+                if applied.review.status != "accepted" {
+                    return Err(ProjectionError::InvalidData(
+                        "an applied candidate must be accepted".into(),
+                    ));
+                }
+                match &applied.memory {
+                    CandidateMemoryChange::Upsert(write) => write.validate(),
+                    CandidateMemoryChange::StatusChange(change) => {
+                        validate_id(&change.id, "id")?;
+                        validate_token(&change.status, "status")
+                    }
+                }
             }
         }
     }
@@ -224,6 +281,13 @@ impl MemoryCandidateRecord {
         validate_token(&self.memory_type, "memoryType")?;
         validate_token(&self.status, "status")?;
         validate_optional_id(self.target_memory_id.as_deref(), "targetMemoryId")?;
+        if self.target_revision == Some(0)
+            || (self.target_memory_id.is_none() && self.target_revision.is_some())
+        {
+            return Err(ProjectionError::InvalidData(
+                "targetRevision requires a target and must be at least 1".into(),
+            ));
+        }
         validate_optional_id(self.source_turn_id.as_deref(), "sourceTurnId")?;
         validate_optional_bounded(
             self.scope_id.as_deref(),
@@ -273,6 +337,7 @@ pub struct MemoryRepository {
     events_path: Option<PathBuf>,
     legacy_path: Option<PathBuf>,
     append_lock: Arc<Mutex<()>>,
+    projection_dirty: Arc<AtomicBool>,
 }
 
 impl MemoryRepository {
@@ -286,6 +351,7 @@ impl MemoryRepository {
             events_path,
             legacy_path,
             append_lock: Arc::new(Mutex::new(())),
+            projection_dirty: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -301,18 +367,33 @@ impl MemoryRepository {
             created_at_ms: now_ms(),
             kind,
         };
-        self.append_event(&event)?;
-        self.apply_event(&event)
-    }
-
-    fn append_event(&self, event: &MemoryEvent) -> Result<(), ProjectionError> {
-        let Some(path) = self.events_path.as_ref() else {
-            return Ok(());
-        };
+        event.validate_for_append()?;
         let _guard = self
             .append_lock
             .lock()
             .map_err(|_| ProjectionError::Poisoned)?;
+        if self.projection_dirty.load(Ordering::Acquire) {
+            self.rebuild_projection_unlocked()?;
+        }
+        self.projection_dirty.store(true, Ordering::Release);
+        self.append_event(&event)?;
+        self.apply_event(&event)?;
+        self.projection_dirty.store(false, Ordering::Release);
+        Ok(())
+    }
+
+    pub fn recover_projection(&self) -> Result<(), ProjectionError> {
+        if self.projection_dirty.load(Ordering::Acquire) {
+            self.rebuild_projection()?;
+        }
+        Ok(())
+    }
+
+    fn append_event(&self, event: &MemoryEvent) -> Result<(), ProjectionError> {
+        event.validate_for_append()?;
+        let Some(path) = self.events_path.as_ref() else {
+            return Ok(());
+        };
         let parent = path.parent().ok_or_else(|| {
             ProjectionError::InvalidData("memory event path has no parent".into())
         })?;
@@ -336,36 +417,49 @@ impl MemoryRepository {
             .map_err(|error| ProjectionError::InvalidData(format!("append memory event: {error}")))
     }
 
-    /// Rebuilds the whole memory projection from the fact log. Every record is parsed and validated
-    /// before any row is touched, so a corrupted log closes the rebuild without emptying the
-    /// projection. When no log exists yet the legacy `advanced/memories.jsonl` is folded in once.
+    /// Rebuilds the whole memory projection from validated facts, then imports only missing legacy
+    /// ids. The legacy file is read-only and durable events always precede projection changes.
     pub fn rebuild_projection(&self) -> Result<(), ProjectionError> {
+        let _guard = self
+            .append_lock
+            .lock()
+            .map_err(|_| ProjectionError::Poisoned)?;
+        self.projection_dirty.store(true, Ordering::Release);
+        self.rebuild_projection_unlocked()
+    }
+
+    fn rebuild_projection_unlocked(&self) -> Result<(), ProjectionError> {
         let Some(path) = self.events_path.as_ref() else {
+            self.projection_dirty.store(false, Ordering::Release);
             return Ok(());
         };
-        if !path.exists() {
-            return self.backfill_legacy_memories();
-        }
-        let content = fs::read_to_string(path).map_err(|error| {
-            ProjectionError::InvalidData(format!("read memory event log: {error}"))
-        })?;
-        if content.trim().is_empty() {
-            return self.backfill_legacy_memories();
-        }
+        let content = if path.exists() {
+            fs::read_to_string(path).map_err(|error| {
+                ProjectionError::InvalidData(format!("read memory event log: {error}"))
+            })?
+        } else {
+            String::new()
+        };
         let lines = content.split('\n').collect::<Vec<_>>();
         let has_trailing_newline = content.ends_with('\n');
         let mut events = Vec::new();
+        let mut valid_bytes = 0u64;
+        let mut truncated_tail = false;
         for (index, raw_line) in lines.iter().enumerate() {
             let line = raw_line.trim_end_matches('\r');
             if line.trim().is_empty() {
+                valid_bytes += raw_line.len() as u64;
+                if index + 1 < lines.len() {
+                    valid_bytes += 1;
+                }
                 continue;
             }
             let event = match serde_json::from_str::<MemoryEvent>(line) {
                 Ok(event) => event,
                 Err(error) if !has_trailing_newline && index + 1 == lines.len() => {
-                    // A process can be interrupted after writing a partial final line. Earlier
-                    // durable facts stay valid and the next mutation appends a clean record.
+                    // Only an interrupted final record is discarded; prior durable facts are kept.
                     let _ = error;
+                    truncated_tail = true;
                     break;
                 }
                 Err(error) => {
@@ -377,11 +471,39 @@ impl MemoryRepository {
             };
             event.validate()?;
             events.push(event);
+            valid_bytes += raw_line.len() as u64;
+            if index + 1 < lines.len() {
+                valid_bytes += 1;
+            }
+        }
+        if truncated_tail {
+            let file = OpenOptions::new().write(true).open(path).map_err(|error| {
+                ProjectionError::InvalidData(format!("open interrupted memory log: {error}"))
+            })?;
+            file.set_len(valid_bytes)
+                .and_then(|_| file.sync_data())
+                .map_err(|error| {
+                    ProjectionError::InvalidData(format!("repair interrupted memory log: {error}"))
+                })?;
+        } else if !has_trailing_newline && !content.is_empty() {
+            let mut file = OpenOptions::new()
+                .append(true)
+                .open(path)
+                .map_err(|error| {
+                    ProjectionError::InvalidData(format!("open unterminated memory log: {error}"))
+                })?;
+            file.write_all(b"\n")
+                .and_then(|_| file.sync_data())
+                .map_err(|error| {
+                    ProjectionError::InvalidData(format!("terminate memory log record: {error}"))
+                })?;
         }
         self.clear_projection()?;
         for event in &events {
             self.apply_event(event)?;
         }
+        self.backfill_legacy_memories()?;
+        self.projection_dirty.store(false, Ordering::Release);
         Ok(())
     }
 
@@ -395,9 +517,8 @@ impl MemoryRepository {
         })
     }
 
-    /// One-time read-only projection of the legacy `advanced/memories.jsonl` log. The original file
-    /// is never modified or deleted, and the newest revision per memory id wins, matching the legacy
-    /// `MemoryStore::latest_unlocked` semantics.
+    /// Imports only legacy ids absent from the rebuilt projection. The original file is never
+    /// modified; the highest legacy revision wins only among rows not already represented by facts.
     fn backfill_legacy_memories(&self) -> Result<(), ProjectionError> {
         let Some(path) = self.legacy_path.as_ref() else {
             return Ok(());
@@ -432,9 +553,19 @@ impl MemoryRepository {
         let mut ids = latest.keys().cloned().collect::<Vec<_>>();
         ids.sort();
         for id in ids {
+            if self.get(&id)?.is_some() {
+                continue;
+            }
             let legacy = latest.remove(&id).expect("legacy memory was collected");
+            if detect_sensitivity(&format!("{}\n{}", legacy.content, legacy.source))
+                == Sensitivity::SecretCandidate
+            {
+                continue;
+            }
             let legacy_updated_at_ms = legacy.updated_at_ms;
-            let write = legacy.into_write();
+            let mut write = legacy.into_write();
+            write.sensitivity = detect_sensitivity(&write.content).as_str().to_owned();
+            write.validate()?;
             let event = MemoryEvent {
                 schema_version: MEMORY_EVENT_SCHEMA_VERSION,
                 event_id: Uuid::new_v4().to_string(),
@@ -454,37 +585,7 @@ impl MemoryRepository {
                 let transaction = connection.transaction()?;
                 match &event.kind {
                     MemoryEventKind::MemoryUpserted(write) => {
-                        transaction.execute(
-                            "INSERT INTO memories(id,scope_type,scope_id,memory_type,normalized_key,
-                               content,source_type,source_ref,confidence,sensitivity,status,revision,
-                               expires_at_ms,created_at_ms,updated_at_ms)
-                             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)
-                             ON CONFLICT(id) DO UPDATE SET scope_type=excluded.scope_type,
-                               scope_id=excluded.scope_id,memory_type=excluded.memory_type,
-                               normalized_key=excluded.normalized_key,content=excluded.content,
-                               source_type=excluded.source_type,source_ref=excluded.source_ref,
-                               confidence=excluded.confidence,sensitivity=excluded.sensitivity,
-                               status=excluded.status,revision=excluded.revision,
-                               expires_at_ms=excluded.expires_at_ms,
-                               updated_at_ms=excluded.updated_at_ms",
-                            params![
-                                write.id,
-                                write.scope_type,
-                                write.scope_id,
-                                write.memory_type,
-                                write.normalized_key,
-                                write.content,
-                                write.source_type,
-                                write.source_ref,
-                                write.confidence,
-                                write.sensitivity,
-                                write.status,
-                                write.revision as i64,
-                                write.expires_at_ms.map(|value| value as i64),
-                                write.created_at_ms as i64,
-                                event.created_at_ms as i64,
-                            ],
-                        )?;
+                        project_memory_upsert(&transaction, write, event.created_at_ms)?;
                     }
                     MemoryEventKind::MemoryStatusChanged(change) => {
                         let changed = transaction.execute(
@@ -496,13 +597,32 @@ impl MemoryRepository {
                         }
                     }
                     MemoryEventKind::CandidateRecorded(candidate) => {
+                        let target_revision = match candidate.target_revision {
+                            Some(revision) => Some(revision as i64),
+                            None => candidate
+                                .target_memory_id
+                                .as_deref()
+                                .map(|id| {
+                                    transaction
+                                        .query_row(
+                                            "SELECT revision FROM memories WHERE id=?1",
+                                            [id],
+                                            |row| row.get::<_, i64>(0),
+                                        )
+                                        .optional()
+                                })
+                                .transpose()?
+                                .flatten(),
+                        };
                         transaction.execute(
                             "INSERT INTO memory_candidates(id,operation,target_memory_id,scope_type,
                                scope_id,memory_type,content,normalized_key,reason,confidence,
-                               requires_review,status,source_turn_id,created_at_ms,reviewed_at_ms)
-                             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,NULL)
+                               requires_review,status,source_turn_id,created_at_ms,reviewed_at_ms,
+                               target_revision)
+                             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,NULL,?15)
                              ON CONFLICT(id) DO UPDATE SET operation=excluded.operation,
                                target_memory_id=excluded.target_memory_id,
+                               target_revision=excluded.target_revision,
                                scope_type=excluded.scope_type,scope_id=excluded.scope_id,
                                memory_type=excluded.memory_type,content=excluded.content,
                                normalized_key=excluded.normalized_key,reason=excluded.reason,
@@ -524,8 +644,37 @@ impl MemoryRepository {
                                 candidate.status,
                                 candidate.source_turn_id,
                                 candidate.created_at_ms as i64,
+                                target_revision,
                             ],
                         )?;
+                    }
+                    MemoryEventKind::CandidateApplied(applied) => {
+                        match &applied.memory {
+                            CandidateMemoryChange::Upsert(write) => {
+                                project_memory_upsert(&transaction, write, event.created_at_ms)?;
+                            }
+                            CandidateMemoryChange::StatusChange(change) => {
+                                let changed = transaction.execute(
+                                    "UPDATE memories SET status=?2,updated_at_ms=?3 WHERE id=?1",
+                                    params![change.id, change.status, event.created_at_ms as i64],
+                                )?;
+                                if changed == 0 {
+                                    return Err(rusqlite::Error::QueryReturnedNoRows);
+                                }
+                            }
+                        }
+                        let changed = transaction.execute(
+                            "UPDATE memory_candidates SET status=?2,reviewed_at_ms=?3
+                             WHERE id=?1 AND status='pending'",
+                            params![
+                                applied.review.id,
+                                applied.review.status,
+                                event.created_at_ms as i64
+                            ],
+                        )?;
+                        if changed == 0 {
+                            return Err(rusqlite::Error::QueryReturnedNoRows);
+                        }
                     }
                     MemoryEventKind::CandidateReviewed(review) => {
                         let changed = transaction.execute(
@@ -801,6 +950,81 @@ impl MemoryRepository {
             rows.collect::<Result<Vec<_>, _>>()
         })
     }
+
+    pub fn list_by_key_in_scope(
+        &self,
+        scope_type: &str,
+        scope_id: Option<&str>,
+        normalized_key: &str,
+    ) -> Result<Vec<MemoryRecord>, ProjectionError> {
+        self.db.with_connection(|connection| {
+            let mut statement = connection.prepare(&format!(
+                "SELECT {MEMORY_COLUMNS} FROM memories
+                 WHERE scope_type=?1 AND scope_id IS ?2 AND normalized_key=?3
+                 ORDER BY updated_at_ms DESC,id ASC"
+            ))?;
+            let rows =
+                statement.query_map(params![scope_type, scope_id, normalized_key], map_memory)?;
+            rows.collect::<Result<Vec<_>, _>>()
+        })
+    }
+
+    pub fn list_candidates_by_key_in_scope(
+        &self,
+        scope_type: &str,
+        scope_id: Option<&str>,
+        normalized_key: &str,
+    ) -> Result<Vec<MemoryCandidateRecord>, ProjectionError> {
+        self.db.with_connection(|connection| {
+            let mut statement = connection.prepare(&format!(
+                "SELECT {CANDIDATE_COLUMNS} FROM memory_candidates
+                 WHERE scope_type=?1 AND scope_id IS ?2 AND normalized_key=?3
+                   AND status IN ('pending','rejected')
+                 ORDER BY created_at_ms ASC,id ASC"
+            ))?;
+            let rows = statement
+                .query_map(params![scope_type, scope_id, normalized_key], map_candidate)?;
+            rows.collect::<Result<Vec<_>, _>>()
+        })
+    }
+}
+
+fn project_memory_upsert(
+    transaction: &rusqlite::Transaction<'_>,
+    write: &MemoryWrite,
+    updated_at_ms: u64,
+) -> Result<(), rusqlite::Error> {
+    transaction.execute(
+        "INSERT INTO memories(id,scope_type,scope_id,memory_type,normalized_key,
+           content,source_type,source_ref,confidence,sensitivity,status,revision,
+           expires_at_ms,created_at_ms,updated_at_ms)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)
+         ON CONFLICT(id) DO UPDATE SET scope_type=excluded.scope_type,
+           scope_id=excluded.scope_id,memory_type=excluded.memory_type,
+           normalized_key=excluded.normalized_key,content=excluded.content,
+           source_type=excluded.source_type,source_ref=excluded.source_ref,
+           confidence=excluded.confidence,sensitivity=excluded.sensitivity,
+           status=excluded.status,revision=excluded.revision,
+           expires_at_ms=excluded.expires_at_ms,updated_at_ms=excluded.updated_at_ms",
+        params![
+            write.id,
+            write.scope_type,
+            write.scope_id,
+            write.memory_type,
+            write.normalized_key,
+            write.content,
+            write.source_type,
+            write.source_ref,
+            write.confidence,
+            write.sensitivity,
+            write.status,
+            write.revision as i64,
+            write.expires_at_ms.map(|value| value as i64),
+            write.created_at_ms as i64,
+            updated_at_ms as i64,
+        ],
+    )?;
+    Ok(())
 }
 
 fn map_memory(row: &rusqlite::Row<'_>) -> Result<MemoryRecord, rusqlite::Error> {
@@ -830,6 +1054,9 @@ fn map_candidate(row: &rusqlite::Row<'_>) -> Result<MemoryCandidateRecord, rusql
         id: row.get(0)?,
         operation: row.get(1)?,
         target_memory_id: row.get(2)?,
+        target_revision: row
+            .get::<_, Option<i64>>(15)?
+            .map(|value| value.max(0) as u64),
         scope_type: row.get(3)?,
         scope_id: row.get(4)?,
         memory_type: row.get(5)?,
@@ -933,6 +1160,357 @@ mod tests {
         }
     }
 
+    fn candidate(id: &str, target: Option<&MemoryWrite>) -> MemoryCandidateRecord {
+        MemoryCandidateRecord {
+            id: id.into(),
+            operation: if target.is_some() { "update" } else { "create" }.into(),
+            target_memory_id: target.map(|target| target.id.clone()),
+            target_revision: target.map(|target| target.revision),
+            scope_type: MEMORY_SCOPE_USER.into(),
+            scope_id: None,
+            memory_type: "fact".into(),
+            content: "Prefer pnpm workspaces".into(),
+            normalized_key: normalize_memory_key("Prefer pnpm workspaces"),
+            reason: "observed in the conversation".into(),
+            confidence: 0.9,
+            requires_review: true,
+            status: CANDIDATE_STATUS_PENDING.into(),
+            source_turn_id: Some(Uuid::new_v4().to_string()),
+            created_at_ms: 1_000,
+            reviewed_at_ms: None,
+        }
+    }
+
+    #[test]
+    fn partial_legacy_backfill_preserves_facts_and_skips_credentials() {
+        let data_root = tempfile::tempdir().unwrap();
+        let repository = repository(data_root.path());
+        let revised_id = Uuid::new_v4().to_string();
+        let deleted_id = Uuid::new_v4().to_string();
+        let archived_id = Uuid::new_v4().to_string();
+        let missing_id = Uuid::new_v4().to_string();
+        let secret_id = Uuid::new_v4().to_string();
+        repository
+            .upsert(write(&revised_id, "current revision", 5))
+            .unwrap();
+        repository
+            .upsert(write(&deleted_id, "deleted note", 1))
+            .unwrap();
+        repository.set_status(&deleted_id, "deleted").unwrap();
+        repository
+            .upsert(write(&archived_id, "archived note", 1))
+            .unwrap();
+        repository.set_status(&archived_id, "archived").unwrap();
+        let legacy = [
+            (&revised_id, "obsolete legacy revision"),
+            (&deleted_id, "legacy resurrected note"),
+            (&archived_id, "legacy archived note"),
+            (&missing_id, "previously unimported note"),
+            (&secret_id, "password: hunter2sword"),
+        ]
+        .into_iter()
+        .map(|(id, content)| {
+            serde_json::json!({
+                "id": id, "revision": 9, "scopeKey": "global", "category": "profile",
+                "content": content, "confidence": 0.9, "source": "chat",
+                "createdAtMs": 1_000, "updatedAtMs": 2_000,
+            })
+            .to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+            + "\n";
+        let legacy_dir = data_root.path().join("advanced");
+        fs::create_dir_all(&legacy_dir).unwrap();
+        let legacy_path = legacy_dir.join("memories.jsonl");
+        fs::write(&legacy_path, &legacy).unwrap();
+        let path = data_root.path().join("memory/events.jsonl");
+        let before = fs::read_to_string(&path).unwrap();
+        repository.rebuild_projection().unwrap();
+        assert_eq!(repository.get(&revised_id).unwrap().unwrap().revision, 5);
+        assert_eq!(
+            repository.get(&revised_id).unwrap().unwrap().content,
+            "current revision"
+        );
+        assert_eq!(
+            repository.get(&deleted_id).unwrap().unwrap().status,
+            "deleted"
+        );
+        assert_eq!(
+            repository.get(&archived_id).unwrap().unwrap().status,
+            "archived"
+        );
+        assert!(repository.get(&missing_id).unwrap().is_some());
+        assert!(repository.get(&secret_id).unwrap().is_none());
+        assert_eq!(fs::read_to_string(&legacy_path).unwrap(), legacy);
+        let after = fs::read_to_string(&path).unwrap();
+        assert!(after.starts_with(&before));
+        assert_eq!(after.lines().count(), before.lines().count() + 1);
+        assert!(!after.contains("hunter2sword"));
+        repository.rebuild_projection().unwrap();
+        assert_eq!(fs::read_to_string(path).unwrap(), after);
+    }
+
+    #[test]
+    fn credential_candidates_never_reach_the_fact_log() {
+        let data_root = tempfile::tempdir().unwrap();
+        let repository = repository(data_root.path());
+        for in_reason in [false, true] {
+            let mut draft = candidate(&Uuid::new_v4().to_string(), None);
+            if in_reason {
+                draft.reason = "password: hunter2sword".into();
+            } else {
+                draft.content = "API_KEY=sk-live-abcdefghijklmnop".into();
+            }
+            assert!(repository.record_candidate(draft).is_err());
+        }
+        assert!(!data_root.path().join("memory/events.jsonl").exists());
+        assert!(
+            repository
+                .list_candidates("pending", 100)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn candidate_target_revisions_survive_reopen_without_event_replay() {
+        let data_root = tempfile::tempdir().unwrap();
+        let repository = repository(data_root.path());
+        let memory_id = Uuid::new_v4().to_string();
+        let target = write(&memory_id, "old target", 1);
+        repository.upsert(target.clone()).unwrap();
+        let proposal = candidate(&Uuid::new_v4().to_string(), Some(&target));
+        let created = candidate(&Uuid::new_v4().to_string(), None);
+        repository.record_candidate(proposal.clone()).unwrap();
+        repository.record_candidate(created.clone()).unwrap();
+        repository
+            .upsert(write(&memory_id, "new target", 2))
+            .unwrap();
+        drop(repository);
+
+        let repository = self::repository(data_root.path());
+        assert_eq!(
+            repository.get_candidate(&proposal.id).unwrap(),
+            Some(proposal.clone())
+        );
+        assert_eq!(
+            repository.get_candidate(&created.id).unwrap(),
+            Some(created.clone())
+        );
+        let listed = repository.list_candidates("pending", 100).unwrap();
+        assert!(listed.contains(&proposal));
+        assert!(listed.contains(&created));
+        let keyed = repository
+            .list_candidates_by_key_in_scope(MEMORY_SCOPE_USER, None, &proposal.normalized_key)
+            .unwrap();
+        assert!(keyed.contains(&proposal));
+        assert!(keyed.contains(&created));
+    }
+
+    #[test]
+    fn candidate_target_revision_column_is_added_idempotently() {
+        let data_root = tempfile::tempdir().unwrap();
+        let repository = repository(data_root.path());
+        let memory_id = Uuid::new_v4().to_string();
+        let target = write(&memory_id, "old target", 1);
+        repository.upsert(target.clone()).unwrap();
+        let proposal = candidate(&Uuid::new_v4().to_string(), Some(&target));
+        repository.record_candidate(proposal.clone()).unwrap();
+        repository
+            .upsert(write(&memory_id, "new target", 2))
+            .unwrap();
+        repository
+            .db
+            .with_connection(|connection| {
+                connection
+                    .execute_batch("ALTER TABLE memory_candidates DROP COLUMN target_revision")
+            })
+            .unwrap();
+        drop(repository);
+
+        let mut legacy = proposal.clone();
+        legacy.target_revision = None;
+        for _ in 0..2 {
+            let repository = self::repository(data_root.path());
+            assert_eq!(
+                repository.get_candidate(&proposal.id).unwrap(),
+                Some(legacy.clone())
+            );
+        }
+        let repository = self::repository(data_root.path());
+        repository.rebuild_projection().unwrap();
+        assert_eq!(
+            repository.get_candidate(&proposal.id).unwrap(),
+            Some(proposal)
+        );
+        assert_eq!(repository.get(&memory_id).unwrap().unwrap().revision, 2);
+    }
+
+    #[test]
+    fn old_candidate_events_restore_the_target_revision_at_recording_time() {
+        let data_root = tempfile::tempdir().unwrap();
+        let repository = repository(data_root.path());
+        let id = Uuid::new_v4().to_string();
+        let first = write(&id, "old target", 1);
+        repository.upsert(first.clone()).unwrap();
+        let candidate_id = Uuid::new_v4().to_string();
+        let mut old = candidate(&candidate_id, Some(&first));
+        old.target_revision = None;
+        repository.record_candidate(old).unwrap();
+        repository.upsert(write(&id, "new target", 2)).unwrap();
+        let path = data_root.path().join("memory/events.jsonl");
+        let events = fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|line| {
+                let mut event: serde_json::Value = serde_json::from_str(line).unwrap();
+                if event["type"] == "memory_candidate_recorded" {
+                    event["data"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("targetRevision");
+                }
+                event.to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        fs::write(&path, events).unwrap();
+        repository.rebuild_projection().unwrap();
+        assert_eq!(
+            repository
+                .get_candidate(&candidate_id)
+                .unwrap()
+                .unwrap()
+                .target_revision,
+            Some(1)
+        );
+        assert_eq!(repository.get(&id).unwrap().unwrap().revision, 2);
+    }
+
+    #[test]
+    fn legacy_candidate_with_a_missing_target_does_not_adopt_a_later_revision() {
+        let data_root = tempfile::tempdir().unwrap();
+        let repository = repository(data_root.path());
+        let memory_id = Uuid::new_v4().to_string();
+        let target = write(&memory_id, "later target", 1);
+        let mut proposal = candidate(&Uuid::new_v4().to_string(), Some(&target));
+        proposal.target_revision = None;
+        repository.record_candidate(proposal.clone()).unwrap();
+        repository.upsert(target).unwrap();
+        assert_eq!(
+            repository.get_candidate(&proposal.id).unwrap(),
+            Some(proposal.clone())
+        );
+        repository.rebuild_projection().unwrap();
+        assert_eq!(
+            repository.get_candidate(&proposal.id).unwrap(),
+            Some(proposal)
+        );
+    }
+
+    #[test]
+    fn candidate_application_recovers_atomically_after_projection_failure() {
+        let data_root = tempfile::tempdir().unwrap();
+        let repository = repository(data_root.path());
+        let candidate_id = Uuid::new_v4().to_string();
+        repository
+            .record_candidate(candidate(&candidate_id, None))
+            .unwrap();
+        repository
+            .db
+            .with_connection(|connection| {
+                connection.execute_batch(
+                    "CREATE TRIGGER fail_candidate_apply BEFORE UPDATE ON memory_candidates
+             WHEN NEW.status='accepted' BEGIN SELECT RAISE(ABORT,'simulated failure'); END;",
+                )
+            })
+            .unwrap();
+        let memory_id = Uuid::new_v4().to_string();
+        let memory = write(&memory_id, "Prefer pnpm workspaces", 1);
+        assert!(
+            repository
+                .append(MemoryEventKind::CandidateApplied(CandidateApplied {
+                    review: CandidateReview {
+                        id: candidate_id.clone(),
+                        status: "accepted".into()
+                    },
+                    memory: CandidateMemoryChange::Upsert(memory),
+                }))
+                .is_err()
+        );
+        assert!(repository.get(&memory_id).unwrap().is_none());
+        assert_eq!(
+            repository
+                .get_candidate(&candidate_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            "pending"
+        );
+        let path = data_root.path().join("memory/events.jsonl");
+        let facts = fs::read_to_string(&path).unwrap();
+        assert_eq!(facts.matches("memory_candidate_applied").count(), 1);
+        repository
+            .db
+            .with_connection(|connection| {
+                connection.execute_batch("DROP TRIGGER fail_candidate_apply;")
+            })
+            .unwrap();
+        repository.recover_projection().unwrap();
+        assert_eq!(repository.get(&memory_id).unwrap().unwrap().revision, 1);
+        assert_eq!(
+            repository
+                .get_candidate(&candidate_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            "accepted"
+        );
+        repository.rebuild_projection().unwrap();
+        assert_eq!(repository.get(&memory_id).unwrap().unwrap().revision, 1);
+        assert_eq!(fs::read_to_string(path).unwrap(), facts);
+    }
+
+    #[test]
+    fn a_combined_delete_and_review_replays_as_one_fact() {
+        let data_root = tempfile::tempdir().unwrap();
+        let repository = repository(data_root.path());
+        let memory_id = Uuid::new_v4().to_string();
+        let memory = write(&memory_id, "obsolete note", 1);
+        repository.upsert(memory.clone()).unwrap();
+        let candidate_id = Uuid::new_v4().to_string();
+        let mut proposal = candidate(&candidate_id, Some(&memory));
+        proposal.operation = "delete".into();
+        repository.record_candidate(proposal).unwrap();
+        repository
+            .append(MemoryEventKind::CandidateApplied(CandidateApplied {
+                review: CandidateReview {
+                    id: candidate_id.clone(),
+                    status: "accepted".into(),
+                },
+                memory: CandidateMemoryChange::StatusChange(MemoryStatusChange {
+                    id: memory_id.clone(),
+                    status: "deleted".into(),
+                }),
+            }))
+            .unwrap();
+        repository.rebuild_projection().unwrap();
+        assert_eq!(
+            repository.get(&memory_id).unwrap().unwrap().status,
+            "deleted"
+        );
+        assert_eq!(
+            repository
+                .get_candidate(&candidate_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            "accepted"
+        );
+    }
+
     #[test]
     fn appending_a_memory_updates_the_projection_and_the_fact_log() {
         let data_root = tempfile::tempdir().unwrap();
@@ -984,6 +1562,7 @@ mod tests {
                 id: "candidate-1".to_owned(),
                 operation: "create".to_owned(),
                 target_memory_id: None,
+                target_revision: None,
                 scope_type: MEMORY_SCOPE_USER.to_owned(),
                 scope_id: None,
                 memory_type: "preference".to_owned(),
@@ -1034,6 +1613,7 @@ mod tests {
                 id: "candidate-1".to_owned(),
                 operation: "delete".to_owned(),
                 target_memory_id: Some("memory-1".to_owned()),
+                target_revision: None,
                 scope_type: MEMORY_SCOPE_USER.to_owned(),
                 scope_id: None,
                 memory_type: "fact".to_owned(),
@@ -1148,6 +1728,51 @@ mod tests {
         );
         let log = fs::read_to_string(data_root.path().join("memory/events.jsonl")).unwrap();
         assert_eq!(log.matches("memory_upserted").count(), 2);
+    }
+
+    #[test]
+    fn interrupted_application_tail_is_repaired_before_the_next_fact() {
+        let data_root = tempfile::tempdir().unwrap();
+        let repository = repository(data_root.path());
+        let memory_id = Uuid::new_v4().to_string();
+        repository
+            .upsert(write(&memory_id, "durable note", 1))
+            .unwrap();
+        let path = data_root.path().join("memory/events.jsonl");
+        let durable = fs::read_to_string(&path).unwrap();
+        let partial =
+            durable.clone() + "{\"schemaVersion\":1,\"type\":\"memory_candidate_applied\"";
+        fs::write(&path, partial).unwrap();
+        repository.rebuild_projection().unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), durable);
+        repository.set_status(&memory_id, "archived").unwrap();
+        repository.rebuild_projection().unwrap();
+        assert_eq!(
+            repository.get(&memory_id).unwrap().unwrap().status,
+            "archived"
+        );
+        assert_eq!(fs::read_to_string(path).unwrap().lines().count(), 2);
+    }
+
+    #[test]
+    fn complete_final_fact_without_a_newline_is_kept_before_appending() {
+        let data_root = tempfile::tempdir().unwrap();
+        let repository = repository(data_root.path());
+        let memory_id = Uuid::new_v4().to_string();
+        repository
+            .upsert(write(&memory_id, "durable note", 1))
+            .unwrap();
+        let path = data_root.path().join("memory/events.jsonl");
+        let log = fs::read_to_string(&path).unwrap();
+        fs::write(&path, log.trim_end_matches('\n')).unwrap();
+        repository.rebuild_projection().unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), log);
+        repository.set_status(&memory_id, "deleted").unwrap();
+        repository.rebuild_projection().unwrap();
+        assert_eq!(
+            repository.get(&memory_id).unwrap().unwrap().status,
+            "deleted"
+        );
     }
 
     #[test]

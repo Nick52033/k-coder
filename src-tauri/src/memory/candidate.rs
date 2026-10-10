@@ -128,11 +128,11 @@ impl CandidateDraft {
     }
 
     pub fn detected_sensitivity(&self) -> Sensitivity {
-        detect_sensitivity(&self.content)
+        detect_sensitivity(&format!("{}\n{}", self.content, self.reason))
     }
 
-    /// Design §4.2: `secret_candidate`, deletion, conflicts and cross-scope updates always need a
-    /// human. High-confidence, non-sensitive creates and updates may be auto-accepted, and only when
+    /// Design §4.2: sensitive content, deletion and conflicts always need a human; credential-bearing
+    /// drafts and cross-scope targets are refused before recording. Auto-accept is possible only when
     /// the user has opted in.
     pub fn requires_review(
         &self,
@@ -162,6 +162,12 @@ impl CandidateDraft {
 
     pub fn validate(&self) -> Result<(), MemoryError> {
         self.scope.validate()?;
+        if self.detected_sensitivity() == Sensitivity::SecretCandidate {
+            return Err(MemoryError::coded(
+                "MEM_SECRET_REJECTED",
+                "candidate content or reason looks like a credential",
+            ));
+        }
         let content_length = self.content.trim().chars().count();
         if content_length == 0 || content_length > MAX_MEMORY_CONTENT_CHARS {
             return Err(MemoryError::coded(
@@ -206,7 +212,9 @@ impl CandidateDraft {
 #[derive(Debug, Clone, PartialEq)]
 pub enum CandidateOutcome {
     /// The draft matched an existing memory with identical content. Nothing was written.
-    Deduplicated { memory: MemoryRecord },
+    Deduplicated {
+        memory: MemoryRecord,
+    },
     /// The draft was high-confidence and non-sensitive, so it was applied immediately. The candidate
     /// is returned already closed so the audit trail shows both the proposal and the decision.
     AutoAccepted {
@@ -214,7 +222,12 @@ pub enum CandidateOutcome {
         candidate: MemoryCandidateRecord,
     },
     /// The draft is waiting for `review_memory_candidate`.
-    Pending { candidate: MemoryCandidateRecord },
+    Pending {
+        candidate: MemoryCandidateRecord,
+    },
+    Suppressed {
+        reason: String,
+    },
 }
 
 #[cfg(test)]
@@ -333,6 +346,30 @@ mod tests {
             AUTO_ACCEPT_CONFIDENCE,
         );
         assert!(!boundary.requires_review(ConflictKind::None, true));
+    }
+
+    #[test]
+    fn credentials_in_candidate_content_or_reason_are_rejected() {
+        for in_reason in [false, true] {
+            let mut candidate = draft(MemoryOperation::Create, "prefer pnpm", 0.9);
+            if in_reason {
+                candidate.reason = "password: hunter2sword".into();
+            } else {
+                candidate.content = "API_KEY=sk-live-abcdefghijklmnop".into();
+            }
+            assert_eq!(
+                candidate.validate().unwrap_err().code(),
+                "MEM_SECRET_REJECTED"
+            );
+        }
+    }
+
+    #[test]
+    fn private_candidate_reasons_prevent_auto_accept() {
+        let mut candidate = draft(MemoryOperation::Create, "prefer pnpm", 1.0);
+        candidate.reason = r"observed at D:\work\checkout".into();
+        assert_eq!(candidate.detected_sensitivity(), Sensitivity::Private);
+        assert!(candidate.requires_review(ConflictKind::None, true));
     }
 
     #[test]
