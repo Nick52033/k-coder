@@ -136,7 +136,6 @@ import type {
 import { toUserFacingPath, workspacePathKey } from "../lib/path";
 import { McpSettingsPage } from "./McpSettingsPage";
 import { MobileSettingsPage } from "./MobileSettingsPage";
-import { WeixinSettingsPage } from "./WeixinSettingsPage";
 import { PluginSettingsPage } from "./PluginSettingsPage";
 import { WorkflowSettingsPage } from "./WorkflowSettingsPage";
 import { RuleSettingsPage } from "./RuleSettingsPage";
@@ -423,8 +422,7 @@ export function SettingsDialog({
               <RuleSettingsPage />
             ) : section === "mobile" ? (
               <>
-                <MobileSettingsPage />
-                <WeixinSettingsPage activeThreadId={activeThreadId} />
+                <MobileSettingsPage activeThreadId={activeThreadId} />
               </>
             ) : section === "skills" ? (
               <ExtensionsPage />

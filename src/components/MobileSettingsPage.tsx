@@ -10,6 +10,7 @@ import {
   Play,
   QrCode,
   RefreshCw,
+  Server,
   ShieldCheck,
   Smartphone,
   Square,
@@ -36,7 +37,10 @@ import type {
   MobilePairingView,
   MobileStatus,
 } from "../types/runtime";
+import { BrandLogo } from "./BrandLogo";
+import type { BrandLogoName } from "./BrandLogo";
 import { useToast } from "./Toast";
+import { WeixinSettingsPage } from "./WeixinSettingsPage";
 import "./MobileSettingsPage.css";
 
 const CAPABILITY_LABELS: Record<MobileCapability, string> = {
@@ -63,7 +67,114 @@ function deviceStatusLabel(device: MobileDeviceView): string {
   return "已授权";
 }
 
-export function MobileSettingsPage() {
+/** 移动设备下的接入分类。服务器中转是既有局域网直连通道，微信是扫码接入通道，钉钉尚未接入。 */
+export type MobileChannel = "weixin" | "dingtalk" | "relay";
+
+interface MobileChannelDefinition {
+  id: MobileChannel;
+  label: string;
+  description: string;
+  icon: "relay" | BrandLogoName;
+  available: boolean;
+}
+
+const MOBILE_CHANNELS: MobileChannelDefinition[] = [
+  {
+    id: "relay",
+    label: "服务器中转",
+    description: "局域网 / 隧道直连，手机扫码配对",
+    icon: "relay",
+    available: true,
+  },
+  {
+    id: "weixin",
+    label: "微信",
+    description: "扫码把微信消息接入桌面会话",
+    icon: "wechat",
+    available: true,
+  },
+  {
+    id: "dingtalk",
+    label: "钉钉",
+    description: "规划中，暂未接入",
+    icon: "dingtalk",
+    available: false,
+  },
+];
+
+interface MobileSettingsPageProps {
+  activeThreadId: string | null;
+}
+
+export function MobileSettingsPage({ activeThreadId }: MobileSettingsPageProps) {
+  const [channel, setChannel] = useState<MobileChannel>("relay");
+  const active = MOBILE_CHANNELS.find((item) => item.id === channel) ?? MOBILE_CHANNELS[0];
+
+  return (
+    <div className="mobile-settings">
+      <header className="mobile-settings__header">
+        <div>
+          <h2>
+            <Smartphone size={16} aria-hidden /> 移动设备
+          </h2>
+          <p>
+            手机只承担控制面：查看会话、发送消息、停止 Turn、处理审批和回答问题。
+            文件浏览、终端、插件与供应商配置继续留在桌面端。
+          </p>
+        </div>
+      </header>
+
+      <div className="mobile-settings__channels">
+        <nav className="mobile-settings__channel-list" aria-label="移动设备接入分类">
+          {MOBILE_CHANNELS.map((item) => {
+            return (
+              <button
+                key={item.id}
+                type="button"
+                className={`mobile-settings__channel ${channel === item.id ? "is-active" : ""}`}
+                aria-current={channel === item.id ? "true" : undefined}
+                onClick={() => setChannel(item.id)}
+              >
+                {item.icon === "relay" ? (
+                  <Server size={15} aria-hidden />
+                ) : (
+                  <BrandLogo brand={item.icon} />
+                )}
+                <span className="mobile-settings__channel-label">{item.label}</span>
+                <small>{item.description}</small>
+                {!item.available ? (
+                  <span className="mobile-settings__channel-flag">未接入</span>
+                ) : null}
+              </button>
+            );
+          })}
+        </nav>
+
+        <div className="mobile-settings__channel-detail">
+          {channel === "relay" ? (
+            <MobileRelaySettingsPage />
+          ) : channel === "weixin" ? (
+            <WeixinSettingsPage activeThreadId={activeThreadId} />
+          ) : (
+            <div className="mobile-settings__card">
+              <div className="mobile-settings__card-head">
+                <h3>
+                  <BrandLogo brand="dingtalk" /> {active.label}接入
+                </h3>
+                <span className="mobile-settings__pill">规划中</span>
+              </div>
+              <p className="mobile-settings__hint">
+                钉钉接入尚未实现，这里只保留分类入口。当前可用的手机接入方式是「服务器中转」和「微信」。
+              </p>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function MobileRelaySettingsPage() {
   const toast = useToast();
   const [status, setStatus] = useState<MobileStatus | null>(null);
   const [pairing, setPairing] = useState<MobilePairingView | null>(null);
@@ -246,17 +357,11 @@ export function MobileSettingsPage() {
   };
 
   return (
-    <div className="mobile-settings">
-      <header className="mobile-settings__header">
-        <div>
-          <h2>
-            <Smartphone size={16} aria-hidden /> 移动设备
-          </h2>
-          <p>
-            手机只承担控制面：查看会话、发送消息、停止 Turn、处理审批和回答问题。
-            文件浏览、终端、插件与供应商配置继续留在桌面端。
-          </p>
-        </div>
+    <div className="mobile-relay">
+      <header className="mobile-settings__subhead">
+        <h3>
+          <Server size={15} aria-hidden /> 服务器中转
+        </h3>
         <button type="button" className="mobile-settings__ghost" onClick={() => void refresh()}>
           <RefreshCw size={14} aria-hidden /> 刷新
         </button>

@@ -1,8 +1,9 @@
 import { useEffect, useState } from "react";
 import QRCode from "qrcode";
-import { CheckCircle2, LoaderCircle, MessageCircle, Play, Square } from "lucide-react";
+import { CheckCircle2, LoaderCircle, Play, Square } from "lucide-react";
 import { listThreads, startWeixin, stopWeixin, weixinStatus } from "../api/runtime";
 import type { ThreadSummary, WeixinStatus } from "../types/runtime";
+import { BrandLogo } from "./BrandLogo";
 import { useToast } from "./Toast";
 
 export function WeixinSettingsPage({ activeThreadId }: { activeThreadId: string | null }) {
@@ -11,7 +12,8 @@ export function WeixinSettingsPage({ activeThreadId }: { activeThreadId: string 
   useEffect(()=>{void refresh(); const id=window.setInterval(()=>void refresh(),1500); return()=>window.clearInterval(id)},[]);
   const start=async()=>{ if(!threadId) return toast.error("请选择桌面会话"); setBusy(true); try { setStatus(await startWeixin(threadId,remember,autoConnect)); toast.success("微信扫码连接已启动"); } catch(e){toast.error(String(e))} finally{setBusy(false)} };
   const stop=async()=>{setBusy(true);try{setStatus(await stopWeixin());toast.info("微信接入已停止")}catch(e){toast.error(String(e))}finally{setBusy(false)}};
-  return <div className="mobile-settings"><header className="mobile-settings__header"><div><h2><MessageCircle size={16}/> 微信接入</h2><p>扫码后，微信文本会进入选定的桌面会话，并沿用该会话的模型、工作区和权限。</p></div></header>
+  return <div className="mobile-settings"><header className="mobile-settings__subhead"><h3><BrandLogo brand="wechat"/> 微信接入</h3></header>
+    <p className="mobile-settings__intro">扫码后，微信文本会进入选定的桌面会话，并沿用该会话的模型、工作区和权限。</p>
     <section className="mobile-settings__card"><label className="mobile-settings__field"><span>绑定桌面会话</span><select value={threadId} onChange={e=>setThreadId(e.target.value)} disabled={status?.running}>{threads.map(t=><option key={t.id} value={t.id}>{t.title||t.id}</option>)}</select></label>
       <label className="mobile-settings__check"><input type="checkbox" checked={remember} onChange={e=>setRemember(e.target.checked)} disabled={status?.running}/> 安全记住登录凭据</label>
       <label className="mobile-settings__check"><input type="checkbox" checked={autoConnect} onChange={e=>setAutoConnect(e.target.checked)} disabled={status?.running}/> 应用启动时自动连接</label>

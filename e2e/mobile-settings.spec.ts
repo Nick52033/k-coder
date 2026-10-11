@@ -139,6 +139,19 @@ test("mobile settings page drives gateway, pairing and device control", async ({
         if (command === "get_reasoning_effort") return "medium";
         if (command === "get_provider_catalog") return fixture.catalog;
         if (command === "list_builtin_workflows") return [];
+        if (command === "weixin_status") {
+          return {
+            running: false,
+            phase: "idle",
+            qrCode: null,
+            qrImageContent: null,
+            threadId: fixture.thread.id,
+            remembered: false,
+            autoConnect: false,
+            owner: null,
+            error: null,
+          };
+        }
         if (command === "list_threads") return [fixture.thread];
         if (command === "read_thread_history") return null;
         if (command === "read_thread") return null;
@@ -250,6 +263,40 @@ test("mobile settings page drives gateway, pairing and device control", async ({
   await page.locator('button[aria-label="设置"]:visible').click();
   const settings = page.getByRole("dialog", { name: "设置" });
   await settings.getByRole("button", { name: "移动设备" }).click();
+
+  // 第二栏是接入分类，第三栏只放当前分类的设置。默认落在「服务器中转」，
+  // 也就是既有的局域网扫码配对通道。
+  const channels = settings.locator(".mobile-settings__channel");
+  await expect(channels).toHaveCount(3);
+  await expect(channels.nth(0)).toContainText("服务器中转");
+  await expect(channels.nth(1)).toContainText("微信");
+  await expect(channels.nth(2)).toContainText("钉钉");
+  await expect(channels.nth(2)).toContainText("未接入");
+  await expect(channels.nth(1).locator('[data-brand-logo="wechat"]')).toBeVisible();
+  await expect(channels.nth(2).locator('[data-brand-logo="dingtalk"]')).toBeVisible();
+  await expect(channels.nth(0)).toHaveAttribute("aria-current", "true");
+  await expect(settings.getByRole("heading", { name: "服务器中转" })).toBeVisible();
+  await expect(settings.getByRole("heading", { name: "局域网访问" })).toBeVisible();
+
+  // 切到微信：原来的微信扫码设置单独成页，不再和服务器中转的设置堆在一起。
+  await channels.nth(1).click();
+  await expect(channels.nth(1)).toHaveAttribute("aria-current", "true");
+  const weixinHeading = settings.getByRole("heading", { name: "微信接入" });
+  await expect(weixinHeading).toBeVisible();
+  await expect(weixinHeading.locator('[data-brand-logo="wechat"]')).toBeVisible();
+  await expect(settings.getByRole("heading", { name: "局域网访问" })).toHaveCount(0);
+
+  // 钉钉只保留分类入口，明确说明尚未接入。
+  await channels.nth(2).click();
+  const dingtalkHeading = settings.getByRole("heading", { name: "钉钉接入" });
+  await expect(dingtalkHeading).toBeVisible();
+  await expect(dingtalkHeading.locator('[data-brand-logo="dingtalk"]')).toBeVisible();
+  await expect(settings.locator(".mobile-settings__channel-detail").getByText("规划中")).toBeVisible();
+  await expect(settings.getByRole("heading", { name: "微信接入" })).toHaveCount(0);
+
+  // 切回服务器中转，网关与配对卡片恢复可见，后续断言继续针对它。
+  await channels.nth(0).click();
+  await expect(settings.getByRole("heading", { name: "局域网访问" })).toBeVisible();
 
   // 概览：运行中的地址、证书指纹与设备列表。
   await expect(settings.getByRole("heading", { name: "移动设备" })).toBeVisible();
